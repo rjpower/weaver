@@ -27,3 +27,5 @@ venv/
 
 # Project specific
 .weaver/index.yml
+.weaver/issues
+.weaver/launches

@@ -78,3 +78,27 @@ class DependencyGraph:
     def get_blocked_by_this(self, issue_id: str) -> set[str]:
         """Get IDs of issues blocked by the given issue."""
         return self.blocks.get(issue_id, set()).copy()
+
+    def get_transitive_blockers(self, issue_id: str) -> list[str]:
+        """Get all transitive blockers in topological order (deepest first).
+
+        Returns a list of issue IDs where dependencies appear before dependents.
+        """
+        visited: set[str] = set()
+        result: list[str] = []
+
+        def dfs(current_id: str) -> None:
+            if current_id in visited:
+                return
+            visited.add(current_id)
+
+            # Visit all blockers first (depth-first)
+            for blocker_id in self.blocked_by.get(current_id, set()):
+                dfs(blocker_id)
+
+            # Add current node after all its dependencies
+            if current_id != issue_id:  # Don't include the starting issue
+                result.append(current_id)
+
+        dfs(issue_id)
+        return result

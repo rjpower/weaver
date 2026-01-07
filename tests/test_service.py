@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from weaver.models import Issue, IssueType, Status
-from weaver.service import DependencyError, IssueNotFoundError, IssueService
-from weaver.storage import MarkdownStorage
+from weaver.models import Hint, Issue, IssueType, Status
+from weaver.service import DependencyError, IssueNotFoundError, IssueService, HintService
+from weaver.storage import HintStorage, MarkdownStorage
 
 
 @pytest.fixture
@@ -272,3 +272,243 @@ class TestGetReadyIssues:
         ids = {i.id for i in ready}
         assert open_issue.id in ids
         assert closed_issue.id not in ids
+
+
+class TestGetIssueWithDependencies:
+    def test_issue_with_no_dependencies(self, service: IssueService):
+        issue = service.create_issue("No deps")
+
+        main_issue, dependencies = service.get_issue_with_dependencies(issue.id)
+
+        assert main_issue.id == issue.id
+        assert dependencies == []
+
+    def test_issue_with_single_level_dependencies(self, service: IssueService):
+        dep1 = service.create_issue("Dep 1")
+        dep2 = service.create_issue("Dep 2")
+        main = service.create_issue("Main", blocked_by=[dep1.id, dep2.id])
+
+        main_issue, dependencies = service.get_issue_with_dependencies(main.id)
+
+        assert main_issue.id == main.id
+        assert len(dependencies) == 2
+        dep_ids = {d.id for d in dependencies}
+        assert dep1.id in dep_ids
+        assert dep2.id in dep_ids
+
+    def test_issue_with_multi_level_dependencies(self, service: IssueService):
+        # Create chain: main -> dep1 -> dep2 -> dep3
+        dep3 = service.create_issue("Dep 3")
+        dep2 = service.create_issue("Dep 2", blocked_by=[dep3.id])
+        dep1 = service.create_issue("Dep 1", blocked_by=[dep2.id])
+        main = service.create_issue("Main", blocked_by=[dep1.id])
+
+        main_issue, dependencies = service.get_issue_with_dependencies(main.id)
+
+        assert main_issue.id == main.id
+        assert len(dependencies) == 3
+
+        # Dependencies should be in topological order (deepest first)
+        dep_ids = [d.id for d in dependencies]
+        assert dep3.id in dep_ids
+        assert dep2.id in dep_ids
+        assert dep1.id in dep_ids
+
+        # Verify topological ordering: dep3 before dep2, dep2 before dep1
+        dep3_idx = dep_ids.index(dep3.id)
+        dep2_idx = dep_ids.index(dep2.id)
+        dep1_idx = dep_ids.index(dep1.id)
+        assert dep3_idx < dep2_idx
+        assert dep2_idx < dep1_idx
+
+    def test_missing_issue_raises_error(self, service: IssueService):
+        with pytest.raises(IssueNotFoundError, match="wv-nonexistent"):
+            service.get_issue_with_dependencies("wv-nonexistent")
+
+
+@pytest.fixture
+def hint_storage(weaver_root: Path) -> HintStorage:
+    storage = HintStorage(weaver_root)
+    storage.ensure_initialized()
+    return storage
+
+
+@pytest.fixture
+def hint_service(hint_storage: HintStorage) -> HintService:
+    return HintService(hint_storage)
+
+
+class TestCreateOrUpdateHint:
+    def test_creates_new_hint(self, hint_service: HintService):
+        hint = hint_service.create_or_update_hint(
+            title="Test Hint", content="This is a test hint"
+        )
+
+        assert hint.id.startswith("wv-hint-")
+        assert hint.title == "test hint"
+        assert hint.content == "This is a test hint"
+        assert hint.labels == []
+
+    def test_creates_with_labels(self, hint_service: HintService):
+        hint = hint_service.create_or_update_hint(
+            title="Test Hint", content="Content", labels=["python", "testing"]
+        )
+
+        assert hint.labels == ["python", "testing"]
+
+    def test_normalizes_title_to_lowercase(self, hint_service: HintService):
+        hint = hint_service.create_or_update_hint(
+            title="Test HINT Title", content="Content"
+        )
+
+        assert hint.title == "test hint title"
+
+    def test_updates_existing_hint_by_title(self, hint_service: HintService):
+        original = hint_service.create_or_update_hint(
+            title="Test Hint", content="Original content", labels=["old"]
+        )
+        original_id = original.id
+
+        updated = hint_service.create_or_update_hint(
+            title="Test Hint", content="Updated content", labels=["new"]
+        )
+
+        assert updated.id == original_id
+        assert updated.content == "Updated content"
+        assert updated.labels == ["new"]
+
+    def test_updates_case_insensitive(self, hint_service: HintService):
+        original = hint_service.create_or_update_hint(
+            title="test hint", content="Original"
+        )
+        original_id = original.id
+
+        updated = hint_service.create_or_update_hint(
+            title="TEST HINT", content="Updated"
+        )
+
+        assert updated.id == original_id
+        assert updated.content == "Updated"
+
+    def test_persists_hint(self, hint_service: HintService, hint_storage: HintStorage):
+        hint = hint_service.create_or_update_hint(title="Persisted", content="Content")
+
+        loaded = hint_storage.read_hint(hint.id)
+        assert loaded is not None
+        assert loaded.title == "persisted"
+        assert loaded.content == "Content"
+
+
+class TestGetHint:
+    def test_gets_by_id(self, hint_service: HintService):
+        created = hint_service.create_or_update_hint(
+            title="Test Hint", content="Content"
+        )
+
+        found = hint_service.get_hint(created.id)
+        assert found is not None
+        assert found.id == created.id
+
+    def test_gets_by_title_exact(self, hint_service: HintService):
+        created = hint_service.create_or_update_hint(
+            title="Test Hint", content="Content"
+        )
+
+        found = hint_service.get_hint("test hint")
+        assert found is not None
+        assert found.id == created.id
+
+    def test_gets_by_title_case_insensitive(self, hint_service: HintService):
+        created = hint_service.create_or_update_hint(
+            title="Test Hint", content="Content"
+        )
+
+        found = hint_service.get_hint("TEST HINT")
+        assert found is not None
+        assert found.id == created.id
+
+    def test_returns_none_for_missing(self, hint_service: HintService):
+        assert hint_service.get_hint("wv-hint-nonexistent") is None
+        assert hint_service.get_hint("nonexistent title") is None
+
+    def test_id_lookup_takes_precedence(
+        self, hint_service: HintService, hint_storage: HintStorage
+    ):
+        # Create a hint with a title that could be confused with an ID
+        hint1 = hint_service.create_or_update_hint(
+            title="Regular Hint", content="Content 1"
+        )
+
+        # Manually create another hint with a title that matches hint1's ID
+        hint2 = Hint(
+            id="wv-hint-test2",
+            title=hint1.id,
+            content="Content 2",
+        )
+        hint_storage.write_hint(hint2)
+
+        # Searching by hint1's ID should return hint1, not hint2
+        found = hint_service.get_hint(hint1.id)
+        assert found is not None
+        assert found.id == hint1.id
+        assert found.content == "Content 1"
+
+
+class TestListHints:
+    def test_returns_empty_list_when_no_hints(self, hint_service: HintService):
+        hints = hint_service.list_hints()
+        assert hints == []
+
+    def test_returns_all_hints(self, hint_service: HintService):
+        hint_service.create_or_update_hint(title="Hint 1", content="Content 1")
+        hint_service.create_or_update_hint(title="Hint 2", content="Content 2")
+
+        hints = hint_service.list_hints()
+        assert len(hints) == 2
+
+    def test_sorted_by_title(self, hint_service: HintService):
+        hint_service.create_or_update_hint(title="Zebra", content="Content")
+        hint_service.create_or_update_hint(title="Apple", content="Content")
+        hint_service.create_or_update_hint(title="Mango", content="Content")
+
+        hints = hint_service.list_hints()
+        titles = [h.title for h in hints]
+        assert titles == ["apple", "mango", "zebra"]
+
+
+class TestSearchHints:
+    def test_finds_by_title(self, hint_service: HintService):
+        hint_service.create_or_update_hint(title="Python Testing", content="Content")
+        hint_service.create_or_update_hint(title="Java Tutorial", content="Content")
+
+        results = hint_service.search_hints("python")
+        assert len(results) == 1
+        assert results[0].title == "python testing"
+
+    def test_finds_by_content(self, hint_service: HintService):
+        hint_service.create_or_update_hint(title="Hint 1", content="Use pytest")
+        hint_service.create_or_update_hint(title="Hint 2", content="Use unittest")
+
+        results = hint_service.search_hints("pytest")
+        assert len(results) == 1
+        assert results[0].title == "hint 1"
+
+    def test_case_insensitive_search(self, hint_service: HintService):
+        hint_service.create_or_update_hint(title="Python", content="Content")
+
+        results = hint_service.search_hints("PYTHON")
+        assert len(results) == 1
+
+    def test_returns_multiple_matches(self, hint_service: HintService):
+        hint_service.create_or_update_hint(title="Python Testing", content="Content")
+        hint_service.create_or_update_hint(title="Testing Guide", content="Python")
+        hint_service.create_or_update_hint(title="Java", content="Content")
+
+        results = hint_service.search_hints("python")
+        assert len(results) == 2
+
+    def test_returns_empty_for_no_matches(self, hint_service: HintService):
+        hint_service.create_or_update_hint(title="Python", content="Content")
+
+        results = hint_service.search_hints("javascript")
+        assert results == []

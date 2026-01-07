@@ -22,6 +22,12 @@ class IssueType(Enum):
     CHORE = "chore"
 
 
+class AgentModel(Enum):
+    SONNET = "claude-sonnet-4-5-20250929"
+    OPUS = "claude-opus-4-5-20251101"
+    FLASH = "claude-3-5-haiku-20241022"
+
+
 @dataclass
 class Issue:
     id: str
@@ -48,6 +54,47 @@ class Issue:
     def is_open(self) -> bool:
         """Check if issue is in an open state (not closed)."""
         return self.status in (Status.OPEN, Status.IN_PROGRESS, Status.BLOCKED)
+
+
+@dataclass
+class WorkflowStep:
+    title: str
+    type: IssueType = IssueType.TASK
+    priority: int = 2
+    description: str = ""
+    labels: list[str] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Workflow:
+    id: str
+    name: str
+    description: str = ""
+    steps: list[WorkflowStep] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class Hint:
+    id: str
+    title: str
+    content: str
+    labels: list[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class LaunchExecution:
+    id: str
+    issue_id: str
+    model: AgentModel
+    started_at: datetime = field(default_factory=datetime.now)
+    completed_at: datetime | None = None
+    exit_code: int | None = None
+    log_file: str = ""
 
 
 def generate_id(prefix: str = "wv") -> str:

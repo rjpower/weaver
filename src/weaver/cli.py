@@ -10,8 +10,8 @@ from rich.console import Console
 from rich.table import Table
 
 from weaver.models import Issue, IssueType, Status
-from weaver.service import DependencyError, IssueNotFoundError, IssueService
-from weaver.storage import MarkdownStorage
+from weaver.service import DependencyError, IssueNotFoundError, IssueService, HintService, WorkflowService
+from weaver.storage import MarkdownStorage, HintStorage, WorkflowStorage
 
 console = Console()
 
@@ -141,6 +141,14 @@ def init() -> None:
         return
     storage = MarkdownStorage(root)
     storage.ensure_initialized()
+    hint_storage = HintStorage(root)
+    hint_storage.ensure_initialized()
+
+    from weaver.storage import WorkflowStorage, LaunchStorage
+    workflow_storage = WorkflowStorage(root)
+    workflow_storage.ensure_initialized()
+    launch_storage = LaunchStorage(root)
+    launch_storage.ensure_initialized()
 
     # Add .weaver/ to .gitignore
     gitignore_path = Path.cwd() / ".gitignore"
@@ -236,14 +244,51 @@ def create(
 
 @cli.command()
 @click.argument("issue_id")
+@click.option("--fetch-deps", is_flag=True, help="Show transitive dependencies in topological order")
 @click.pass_context
-def show(ctx: click.Context, issue_id: str) -> None:
+def show(ctx: click.Context, issue_id: str, fetch_deps: bool) -> None:
     """Show issue details."""
     service = get_service(ctx)
-    issue = service.get_issue(issue_id)
-    if issue is None:
-        raise click.ClickException(f"Issue {issue_id} not found")
 
+    if fetch_deps:
+        try:
+            issue, dependencies = service.get_issue_with_dependencies(issue_id)
+        except IssueNotFoundError:
+            raise click.ClickException(f"Issue {issue_id} not found")
+
+        # Display dependencies first
+        if dependencies:
+            console.print("[bold]Dependencies (topological order - deepest first):[/bold]\n")
+
+            for dep in dependencies:
+                console.print(f"[bold cyan]{dep.id}[/bold cyan]: {dep.title}")
+                console.print(f"Status: {dep.status.value}  Priority: P{dep.priority}  Type: {dep.type.value}")
+
+                # Combine description and design_notes for truncation
+                content = dep.description
+                if dep.design_notes:
+                    content += "\n\n" + dep.design_notes
+
+                # Use truncate_content utility
+                if content:
+                    from weaver.utils import truncate_content
+                    truncated, was_truncated = truncate_content(content, max_words=200)
+                    console.print(f"\n{truncated}\n")
+
+                    if was_truncated:
+                        console.print(f"[dim]Use 'weaver show {dep.id}' to see complete content[/dim]\n")
+
+                console.print("─" * 60)
+                console.print()
+
+        # Display main issue
+        console.print("[bold]Main Issue:[/bold]\n")
+    else:
+        issue = service.get_issue(issue_id)
+        if issue is None:
+            raise click.ClickException(f"Issue {issue_id} not found")
+
+    # Display issue details
     console.print(f"[bold cyan]{issue.id}[/bold cyan]: {issue.title}")
     console.print(
         f"Status: {issue.status.value}  Priority: P{issue.priority}  Type: {issue.type.value}"
@@ -585,6 +630,327 @@ def sync(branch: str | None, do_push: bool, do_pull: bool) -> None:
         if issues_dir.exists():
             issue_count = len(list(issues_dir.glob("*.md")))
             console.print(f"Local issues: {issue_count}")
+
+
+@cli.group()
+def workflow() -> None:
+    """Manage workflow templates."""
+    pass
+
+
+@workflow.command("create")
+@click.argument("name")
+@click.option(
+    "-f",
+    "--file",
+    "file_path",
+    type=click.Path(exists=False),
+    help="Read workflow YAML from file (use '-' for stdin)",
+)
+@click.pass_context
+def workflow_create(ctx: click.Context, name: str, file_path: str | None) -> None:
+    """Create or update a workflow template."""
+    workflow_service = get_workflow_service(ctx)
+
+    if not file_path:
+        raise click.ClickException("Workflow YAML required. Use -f - to read from stdin.")
+
+    if file_path == "-":
+        yaml_content = sys.stdin.read()
+    else:
+        path = Path(file_path)
+        if not path.exists():
+            raise click.ClickException(f"File not found: {file_path}")
+        yaml_content = path.read_text()
+
+    try:
+        workflow = workflow_service.create_or_update_workflow(yaml_content)
+        console.print(f"Created workflow [cyan]{workflow.name}[/cyan] ({workflow.id})")
+        console.print(f"Steps: {len(workflow.steps)}")
+    except Exception as e:
+        raise click.ClickException(f"Failed to parse workflow: {e}")
+
+
+@workflow.command("execute")
+@click.argument("workflow_name")
+@click.option("--label", help="Additional label prefix for created issues")
+@click.pass_context
+def workflow_execute(ctx: click.Context, workflow_name: str, label: str | None) -> None:
+    """Execute a workflow, creating all its issues."""
+    workflow_service = get_workflow_service(ctx)
+
+    try:
+        issues = workflow_service.execute_workflow(workflow_name, label)
+        console.print(f"Created {len(issues)} issues from workflow [cyan]{workflow_name}[/cyan]:")
+
+        for issue in issues:
+            console.print(f"  [cyan]{issue.id}[/cyan]: {issue.title}")
+
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+
+@workflow.command("show")
+@click.argument("workflow_name")
+@click.pass_context
+def workflow_show(ctx: click.Context, workflow_name: str) -> None:
+    """Show workflow details."""
+    workflow_service = get_workflow_service(ctx)
+    workflow = workflow_service.get_workflow(workflow_name)
+
+    if not workflow:
+        raise click.ClickException(f"Workflow not found: {workflow_name}")
+
+    console.print(f"[bold cyan]{workflow.name}[/bold cyan] ({workflow.id})")
+    if workflow.description:
+        console.print(f"{workflow.description}\n")
+
+    console.print(f"[bold]Steps ({len(workflow.steps)}):[/bold]")
+    for i, step in enumerate(workflow.steps, 1):
+        console.print(f"\n{i}. [cyan]{step.title}[/cyan]")
+        console.print(f"   Type: {step.type.value}, Priority: P{step.priority}")
+        if step.depends_on:
+            console.print(f"   Depends on: {', '.join(step.depends_on)}")
+        if step.labels:
+            console.print(f"   Labels: {', '.join(step.labels)}")
+
+
+@workflow.command("list")
+@click.pass_context
+def workflow_list(ctx: click.Context) -> None:
+    """List all workflows."""
+    workflow_service = get_workflow_service(ctx)
+    workflows = workflow_service.list_workflows()
+
+    if not workflows:
+        console.print("No workflows found.")
+        return
+
+    table = Table()
+    table.add_column("Name", style="cyan")
+    table.add_column("ID")
+    table.add_column("Steps")
+    table.add_column("Description")
+
+    for wf in workflows:
+        table.add_row(
+            wf.name,
+            wf.id,
+            str(len(wf.steps)),
+            wf.description[:50] if wf.description else "",
+        )
+
+    console.print(table)
+
+
+def get_workflow_service(ctx: click.Context) -> WorkflowService:
+    """Get or create WorkflowService from context."""
+    if "workflow_service" not in ctx.obj:
+        root = find_weaver_root()
+        if not root:
+            raise click.ClickException("Not in a weaver project.")
+        service = get_service(ctx)
+        workflow_storage = WorkflowStorage(root)
+        workflow_storage.ensure_initialized()
+        ctx.obj["workflow_service"] = WorkflowService(workflow_storage, service)
+    return ctx.obj["workflow_service"]
+
+
+def get_hint_service(ctx: click.Context) -> HintService:
+    """Get or create HintService from context."""
+    if "hint_service" not in ctx.obj:
+        root = find_weaver_root()
+        if not root:
+            raise click.ClickException("Not in a weaver project.")
+        ctx.obj["hint_service"] = HintService(HintStorage(root))
+    return ctx.obj["hint_service"]
+
+
+@cli.group()
+def hint() -> None:
+    """Manage repository knowledge hints."""
+    pass
+
+
+@hint.command("add")
+@click.argument("title")
+@click.option("-l", "--label", "labels", multiple=True, help="Add label (repeatable)")
+@click.option(
+    "-f",
+    "--file",
+    "file_path",
+    type=click.Path(exists=False),
+    help="Read content from file (use '-' for stdin)",
+)
+@click.pass_context
+def hint_add(ctx: click.Context, title: str, labels: tuple[str, ...], file_path: str | None) -> None:
+    """Add or update a hint. Use -f - to read from stdin/HEREDOC."""
+    hint_service = get_hint_service(ctx)
+
+    if not file_path:
+        raise click.ClickException("Content required. Use -f - to read from stdin.")
+
+    if file_path == "-":
+        content = sys.stdin.read()
+    else:
+        path = Path(file_path)
+        if not path.exists():
+            raise click.ClickException(f"File not found: {file_path}")
+        content = path.read_text()
+
+    existing = hint_service.get_hint(title)
+    hint = hint_service.create_or_update_hint(title, content, list(labels))
+    action = "Updated" if existing else "Created"
+    console.print(f"{action} hint [cyan]{hint.title}[/cyan] ({hint.id})")
+
+
+@hint.command("show")
+@click.argument("title_or_id")
+@click.pass_context
+def hint_show(ctx: click.Context, title_or_id: str) -> None:
+    """Show a hint by title or ID."""
+    hint_service = get_hint_service(ctx)
+    hint_obj = hint_service.get_hint(title_or_id)
+
+    if not hint_obj:
+        raise click.ClickException(f"Hint not found: {title_or_id}")
+
+    console.print(f"[bold cyan]{hint_obj.title}[/bold cyan] ({hint_obj.id})")
+    if hint_obj.labels:
+        console.print(f"Labels: {', '.join(hint_obj.labels)}")
+    console.print(f"\n{hint_obj.content}")
+
+
+@hint.command("list")
+@click.pass_context
+def hint_list(ctx: click.Context) -> None:
+    """List all hints."""
+    hint_service = get_hint_service(ctx)
+    hints = hint_service.list_hints()
+
+    if not hints:
+        console.print("No hints found.")
+        return
+
+    table = Table()
+    table.add_column("Title", style="cyan")
+    table.add_column("ID")
+    table.add_column("Labels")
+
+    for hint_obj in hints:
+        table.add_row(hint_obj.title, hint_obj.id, ", ".join(hint_obj.labels))
+
+    console.print(table)
+
+
+@hint.command("search")
+@click.argument("query")
+@click.pass_context
+def hint_search(ctx: click.Context, query: str) -> None:
+    """Search hints by content."""
+    hint_service = get_hint_service(ctx)
+    hints = hint_service.search_hints(query)
+
+    if not hints:
+        console.print(f"No hints found matching '{query}'")
+        return
+
+    from weaver.utils import truncate_content
+    for hint_obj in hints:
+        console.print(f"[cyan]{hint_obj.title}[/cyan] ({hint_obj.id})")
+        preview, _ = truncate_content(hint_obj.content, max_words=50)
+        console.print(f"  {preview}\n")
+
+
+@cli.command()
+@click.argument("issue_id")
+@click.option(
+    "--model",
+    type=click.Choice(["sonnet", "opus", "flash"]),
+    default="sonnet",
+    help="Claude model to use",
+)
+@click.pass_context
+def launch(ctx: click.Context, issue_id: str, model: str) -> None:
+    """Launch an AI agent to work on a task.
+
+    This spawns a Claude subprocess that will attempt to complete the task
+    autonomously. The agent receives the task context, relevant hints, and
+    dependency information.
+    """
+    service = get_service(ctx)
+    hint_service = get_hint_service(ctx)
+
+    # Validate issue exists
+    issue = service.get_issue(issue_id)
+    if not issue:
+        raise click.ClickException(f"Issue {issue_id} not found")
+
+    # Map model name to enum
+    from weaver.models import AgentModel
+    model_map = {
+        "sonnet": AgentModel.SONNET,
+        "opus": AgentModel.OPUS,
+        "flash": AgentModel.FLASH,
+    }
+    agent_model = model_map[model]
+
+    # Create launch service
+    root = find_weaver_root()
+    from weaver.storage import LaunchStorage
+    from weaver.service import LaunchService
+
+    launch_storage = LaunchStorage(root)
+    launch_storage.ensure_initialized()
+    launch_service = LaunchService(service, launch_storage, hint_service)
+
+    # Prepare and launch
+    console.print(f"Launching {model} agent on [cyan]{issue_id}[/cyan]: {issue.title}")
+    launch = launch_service.launch_agent(issue_id, agent_model)
+
+    # Build the claude command
+    from pathlib import Path
+    context_file = Path(launch.log_file).parent / f"{launch.id}-context.md"
+    log_file = Path(launch.log_file)
+
+    # Execute claude subprocess
+    cmd = [
+        "claude",
+        "--model", agent_model.value,
+        "--dangerously-skip-display",
+        f"@{context_file}",
+    ]
+
+    console.print(f"Running: {' '.join(cmd)}")
+    console.print(f"Logs: {log_file}")
+
+    try:
+        import subprocess
+        from datetime import datetime
+
+        with open(log_file, "w") as log:
+            result = subprocess.run(
+                cmd,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+        launch.completed_at = datetime.now()
+        launch.exit_code = result.returncode
+        launch_storage.write_launch(launch)
+
+        if result.returncode == 0:
+            console.print(f"[green]Agent completed successfully[/green]")
+        else:
+            console.print(f"[red]Agent exited with code {result.returncode}[/red]")
+            console.print(f"Check logs: {log_file}")
+
+    except FileNotFoundError:
+        raise click.ClickException("Claude CLI not found. Install with: pip install claude-code")
+    except Exception as e:
+        console.print(f"[red]Error launching agent: {e}[/red]")
+        raise
 
 
 if __name__ == "__main__":
