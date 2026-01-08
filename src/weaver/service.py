@@ -169,6 +169,7 @@ class IssueService:
         status: Status | None = None,
         labels: list[str] | None = None,
         type: IssueType | None = None,
+        exclude_closed: bool = False,
     ) -> list[Issue]:
         """List issues with optional filters."""
         issues = self.storage.read_all_issues()
@@ -180,6 +181,8 @@ class IssueService:
             issues = [i for i in issues if label_set & set(i.labels)]
         if type is not None:
             issues = [i for i in issues if i.type == type]
+        if exclude_closed:
+            issues = [i for i in issues if i.status != Status.CLOSED]
 
         return sorted(issues, key=lambda i: (i.priority, i.created_at))
 

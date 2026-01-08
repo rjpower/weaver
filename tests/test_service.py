@@ -219,6 +219,23 @@ class TestListIssues:
         priorities = [i.priority for i in issues]
         assert priorities == [0, 1, 2]
 
+    def test_excludes_closed_when_flag_set(self, service: IssueService):
+        open_issue = service.create_issue("Open")
+        closed_issue = service.create_issue("Closed")
+        service.close_issue(closed_issue.id)
+
+        issues = service.list_issues(exclude_closed=True)
+        assert len(issues) == 1
+        assert issues[0].id == open_issue.id
+
+    def test_includes_closed_when_flag_not_set(self, service: IssueService):
+        open_issue = service.create_issue("Open")
+        closed_issue = service.create_issue("Closed")
+        service.close_issue(closed_issue.id)
+
+        issues = service.list_issues(exclude_closed=False)
+        assert len(issues) == 2
+
 
 class TestGetReadyIssues:
     def test_excludes_blocked(self, service: IssueService):

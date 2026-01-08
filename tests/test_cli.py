@@ -320,16 +320,33 @@ class TestShow:
 
 
 class TestList:
-    def test_lists_all(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+    def test_lists_all_open_by_default(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
         os.chdir(weaver_dir)
         service.create_issue("Issue 1")
         service.create_issue("Issue 2")
+        closed_issue = service.create_issue("Closed Issue")
+        service.close_issue(closed_issue.id)
 
         result = runner.invoke(cli, ["list"])
 
         assert result.exit_code == 0
         assert "Issue 1" in result.output
         assert "Issue 2" in result.output
+        assert "Closed Issue" not in result.output
+
+    def test_lists_all_with_flag(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+        os.chdir(weaver_dir)
+        service.create_issue("Issue 1")
+        service.create_issue("Issue 2")
+        closed_issue = service.create_issue("Closed Issue")
+        service.close_issue(closed_issue.id)
+
+        result = runner.invoke(cli, ["list", "--all"])
+
+        assert result.exit_code == 0
+        assert "Issue 1" in result.output
+        assert "Issue 2" in result.output
+        assert "Closed Issue" in result.output
 
     def test_filters_by_status(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
         os.chdir(weaver_dir)
@@ -342,6 +359,18 @@ class TestList:
         assert result.exit_code == 0
         assert "Open" in result.output
         assert "Closed" not in result.output
+
+    def test_filters_by_status_closed(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+        os.chdir(weaver_dir)
+        open_issue = service.create_issue("Open")
+        closed_issue = service.create_issue("Closed")
+        service.close_issue(closed_issue.id)
+
+        result = runner.invoke(cli, ["list", "-s", "closed"])
+
+        assert result.exit_code == 0
+        assert "Closed" in result.output
+        assert "Open" not in result.output
 
     def test_filters_by_label(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
         os.chdir(weaver_dir)

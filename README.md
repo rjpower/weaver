@@ -1,8 +1,22 @@
 # Weaver
 
-Issue tracking for AI coding agents.
+Issue tracking designed for AI coding agents.
 
-Weaver is a CLI tool that stores issues as markdown files with YAML frontmatter, making it easy for both humans and AI agents to read and modify issues. It features dependency tracking with cycle detection, automatic "ready queue" computation, and fast queries via a lightweight index.
+Weaver stores issues as markdown files with YAML frontmatter, making it easy for both humans and AI agents to read and modify issues. It features dependency tracking with cycle detection, automatic "ready queue" computation, workflows, hints, and autonomous agent launch.
+
+> **For AI Agents**: See [AGENTS.md](./AGENTS.md) for essential guidance on structuring work, writing good issues, and using the ready queue effectively.
+
+## Quick Reference
+
+| Task | Command |
+|------|---------|
+| Find ready work | `weaver ready` |
+| View with context | `weaver show <id> --fetch-deps` |
+| Start work | `weaver start <id>` |
+| Create issue | `weaver create "Title" -t task -p 1` |
+| Complete work | `weaver close <id>` |
+| Search project knowledge | `weaver hint search <query>` |
+| Launch autonomous agent | `weaver launch <id> --model sonnet` |
 
 ## Installation
 
@@ -10,37 +24,114 @@ Weaver is a CLI tool that stores issues as markdown files with YAML frontmatter,
 uv pip install -e .
 ```
 
-## Quick Start
+## Core Concepts
 
-```bash
-# Initialize a new weaver project
-weaver init
+**Issues**: Markdown files with YAML frontmatter in `.weaver/issues/`. Human and agent readable.
 
-# Create issues
-weaver create "Implement user authentication" -t feature -p 1 -l backend -l security
-weaver create "Add login endpoint" -t task -b wv-a3f8  # blocked by the feature
+**Dependencies**: Issues can block other issues. Weaver detects cycles and computes the ready queue automatically. Use `weaver dep add <child> <parent>` to mark dependencies.
 
-# Create issue with description from file or stdin
-weaver create "Complex feature" -f description.md
-cat spec.md | weaver create "Feature from spec" -f -
+**Ready Queue**: `weaver ready` shows unblocked issues sorted by priority. Use this to find your next task.
 
-# View issues
-weaver list                    # List all issues
-weaver list -s open            # Filter by status
-weaver list -l backend         # Filter by label
-weaver ready                   # Show unblocked issues ready for work
-weaver show wv-a3f8           # Show issue details
+**Hints**: Persistent project knowledge stored in `.weaver/hints/`. Use for coding conventions, architecture notes, or domain knowledge that agents need across sessions. Searchable with `weaver hint search`.
 
-# Update status
-weaver start wv-a3f8          # Mark as in_progress
-weaver close wv-a3f8          # Close the issue
+**Workflows**: YAML templates in `.weaver/workflows/` that create multiple linked issues at once. Useful for repeatable processes like "add new API endpoint" or "bug triage."
 
-# Manage dependencies
-weaver dep add wv-b2c9 wv-a3f8   # wv-b2c9 is blocked by wv-a3f8
-weaver dep rm wv-b2c9 wv-a3f8    # Remove the dependency
+**Launch**: Spawn autonomous Claude agents to work on issues with full context injection. Logs stored in `.weaver/launches/`.
+
+**Sync**: Push/pull issues to a git branch for sharing across machines or team members.
+
+## File Layout
+
+```
+.weaver/
+  issues/           # Issue markdown files
+  hints/            # Hint markdown files
+  workflows/        # Workflow YAML files
+  launches/         # Agent launch logs
+  index.yml         # Issue index (auto-generated, gitignored)
+  hints_index.yml   # Hints index (auto-generated)
 ```
 
-## Storage Format
+## CLI Reference
+
+### Issues
+
+| Command | Description |
+|---------|-------------|
+| `weaver create "Title" [options]` | Create a new issue |
+| `weaver show <id>` | Show issue details |
+| `weaver show <id> --fetch-deps` | Show issue with transitive dependencies |
+| `weaver list [options]` | List all open issues |
+| `weaver list -a` | List all issues including closed |
+| `weaver list -s <status>` | Filter by status (open, in_progress, closed) |
+| `weaver list -l <label>` | Filter by label |
+| `weaver list -t <type>` | Filter by type |
+| `weaver ready [options]` | List unblocked issues ready for work |
+| `weaver ready -l <label>` | Filter ready queue by label |
+| `weaver ready -t <type>` | Filter ready queue by type |
+| `weaver ready -n <limit>` | Limit results |
+| `weaver start <id>` | Mark issue as in_progress |
+| `weaver close <id>` | Close issue |
+
+**Create options:**
+```
+-t, --type TYPE          # task, bug, feature, epic, chore
+-p, --priority 0-4       # 0=critical, 1=high, 2=medium (default), 3=low, 4=trivial
+-l, --label LABEL        # Add label (repeatable)
+-b, --blocked-by ID      # Add blocker (repeatable)
+--parent ID              # Parent epic
+-d, --description TEXT   # Short description
+-f, --file PATH          # Read description from file ('-' for stdin)
+```
+
+### Dependencies
+
+| Command | Description |
+|---------|-------------|
+| `weaver dep add <child> <parent>` | Add dependency (child blocked by parent) |
+| `weaver dep rm <child> <parent>` | Remove dependency |
+
+### Hints
+
+| Command | Description |
+|---------|-------------|
+| `weaver hint add <title> -f <file>` | Add or update a hint from file |
+| `weaver hint show <title_or_id>` | Show hint content |
+| `weaver hint list` | List all hints |
+| `weaver hint search <query>` | Search hints by content |
+
+### Workflows
+
+| Command | Description |
+|---------|-------------|
+| `weaver workflow create <name> -f <file>` | Create workflow template from YAML file |
+| `weaver workflow execute <name>` | Create issues from workflow |
+| `weaver workflow list` | List all workflows |
+| `weaver workflow show <name>` | Show workflow details |
+
+### Agent Launch
+
+| Command | Description |
+|---------|-------------|
+| `weaver launch <id> [--model sonnet\|opus\|flash]` | Launch autonomous Claude agent on issue |
+
+### Sync
+
+| Command | Description |
+|---------|-------------|
+| `weaver sync` | Sync to `weaver-<username>` branch |
+| `weaver sync -b <branch>` | Sync to specified branch |
+| `weaver sync --push` | Push changes after sync |
+| `weaver sync --pull` | Pull changes before sync |
+
+### Other
+
+| Command | Description |
+|---------|-------------|
+| `weaver init` | Initialize project |
+| `weaver readme` | Display this guide |
+
+## Example: Issue Storage Format
 
 Issues are stored as markdown files in `.weaver/issues/`:
 
@@ -52,103 +143,31 @@ type: feature
 status: open
 priority: 1
 labels: [backend, security]
-blocked_by: [wv-b2c9]
+blocked_by: []
 parent: null
 created_at: 2025-01-06T10:00:00
 updated_at: 2025-01-06T10:00:00
 ---
 
-Add JWT-based authentication to the API endpoints.
+**Goal**: Add JWT-based authentication to API endpoints.
 
-## Design Notes
-
-Use pyjwt library. Token expiry: 24 hours.
-
-## Acceptance Criteria
-
+**Exit Conditions**:
 - [ ] Login endpoint returns JWT
 - [ ] Protected routes validate token
 - [ ] Refresh token mechanism
-```
-
-## CLI Reference
-
-```
-weaver init                           # Initialize project
-weaver create "Title" [options]       # Create issue
-  -t, --type TYPE                     # task|bug|feature|epic|chore
-  -p, --priority 0-4                  # Priority (0=critical)
-  -l, --label LABEL                   # Add label (repeatable)
-  -b, --blocked-by ID                 # Add blocker (repeatable)
-  --parent ID                         # Parent epic
-  -d, --description TEXT              # Issue description (short)
-  -f, --file PATH                     # Read description from file ('-' for stdin)
-
-weaver show ID                        # Show issue details
-weaver list [options]                 # List issues
-  -s, --status STATUS                 # Filter by status
-  -l, --label LABEL                   # Filter by label
-  -t, --type TYPE                     # Filter by type
-
-weaver ready [options]                # List ready (unblocked) issues
-  -l, --label LABEL                   # Filter by label
-  -t, --type TYPE                     # Filter by type
-  -n, --limit N                       # Max results
-
-weaver start ID                       # Mark issue as in_progress
-weaver close ID                       # Close issue
-weaver dep add CHILD PARENT           # Add dependency
-weaver dep rm CHILD PARENT            # Remove dependency
-```
-
-## Features
-
-- **Markdown storage** - Human-readable, git-friendly issue files
-- **Dependency tracking** - Block issues on other issues with cycle detection
-- **Ready queue** - Automatically find unblocked issues ready for work
-- **Fast queries** - Lightweight index.yml for quick filtering
-- **Priority levels** - P0 (critical) through P4 (low)
-- **Issue types** - task, bug, feature, epic, chore
-- **Labels** - Tag issues for filtering
-
-## Writing Good Issues
-
-A well-written issue helps AI agents (and humans) understand what needs to be done. Structure issues like bug reports:
-
-**Goal**: A concise 1-2 sentence description of what should be accomplished.
-
-**Exit Conditions**: Concrete, verifiable criteria that indicate the issue is complete.
-
-**Related Code**: File paths, function names, or modules relevant to the issue.
-
-**Context** (optional): Background information, constraints, or design decisions.
-
-Example:
-
-```markdown
----
-id: wv-a1b2
-title: Fix token refresh race condition
-type: bug
-status: open
-priority: 1
-labels: [auth, backend]
----
-
-**Goal**: Prevent concurrent API requests from triggering multiple token refreshes.
-
-**Exit Conditions**:
-- [ ] Only one refresh request occurs when token expires
-- [ ] Concurrent requests wait for the single refresh to complete
-- [ ] Tests cover the race condition scenario
 
 **Related Code**:
-- src/auth/token_manager.py: `refresh_token()`, `get_valid_token()`
-- tests/test_auth.py
+- src/auth/token_manager.py
+- src/api/endpoints.py
 
-**Context**: Users report 401 errors when multiple tabs are open. The refresh
-endpoint is being called multiple times simultaneously.
+**Context**: Use pyjwt library. Token expiry: 24 hours.
 ```
+
+## Additional Resources
+
+- [AGENTS.md](./AGENTS.md) - Comprehensive guide for AI agents
+- `.weaver/hints/` - Project-specific knowledge hints
+- `weaver readme` - Display this guide in terminal
 
 ## Development
 

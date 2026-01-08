@@ -29,3 +29,4 @@ venv/
 .weaver/index.yml
 .weaver/issues
 .weaver/launches
+.weaver/hints*

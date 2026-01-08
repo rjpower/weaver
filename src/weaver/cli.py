@@ -3,10 +3,12 @@
 import getpass
 import subprocess
 import sys
+from importlib.resources import files
 from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.table import Table
 
 from weaver.models import Issue, IssueType, Status
@@ -14,6 +16,12 @@ from weaver.service import DependencyError, IssueNotFoundError, IssueService, Hi
 from weaver.storage import MarkdownStorage, HintStorage, WorkflowStorage
 
 console = Console()
+
+
+def get_readme_content() -> str:
+    """Load README.md content from package."""
+    readme_path = files("weaver").joinpath("README.md")
+    return readme_path.read_text()
 
 
 def find_weaver_root() -> Path | None:
@@ -42,94 +50,13 @@ def cli(ctx: click.Context) -> None:
     ctx.obj["service"] = IssueService(MarkdownStorage(root)) if root else None
 
     if ctx.invoked_subcommand is None:
-        console.print(README_TEXT)
-
-
-README_TEXT = """
-[bold cyan]Weaver[/bold cyan] - Issue tracking for AI coding agents
-
-[bold]Quick Start[/bold]
-  weaver init                         Initialize a new weaver project
-  weaver create "Title" [options]     Create a new issue
-  weaver list                         List all issues
-  weaver ready                        Show unblocked issues ready for work
-  weaver show ID                      Show issue details
-  weaver start ID                     Mark issue as in_progress
-  weaver close ID                     Close an issue
-
-[bold]Create Options[/bold]
-  -t, --type TYPE       Issue type: task, bug, feature, epic, chore (default: task)
-  -p, --priority 0-4    Priority level, 0=critical, 4=low (default: 2)
-  -l, --label LABEL     Add label (repeatable)
-  -b, --blocked-by ID   Block by another issue (repeatable)
-  --parent ID           Parent epic
-  -d, --description     Issue description
-  -f, --file PATH       Read description from file (use '-' for stdin)
-
-[bold]List/Filter Options[/bold]
-  -s, --status STATUS   Filter: open, in_progress, blocked, closed
-  -l, --label LABEL     Filter by label
-  -t, --type TYPE       Filter by type
-  -n, --limit N         Max results (ready command only)
-
-[bold]Dependencies[/bold]
-  weaver dep add CHILD PARENT   CHILD is blocked by PARENT
-  weaver dep rm CHILD PARENT    Remove dependency
-
-[bold]Sync (Multi-Instance)[/bold]
-  weaver sync                   Sync issues to weaver-<username> branch
-  weaver sync --branch NAME     Sync to a specific branch
-  weaver sync --push            Push changes after sync
-  weaver sync --pull            Pull changes before sync
-
-[bold]Writing Good Issues[/bold]
-  Structure issues to help AI agents (and humans) understand the work:
-
-  [bold]Goal[/bold]: 1-2 sentence description of what to accomplish.
-
-  [bold]Exit Conditions[/bold]: Concrete, verifiable criteria indicating completion.
-
-  [bold]Related Code[/bold]: File paths, function names, or modules involved.
-
-  [bold]Context[/bold] (optional): Background info, constraints, or design decisions.
-
-  Example:
-    ---
-    id: wv-a1b2
-    title: Fix token refresh race condition
-    type: bug
-    status: open
-    priority: 1
-    labels: [auth, backend]
-    ---
-
-    **Goal**: Prevent concurrent API requests from triggering multiple refreshes.
-
-    **Exit Conditions**:
-    - [ ] Only one refresh request occurs when token expires
-    - [ ] Concurrent requests wait for the single refresh to complete
-    - [ ] Tests cover the race condition scenario
-
-    **Related Code**:
-    - src/auth/token_manager.py: refresh_token(), get_valid_token()
-    - tests/test_auth.py
-
-    **Context**: Users report 401 errors when multiple tabs are open.
-
-[bold]Example Workflow[/bold]
-  weaver create "Add user auth" -t feature -p 1 -l backend
-  weaver create "Add login endpoint" -t task -b wv-xxxx
-  cat issue.md | weaver create "Complex feature" -f -
-  weaver ready                  # Shows unblocked issues
-  weaver start wv-yyyy          # Start working on an issue
-  weaver close wv-yyyy          # Complete the issue
-""".strip()
+        console.print(Markdown(get_readme_content()))
 
 
 @cli.command()
 def readme() -> None:
     """Show a quick reference guide for using weaver."""
-    console.print(README_TEXT)
+    console.print(Markdown(get_readme_content()))
 
 
 @cli.command()
@@ -324,19 +251,28 @@ def show(ctx: click.Context, issue_id: str, fetch_deps: bool) -> None:
     type=click.Choice(["task", "bug", "feature", "epic", "chore"]),
     help="Filter by type",
 )
+@click.option(
+    "-a",
+    "--all",
+    "show_all",
+    is_flag=True,
+    help="Show all issues including closed ones",
+)
 @click.pass_context
 def list_issues(
     ctx: click.Context,
     status: str | None,
     labels: tuple[str, ...],
     issue_type: str | None,
+    show_all: bool,
 ) -> None:
-    """List issues with optional filters."""
+    """List issues with optional filters. By default, closed issues are hidden."""
     service = get_service(ctx)
     issues = service.list_issues(
         status=Status(status) if status else None,
         labels=list(labels) if labels else None,
         type=IssueType(issue_type) if issue_type else None,
+        exclude_closed=not show_all and status is None,
     )
     if not issues:
         console.print("No issues found.")
@@ -762,7 +698,9 @@ def get_hint_service(ctx: click.Context) -> HintService:
         root = find_weaver_root()
         if not root:
             raise click.ClickException("Not in a weaver project.")
-        ctx.obj["hint_service"] = HintService(HintStorage(root))
+        hint_storage = HintStorage(root)
+        hint_storage.ensure_initialized()
+        ctx.obj["hint_service"] = HintService(hint_storage)
     return ctx.obj["hint_service"]
 
 
@@ -874,9 +812,9 @@ def hint_search(ctx: click.Context, query: str) -> None:
 def launch(ctx: click.Context, issue_id: str, model: str) -> None:
     """Launch an AI agent to work on a task.
 
-    This spawns a Claude subprocess that will attempt to complete the task
-    autonomously. The agent receives the task context, relevant hints, and
-    dependency information.
+    This spawns a Claude agent using the Agent SDK that will attempt to complete
+    the task autonomously. The agent receives the task context, relevant hints,
+    and dependency information.
     """
     service = get_service(ctx)
     hint_service = get_hint_service(ctx)
@@ -908,46 +846,61 @@ def launch(ctx: click.Context, issue_id: str, model: str) -> None:
     console.print(f"Launching {model} agent on [cyan]{issue_id}[/cyan]: {issue.title}")
     launch = launch_service.launch_agent(issue_id, agent_model)
 
-    # Build the claude command
+    # Get context file and log file paths
     from pathlib import Path
     context_file = Path(launch.log_file).parent / f"{launch.id}-context.md"
     log_file = Path(launch.log_file)
 
-    # Execute claude subprocess
-    cmd = [
-        "claude",
-        "--model", agent_model.value,
-        "--dangerously-skip-display",
-        f"@{context_file}",
-    ]
-
-    console.print(f"Running: {' '.join(cmd)}")
+    console.print(f"Model: {agent_model.value}")
+    console.print(f"Context: {context_file}")
     console.print(f"Logs: {log_file}")
 
-    try:
-        import subprocess
-        from datetime import datetime
+    # Read the context file to get the prompt
+    with open(context_file, "r") as f:
+        prompt = f.read()
+
+    # Run the agent using the SDK
+    import anyio
+    from claude_agent_sdk import query, ClaudeAgentOptions
+    from datetime import datetime
+
+    async def run_agent():
+        """Run the agent and stream output to log file."""
+        # Use the parent directory of .weaver as the working directory
+        project_root = root.parent if root else Path.cwd()
+
+        options = ClaudeAgentOptions(
+            model=agent_model.value,
+            cwd=str(project_root),
+            permission_mode="acceptEdits",
+        )
 
         with open(log_file, "w") as log:
-            result = subprocess.run(
-                cmd,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
+            try:
+                async for message in query(prompt=prompt, options=options):
+                    # Write all messages to log file
+                    log.write(str(message))
+                    log.write("\n")
+                    log.flush()
+                return 0
+            except Exception as e:
+                log.write(f"\nError: {e}\n")
+                log.flush()
+                return 1
+
+    try:
+        exit_code = anyio.run(run_agent)
 
         launch.completed_at = datetime.now()
-        launch.exit_code = result.returncode
+        launch.exit_code = exit_code
         launch_storage.write_launch(launch)
 
-        if result.returncode == 0:
+        if exit_code == 0:
             console.print(f"[green]Agent completed successfully[/green]")
         else:
-            console.print(f"[red]Agent exited with code {result.returncode}[/red]")
+            console.print(f"[red]Agent exited with code {exit_code}[/red]")
             console.print(f"Check logs: {log_file}")
 
-    except FileNotFoundError:
-        raise click.ClickException("Claude CLI not found. Install with: pip install claude-code")
     except Exception as e:
         console.print(f"[red]Error launching agent: {e}[/red]")
         raise
