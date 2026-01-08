@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from weaver.models import Hint, Issue, Status
+from weaver.models import Comment, Hint, Issue, Status
 from weaver.service import DependencyError, IssueNotFoundError, IssueService, HintService
 from weaver.storage import HintStorage, MarkdownStorage
 
@@ -510,3 +510,74 @@ class TestSearchHints:
 
         results = hint_service.search_hints("javascript")
         assert results == []
+
+
+class TestUpdateIssueStatus:
+    def test_updates_status(self, service: IssueService):
+        issue = service.create_issue("Test issue")
+        updated = service.update_issue_status(issue.id, Status.BLOCKED)
+
+        assert updated.status == Status.BLOCKED
+
+    def test_sets_closed_at_when_closing(self, service: IssueService):
+        issue = service.create_issue("Test issue")
+        updated = service.update_issue_status(issue.id, Status.CLOSED)
+
+        assert updated.status == Status.CLOSED
+        assert updated.closed_at is not None
+
+    def test_doesnt_overwrite_closed_at(self, service: IssueService):
+        issue = service.create_issue("Test issue")
+        first_close = service.update_issue_status(issue.id, Status.CLOSED)
+        first_closed_at = first_close.closed_at
+
+        # Reopen and close again
+        service.update_issue_status(issue.id, Status.OPEN)
+        second_close = service.update_issue_status(issue.id, Status.CLOSED)
+
+        # Should keep the original closed_at timestamp
+        assert second_close.closed_at == first_closed_at
+
+    def test_raises_for_missing_issue(self, service: IssueService):
+        with pytest.raises(IssueNotFoundError):
+            service.update_issue_status("wv-nonexistent", Status.IN_PROGRESS)
+
+    def test_persists_status_change(self, service: IssueService, storage: MarkdownStorage):
+        issue = service.create_issue("Test issue")
+        service.update_issue_status(issue.id, Status.IN_PROGRESS)
+
+        loaded = storage.read_issue(issue.id)
+        assert loaded is not None
+        assert loaded.status == Status.IN_PROGRESS
+
+
+class TestAddComment:
+    def test_adds_comment_to_issue(self, service: IssueService):
+        issue = service.create_issue("Test issue")
+        updated = service.add_comment(issue.id, "This is a test comment")
+
+        assert len(updated.comments) == 1
+        assert updated.comments[0].text == "This is a test comment"
+        assert updated.comments[0].timestamp is not None
+
+    def test_adds_multiple_comments(self, service: IssueService):
+        issue = service.create_issue("Test issue")
+        service.add_comment(issue.id, "First comment")
+        updated = service.add_comment(issue.id, "Second comment")
+
+        assert len(updated.comments) == 2
+        assert updated.comments[0].text == "First comment"
+        assert updated.comments[1].text == "Second comment"
+
+    def test_raises_for_missing_issue(self, service: IssueService):
+        with pytest.raises(IssueNotFoundError):
+            service.add_comment("wv-nonexistent", "Comment")
+
+    def test_persists_comments(self, service: IssueService, storage: MarkdownStorage):
+        issue = service.create_issue("Test issue")
+        service.add_comment(issue.id, "Persisted comment")
+
+        loaded = storage.read_issue(issue.id)
+        assert loaded is not None
+        assert len(loaded.comments) == 1
+        assert loaded.comments[0].text == "Persisted comment"

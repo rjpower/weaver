@@ -9,6 +9,7 @@ import yaml
 
 from weaver.models import (
     AgentModel,
+    Comment,
     Hint,
     Issue,
     LaunchExecution,
@@ -116,6 +117,7 @@ class MarkdownStorage:
         description = ""
         design_notes = ""
         acceptance_criteria: list[str] = []
+        comments: list[Comment] = []
 
         lines = content.split("\n")
         current_section = "description"
@@ -123,6 +125,7 @@ class MarkdownStorage:
             "description": [],
             "design_notes": [],
             "acceptance_criteria": [],
+            "comments": [],
         }
 
         for line in lines:
@@ -131,6 +134,9 @@ class MarkdownStorage:
                 continue
             elif line.startswith("## Acceptance Criteria"):
                 current_section = "acceptance_criteria"
+                continue
+            elif line.startswith("## Comments"):
+                current_section = "comments"
                 continue
             elif line.startswith("## "):
                 current_section = "other"
@@ -148,6 +154,39 @@ class MarkdownStorage:
             if match:
                 acceptance_criteria.append(match.group(1))
 
+        # Parse comments (format: "- **YYYY-MM-DD HH:MM:SS**: comment text")
+        # Combine lines back into text and then parse comments
+        comments_text = "\n".join(section_lines["comments"])
+        # Split by comment markers (lines starting with "- **")
+        comment_lines = []
+        current_comment = []
+
+        for line in section_lines["comments"]:
+            if line.strip().startswith("- **"):
+                # New comment starts
+                if current_comment:
+                    comment_lines.append("\n".join(current_comment))
+                current_comment = [line]
+            elif current_comment:
+                # Continuation of previous comment
+                current_comment.append(line)
+
+        # Don't forget the last comment
+        if current_comment:
+            comment_lines.append("\n".join(current_comment))
+
+        # Parse each comment block
+        for comment_block in comment_lines:
+            match = re.match(r"^\s*-\s*\*\*(.+?)\*\*:\s*(.+)$", comment_block.strip(), re.DOTALL)
+            if match:
+                timestamp_str, text = match.groups()
+                try:
+                    timestamp = datetime.fromisoformat(timestamp_str)
+                    comments.append(Comment(text=text.strip(), timestamp=timestamp))
+                except ValueError:
+                    # Skip malformed comment timestamps
+                    pass
+
         # Parse datetime fields
         created_at = self._parse_datetime(metadata.get("created_at"))
         updated_at = self._parse_datetime(metadata.get("updated_at"))
@@ -164,6 +203,7 @@ class MarkdownStorage:
             labels=metadata.get("labels", []) or [],
             blocked_by=metadata.get("blocked_by", []) or [],
             parent=metadata.get("parent"),
+            comments=comments,
             created_at=created_at,
             updated_at=updated_at,
             closed_at=closed_at,
@@ -208,6 +248,15 @@ class MarkdownStorage:
             ]
             content_parts.append(
                 f"## Acceptance Criteria\n\n" + "\n".join(criteria_lines)
+            )
+
+        if issue.comments:
+            comment_lines = [
+                f"- **{comment.timestamp.isoformat()}**: {comment.text}"
+                for comment in issue.comments
+            ]
+            content_parts.append(
+                f"## Comments\n\n" + "\n".join(comment_lines)
             )
 
         content = "\n\n".join(content_parts)

@@ -21,6 +21,13 @@ class AgentModel(Enum):
 
 
 @dataclass
+class Comment:
+    """A timestamped comment or update note on an issue."""
+    text: str
+    timestamp: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
 class Issue:
     id: str
     title: str
@@ -32,6 +39,7 @@ class Issue:
     labels: list[str] = field(default_factory=list)
     blocked_by: list[str] = field(default_factory=list)
     parent: str | None = None
+    comments: list[Comment] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     closed_at: datetime | None = None

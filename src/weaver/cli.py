@@ -224,6 +224,11 @@ def show(ctx: click.Context, issue_id: str, fetch_deps: bool) -> None:
         console.print("\n[bold]Acceptance Criteria[/bold]")
         for criterion in issue.acceptance_criteria:
             console.print(f"  - [ ] {criterion}")
+    if issue.comments:
+        console.print("\n[bold]Comments[/bold]")
+        for comment in issue.comments:
+            timestamp_str = comment.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            console.print(f"  [{timestamp_str}] {comment.text}")
 
 
 @cli.command("list")
@@ -321,6 +326,79 @@ def close(ctx: click.Context, issue_ids: tuple[str, ...]) -> None:
     if failed_ids:
         error_msg = f"Issue{'s' if len(failed_ids) > 1 else ''} not found: {', '.join(failed_ids)}"
         raise click.ClickException(error_msg)
+
+
+@cli.command()
+@click.argument("issue_id")
+@click.option(
+    "--status",
+    "-s",
+    type=click.Choice(["open", "in_progress", "blocked", "closed"]),
+    help="Update issue status",
+)
+@click.option(
+    "--comment",
+    "-c",
+    help="Add a comment to the issue",
+)
+@click.option(
+    "-f",
+    "--file",
+    "file_path",
+    type=click.Path(exists=False),
+    help="Read comment from file (use '-' for stdin)",
+)
+@click.pass_context
+def update(
+    ctx: click.Context,
+    issue_id: str,
+    status: str | None,
+    comment: str | None,
+    file_path: str | None,
+) -> None:
+    """Update an issue's status or add a comment.
+
+    Examples:
+        weaver update wv-1234 --status in_progress
+        weaver update wv-1234 --comment "Found the bug in authentication.py"
+        weaver update wv-1234 -s blocked -c "Waiting for API design"
+        echo "Test failures in test_auth.py" | weaver update wv-1234 -f -
+    """
+    service = get_service(ctx)
+
+    # Check if at least one update option is provided
+    if not status and not comment and not file_path:
+        raise click.ClickException(
+            "Please specify at least one update option: --status, --comment, or --file"
+        )
+
+    # File/stdin takes precedence over -c flag for comment
+    if file_path:
+        if file_path == "-":
+            comment = sys.stdin.read()
+        else:
+            path = Path(file_path)
+            if not path.exists():
+                raise click.ClickException(f"File not found: {file_path}")
+            comment = path.read_text()
+
+        # Strip only leading/trailing whitespace but preserve internal newlines
+        comment = comment.strip()
+
+    try:
+        # Update status if provided
+        if status:
+            issue = service.update_issue_status(issue_id, Status(status))
+            console.print(f"Updated [cyan]{issue.id}[/cyan] status to: {status}")
+
+        # Add comment if provided
+        if comment:
+            issue = service.add_comment(issue_id, comment)
+            console.print(f"Added comment to [cyan]{issue.id}[/cyan]: {issue.title}")
+            console.print(f"  \"{comment}\"")
+
+    except IssueNotFoundError:
+        raise click.ClickException(f"Issue {issue_id} not found")
 
 
 @cli.group()

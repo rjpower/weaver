@@ -491,6 +491,132 @@ class TestClose:
         # Click will show usage error for missing required argument
 
 
+class TestUpdate:
+    def test_updates_status(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+        os.chdir(weaver_dir)
+        issue = service.create_issue("Test issue")
+
+        result = runner.invoke(cli, ["update", issue.id, "--status", "in_progress"])
+
+        assert result.exit_code == 0
+        assert "Updated" in result.output
+        assert "in_progress" in result.output
+
+        updated = service.get_issue(issue.id)
+        assert updated is not None
+        assert updated.status == Status.IN_PROGRESS
+
+    def test_adds_comment(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+        os.chdir(weaver_dir)
+        issue = service.create_issue("Test issue")
+
+        result = runner.invoke(cli, ["update", issue.id, "--comment", "Test comment"])
+
+        assert result.exit_code == 0
+        assert "Added comment" in result.output
+        assert "Test comment" in result.output
+
+        updated = service.get_issue(issue.id)
+        assert updated is not None
+        assert len(updated.comments) == 1
+        assert updated.comments[0].text == "Test comment"
+
+    def test_updates_both_status_and_comment(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+        os.chdir(weaver_dir)
+        issue = service.create_issue("Test issue")
+
+        result = runner.invoke(
+            cli,
+            ["update", issue.id, "-s", "blocked", "-c", "Waiting for dependency"],
+        )
+
+        assert result.exit_code == 0
+        assert "Updated" in result.output
+        assert "blocked" in result.output
+        assert "Added comment" in result.output
+
+        updated = service.get_issue(issue.id)
+        assert updated is not None
+        assert updated.status == Status.BLOCKED
+        assert len(updated.comments) == 1
+        assert updated.comments[0].text == "Waiting for dependency"
+
+    def test_comment_from_stdin(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+        os.chdir(weaver_dir)
+        issue = service.create_issue("Test issue")
+
+        result = runner.invoke(
+            cli,
+            ["update", issue.id, "-f", "-"],
+            input="Comment from stdin",
+        )
+
+        assert result.exit_code == 0
+        assert "Added comment" in result.output
+
+        updated = service.get_issue(issue.id)
+        assert updated is not None
+        assert len(updated.comments) == 1
+        assert updated.comments[0].text == "Comment from stdin"
+
+    def test_comment_from_file(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+        os.chdir(weaver_dir)
+        issue = service.create_issue("Test issue")
+        comment_file = weaver_dir / "comment.txt"
+        comment_file.write_text("Comment from file\nWith multiple lines")
+
+        result = runner.invoke(cli, ["update", issue.id, "-f", str(comment_file)])
+
+        assert result.exit_code == 0
+        assert "Added comment" in result.output
+
+        updated = service.get_issue(issue.id)
+        assert updated is not None
+        assert len(updated.comments) == 1
+        assert updated.comments[0].text == "Comment from file\nWith multiple lines"
+
+    def test_file_overrides_comment_flag(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+        os.chdir(weaver_dir)
+        issue = service.create_issue("Test issue")
+        comment_file = weaver_dir / "comment.txt"
+        comment_file.write_text("From file")
+
+        result = runner.invoke(
+            cli,
+            ["update", issue.id, "-c", "From flag", "-f", str(comment_file)],
+        )
+
+        assert result.exit_code == 0
+
+        updated = service.get_issue(issue.id)
+        assert updated is not None
+        assert updated.comments[0].text == "From file"
+
+    def test_requires_at_least_one_option(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+        os.chdir(weaver_dir)
+        issue = service.create_issue("Test issue")
+
+        result = runner.invoke(cli, ["update", issue.id])
+
+        assert result.exit_code != 0
+        assert "at least one update option" in result.output
+
+    def test_not_found(self, runner: CliRunner, weaver_dir: Path):
+        os.chdir(weaver_dir)
+        result = runner.invoke(cli, ["update", "wv-nonexistent", "-s", "blocked"])
+
+        assert result.exit_code != 0
+        assert "not found" in result.output
+
+    def test_file_not_found(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+        os.chdir(weaver_dir)
+        issue = service.create_issue("Test issue")
+        result = runner.invoke(cli, ["update", issue.id, "-f", "/nonexistent/path.txt"])
+
+        assert result.exit_code != 0
+        assert "File not found" in result.output
+
+
 class TestDepAdd:
     def test_adds_dependency(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
         os.chdir(weaver_dir)

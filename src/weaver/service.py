@@ -7,6 +7,7 @@ import yaml
 from weaver.graph import DependencyGraph
 from weaver.models import (
     AgentModel,
+    Comment,
     Hint,
     Issue,
     LaunchExecution,
@@ -111,6 +112,29 @@ class IssueService:
             raise IssueNotFoundError(issue_id)
 
         issue.status = Status.IN_PROGRESS
+        self.update_issue(issue)
+        return issue
+
+    def update_issue_status(self, issue_id: str, new_status: Status) -> Issue:
+        """Update issue status to a specific value."""
+        issue = self.get_issue(issue_id)
+        if issue is None:
+            raise IssueNotFoundError(issue_id)
+
+        issue.status = new_status
+        if new_status == Status.CLOSED and issue.closed_at is None:
+            issue.closed_at = datetime.now()
+        self.update_issue(issue)
+        return issue
+
+    def add_comment(self, issue_id: str, comment_text: str) -> Issue:
+        """Add a comment to an issue."""
+        issue = self.get_issue(issue_id)
+        if issue is None:
+            raise IssueNotFoundError(issue_id)
+
+        comment = Comment(text=comment_text, timestamp=datetime.now())
+        issue.comments.append(comment)
         self.update_issue(issue)
         return issue
 
