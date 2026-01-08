@@ -14,14 +14,6 @@ class Status(Enum):
     CLOSED = "closed"
 
 
-class IssueType(Enum):
-    TASK = "task"
-    BUG = "bug"
-    FEATURE = "feature"
-    EPIC = "epic"
-    CHORE = "chore"
-
-
 class AgentModel(Enum):
     SONNET = "claude-sonnet-4-5-20250929"
     OPUS = "claude-opus-4-5-20251101"
@@ -33,7 +25,6 @@ class Issue:
     id: str
     title: str
     status: Status = Status.OPEN
-    type: IssueType = IssueType.TASK
     priority: int = 2  # 0-4, lower = higher priority
     description: str = ""
     design_notes: str = ""
@@ -59,7 +50,6 @@ class Issue:
 @dataclass
 class WorkflowStep:
     title: str
-    type: IssueType = IssueType.TASK
     priority: int = 2
     description: str = ""
     labels: list[str] = field(default_factory=list)

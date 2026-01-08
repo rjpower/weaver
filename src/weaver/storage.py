@@ -11,7 +11,6 @@ from weaver.models import (
     AgentModel,
     Hint,
     Issue,
-    IssueType,
     LaunchExecution,
     Status,
     Workflow,
@@ -93,7 +92,6 @@ class MarkdownStorage:
         index["issues"][issue.id] = {
             "title": issue.title,
             "status": issue.status.value,
-            "type": issue.type.value,
             "priority": issue.priority,
             "labels": issue.labels,
             "blocked_by": issue.blocked_by,
@@ -158,7 +156,6 @@ class MarkdownStorage:
             id=metadata["id"],
             title=metadata["title"],
             status=Status(metadata.get("status", "open")),
-            type=IssueType(metadata.get("type", "task")),
             priority=metadata.get("priority", 2),
             description=description,
             design_notes=design_notes,
@@ -184,7 +181,6 @@ class MarkdownStorage:
         metadata = {
             "id": issue.id,
             "title": issue.title,
-            "type": issue.type.value,
             "status": issue.status.value,
             "priority": issue.priority,
             "labels": issue.labels,
@@ -415,7 +411,6 @@ class WorkflowStorage:
         """Serialize WorkflowStep to dict for YAML."""
         return {
             "title": step.title,
-            "type": step.type.value,
             "priority": step.priority,
             "description": step.description,
             "labels": step.labels,
@@ -437,7 +432,6 @@ class WorkflowStorage:
         """Deserialize dict to WorkflowStep object."""
         return WorkflowStep(
             title=data["title"],
-            type=IssueType(data.get("type", "task")),
             priority=data.get("priority", 2),
             description=data.get("description", ""),
             labels=data.get("labels", []) or [],

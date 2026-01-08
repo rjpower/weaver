@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from weaver.models import Issue, IssueType, Status
+from weaver.models import Issue, Status
 from weaver.storage import MarkdownStorage
 
 
@@ -42,7 +42,6 @@ class TestMarkdownStorage:
         issue = Issue(
             id="wv-test",
             title="Test Issue",
-            type=IssueType.FEATURE,
             status=Status.OPEN,
             priority=1,
             description="This is a test description.",
@@ -61,7 +60,6 @@ class TestMarkdownStorage:
         assert loaded is not None
         assert loaded.id == issue.id
         assert loaded.title == issue.title
-        assert loaded.type == issue.type
         assert loaded.status == issue.status
         assert loaded.priority == issue.priority
         assert loaded.description == issue.description

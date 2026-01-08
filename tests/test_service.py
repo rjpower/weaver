@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from weaver.models import Hint, Issue, IssueType, Status
+from weaver.models import Hint, Issue, Status
 from weaver.service import DependencyError, IssueNotFoundError, IssueService, HintService
 from weaver.storage import HintStorage, MarkdownStorage
 
@@ -36,19 +36,16 @@ class TestCreateIssue:
         assert issue.id.startswith("wv-")
         assert issue.title == "Test issue"
         assert issue.status == Status.OPEN
-        assert issue.type == IssueType.TASK
         assert issue.priority == 2
 
     def test_creates_with_all_options(self, service: IssueService):
         issue = service.create_issue(
             title="Feature issue",
-            type=IssueType.FEATURE,
             priority=0,
             description="A new feature",
             labels=["backend", "api"],
         )
 
-        assert issue.type == IssueType.FEATURE
         assert issue.priority == 0
         assert issue.description == "A new feature"
         assert issue.labels == ["backend", "api"]
@@ -202,14 +199,6 @@ class TestListIssues:
         backend = service.list_issues(labels=["backend"])
         assert len(backend) == 2
 
-    def test_filters_by_type(self, service: IssueService):
-        service.create_issue("Task", type=IssueType.TASK)
-        service.create_issue("Bug", type=IssueType.BUG)
-
-        bugs = service.list_issues(type=IssueType.BUG)
-        assert len(bugs) == 1
-        assert bugs[0].type == IssueType.BUG
-
     def test_sorted_by_priority_then_date(self, service: IssueService):
         p2 = service.create_issue("Priority 2", priority=2)
         p0 = service.create_issue("Priority 0", priority=0)
@@ -264,14 +253,6 @@ class TestGetReadyIssues:
         ready = service.get_ready_issues(labels=["backend"])
         assert len(ready) == 1
         assert ready[0].labels == ["backend"]
-
-    def test_filters_by_type(self, service: IssueService):
-        service.create_issue("Task", type=IssueType.TASK)
-        service.create_issue("Bug", type=IssueType.BUG)
-
-        ready = service.get_ready_issues(type=IssueType.BUG)
-        assert len(ready) == 1
-        assert ready[0].type == IssueType.BUG
 
     def test_respects_limit(self, service: IssueService):
         for i in range(5):

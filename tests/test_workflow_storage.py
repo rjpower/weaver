@@ -4,7 +4,7 @@ import pytest
 from datetime import datetime
 from pathlib import Path
 
-from weaver.models import IssueType, Workflow, WorkflowStep
+from weaver.models import Workflow, WorkflowStep
 from weaver.storage import WorkflowStorage
 
 
@@ -28,7 +28,6 @@ def sample_workflow():
         steps=[
             WorkflowStep(
                 title="Background research",
-                type=IssueType.TASK,
                 priority=1,
                 description="Research existing solutions",
                 labels=["research"],
@@ -36,7 +35,6 @@ def sample_workflow():
             ),
             WorkflowStep(
                 title="Design document",
-                type=IssueType.TASK,
                 priority=1,
                 description="Write design doc",
                 depends_on=["Background research"],
@@ -76,7 +74,6 @@ def test_write_workflow(temp_storage, sample_workflow):
     assert "name: design" in content
     assert "description: Standard design workflow" in content
     assert "title: Background research" in content
-    assert "type: task" in content
 
 
 def test_read_workflow(temp_storage, sample_workflow):
@@ -109,7 +106,6 @@ def test_workflow_step_serialization(temp_storage, sample_workflow):
     assert loaded is not None
     step1 = loaded.steps[0]
     assert step1.title == "Background research"
-    assert step1.type == IssueType.TASK
     assert step1.priority == 1
     assert step1.description == "Research existing solutions"
     assert step1.labels == ["research"]
@@ -244,34 +240,33 @@ def test_workflow_step_with_defaults(temp_storage):
     assert loaded is not None
     step = loaded.steps[0]
     assert step.title == "Simple task"
-    assert step.type == IssueType.TASK
     assert step.priority == 2
     assert step.description == ""
     assert step.labels == []
     assert step.depends_on == []
 
 
-def test_workflow_step_with_multiple_issue_types(temp_storage):
-    """Test workflow steps with different issue types."""
+def test_workflow_step_with_multiple_priorities(temp_storage):
+    """Test workflow steps with different priorities."""
     workflow = Workflow(
-        id="wv-types",
-        name="types",
+        id="wv-priorities",
+        name="priorities",
         steps=[
-            WorkflowStep(title="Bug fix", type=IssueType.BUG),
-            WorkflowStep(title="New feature", type=IssueType.FEATURE),
-            WorkflowStep(title="Epic story", type=IssueType.EPIC),
-            WorkflowStep(title="Chore", type=IssueType.CHORE),
+            WorkflowStep(title="Bug fix", priority=0),
+            WorkflowStep(title="New feature", priority=1),
+            WorkflowStep(title="Enhancement", priority=2),
+            WorkflowStep(title="Nice to have", priority=4),
         ],
     )
 
     temp_storage.write_workflow(workflow)
-    loaded = temp_storage.read_workflow("wv-types")
+    loaded = temp_storage.read_workflow("wv-priorities")
 
     assert loaded is not None
-    assert loaded.steps[0].type == IssueType.BUG
-    assert loaded.steps[1].type == IssueType.FEATURE
-    assert loaded.steps[2].type == IssueType.EPIC
-    assert loaded.steps[3].type == IssueType.CHORE
+    assert loaded.steps[0].priority == 0
+    assert loaded.steps[1].priority == 1
+    assert loaded.steps[2].priority == 2
+    assert loaded.steps[3].priority == 4
 
 
 def test_workflow_with_complex_dependencies(temp_storage):

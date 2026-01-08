@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from weaver.models import IssueType, Status
+from weaver.models import Status
 from weaver.service import IssueService, WorkflowService
 from weaver.storage import MarkdownStorage, WorkflowStorage
 
@@ -130,7 +130,6 @@ class TestParseWorkflowYaml:
 
         step1 = workflow.steps[0]
         assert step1.title == "Step 1"
-        assert step1.type == IssueType.TASK
         assert step1.priority == 1
         assert step1.description == "First step"
         assert step1.labels == ["backend"]
@@ -138,7 +137,6 @@ class TestParseWorkflowYaml:
 
         step2 = workflow.steps[1]
         assert step2.title == "Step 2"
-        assert step2.type == IssueType.FEATURE
         assert step2.priority == 2
         assert step2.description == "Second step"
         assert step2.labels == ["frontend"]
@@ -154,7 +152,6 @@ class TestParseWorkflowYaml:
 
         step = workflow.steps[0]
         assert step.title == "Only Step"
-        assert step.type == IssueType.TASK  # default
         assert step.priority == 2  # default
         assert step.description == ""
         assert step.labels == []
@@ -321,13 +318,11 @@ class TestExecuteWorkflow:
         issues = workflow_service.execute_workflow(workflow.name)
 
         step1_issue = next(i for i in issues if i.title == "Step 1")
-        assert step1_issue.type == IssueType.TASK
         assert step1_issue.priority == 1
         assert step1_issue.description == "First step"
         assert step1_issue.status == Status.OPEN
 
         step2_issue = next(i for i in issues if i.title == "Step 2")
-        assert step2_issue.type == IssueType.FEATURE
         assert step2_issue.priority == 2
         assert step2_issue.description == "Second step"
 

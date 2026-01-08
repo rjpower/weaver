@@ -11,7 +11,7 @@ Weaver stores issues as markdown files with YAML frontmatter, making it easy for
 | Find ready work | `weaver ready` |
 | View with context | `weaver show <id> --fetch-deps` |
 | Start work | `weaver start <id>` |
-| Create issue | `weaver create "Title" -t task -p 1` |
+| Create issue | `weaver create "Title" -p 1` |
 | Complete work | `weaver close <id>` |
 | Search project knowledge | `weaver hint search <query>` |
 | Launch autonomous agent | `weaver launch <id> --model sonnet` |
@@ -69,17 +69,14 @@ for local development
 | `weaver list -a` | List all issues including closed |
 | `weaver list -s <status>` | Filter by status (open, in_progress, closed) |
 | `weaver list -l <label>` | Filter by label |
-| `weaver list -t <type>` | Filter by type |
 | `weaver ready [options]` | List unblocked issues ready for work |
 | `weaver ready -l <label>` | Filter ready queue by label |
-| `weaver ready -t <type>` | Filter ready queue by type |
 | `weaver ready -n <limit>` | Limit results |
 | `weaver start <id>` | Mark issue as in_progress |
 | `weaver close <id>` | Close issue |
 
 **Create options:**
 ```
--t, --type TYPE          # task, bug, feature, epic, chore
 -p, --priority 0-4       # 0=critical, 1=high, 2=medium (default), 3=low, 4=trivial
 -l, --label LABEL        # Add label (repeatable)
 -b, --blocked-by ID      # Add blocker (repeatable)
@@ -143,7 +140,6 @@ Issues are stored as markdown files in `.weaver/issues/`:
 ---
 id: wv-a3f8
 title: Implement user authentication
-type: feature
 status: open
 priority: 1
 labels: [backend, security]
@@ -184,7 +180,7 @@ updated_at: 2025-01-06T10:00:00
 ```bash
 # Bad: "I notice we should also update the tests"
 # Good:
-weaver create "Update tests for authentication changes" -t task -b wv-a3f8 -f- <<HERE
+weaver create "Update tests for authentication changes" -b wv-a3f8 -f- <<HERE
 We're missing tests for the new authentication flow in src/auth/token_manager.py...
 HERE
 ```
@@ -197,13 +193,13 @@ When you receive a large task, break it into smaller issues with dependencies:
 
 ```bash
 # Main feature
-weaver create "Add user authentication" -t feature -p 1
+weaver create "Add user authentication" -p 1
 
 # Subtasks (assuming the feature ID is wv-a3f8)
-weaver create "Design auth token schema" -t task -b wv-a3f8 -p 1
-weaver create "Implement login endpoint" -t task -b wv-b2c9 -p 1
-weaver create "Add auth middleware" -t task -b wv-c1d4 -p 1
-weaver create "Write auth tests" -t task -b wv-e5f6 -p 1
+weaver create "Design auth token schema" -b wv-a3f8 -p 1
+weaver create "Implement login endpoint" -b wv-b2c9 -p 1
+weaver create "Add auth middleware" -b wv-c1d4 -p 1
+weaver create "Write auth tests" -b wv-e5f6 -p 1
 ```
 
 #### Use Dependencies to Show Order
@@ -266,10 +262,10 @@ As you explore code and discover work, file issues immediately:
 
 ```bash
 # While implementing feature A, you notice B needs fixing
-weaver create "Fix error handling in token refresh" -t bug -p 1 -l auth
+weaver create "Fix error handling in token refresh" -p 1 -l auth
 
 # You realize C is needed
-weaver create "Add rate limiting to auth endpoints" -t task -p 2 -l auth -l security
+weaver create "Add rate limiting to auth endpoints" -p 2 -l auth -l security
 ```
 
 #### Use Labels for Context
@@ -283,7 +279,7 @@ weaver ready -l backend  # Show only backend tasks
 
 Common labels:
 - Component: `backend`, `frontend`, `api`, `cli`
-- Type: `bug`, `refactor`, `docs`, `tests`
+- Category: `bug`, `refactor`, `docs`, `tests`
 - Priority: `urgent`, `blocked`, `tech-debt`
 
 #### Track Blockers
@@ -292,7 +288,7 @@ If you're blocked on external input or another task:
 
 ```bash
 # Create blocker task
-weaver create "Research best practice for JWT expiry" -t task -p 1
+weaver create "Research best practice for JWT expiry" -p 1
 
 # Link your task to the blocker (assuming blocker is wv-z9x8)
 weaver dep add wv-a3f8 wv-z9x8  # wv-a3f8 is blocked by wv-z9x8
@@ -322,7 +318,7 @@ This shows the full context: what this task depends on, what's already done, and
 
 ```bash
 # 1. File the bug
-cat <<'EOF' | weaver create "Fix race condition in token refresh" -t bug -p 0 -f -
+cat <<'EOF' | weaver create "Fix race condition in token refresh" -p 0 -f -
 **Goal**: Prevent multiple simultaneous token refreshes when token expires.
 
 **Exit Conditions**:
@@ -351,14 +347,14 @@ weaver close wv-xxxx
 
 ```bash
 # 1. Create epic
-weaver create "User authentication system" -t epic -p 1
+weaver create "User authentication system" -p 1
 
 # 2. Break into tasks (assuming epic is wv-e1e1)
-weaver create "Design auth schema" -t task --parent wv-e1e1 -p 1
-weaver create "Implement JWT generation" -t task --parent wv-e1e1 -p 1
-weaver create "Add login endpoint" -t task --parent wv-e1e1 -p 1
-weaver create "Add auth middleware" -t task --parent wv-e1e1 -p 1
-weaver create "Write tests" -t task --parent wv-e1e1 -p 1
+weaver create "Design auth schema" --parent wv-e1e1 -p 1
+weaver create "Implement JWT generation" --parent wv-e1e1 -p 1
+weaver create "Add login endpoint" --parent wv-e1e1 -p 1
+weaver create "Add auth middleware" --parent wv-e1e1 -p 1
+weaver create "Write tests" --parent wv-e1e1 -p 1
 
 # 3. Add dependencies
 # (each task depends on the previous one)

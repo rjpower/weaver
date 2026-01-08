@@ -4,7 +4,7 @@ import re
 
 import pytest
 
-from weaver.models import Hint, Issue, IssueType, Status, Workflow, WorkflowStep, generate_id
+from weaver.models import Hint, Issue, Status, Workflow, WorkflowStep, generate_id
 
 
 class TestStatus:
@@ -19,20 +19,10 @@ class TestStatus:
         assert Status("in_progress") == Status.IN_PROGRESS
 
 
-class TestIssueType:
-    def test_enum_values(self):
-        assert IssueType.TASK.value == "task"
-        assert IssueType.BUG.value == "bug"
-        assert IssueType.FEATURE.value == "feature"
-        assert IssueType.EPIC.value == "epic"
-        assert IssueType.CHORE.value == "chore"
-
-
 class TestIssue:
     def test_defaults(self):
         issue = Issue(id="wv-1234", title="Test issue")
         assert issue.status == Status.OPEN
-        assert issue.type == IssueType.TASK
         assert issue.priority == 2
         assert issue.description == ""
         assert issue.design_notes == ""
@@ -92,7 +82,6 @@ class TestHint:
 class TestWorkflowStep:
     def test_defaults(self):
         step = WorkflowStep(title="Test step")
-        assert step.type == IssueType.TASK
         assert step.priority == 2
         assert step.description == ""
         assert step.labels == []
@@ -105,14 +94,12 @@ class TestWorkflowStep:
     def test_custom_values(self):
         step = WorkflowStep(
             title="Design phase",
-            type=IssueType.FEATURE,
             priority=1,
             description="Design the feature",
             labels=["design", "phase1"],
             depends_on=["Requirements"],
         )
         assert step.title == "Design phase"
-        assert step.type == IssueType.FEATURE
         assert step.priority == 1
         assert step.description == "Design the feature"
         assert step.labels == ["design", "phase1"]

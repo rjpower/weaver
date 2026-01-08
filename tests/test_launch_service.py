@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from weaver.models import AgentModel, IssueType, Status
+from weaver.models import AgentModel, Status
 from weaver.service import HintService, IssueNotFoundError, IssueService, LaunchService
 from weaver.storage import HintStorage, LaunchStorage, MarkdownStorage
 
@@ -62,7 +62,6 @@ class TestPrepareContext:
     ):
         issue = issue_service.create_issue(
             title="Test Task",
-            type=IssueType.TASK,
             priority=1,
         )
 
@@ -70,7 +69,6 @@ class TestPrepareContext:
 
         assert "# Task: Test Task" in context
         assert f"**ID**: {issue.id}" in context
-        assert "**Type**: task" in context
         assert "**Priority**: P1" in context
 
     def test_includes_description(
@@ -207,6 +205,20 @@ class TestPrepareContext:
         assert "## Acceptance Criteria" not in context
         assert "## Relevant Hints" not in context
         assert "## Dependencies (Blockers)" not in context
+
+    def test_includes_workflow_instructions(
+        self, launch_service: LaunchService, issue_service: IssueService
+    ):
+        issue = issue_service.create_issue(title="Test Task")
+
+        context = launch_service.prepare_context(issue)
+
+        assert "## Workflow Instructions" in context
+        assert "When you have completed this task:" in context
+        assert "Verify all acceptance criteria are met" in context
+        assert "Run any relevant tests" in context
+        assert f"weaver close {issue.id}" in context
+        assert "This marks the issue as complete and unblocks any dependent tasks" in context
 
 
 class TestLaunchAgent:

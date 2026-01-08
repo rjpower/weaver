@@ -9,7 +9,6 @@ from weaver.models import (
     AgentModel,
     Hint,
     Issue,
-    IssueType,
     LaunchExecution,
     Status,
     Workflow,
@@ -54,7 +53,6 @@ class IssueService:
     def create_issue(
         self,
         title: str,
-        type: IssueType = IssueType.TASK,
         priority: int = 2,
         description: str = "",
         labels: list[str] | None = None,
@@ -75,7 +73,6 @@ class IssueService:
         issue = Issue(
             id=generate_id(),
             title=title,
-            type=type,
             priority=priority,
             description=description,
             labels=labels or [],
@@ -168,7 +165,6 @@ class IssueService:
         self,
         status: Status | None = None,
         labels: list[str] | None = None,
-        type: IssueType | None = None,
         exclude_closed: bool = False,
     ) -> list[Issue]:
         """List issues with optional filters."""
@@ -179,8 +175,6 @@ class IssueService:
         if labels:
             label_set = set(labels)
             issues = [i for i in issues if label_set & set(i.labels)]
-        if type is not None:
-            issues = [i for i in issues if i.type == type]
         if exclude_closed:
             issues = [i for i in issues if i.status != Status.CLOSED]
 
@@ -189,7 +183,6 @@ class IssueService:
     def get_ready_issues(
         self,
         labels: list[str] | None = None,
-        type: IssueType | None = None,
         limit: int | None = None,
     ) -> list[Issue]:
         """Get unblocked issues ready for work, with filters."""
@@ -203,8 +196,6 @@ class IssueService:
         if labels:
             label_set = set(labels)
             ready = [i for i in ready if label_set & set(i.labels)]
-        if type is not None:
-            ready = [i for i in ready if i.type == type]
 
         # Sort by priority, then creation date
         ready = sorted(ready, key=lambda i: (i.priority, i.created_at))
@@ -312,7 +303,6 @@ class WorkflowService:
         for step_dict in steps_data:
             step = WorkflowStep(
                 title=step_dict["title"],
-                type=IssueType(step_dict.get("type", "task")),
                 priority=step_dict.get("priority", 2),
                 description=step_dict.get("description", ""),
                 labels=step_dict.get("labels", []) or [],
@@ -396,7 +386,6 @@ class WorkflowService:
             # Create issue
             issue = self.issue_service.create_issue(
                 title=step.title,
-                type=step.type,
                 priority=step.priority,
                 description=step.description,
                 labels=labels,
@@ -440,13 +429,13 @@ class LaunchService:
         - Issue details (title, type, priority, description, design notes, acceptance criteria)
         - Relevant hints (based on issue labels)
         - Dependency information (blockers with status)
+        - Workflow instructions for completing the issue
         """
         parts = []
 
         # Issue details
         parts.append(f"# Task: {issue.title}\n")
         parts.append(f"**ID**: {issue.id}\n")
-        parts.append(f"**Type**: {issue.type.value}\n")
         parts.append(f"**Priority**: P{issue.priority}\n")
 
         if issue.description:
@@ -477,6 +466,97 @@ class LaunchService:
                 blocker = self.issue_service.get_issue(blocker_id)
                 if blocker:
                     parts.append(f"- {blocker.id}: {blocker.title} ({blocker.status.value})\n")
+
+        # Add workflow instructions
+        parts.append("\n## Workflow Instructions\n")
+        parts.append("\nWhen you have completed this task:\n\n")
+        parts.append("1. **Verify all acceptance criteria are met** (if specified above)\n")
+        parts.append("2. **Run any relevant tests** to ensure your changes work correctly\n")
+        parts.append(f"3. **Close this issue** by running: `weaver close {issue.id}`\n")
+        parts.append("\nThis marks the issue as complete and unblocks any dependent tasks.\n")
+
+        # Add comprehensive weaver usage guide
+        parts.append("\n## Using Weaver During This Task\n")
+        parts.append("\n### Core Principle: Always File Issues\n")
+        parts.append("\n**When you encounter new work, file a weaver issue immediately.** This includes:\n")
+        parts.append("- New features or tasks discovered during implementation\n")
+        parts.append("- Bugs found while working on this task\n")
+        parts.append("- Refactoring needed before proceeding\n")
+        parts.append("- Technical debt that blocks progress\n")
+        parts.append("- Research tasks to understand the codebase\n")
+        parts.append("\n**Don't just announce work - file it:**\n")
+        parts.append("```bash\n")
+        parts.append("# Bad: \"I notice we should also update the tests\"\n")
+        parts.append("# Good:\n")
+        parts.append(f"weaver create \"Update tests for {issue.title}\" -t task -b {issue.id}\n")
+        parts.append("```\n")
+
+        parts.append("\n### Creating New Issues\n")
+        parts.append("\nIf you discover additional work while completing this task:\n")
+        parts.append("```bash\n")
+        parts.append("# Create a related task\n")
+        parts.append("weaver create \"Task title\" -t task -p 2\n")
+        parts.append("\n# Create a task that blocks this one\n")
+        parts.append(f"weaver create \"Prerequisite work\" -t task -p 1 -b {issue.id}\n")
+        parts.append("\n# Create a task with labels\n")
+        parts.append("weaver create \"Task title\" -t task -l backend -l tests\n")
+        parts.append("\n# Create with description from stdin\n")
+        parts.append("cat <<'EOF' | weaver create \"Task title\" -f -\n")
+        parts.append("**Goal**: What to accomplish\n")
+        parts.append("\n**Exit Conditions**:\n")
+        parts.append("- [ ] Specific verifiable condition\n")
+        parts.append("- [ ] Tests pass\n")
+        parts.append("EOF\n")
+        parts.append("```\n")
+
+        parts.append("\n### Issue Types and Priorities\n")
+        parts.append("\n**Types**: `-t task|bug|feature|epic|chore`\n")
+        parts.append("- `task`: Standard work item (default)\n")
+        parts.append("- `bug`: Something broken that needs fixing\n")
+        parts.append("- `feature`: New functionality\n")
+        parts.append("- `epic`: Large feature broken into subtasks\n")
+        parts.append("- `chore`: Maintenance work\n")
+        parts.append("\n**Priorities**: `-p 0|1|2|3|4` (default: 2)\n")
+        parts.append("- **P0**: Critical - System broken, blocking all work\n")
+        parts.append("- **P1**: High - Important feature or serious bug\n")
+        parts.append("- **P2**: Medium - Standard tasks\n")
+        parts.append("- **P3**: Low - Nice to have\n")
+        parts.append("- **P4**: Trivial - Cleanup, minor improvements\n")
+
+        parts.append("\n### Managing Dependencies\n")
+        parts.append("\nUse dependencies to show task ordering:\n")
+        parts.append("```bash\n")
+        parts.append("# Make task B depend on task A completing first\n")
+        parts.append("weaver dep add wv-b2c9 wv-a3f8  # B is blocked by A\n")
+        parts.append("\n# Remove a dependency\n")
+        parts.append("weaver dep remove wv-b2c9 wv-a3f8\n")
+        parts.append("```\n")
+
+        parts.append("\n### Useful Commands\n")
+        parts.append("\n```bash\n")
+        parts.append("# View what's ready to work on\n")
+        parts.append("weaver ready\n")
+        parts.append("\n# Show issue details with all dependencies\n")
+        parts.append("weaver show wv-xxxx --fetch-deps\n")
+        parts.append("\n# List all issues\n")
+        parts.append("weaver list\n")
+        parts.append("\n# Filter by status\n")
+        parts.append("weaver list -s OPEN -s IN_PROGRESS\n")
+        parts.append("\n# Search in hints for guidance\n")
+        parts.append("weaver hint list\n")
+        parts.append("weaver hint show <hint-id>\n")
+        parts.append("```\n")
+
+        parts.append("\n### Best Practices\n")
+        parts.append("\n1. **Break down large tasks**: If this task is complex, create subtasks with dependencies\n")
+        parts.append("2. **Use labels**: Add labels like `backend`, `frontend`, `tests`, `docs` for organization\n")
+        parts.append("3. **Write clear descriptions**: Include goal, exit conditions, related code, and context\n")
+        parts.append("4. **Track blockers**: If blocked, create a blocker issue and link it with dependencies\n")
+        parts.append("5. **Check hints**: Review hints matching this issue's labels for guidance\n")
+        parts.append("6. **Close when done**: Always run `weaver close` to update status and unblock dependents\n")
+
+        parts.append("\n---\n")
+        parts.append("\n**Remember**: Weaver helps maintain context and structure work. Use it liberally to track everything you discover!\n")
 
         return "".join(parts)
 

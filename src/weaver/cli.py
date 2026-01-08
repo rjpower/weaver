@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
-from weaver.models import Issue, IssueType, Status
+from weaver.models import Issue, Status
 from weaver.service import DependencyError, IssueNotFoundError, IssueService, HintService, WorkflowService
 from weaver.storage import MarkdownStorage, HintStorage, WorkflowStorage
 
@@ -98,14 +98,6 @@ def init() -> None:
 @cli.command()
 @click.argument("title")
 @click.option(
-    "-t",
-    "--type",
-    "issue_type",
-    type=click.Choice(["task", "bug", "feature", "epic", "chore"]),
-    default="task",
-    help="Issue type",
-)
-@click.option(
     "-p",
     "--priority",
     type=click.IntRange(0, 4),
@@ -129,7 +121,6 @@ def init() -> None:
 def create(
     ctx: click.Context,
     title: str,
-    issue_type: str,
     priority: int,
     labels: tuple[str, ...],
     blocked_by: tuple[str, ...],
@@ -157,7 +148,6 @@ def create(
     try:
         issue = service.create_issue(
             title=title,
-            type=IssueType(issue_type),
             priority=priority,
             description=description,
             labels=list(labels),
@@ -189,7 +179,7 @@ def show(ctx: click.Context, issue_id: str, fetch_deps: bool) -> None:
 
             for dep in dependencies:
                 console.print(f"[bold cyan]{dep.id}[/bold cyan]: {dep.title}")
-                console.print(f"Status: {dep.status.value}  Priority: P{dep.priority}  Type: {dep.type.value}")
+                console.print(f"Status: {dep.status.value}  Priority: P{dep.priority}")
 
                 # Combine description and design_notes for truncation
                 content = dep.description
@@ -218,7 +208,7 @@ def show(ctx: click.Context, issue_id: str, fetch_deps: bool) -> None:
     # Display issue details
     console.print(f"[bold cyan]{issue.id}[/bold cyan]: {issue.title}")
     console.print(
-        f"Status: {issue.status.value}  Priority: P{issue.priority}  Type: {issue.type.value}"
+        f"Status: {issue.status.value}  Priority: P{issue.priority}"
     )
     if issue.labels:
         console.print(f"Labels: {', '.join(issue.labels)}")
@@ -245,13 +235,6 @@ def show(ctx: click.Context, issue_id: str, fetch_deps: bool) -> None:
 )
 @click.option("-l", "--label", "labels", multiple=True, help="Filter by label")
 @click.option(
-    "-t",
-    "--type",
-    "issue_type",
-    type=click.Choice(["task", "bug", "feature", "epic", "chore"]),
-    help="Filter by type",
-)
-@click.option(
     "-a",
     "--all",
     "show_all",
@@ -263,7 +246,6 @@ def list_issues(
     ctx: click.Context,
     status: str | None,
     labels: tuple[str, ...],
-    issue_type: str | None,
     show_all: bool,
 ) -> None:
     """List issues with optional filters. By default, closed issues are hidden."""
@@ -271,7 +253,6 @@ def list_issues(
     issues = service.list_issues(
         status=Status(status) if status else None,
         labels=list(labels) if labels else None,
-        type=IssueType(issue_type) if issue_type else None,
         exclude_closed=not show_all and status is None,
     )
     if not issues:
@@ -288,26 +269,17 @@ def list_issues(
     multiple=True,
     help="Filter by label (can specify multiple)",
 )
-@click.option(
-    "-t",
-    "--type",
-    "issue_type",
-    type=click.Choice(["task", "bug", "feature", "epic", "chore"]),
-    help="Filter by issue type",
-)
 @click.option("-n", "--limit", type=int, help="Max number of issues to show")
 @click.pass_context
 def ready(
     ctx: click.Context,
     labels: tuple[str, ...],
-    issue_type: str | None,
     limit: int | None,
 ) -> None:
     """List unblocked issues ready for work."""
     service = get_service(ctx)
     issues = service.get_ready_issues(
         labels=list(labels) if labels else None,
-        type=IssueType(issue_type) if issue_type else None,
         limit=limit,
     )
     if not issues:
@@ -386,7 +358,6 @@ def _print_issue_table(issues: list[Issue]) -> None:
     table.add_column("ID", style="cyan")
     table.add_column("P", justify="center")
     table.add_column("Status")
-    table.add_column("Type")
     table.add_column("Title")
     table.add_column("Labels")
 
@@ -395,7 +366,6 @@ def _print_issue_table(issues: list[Issue]) -> None:
             issue.id,
             str(issue.priority),
             issue.status.value,
-            issue.type.value,
             issue.title[:50],
             ", ".join(issue.labels),
         )
@@ -644,7 +614,7 @@ def workflow_show(ctx: click.Context, workflow_name: str) -> None:
     console.print(f"[bold]Steps ({len(workflow.steps)}):[/bold]")
     for i, step in enumerate(workflow.steps, 1):
         console.print(f"\n{i}. [cyan]{step.title}[/cyan]")
-        console.print(f"   Type: {step.type.value}, Priority: P{step.priority}")
+        console.print(f"   Priority: P{step.priority}")
         if step.depends_on:
             console.print(f"   Depends on: {', '.join(step.depends_on)}")
         if step.labels:
@@ -872,7 +842,7 @@ def launch(ctx: click.Context, issue_id: str, model: str) -> None:
         options = ClaudeAgentOptions(
             model=agent_model.value,
             cwd=str(project_root),
-            permission_mode="acceptEdits",
+            permission_mode="bypassPermissions",
         )
 
         with open(log_file, "w") as log:
