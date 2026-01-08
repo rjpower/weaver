@@ -17,7 +17,7 @@ class Status(Enum):
 class AgentModel(Enum):
     SONNET = "claude-sonnet-4-5-20250929"
     OPUS = "claude-opus-4-5-20251101"
-    FLASH = "claude-3-5-haiku-20241022"
+    FLASH = "claude-haiku-4-5-20251001"
 
 
 @dataclass

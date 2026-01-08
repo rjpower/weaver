@@ -1,7 +1,9 @@
 """Tests for weaver.cli."""
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, AsyncIterator
 from unittest.mock import Mock, mock_open, patch
 
 import pytest
@@ -351,13 +353,13 @@ class TestReady:
     def test_shows_unblocked(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
         os.chdir(weaver_dir)
         blocker = service.create_issue("Blocker")
-        service.create_issue("Blocked", blocked_by=[blocker.id])
+        blocked = service.create_issue("Blocked", blocked_by=[blocker.id])
 
         result = runner.invoke(cli, ["ready"])
 
         assert result.exit_code == 0
-        assert "Blocker" in result.output
-        assert "Blocked" not in result.output
+        assert blocker.id in result.output
+        assert blocked.id not in result.output
 
     def test_filters_by_label(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
         os.chdir(weaver_dir)
@@ -1128,16 +1130,30 @@ steps:
         assert "…" in result.output or "..." in result.output
 
 
-@pytest.mark.skip
+# Mock helpers for Agent SDK
+@dataclass
+class _MockTextBlock:
+    text: str
+
+
+@dataclass
+class _MockMessage:
+    content: list[_MockTextBlock]
+
+
+async def _mock_agent_query(prompt: str, options: Any) -> AsyncIterator[_MockMessage]:
+    """Simple mock for claude_agent_sdk.query that yields a success message."""
+    yield _MockMessage(content=[_MockTextBlock(text="Task completed")])
+
+
 class TestLaunch:
     def test_launches_agent_with_default_model(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
         os.chdir(weaver_dir)
         issue = service.create_issue("Test task", description="Test description")
 
-        mock_result = Mock()
-        mock_result.returncode = 0
-
-        with patch("weaver.cli.subprocess.run", return_value=mock_result) as mock_run:
+        with patch("claude_agent_sdk.query", side_effect=_mock_agent_query), patch(
+            "weaver.utils.summarize_conversation_log", return_value=None
+        ):
             result = runner.invoke(cli, ["launch", issue.id])
 
         assert result.exit_code == 0
@@ -1146,56 +1162,37 @@ class TestLaunch:
         assert "Test task" in result.output
         assert "Agent completed successfully" in result.output
 
-        # Verify subprocess was called with correct arguments
-        mock_run.assert_called_once()
-        call_args = mock_run.call_args[0][0]
-        assert call_args[0] == "claude"
-        assert "--model" in call_args
-        assert "claude-sonnet-4-5-20250929" in call_args
-        assert "--dangerously-skip-display" in call_args
-
     def test_launches_agent_with_opus_model(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
         os.chdir(weaver_dir)
         issue = service.create_issue("Test task")
 
-        mock_result = Mock()
-        mock_result.returncode = 0
-
-        with patch("weaver.cli.subprocess.run", return_value=mock_result) as mock_run:
+        with patch("claude_agent_sdk.query", side_effect=_mock_agent_query), patch(
+            "weaver.utils.summarize_conversation_log", return_value=None
+        ):
             result = runner.invoke(cli, ["launch", issue.id, "--model", "opus"])
 
         assert result.exit_code == 0
         assert "Launching opus agent" in result.output
 
-        # Verify opus model was used
-        call_args = mock_run.call_args[0][0]
-        assert "claude-opus-4-5-20251101" in call_args
-
     def test_launches_agent_with_flash_model(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
         os.chdir(weaver_dir)
         issue = service.create_issue("Test task")
 
-        mock_result = Mock()
-        mock_result.returncode = 0
-
-        with patch("weaver.cli.subprocess.run", return_value=mock_result) as mock_run:
+        with patch("claude_agent_sdk.query", side_effect=_mock_agent_query), patch(
+            "weaver.utils.summarize_conversation_log", return_value=None
+        ):
             result = runner.invoke(cli, ["launch", issue.id, "--model", "flash"])
 
         assert result.exit_code == 0
         assert "Launching flash agent" in result.output
 
-        # Verify flash model was used
-        call_args = mock_run.call_args[0][0]
-        assert "claude-3-5-haiku-20241022" in call_args
-
     def test_creates_context_file(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
         os.chdir(weaver_dir)
         issue = service.create_issue("Test task", description="Task description", labels=["backend"])
 
-        mock_result = Mock()
-        mock_result.returncode = 0
-
-        with patch("weaver.cli.subprocess.run", return_value=mock_result):
+        with patch("claude_agent_sdk.query", side_effect=_mock_agent_query), patch(
+            "weaver.utils.summarize_conversation_log", return_value=None
+        ):
             runner.invoke(cli, ["launch", issue.id])
 
         # Verify context file was created
@@ -1209,10 +1206,9 @@ class TestLaunch:
         os.chdir(weaver_dir)
         issue = service.create_issue("Test task")
 
-        mock_result = Mock()
-        mock_result.returncode = 0
-
-        with patch("weaver.cli.subprocess.run", return_value=mock_result):
+        with patch("claude_agent_sdk.query", side_effect=_mock_agent_query), patch(
+            "weaver.utils.summarize_conversation_log", return_value=None
+        ):
             result = runner.invoke(cli, ["launch", issue.id])
 
         assert result.exit_code == 0
@@ -1228,26 +1224,18 @@ class TestLaunch:
         os.chdir(weaver_dir)
         issue = service.create_issue("Test task")
 
-        mock_result = Mock()
-        mock_result.returncode = 1
+        async def _raise_error(*_: Any, **__: Any) -> AsyncIterator[_MockMessage]:
+            raise RuntimeError("Agent failed")
+            yield  # type: ignore  # unreachable but makes it a generator
 
-        with patch("weaver.cli.subprocess.run", return_value=mock_result):
+        with patch("claude_agent_sdk.query", side_effect=_raise_error), patch(
+            "weaver.utils.summarize_conversation_log", return_value=None
+        ):
             result = runner.invoke(cli, ["launch", issue.id])
 
         assert result.exit_code == 0  # CLI itself shouldn't fail
         assert "Agent exited with code 1" in result.output
         assert "Check logs:" in result.output
-
-    def test_handles_claude_not_found(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
-        os.chdir(weaver_dir)
-        issue = service.create_issue("Test task")
-
-        with patch("weaver.cli.subprocess.run", side_effect=FileNotFoundError):
-            result = runner.invoke(cli, ["launch", issue.id])
-
-        assert result.exit_code != 0
-        assert "Claude CLI not found" in result.output
-        assert "pip install claude-code" in result.output
 
     def test_handles_invalid_issue(self, runner: CliRunner, weaver_dir: Path):
         os.chdir(weaver_dir)
@@ -1260,10 +1248,9 @@ class TestLaunch:
         os.chdir(weaver_dir)
         issue = service.create_issue("Test task")
 
-        mock_result = Mock()
-        mock_result.returncode = 0
-
-        with patch("weaver.cli.subprocess.run", return_value=mock_result):
+        with patch("claude_agent_sdk.query", side_effect=_mock_agent_query), patch(
+            "weaver.utils.summarize_conversation_log", return_value=None
+        ):
             runner.invoke(cli, ["launch", issue.id])
 
         # Verify launch record was saved
@@ -1292,10 +1279,9 @@ class TestLaunch:
         # Create issue with backend label
         issue = service.create_issue("Backend task", labels=["backend"])
 
-        mock_result = Mock()
-        mock_result.returncode = 0
-
-        with patch("weaver.cli.subprocess.run", return_value=mock_result):
+        with patch("claude_agent_sdk.query", side_effect=_mock_agent_query), patch(
+            "weaver.utils.summarize_conversation_log", return_value=None
+        ):
             runner.invoke(cli, ["launch", issue.id])
 
         # Verify context file includes hint
@@ -1312,10 +1298,9 @@ class TestLaunch:
         blocker = service.create_issue("Blocker task")
         issue = service.create_issue("Main task", blocked_by=[blocker.id])
 
-        mock_result = Mock()
-        mock_result.returncode = 0
-
-        with patch("weaver.cli.subprocess.run", return_value=mock_result):
+        with patch("claude_agent_sdk.query", side_effect=_mock_agent_query), patch(
+            "weaver.utils.summarize_conversation_log", return_value=None
+        ):
             runner.invoke(cli, ["launch", issue.id])
 
         # Verify context file includes dependencies
@@ -1325,7 +1310,6 @@ class TestLaunch:
         assert "Dependencies (Blockers)" in context_content
         assert "Blocker task" in context_content
         assert blocker.id in context_content
-
 
     def test_not_in_weaver_project(self, runner: CliRunner, tmp_path: Path):
         with runner.isolated_filesystem(temp_dir=tmp_path):

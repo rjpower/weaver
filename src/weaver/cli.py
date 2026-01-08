@@ -360,6 +360,7 @@ def _print_issue_table(issues: list[Issue]) -> None:
     table.add_column("Status")
     table.add_column("Title")
     table.add_column("Labels")
+    table.add_column("Blocked By")
 
     for issue in issues:
         table.add_row(
@@ -368,6 +369,7 @@ def _print_issue_table(issues: list[Issue]) -> None:
             issue.status.value,
             issue.title[:50],
             ", ".join(issue.labels),
+            ", ".join(issue.blocked_by) if issue.blocked_by else "",
         )
     console.print(table)
 
@@ -778,8 +780,13 @@ def hint_search(ctx: click.Context, query: str) -> None:
     default="sonnet",
     help="Claude model to use",
 )
+@click.option(
+    "--follow",
+    is_flag=True,
+    help="Stream logs to console in real-time while agent runs",
+)
 @click.pass_context
-def launch(ctx: click.Context, issue_id: str, model: str) -> None:
+def launch(ctx: click.Context, issue_id: str, model: str, follow: bool) -> None:
     """Launch an AI agent to work on a task.
 
     This spawns a Claude agent using the Agent SDK that will attempt to complete
@@ -824,6 +831,8 @@ def launch(ctx: click.Context, issue_id: str, model: str) -> None:
     console.print(f"Model: {agent_model.value}")
     console.print(f"Context: {context_file}")
     console.print(f"Logs: {log_file}")
+    if follow:
+        console.print(f"[bold]Streaming logs to console...[/bold]")
 
     # Read the context file to get the prompt
     with open(context_file, "r") as f:
@@ -846,34 +855,58 @@ def launch(ctx: click.Context, issue_id: str, model: str) -> None:
         )
 
         with open(log_file, "w") as log:
-            try:
-                async for message in query(prompt=prompt, options=options):
-                    # Write all messages to log file
-                    log.write(str(message))
-                    log.write("\n")
-                    log.flush()
-                return 0
-            except Exception as e:
-                log.write(f"\nError: {e}\n")
+            async for message in query(prompt=prompt, options=options):
+                # Write message as JSON to log file for proper parsing
+                from weaver.utils import serialize_message
+                log.write(serialize_message(message))
+                log.write("\n")
                 log.flush()
-                return 1
+                # Stream to console if --follow is enabled
+                if follow:
+                    from weaver.utils import format_agent_message
+                    format_agent_message(message, console)
+            return 0
 
-    try:
+    # Unset ANTHROPIC_API_KEY to use Claude Code OAuth credentials
+    import os
+    from contextlib import contextmanager
+
+    @contextmanager
+    def without_api_key():
+        api_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+        auth_token = os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+
+        if api_key:
+            console.print("[dim]Temporarily unsetting ANTHROPIC_API_KEY to use OAuth[/dim]")
+        if auth_token:
+            console.print("[dim]Temporarily unsetting ANTHROPIC_AUTH_TOKEN to use OAuth[/dim]")
+
+        try:
+            yield
+        finally:
+            if api_key:
+                os.environ["ANTHROPIC_API_KEY"] = api_key
+            if auth_token:
+                os.environ["ANTHROPIC_AUTH_TOKEN"] = auth_token
+
+    with without_api_key():
         exit_code = anyio.run(run_agent)
 
-        launch.completed_at = datetime.now()
-        launch.exit_code = exit_code
-        launch_storage.write_launch(launch)
+    launch.completed_at = datetime.now()
+    launch.exit_code = exit_code
+    launch_storage.write_launch(launch)
 
-        if exit_code == 0:
-            console.print(f"[green]Agent completed successfully[/green]")
-        else:
-            console.print(f"[red]Agent exited with code {exit_code}[/red]")
-            console.print(f"Check logs: {log_file}")
+    if exit_code == 0:
+        console.print(f"[green]Agent completed successfully[/green]")
+    else:
+        console.print(f"[red]Agent exited with code {exit_code}[/red]")
+        console.print(f"Check logs: {log_file}")
 
-    except Exception as e:
-        console.print(f"[red]Error launching agent: {e}[/red]")
-        raise
+    # Summarize the conversation log using Haiku
+    from weaver.utils import summarize_conversation_log
+    summary = summarize_conversation_log(log_file)
+    if summary:
+        console.print(f"\n[bold]Summary:[/bold]\n{summary}")
 
 
 if __name__ == "__main__":
