@@ -7,6 +7,7 @@ from importlib.resources import files
 from pathlib import Path
 
 import click
+from click.shell_completion import CompletionItem
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
@@ -39,6 +40,60 @@ def get_service(ctx: click.Context) -> IssueService:
     return ctx.obj["service"]
 
 
+# Shell completion helper functions
+def complete_issue_ids(ctx: click.Context, param: click.Parameter, incomplete: str) -> list[CompletionItem]:
+    """Provide completion for issue IDs."""
+    root = find_weaver_root()
+    if not root:
+        return []
+    try:
+        storage = MarkdownStorage(root)
+        issue_ids = storage.list_issue_ids()
+        return [
+            CompletionItem(issue_id)
+            for issue_id in issue_ids
+            if issue_id.startswith(incomplete)
+        ]
+    except Exception:
+        return []
+
+
+def complete_workflow_names(ctx: click.Context, param: click.Parameter, incomplete: str) -> list[CompletionItem]:
+    """Provide completion for workflow names."""
+    root = find_weaver_root()
+    if not root:
+        return []
+    try:
+        storage = WorkflowStorage(root)
+        workflows = storage.list_all_workflows()
+        return [
+            CompletionItem(wf.name)
+            for wf in workflows
+            if wf.name.startswith(incomplete)
+        ]
+    except Exception:
+        return []
+
+
+def complete_hint_titles(ctx: click.Context, param: click.Parameter, incomplete: str) -> list[CompletionItem]:
+    """Provide completion for hint titles and IDs."""
+    root = find_weaver_root()
+    if not root:
+        return []
+    try:
+        storage = HintStorage(root)
+        hints = storage.list_all_hints()
+        completions = []
+        for hint in hints:
+            if hint.title.startswith(incomplete):
+                completions.append(CompletionItem(hint.title))
+            elif hint.id.startswith(incomplete):
+                completions.append(CompletionItem(hint.id))
+        return completions
+    except Exception:
+        return []
+
+
 @click.group(invoke_without_command=True)
 @click.pass_context
 def cli(ctx: click.Context) -> None:
@@ -57,6 +112,43 @@ def cli(ctx: click.Context) -> None:
 def readme() -> None:
     """Show a quick reference guide for using weaver."""
     console.print(Markdown(get_readme_content()))
+
+
+@cli.command()
+@click.argument("shell", type=click.Choice(["bash", "zsh", "fish"]), required=False)
+def completion(shell: str | None) -> None:
+    """Install shell completion for weaver commands.
+
+    Usage:
+        # For zsh (add to ~/.zshrc):
+        eval "$(weaver completion zsh)"
+
+        # For bash (add to ~/.bashrc):
+        eval "$(weaver completion bash)"
+
+        # For fish (add to ~/.config/fish/config.fish):
+        weaver completion fish | source
+    """
+    if not shell:
+        console.print("[yellow]Please specify a shell: bash, zsh, or fish[/yellow]")
+        console.print("\nExamples:")
+        console.print("  zsh:  eval \"$(weaver completion zsh)\"")
+        console.print("  bash: eval \"$(weaver completion bash)\"")
+        console.print("  fish: weaver completion fish | source")
+        return
+
+    # Click provides built-in completion generation
+    from click.shell_completion import get_completion_class
+
+    completion_class = get_completion_class(shell)
+    if completion_class is None:
+        console.print(f"[red]Unsupported shell: {shell}[/red]")
+        return
+
+    # Generate and output the completion script
+    completion_obj = completion_class(cli, {}, "weaver", "_WEAVER_COMPLETE")
+    script = completion_obj.source()
+    click.echo(script)
 
 
 @cli.command()
@@ -160,7 +252,7 @@ def create(
 
 
 @cli.command()
-@click.argument("issue_id")
+@click.argument("issue_id", shell_complete=complete_issue_ids)
 @click.option("--fetch-deps", is_flag=True, help="Show transitive dependencies in topological order")
 @click.pass_context
 def show(ctx: click.Context, issue_id: str, fetch_deps: bool) -> None:
@@ -294,7 +386,7 @@ def ready(
 
 
 @cli.command()
-@click.argument("issue_id")
+@click.argument("issue_id", shell_complete=complete_issue_ids)
 @click.pass_context
 def start(ctx: click.Context, issue_id: str) -> None:
     """Mark an issue as in progress."""
@@ -307,19 +399,25 @@ def start(ctx: click.Context, issue_id: str) -> None:
 
 
 @cli.command()
-@click.argument("issue_ids", nargs=-1, required=True)
+@click.argument("issue_ids", nargs=-1, required=True, shell_complete=complete_issue_ids)
 @click.pass_context
 def close(ctx: click.Context, issue_ids: tuple[str, ...]) -> None:
     """Close one or more issues."""
     service = get_service(ctx)
     closed_issues = []
     failed_ids = []
+    all_unblocked = []
 
     for issue_id in issue_ids:
         try:
-            issue = service.close_issue(issue_id)
+            issue, newly_unblocked = service.close_issue(issue_id)
             closed_issues.append(issue)
             console.print(f"Closed [cyan]{issue.id}[/cyan]: {issue.title}")
+
+            if newly_unblocked:
+                all_unblocked.extend(newly_unblocked)
+                for unblocked in newly_unblocked:
+                    console.print(f"  → Unblocked [green]{unblocked.id}[/green]: {unblocked.title}")
         except IssueNotFoundError:
             failed_ids.append(issue_id)
 
@@ -327,9 +425,13 @@ def close(ctx: click.Context, issue_ids: tuple[str, ...]) -> None:
         error_msg = f"Issue{'s' if len(failed_ids) > 1 else ''} not found: {', '.join(failed_ids)}"
         raise click.ClickException(error_msg)
 
+    # Summary of newly ready tasks
+    if all_unblocked:
+        console.print(f"\n[bold green]✓ {len(all_unblocked)} task{'s' if len(all_unblocked) > 1 else ''} now ready for work![/bold green]")
+
 
 @cli.command()
-@click.argument("issue_id")
+@click.argument("issue_id", shell_complete=complete_issue_ids)
 @click.option(
     "--status",
     "-s",
@@ -408,8 +510,8 @@ def dep() -> None:
 
 
 @dep.command("add")
-@click.argument("issue_id")
-@click.argument("blocked_by_id")
+@click.argument("issue_id", shell_complete=complete_issue_ids)
+@click.argument("blocked_by_id", shell_complete=complete_issue_ids)
 @click.pass_context
 def dep_add(ctx: click.Context, issue_id: str, blocked_by_id: str) -> None:
     """Mark ISSUE_ID as blocked by BLOCKED_BY_ID."""
@@ -424,8 +526,8 @@ def dep_add(ctx: click.Context, issue_id: str, blocked_by_id: str) -> None:
 
 
 @dep.command("rm")
-@click.argument("issue_id")
-@click.argument("blocked_by_id")
+@click.argument("issue_id", shell_complete=complete_issue_ids)
+@click.argument("blocked_by_id", shell_complete=complete_issue_ids)
 @click.pass_context
 def dep_rm(ctx: click.Context, issue_id: str, blocked_by_id: str) -> None:
     """Remove dependency: ISSUE_ID no longer blocked by BLOCKED_BY_ID."""
@@ -441,6 +543,9 @@ def dep_rm(ctx: click.Context, issue_id: str, blocked_by_id: str) -> None:
 
 def _print_issue_table(issues: list[Issue]) -> None:
     """Print issues as a formatted table."""
+    # Get service to check blocker status
+    service = get_service(click.get_current_context())
+
     table = Table()
     table.add_column("ID", style="cyan")
     table.add_column("P", justify="center")
@@ -450,13 +555,26 @@ def _print_issue_table(issues: list[Issue]) -> None:
     table.add_column("Blocked By")
 
     for issue in issues:
+        # Format blocked_by with status indicator
+        blocked_by_display = ""
+        if issue.blocked_by:
+            blocker_parts = []
+            for blocker_id in issue.blocked_by:
+                blocker = service.get_issue(blocker_id)
+                if blocker and blocker.status == Status.CLOSED:
+                    # Add asterisk to indicate blocker is closed
+                    blocker_parts.append(f"{blocker_id}(*)")
+                else:
+                    blocker_parts.append(blocker_id)
+            blocked_by_display = ", ".join(blocker_parts)
+
         table.add_row(
             issue.id,
             str(issue.priority),
             issue.status.value,
             issue.title[:50],
             ", ".join(issue.labels),
-            ", ".join(issue.blocked_by) if issue.blocked_by else "",
+            blocked_by_display,
         )
     console.print(table)
 
@@ -667,7 +785,7 @@ def workflow_create(ctx: click.Context, name: str, file_path: str | None) -> Non
 
 
 @workflow.command("execute")
-@click.argument("workflow_name")
+@click.argument("workflow_name", shell_complete=complete_workflow_names)
 @click.option("--label", help="Additional label prefix for created issues")
 @click.pass_context
 def workflow_execute(ctx: click.Context, workflow_name: str, label: str | None) -> None:
@@ -686,7 +804,7 @@ def workflow_execute(ctx: click.Context, workflow_name: str, label: str | None) 
 
 
 @workflow.command("show")
-@click.argument("workflow_name")
+@click.argument("workflow_name", shell_complete=complete_workflow_names)
 @click.pass_context
 def workflow_show(ctx: click.Context, workflow_name: str) -> None:
     """Show workflow details."""
@@ -802,7 +920,7 @@ def hint_add(ctx: click.Context, title: str, labels: tuple[str, ...], file_path:
 
 
 @hint.command("show")
-@click.argument("title_or_id")
+@click.argument("title_or_id", shell_complete=complete_hint_titles)
 @click.pass_context
 def hint_show(ctx: click.Context, title_or_id: str) -> None:
     """Show a hint by title or ID."""
@@ -860,7 +978,7 @@ def hint_search(ctx: click.Context, query: str) -> None:
 
 
 @cli.command()
-@click.argument("issue_id")
+@click.argument("issue_id", shell_complete=complete_issue_ids)
 @click.option(
     "--model",
     type=click.Choice(["sonnet", "opus", "flash"]),

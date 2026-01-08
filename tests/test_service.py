@@ -87,14 +87,74 @@ class TestGetIssue:
 class TestCloseIssue:
     def test_closes_issue(self, service: IssueService):
         issue = service.create_issue("To close")
-        closed = service.close_issue(issue.id)
+        closed, unblocked = service.close_issue(issue.id)
 
         assert closed.status == Status.CLOSED
         assert closed.closed_at is not None
+        assert unblocked == []
 
     def test_raises_for_missing(self, service: IssueService):
         with pytest.raises(IssueNotFoundError):
             service.close_issue("wv-nonexistent")
+
+    def test_returns_newly_unblocked_issues(self, service: IssueService):
+        blocker = service.create_issue("Blocker")
+        blocked = service.create_issue("Blocked", blocked_by=[blocker.id])
+
+        closed, unblocked = service.close_issue(blocker.id)
+
+        assert closed.id == blocker.id
+        assert len(unblocked) == 1
+        assert unblocked[0].id == blocked.id
+
+    def test_does_not_return_blocked_with_multiple_blockers(self, service: IssueService):
+        blocker1 = service.create_issue("Blocker 1")
+        blocker2 = service.create_issue("Blocker 2")
+        blocked = service.create_issue("Blocked", blocked_by=[blocker1.id, blocker2.id])
+
+        # Close first blocker - blocked should NOT be unblocked yet
+        closed1, unblocked1 = service.close_issue(blocker1.id)
+        assert len(unblocked1) == 0
+
+        # Close second blocker - blocked should now be unblocked
+        closed2, unblocked2 = service.close_issue(blocker2.id)
+        assert len(unblocked2) == 1
+        assert unblocked2[0].id == blocked.id
+
+    def test_does_not_return_closed_dependents(self, service: IssueService):
+        blocker = service.create_issue("Blocker")
+        blocked = service.create_issue("Blocked", blocked_by=[blocker.id])
+
+        # Close the blocked issue first
+        service.close_issue(blocked.id)
+
+        # Then close the blocker - should not return closed issues
+        closed, unblocked = service.close_issue(blocker.id)
+        assert len(unblocked) == 0
+
+    def test_unblocks_multiple_dependents(self, service: IssueService):
+        blocker = service.create_issue("Blocker")
+        blocked1 = service.create_issue("Blocked 1", blocked_by=[blocker.id])
+        blocked2 = service.create_issue("Blocked 2", blocked_by=[blocker.id])
+
+        closed, unblocked = service.close_issue(blocker.id)
+
+        assert len(unblocked) == 2
+        unblocked_ids = {issue.id for issue in unblocked}
+        assert blocked1.id in unblocked_ids
+        assert blocked2.id in unblocked_ids
+
+    def test_dependencies_remain_after_close(self, service: IssueService):
+        """Verify that blocked_by list is preserved after closing blocker."""
+        blocker = service.create_issue("Blocker")
+        blocked = service.create_issue("Blocked", blocked_by=[blocker.id])
+
+        service.close_issue(blocker.id)
+
+        # Verify the dependency is still recorded
+        blocked_issue = service.get_issue(blocked.id)
+        assert blocked_issue is not None
+        assert blocker.id in blocked_issue.blocked_by
 
 
 class TestStartIssue:
@@ -240,7 +300,7 @@ class TestGetReadyIssues:
         blocker = service.create_issue("Blocker")
         blocked = service.create_issue("Blocked", blocked_by=[blocker.id])
 
-        service.close_issue(blocker.id)
+        closed, unblocked = service.close_issue(blocker.id)
 
         ready = service.get_ready_issues()
         ids = {i.id for i in ready}

@@ -94,16 +94,42 @@ class IssueService:
         self.storage.write_issue(issue)
         self._invalidate_graph()
 
-    def close_issue(self, issue_id: str) -> Issue:
-        """Close an issue."""
+    def close_issue(self, issue_id: str) -> tuple[Issue, list[Issue]]:
+        """Close an issue and return list of issues that became unblocked.
+
+        Returns:
+            Tuple of (closed_issue, list_of_newly_unblocked_issues)
+        """
         issue = self.get_issue(issue_id)
         if issue is None:
             raise IssueNotFoundError(issue_id)
 
+        # Get dependency graph before closing
+        graph = self._get_graph()
+        dependent_ids = graph.get_blocked_by_this(issue_id)
+
+        # Close the issue
         issue.status = Status.CLOSED
         issue.closed_at = datetime.now()
         self.update_issue(issue)
-        return issue
+
+        # Check which dependents became unblocked
+        # An issue is unblocked if all its blockers are now closed
+        newly_unblocked = []
+        all_issues = self.storage.read_all_issues()
+        open_ids = {i.id for i in all_issues if i.is_open()}
+
+        # Refresh graph after closing
+        graph = self._get_graph()
+
+        for dep_id in dependent_ids:
+            dep_issue = self.get_issue(dep_id)
+            if dep_issue and dep_issue.is_open():
+                # Check if this dependent is now unblocked
+                if not graph.is_blocked(dep_id, open_ids):
+                    newly_unblocked.append(dep_issue)
+
+        return issue, newly_unblocked
 
     def start_issue(self, issue_id: str) -> Issue:
         """Mark an issue as in progress."""
