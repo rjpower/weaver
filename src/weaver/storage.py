@@ -90,6 +90,7 @@ class MarkdownStorage:
         """Update index entry for an issue."""
         index = self._load_index()
         index["issues"][issue.id] = {
+            "type": "issue",
             "title": issue.title,
             "status": issue.status.value,
             "priority": issue.priority,
@@ -221,13 +222,13 @@ class HintStorage:
     def __init__(self, root: Path):
         self.root = root
         self.hints_dir = root / "hints"
-        self.index_path = root / "hints_index.yml"
+        self.index_path = root / "index.yml"
 
     def ensure_initialized(self) -> None:
         """Create .weaver/hints/ directory and index if not exists."""
         self.hints_dir.mkdir(parents=True, exist_ok=True)
         if not self.index_path.exists():
-            self._save_index({"hints": {}})
+            self._save_index({"issues": {}, "hints": {}})
 
     def hint_path(self, hint_id: str) -> Path:
         """Get path to a hint's markdown file."""
@@ -285,21 +286,31 @@ class HintStorage:
         return [p.stem for p in self.hints_dir.glob("*.md")]
 
     def _load_index(self) -> dict:
-        """Load index from hints_index.yml."""
+        """Load index from index.yml."""
         if not self.index_path.exists():
-            return {"hints": {}}
+            return {"issues": {}, "hints": {}}
         with open(self.index_path) as f:
-            return yaml.safe_load(f) or {"hints": {}}
+            index = yaml.safe_load(f) or {}
+            # Ensure hints section exists
+            if "hints" not in index:
+                index["hints"] = {}
+            # Ensure issues section exists for unified index
+            if "issues" not in index:
+                index["issues"] = {}
+            return index
 
     def _save_index(self, index: dict) -> None:
-        """Save index to hints_index.yml."""
+        """Save index to index.yml."""
         with open(self.index_path, "w") as f:
             yaml.dump(index, f, default_flow_style=False, sort_keys=False)
 
     def _update_index(self, hint: Hint) -> None:
         """Update index entry for a hint."""
         index = self._load_index()
+        if "hints" not in index:
+            index["hints"] = {}
         index["hints"][hint.id] = {
+            "type": "hint",
             "title": hint.title,
             "labels": hint.labels,
             "updated_at": hint.updated_at.isoformat(),
@@ -351,21 +362,25 @@ class WorkflowStorage:
     def __init__(self, root: Path):
         self.root = root
         self.workflows_dir = root / "workflows"
+        self.index_path = root / "index.yml"
 
     def ensure_initialized(self) -> None:
         """Create .weaver/workflows/ directory if not exists."""
         self.workflows_dir.mkdir(parents=True, exist_ok=True)
+        if not self.index_path.exists():
+            self._save_index({"issues": {}, "hints": {}, "workflows": {}})
 
     def workflow_path(self, workflow_id: str) -> Path:
         """Get path to a workflow's YAML file."""
         return self.workflows_dir / f"{workflow_id}.yml"
 
     def write_workflow(self, workflow: Workflow) -> None:
-        """Save workflow as YAML."""
+        """Save workflow as YAML and update index."""
         data = self._serialize_workflow(workflow)
         path = self.workflow_path(workflow.id)
         with open(path, "w") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        self._update_index(workflow)
 
     def read_workflow(self, workflow_id: str) -> Workflow | None:
         """Read and parse a workflow file."""
@@ -438,6 +453,43 @@ class WorkflowStorage:
             depends_on=data.get("depends_on", []) or [],
         )
 
+    def _load_index(self) -> dict:
+        """Load index from index.yml."""
+        if not self.index_path.exists():
+            return {"issues": {}, "hints": {}, "workflows": {}}
+        with open(self.index_path) as f:
+            index = yaml.safe_load(f) or {}
+            # Ensure all sections exist
+            for section in ["issues", "hints", "workflows"]:
+                if section not in index:
+                    index[section] = {}
+            return index
+
+    def _save_index(self, index: dict) -> None:
+        """Save index to index.yml."""
+        with open(self.index_path, "w") as f:
+            yaml.dump(index, f, default_flow_style=False, sort_keys=False)
+
+    def _update_index(self, workflow: Workflow) -> None:
+        """Update index entry for a workflow."""
+        index = self._load_index()
+        if "workflows" not in index:
+            index["workflows"] = {}
+        index["workflows"][workflow.id] = {
+            "type": "workflow",
+            "name": workflow.name,
+            "description": workflow.description,
+            "updated_at": workflow.updated_at.isoformat(),
+        }
+        self._save_index(index)
+
+    def _remove_from_index(self, workflow_id: str) -> None:
+        """Remove workflow from index."""
+        index = self._load_index()
+        if workflow_id in index.get("workflows", {}):
+            del index["workflows"][workflow_id]
+            self._save_index(index)
+
 
 class LaunchStorage:
     """Read/write launch executions as YAML files."""
@@ -446,18 +498,21 @@ class LaunchStorage:
         self.root = root
         self.launches_dir = root / "launches"
         self.logs_dir = root / "launches" / "logs"
+        self.index_path = root / "index.yml"
 
     def ensure_initialized(self) -> None:
         """Create .weaver/launches/ and logs/ directories if not exist."""
         self.launches_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        if not self.index_path.exists():
+            self._save_index({"issues": {}, "hints": {}, "workflows": {}, "launches": {}})
 
     def launch_path(self, launch_id: str) -> Path:
         """Get path to a launch's YAML file."""
         return self.launches_dir / f"{launch_id}.yml"
 
     def write_launch(self, launch: LaunchExecution) -> None:
-        """Save launch execution metadata as YAML."""
+        """Save launch execution metadata as YAML and update index."""
         data = {
             "id": launch.id,
             "issue_id": launch.issue_id,
@@ -471,6 +526,7 @@ class LaunchStorage:
         path = self.launch_path(launch.id)
         with open(path, "w") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        self._update_index(launch)
 
     def read_launch(self, launch_id: str) -> LaunchExecution | None:
         """Read and parse a launch execution file."""
@@ -506,3 +562,42 @@ class LaunchStorage:
                 launches.append(launch)
 
         return launches
+
+    def _load_index(self) -> dict:
+        """Load index from index.yml."""
+        if not self.index_path.exists():
+            return {"issues": {}, "hints": {}, "workflows": {}, "launches": {}}
+        with open(self.index_path) as f:
+            index = yaml.safe_load(f) or {}
+            # Ensure all sections exist
+            for section in ["issues", "hints", "workflows", "launches"]:
+                if section not in index:
+                    index[section] = {}
+            return index
+
+    def _save_index(self, index: dict) -> None:
+        """Save index to index.yml."""
+        with open(self.index_path, "w") as f:
+            yaml.dump(index, f, default_flow_style=False, sort_keys=False)
+
+    def _update_index(self, launch: LaunchExecution) -> None:
+        """Update index entry for a launch."""
+        index = self._load_index()
+        if "launches" not in index:
+            index["launches"] = {}
+        index["launches"][launch.id] = {
+            "type": "launch",
+            "issue_id": launch.issue_id,
+            "model": launch.model.value,
+            "started_at": launch.started_at.isoformat(),
+            "completed_at": launch.completed_at.isoformat() if launch.completed_at else None,
+            "exit_code": launch.exit_code,
+        }
+        self._save_index(index)
+
+    def _remove_from_index(self, launch_id: str) -> None:
+        """Remove launch from index."""
+        index = self._load_index()
+        if launch_id in index.get("launches", {}):
+            del index["launches"][launch_id]
+            self._save_index(index)

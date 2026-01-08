@@ -302,16 +302,25 @@ def start(ctx: click.Context, issue_id: str) -> None:
 
 
 @cli.command()
-@click.argument("issue_id")
+@click.argument("issue_ids", nargs=-1, required=True)
 @click.pass_context
-def close(ctx: click.Context, issue_id: str) -> None:
-    """Close an issue."""
+def close(ctx: click.Context, issue_ids: tuple[str, ...]) -> None:
+    """Close one or more issues."""
     service = get_service(ctx)
-    try:
-        issue = service.close_issue(issue_id)
-        console.print(f"Closed [cyan]{issue.id}[/cyan]: {issue.title}")
-    except IssueNotFoundError:
-        raise click.ClickException(f"Issue {issue_id} not found")
+    closed_issues = []
+    failed_ids = []
+
+    for issue_id in issue_ids:
+        try:
+            issue = service.close_issue(issue_id)
+            closed_issues.append(issue)
+            console.print(f"Closed [cyan]{issue.id}[/cyan]: {issue.title}")
+        except IssueNotFoundError:
+            failed_ids.append(issue_id)
+
+    if failed_ids:
+        error_msg = f"Issue{'s' if len(failed_ids) > 1 else ''} not found: {', '.join(failed_ids)}"
+        raise click.ClickException(error_msg)
 
 
 @cli.group()

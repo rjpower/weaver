@@ -31,7 +31,7 @@ class TestHintStorage:
         storage.ensure_initialized()
 
         assert (root / "hints").is_dir()
-        assert (root / "hints_index.yml").exists()
+        assert (root / "index.yml").exists()
 
     def test_hint_path(self, storage: HintStorage, weaver_root: Path):
         path = storage.hint_path("wv-hint-1234")
@@ -222,11 +222,12 @@ class TestHintIndex:
         )
         storage.write_hint(hint)
 
-        with open(weaver_root / "hints_index.yml") as f:
+        with open(weaver_root / "index.yml") as f:
             index = yaml.safe_load(f)
 
         assert "wv-hint-idx" in index["hints"]
         entry = index["hints"]["wv-hint-idx"]
+        assert entry["type"] == "hint"
         assert entry["title"] == "Indexed Hint"
         assert entry["labels"] == ["test", "index"]
         assert "updated_at" in entry

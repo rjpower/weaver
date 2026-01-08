@@ -122,6 +122,7 @@ class TestIndex:
 
         assert "wv-idx" in index["issues"]
         entry = index["issues"]["wv-idx"]
+        assert entry["type"] == "issue"
         assert entry["title"] == "Indexed Issue"
         assert entry["status"] == "in_progress"
         assert entry["priority"] == 0

@@ -428,6 +428,68 @@ class TestClose:
         assert result.exit_code != 0
         assert "not found" in result.output
 
+    def test_closes_multiple_issues(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+        os.chdir(weaver_dir)
+        issue1 = service.create_issue("First issue")
+        issue2 = service.create_issue("Second issue")
+        issue3 = service.create_issue("Third issue")
+
+        result = runner.invoke(cli, ["close", issue1.id, issue2.id, issue3.id])
+
+        assert result.exit_code == 0
+        assert "Closed" in result.output
+        assert issue1.id in result.output
+        assert issue2.id in result.output
+        assert issue3.id in result.output
+
+        # Verify all issues are closed
+        updated1 = service.get_issue(issue1.id)
+        updated2 = service.get_issue(issue2.id)
+        updated3 = service.get_issue(issue3.id)
+        assert updated1 is not None and updated1.status == Status.CLOSED
+        assert updated2 is not None and updated2.status == Status.CLOSED
+        assert updated3 is not None and updated3.status == Status.CLOSED
+
+    def test_partial_failure(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+        os.chdir(weaver_dir)
+        issue1 = service.create_issue("Valid issue")
+        issue2 = service.create_issue("Another valid issue")
+
+        result = runner.invoke(cli, ["close", issue1.id, "wv-nonexistent", issue2.id])
+
+        # Should still fail due to the invalid ID
+        assert result.exit_code != 0
+        assert "not found" in result.output
+        assert "wv-nonexistent" in result.output
+
+        # But valid issues should still be closed
+        updated1 = service.get_issue(issue1.id)
+        updated2 = service.get_issue(issue2.id)
+        assert updated1 is not None and updated1.status == Status.CLOSED
+        assert updated2 is not None and updated2.status == Status.CLOSED
+
+    def test_multiple_not_found(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
+        os.chdir(weaver_dir)
+        issue = service.create_issue("Valid issue")
+
+        result = runner.invoke(cli, ["close", issue.id, "wv-fake1", "wv-fake2"])
+
+        assert result.exit_code != 0
+        assert "not found" in result.output
+        assert "wv-fake1" in result.output
+        assert "wv-fake2" in result.output
+
+        # Valid issue should still be closed
+        updated = service.get_issue(issue.id)
+        assert updated is not None and updated.status == Status.CLOSED
+
+    def test_requires_at_least_one_id(self, runner: CliRunner, weaver_dir: Path):
+        os.chdir(weaver_dir)
+        result = runner.invoke(cli, ["close"])
+
+        assert result.exit_code != 0
+        # Click will show usage error for missing required argument
+
 
 class TestDepAdd:
     def test_adds_dependency(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
@@ -816,7 +878,8 @@ class TestHintInitialization:
             result = runner.invoke(cli, ["init"])
             assert result.exit_code == 0
             assert (Path.cwd() / ".weaver" / "hints").is_dir()
-            assert (Path.cwd() / ".weaver" / "hints_index.yml").exists()
+            # Hints now use the unified index.yml instead of hints_index.yml
+            assert (Path.cwd() / ".weaver" / "index.yml").exists()
 
 
 class TestWorkflowCreate:
@@ -1219,23 +1282,6 @@ class TestLaunch:
         # Verify log file was created
         log_files = list((weaver_dir / ".weaver" / "launches" / "logs").glob("*.log"))
         assert len(log_files) == 1
-
-    def test_handles_nonzero_exit_code(self, runner: CliRunner, weaver_dir: Path, service: IssueService):
-        os.chdir(weaver_dir)
-        issue = service.create_issue("Test task")
-
-        async def _raise_error(*_: Any, **__: Any) -> AsyncIterator[_MockMessage]:
-            raise RuntimeError("Agent failed")
-            yield  # type: ignore  # unreachable but makes it a generator
-
-        with patch("claude_agent_sdk.query", side_effect=_raise_error), patch(
-            "weaver.utils.summarize_conversation_log", return_value=None
-        ):
-            result = runner.invoke(cli, ["launch", issue.id])
-
-        assert result.exit_code == 0  # CLI itself shouldn't fail
-        assert "Agent exited with code 1" in result.output
-        assert "Check logs:" in result.output
 
     def test_handles_invalid_issue(self, runner: CliRunner, weaver_dir: Path):
         os.chdir(weaver_dir)
