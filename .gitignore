@@ -1,0 +1,13 @@
+target/
+static/dist/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+node_modules/
+.playwright/
+.playwright-mcp/
+.claude/
+.weaver/
+.bot/
+e2e/test-results/
+*.pyc
