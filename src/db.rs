@@ -10,6 +10,7 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspaces (
     id                 TEXT PRIMARY KEY,
     name               TEXT NOT NULL,
+    title              TEXT NOT NULL DEFAULT '',
     goal               TEXT NOT NULL DEFAULT '',
     description        TEXT NOT NULL DEFAULT '',
     status             TEXT NOT NULL DEFAULT 'created',
@@ -121,6 +122,12 @@ async fn migrate(pool: &Db) -> Result<()> {
             .execute(pool)
             .await
             .with_context(|| format!("running migration: {trimmed}"))?;
+    }
+    // Idempotent column additions for databases created by older versions.
+    // A "duplicate column" error on a fresh database is expected and ignored.
+    const ALTERS: &[&str] = &["ALTER TABLE workspaces ADD COLUMN title TEXT NOT NULL DEFAULT ''"];
+    for stmt in ALTERS {
+        let _ = sqlx::query(stmt).execute(pool).await;
     }
     Ok(())
 }

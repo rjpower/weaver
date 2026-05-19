@@ -21,18 +21,21 @@ enum Cmd {
     },
     /// Create a new workspace: worktree + tmux session + agent.
     New {
-        /// High-level goal for the workspace.
+        /// What the agent should do. Optional — omit to start it unprompted.
         goal: Vec<String>,
+        /// Human-readable title (derived from the goal when omitted).
+        #[arg(long)]
+        title: Option<String>,
         /// Base branch to fork from (defaults to the repo's current branch).
         #[arg(long)]
         base: Option<String>,
         /// Agent to launch: claude (default), shell, or a custom command.
         #[arg(long)]
         agent: Option<String>,
-        /// Explicit workspace name / branch slug.
+        /// Explicit name / branch slug (derived from the title when omitted).
         #[arg(long)]
         name: Option<String>,
-        /// GitHub issue number to link and seed the goal from.
+        /// GitHub issue number to link and seed the workspace from.
         #[arg(long)]
         issue: Option<i64>,
     },
@@ -105,11 +108,12 @@ async fn run() -> Result<()> {
         }
         Cmd::New {
             goal,
+            title,
             base,
             agent,
             name,
             issue,
-        } => cmd_new(goal.join(" "), base, agent, name, issue).await,
+        } => cmd_new(goal.join(" "), title, base, agent, name, issue).await,
         Cmd::Ls => cmd_ls().await,
         Cmd::Status { id } => cmd_status(id).await,
         Cmd::Attach { id } => cmd_attach(id).await,
@@ -159,6 +163,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 async fn cmd_new(
     goal: String,
+    title: Option<String>,
     base: Option<String>,
     agent: Option<String>,
     name: Option<String>,
@@ -171,6 +176,7 @@ async fn cmd_new(
             "/api/workspaces",
             json!({
                 "goal": goal,
+                "title": title,
                 "cwd": cwd.display().to_string(),
                 "base": base,
                 "agent": agent,
@@ -181,7 +187,16 @@ async fn cmd_new(
         .await?;
     let id = str_field(&ws, "id");
     println!("created workspace {id}  ({})", str_field(&ws, "name"));
-    println!("  goal:   {}", str_field(&ws, "goal"));
+    println!("  title:  {}", str_field(&ws, "title"));
+    let goal = str_field(&ws, "goal");
+    println!(
+        "  goal:   {}",
+        if goal.is_empty() {
+            "(none — agent started unprompted)"
+        } else {
+            goal
+        }
+    );
     println!("  branch: {}", str_field(&ws, "branch"));
     println!("  dir:    {}", str_field(&ws, "work_dir"));
     println!("  attach: weaver attach {id}");
@@ -196,14 +211,14 @@ async fn cmd_ls() -> Result<()> {
         println!("no workspaces — create one with `weaver new \"<goal>\"`");
         return Ok(());
     }
-    println!("{:<10}  {:<9}  {:<22}  GOAL", "ID", "STATUS", "NAME");
+    println!("{:<10}  {:<9}  {:<24}  TITLE", "ID", "STATUS", "NAME");
     for ws in rows {
         println!(
-            "{:<10}  {:<9}  {:<22}  {}",
+            "{:<10}  {:<9}  {:<24}  {}",
             str_field(&ws, "id"),
             str_field(&ws, "status"),
-            truncate(str_field(&ws, "name"), 22),
-            truncate(str_field(&ws, "goal"), 48),
+            truncate(str_field(&ws, "name"), 24),
+            truncate(str_field(&ws, "title"), 46),
         );
     }
     Ok(())
@@ -216,8 +231,10 @@ async fn cmd_status(id: Option<String>) -> Result<()> {
     let client = Client::new();
     let ws = client.get(&format!("/api/workspaces/{id}")).await?;
     println!("workspace {}  ({})", str_field(&ws, "id"), str_field(&ws, "name"));
+    println!("  title:    {}", str_field(&ws, "title"));
     println!("  status:   {}", str_field(&ws, "status"));
-    println!("  goal:     {}", str_field(&ws, "goal"));
+    let goal = str_field(&ws, "goal");
+    println!("  goal:     {}", if goal.is_empty() { "(none)" } else { goal });
     let description = str_field(&ws, "description");
     if !description.is_empty() {
         println!("  summary:  {description}");

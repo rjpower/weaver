@@ -14,6 +14,7 @@ const DIST_INDEX = join(WEAVER_ROOT, 'static', 'dist', 'index.html');
 export interface Workspace {
   id: string;
   name: string;
+  title: string;
   goal: string;
   description: string;
   status: string;
@@ -33,6 +34,8 @@ export interface Workspace {
 
 export interface SeedOpts {
   goal: string;
+  /** Title; defaults to `name` so the detail heading is predictable in tests. */
+  title?: string;
   name?: string;
   base?: string;
 }
@@ -187,6 +190,7 @@ export const test = base.extend<{ weaver: WeaverFixture }>({
           method: 'POST',
           body: JSON.stringify({
             goal: opts.goal,
+            title: opts.title ?? opts.name,
             cwd: repoPath,
             agent: 'shell',
             name: opts.name,

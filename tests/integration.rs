@@ -82,6 +82,7 @@ async fn workspace_lifecycle() {
         "worktree should live inside the repo at .worktrees/<slug>, got {work_dir}"
     );
     assert_eq!(ws["branch"], "weaver/integration-test-goal");
+    assert_eq!(ws["title"], "integration test goal", "title derived from goal");
     assert!(tmux::has_session(&session).await, "tmux session missing");
 
     // It shows up in the listing.
@@ -128,6 +129,26 @@ async fn workspace_lifecycle() {
         .await
         .unwrap();
     assert!(diff["patch"].is_string());
+
+    // A workspace can be created with no goal at all (agent starts unprompted).
+    let bare = client
+        .post(
+            "/api/workspaces",
+            json!({
+                "cwd": repo.path().to_string_lossy(),
+                "title": "no goal here",
+                "agent": "shell",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bare["goal"], "", "goal should be empty");
+    assert_eq!(bare["title"], "no goal here");
+    let bare_id = bare["id"].as_str().unwrap().to_string();
+    client
+        .delete(&format!("/api/workspaces/{bare_id}"))
+        .await
+        .unwrap();
 
     // Deleting the workspace tears down the tmux session and the DB row.
     client

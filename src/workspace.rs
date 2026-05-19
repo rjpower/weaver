@@ -9,8 +9,13 @@ use crate::db::{now_iso, Db};
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Workspace {
     pub id: String,
+    /// Slug — names the worktree directory and the `weaver/<name>` branch.
     pub name: String,
+    /// Human-readable title.
+    pub title: String,
+    /// What the agent should accomplish; may be empty (agent starts unprompted).
     pub goal: String,
+    /// Evolving summary of the workspace's current state.
     pub description: String,
     /// One of: created, launching, working, waiting, idle, done, error.
     pub status: String,
@@ -46,6 +51,25 @@ pub fn new_id() -> String {
         .collect()
 }
 
+/// Derive a human-readable title from goal text: its first non-empty line,
+/// trimmed and length-capped.
+pub fn derive_title(goal: &str) -> String {
+    let first = goal
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if first.is_empty() {
+        return "Untitled workspace".to_string();
+    }
+    if first.chars().count() > 72 {
+        let t: String = first.chars().take(71).collect();
+        format!("{t}…")
+    } else {
+        first.to_string()
+    }
+}
+
 /// Turn free text into a short kebab-case slug suitable for a branch name.
 pub fn slugify(text: &str) -> String {
     let mut out = String::new();
@@ -71,6 +95,7 @@ pub fn slugify(text: &str) -> String {
 pub struct NewWorkspace {
     pub id: String,
     pub name: String,
+    pub title: String,
     pub goal: String,
     pub description: String,
     pub status: String,
@@ -87,12 +112,13 @@ pub struct NewWorkspace {
 pub async fn insert(db: &Db, w: &NewWorkspace) -> Result<Workspace> {
     sqlx::query(
         "INSERT INTO workspaces
-         (id, name, goal, description, status, repo_root, work_dir, branch,
+         (id, name, title, goal, description, status, repo_root, work_dir, branch,
           base_branch, tmux_session, agent_kind, github_repo, github_issue)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(&w.id)
     .bind(&w.name)
+    .bind(&w.title)
     .bind(&w.goal)
     .bind(&w.description)
     .bind(&w.status)
@@ -157,6 +183,16 @@ pub async fn touch(db: &Db, id: &str) -> Result<()> {
     sqlx::query("UPDATE workspaces SET last_activity_at = ?, updated_at = ? WHERE id = ?")
         .bind(&now)
         .bind(&now)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_title(db: &Db, id: &str, title: &str) -> Result<()> {
+    sqlx::query("UPDATE workspaces SET title = ?, updated_at = ? WHERE id = ?")
+        .bind(title)
+        .bind(now_iso())
         .bind(id)
         .execute(db)
         .await?;
@@ -234,6 +270,14 @@ mod tests {
         assert_eq!(slugify("Add a /health endpoint!"), "add-a-health-endpoint");
         assert_eq!(slugify("   "), "workspace");
         assert!(slugify(&"x".repeat(100)).len() <= 32);
+    }
+
+    #[test]
+    fn derive_title_uses_first_line() {
+        assert_eq!(derive_title("Add a /health endpoint"), "Add a /health endpoint");
+        assert_eq!(derive_title("\n\nFix the bug\nmore detail"), "Fix the bug");
+        assert_eq!(derive_title("   "), "Untitled workspace");
+        assert!(derive_title(&"x".repeat(200)).chars().count() <= 72);
     }
 
     #[test]

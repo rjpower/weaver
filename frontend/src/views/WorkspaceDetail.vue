@@ -14,6 +14,7 @@ const events = ref<WeaverEvent[]>([]);
 const error = ref('');
 const notice = ref('');
 
+const titleDraft = ref('');
 const goalDraft = ref('');
 const descDraft = ref('');
 const sendText = ref('');
@@ -26,6 +27,7 @@ let source: EventSource | null = null;
 
 async function loadWorkspace() {
   ws.value = (await get(`/workspaces/${props.id}`)) as Workspace;
+  titleDraft.value = ws.value.title;
   goalDraft.value = ws.value.goal;
   descDraft.value = ws.value.description;
 }
@@ -76,6 +78,13 @@ async function act(name: string, fn: () => Promise<void>) {
     busy.value = '';
   }
 }
+
+const saveTitle = () =>
+  act('title', async () => {
+    await patch(`/workspaces/${props.id}`, { title: titleDraft.value });
+    notice.value = 'Title saved.';
+    await loadWorkspace();
+  });
 
 const saveGoal = () =>
   act('goal', async () => {
@@ -148,7 +157,7 @@ onUnmounted(() => source?.close());
   <div v-if="ws">
     <div class="flex items-center gap-3 mb-1">
       <router-link to="/" class="text-neutral-500 hover:text-neutral-300 text-sm">← all</router-link>
-      <h1 class="text-xl font-semibold">{{ ws.name }}</h1>
+      <h1 class="text-xl font-semibold">{{ ws.title || ws.name }}</h1>
       <StatusBadge :status="ws.status" />
     </div>
     <div class="text-xs text-neutral-600 font-mono mb-1">
@@ -164,7 +173,24 @@ onUnmounted(() => source?.close());
       <!-- Left: goal, description, actions -->
       <div class="space-y-5 lg:col-span-1">
         <section class="rounded border border-neutral-800 bg-neutral-900 p-4">
-          <label class="block text-xs text-neutral-400 mb-1">Goal</label>
+          <label class="block text-xs text-neutral-400 mb-1">Title</label>
+          <input
+            v-model="titleDraft"
+            class="w-full rounded bg-neutral-800 px-2 py-1.5 text-sm outline-none"
+          />
+          <button
+            class="mt-2 rounded bg-neutral-700 hover:bg-neutral-600 px-2 py-1 text-xs"
+            :disabled="busy === 'title'"
+            @click="saveTitle"
+          >
+            Save title
+          </button>
+        </section>
+
+        <section class="rounded border border-neutral-800 bg-neutral-900 p-4">
+          <label class="block text-xs text-neutral-400 mb-1">
+            Goal — the agent's prompt (may be empty)
+          </label>
           <textarea
             v-model="goalDraft"
             rows="3"

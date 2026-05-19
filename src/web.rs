@@ -139,9 +139,15 @@ async fn get_workspace(
 
 #[derive(Debug, Deserialize)]
 struct CreateReq {
-    goal: String,
     /// Directory the user invoked `weaver new` from; resolved to a repo root.
     cwd: String,
+    /// Human-readable title; derived from the goal when omitted.
+    #[serde(default)]
+    title: Option<String>,
+    /// What the agent should do. Optional — an empty goal starts the agent
+    /// with no initial prompt.
+    #[serde(default)]
+    goal: Option<String>,
     base: Option<String>,
     agent: Option<String>,
     name: Option<String>,
@@ -163,8 +169,13 @@ async fn create_workspace(
         None => config::get_or(&st.db, "agent.default", config::DEFAULT_AGENT).await,
     };
 
-    // Optional GitHub issue seeds the goal/description.
-    let mut goal = req.goal.trim().to_string();
+    // A workspace has a title, an (optional) goal, and a description. An
+    // optional GitHub issue seeds all three.
+    let mut goal = req.goal.unwrap_or_default().trim().to_string();
+    let mut title = req
+        .title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
     let mut description = String::new();
     let mut github_repo = None;
     let mut github_issue = None;
@@ -172,21 +183,33 @@ async fn create_workspace(
         let issue = github::fetch_issue(&repo_root, number)
             .await
             .map_err(|e| AppError::bad_request(format!("issue #{number}: {e}")))?;
+        if title.is_none() {
+            title = Some(issue.title.clone());
+        }
         if goal.is_empty() {
-            goal = issue.title.clone();
+            goal = if issue.body.trim().is_empty() {
+                issue.title.clone()
+            } else {
+                format!("{}\n\n{}", issue.title, issue.body)
+            };
         }
         description = issue.body.clone();
         github_issue = Some(number);
         github_repo = github::repo_slug(&repo_root).await.ok();
     }
-    if goal.is_empty() {
-        return Err(AppError::bad_request("goal is required"));
-    }
+    // A workspace always has a title; fall back to the goal, then a default.
+    let title = title.unwrap_or_else(|| {
+        if goal.is_empty() {
+            "Untitled workspace".to_string()
+        } else {
+            workspace::derive_title(&goal)
+        }
+    });
 
-    // The slug: an explicit name wins, otherwise it is derived from the goal.
+    // The slug: an explicit name wins, otherwise it is derived from the title.
     // It is always slugified so it is safe as both a branch and directory name.
     let explicit = req.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
-    let base_slug = workspace::slugify(explicit.unwrap_or(goal.as_str()));
+    let base_slug = workspace::slugify(explicit.unwrap_or(title.as_str()));
     let mut slug = base_slug.clone();
     let mut suffix = 2;
     loop {
@@ -219,8 +242,15 @@ async fn create_workspace(
     git::worktree_add(&repo_root, &work_dir, &branch, &base)
         .await
         .map_err(|e| AppError::bad_request(e.to_string()))?;
-    let goal_file = run_dir.join("goal.txt");
-    tokio::fs::write(&goal_file, &goal).await?;
+    // The goal file seeds the agent's first prompt; with no goal there is no
+    // file and the agent launches unprompted.
+    let goal_file = if goal.is_empty() {
+        None
+    } else {
+        let f = run_dir.join("goal.txt");
+        tokio::fs::write(&f, &goal).await?;
+        Some(f)
+    };
 
     // Install Claude Code status hooks for claude-backed workspaces.
     let weaver_bin = std::env::current_exe()
@@ -237,7 +267,7 @@ async fn create_workspace(
         ("WEAVER_API", api_url.as_str()),
         ("WEAVER_WORKSPACE", id.as_str()),
     ];
-    let script = agent::launch_script(&agent, &goal_file, &env);
+    let script = agent::launch_script(&agent, goal_file.as_deref(), &env);
     tmux::new_session(&session, &work_dir, &script)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("tmux: {e}")))?;
@@ -252,6 +282,7 @@ async fn create_workspace(
         &NewWorkspace {
             id: id.clone(),
             name: slug,
+            title,
             goal,
             description,
             status: status.to_string(),
@@ -280,6 +311,7 @@ async fn create_workspace(
 
 #[derive(Debug, Deserialize)]
 struct PatchReq {
+    title: Option<String>,
     goal: Option<String>,
     description: Option<String>,
     status: Option<String>,
@@ -291,6 +323,9 @@ async fn patch_workspace(
     Json(req): Json<PatchReq>,
 ) -> ApiResult<Json<Workspace>> {
     let ws = require(&st.db, &key).await?;
+    if let Some(title) = &req.title {
+        workspace::set_title(&st.db, &ws.id, title).await?;
+    }
     if let Some(goal) = &req.goal {
         workspace::set_goal(&st.db, &ws.id, goal).await?;
         tokio::fs::write(db::run_dir(&ws.id).join("goal.txt"), goal)

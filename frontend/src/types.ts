@@ -1,6 +1,7 @@
 export interface Workspace {
   id: string;
   name: string;
+  title: string;
   goal: string;
   description: string;
   status: string;

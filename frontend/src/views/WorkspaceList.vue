@@ -7,10 +7,11 @@ import StatusBadge from '../components/StatusBadge.vue';
 const workspaces = ref<Workspace[]>([]);
 const error = ref('');
 const showForm = ref(false);
+const repo = ref('');
+const title = ref('');
 const goal = ref('');
 const name = ref('');
 const nameEdited = ref(false);
-const repo = ref('');
 const creating = ref(false);
 let timer: number | undefined;
 
@@ -22,9 +23,9 @@ function slugify(s: string): string {
     .slice(0, 40);
 }
 
-// Keep the name in sync with the goal until the user edits it directly.
-watch(goal, (g) => {
-  if (!nameEdited.value) name.value = slugify(g);
+// Keep the name in sync with the title (or goal) until the user edits it.
+watch([title, goal], ([t, g]) => {
+  if (!nameEdited.value) name.value = slugify(t || g);
 });
 
 async function load() {
@@ -37,14 +38,18 @@ async function load() {
 }
 
 async function create() {
-  if (!goal.value.trim() || !repo.value.trim()) return;
+  // A workspace needs a repo and at least a title or a goal; the goal alone
+  // is optional (an empty goal just starts the agent unprompted).
+  if (!repo.value.trim() || !(title.value.trim() || goal.value.trim())) return;
   creating.value = true;
   try {
     await post('/workspaces', {
-      goal: goal.value,
       cwd: repo.value,
+      title: title.value || undefined,
+      goal: goal.value,
       name: name.value || undefined,
     });
+    title.value = '';
     goal.value = '';
     name.value = '';
     nameEdited.value = false;
@@ -90,10 +95,20 @@ onUnmounted(() => clearInterval(timer));
         />
       </div>
       <div>
-        <label class="block text-xs text-neutral-400 mb-1">Goal</label>
+        <label class="block text-xs text-neutral-400 mb-1">Title</label>
+        <input
+          v-model="title"
+          placeholder="Health endpoint"
+          class="w-full rounded bg-neutral-800 px-2 py-1.5 text-sm outline-none focus:ring-1 ring-emerald-600"
+        />
+      </div>
+      <div>
+        <label class="block text-xs text-neutral-400 mb-1">
+          Goal — optional; leave blank to start the agent with no prompt
+        </label>
         <input
           v-model="goal"
-          placeholder="Add a /health endpoint"
+          placeholder="Add a /health endpoint that returns 200"
           class="w-full rounded bg-neutral-800 px-2 py-1.5 text-sm outline-none focus:ring-1 ring-emerald-600"
         />
       </div>
@@ -104,7 +119,7 @@ onUnmounted(() => clearInterval(timer));
         <input
           v-model="name"
           @input="nameEdited = true"
-          placeholder="add-a-health-endpoint"
+          placeholder="health-endpoint"
           class="w-full rounded bg-neutral-800 px-2 py-1.5 text-sm outline-none focus:ring-1 ring-emerald-600 font-mono"
         />
       </div>
@@ -133,10 +148,10 @@ onUnmounted(() => clearInterval(timer));
         class="block rounded border border-neutral-800 bg-neutral-900 p-4 hover:border-neutral-600 transition"
       >
         <div class="flex items-center justify-between gap-2 mb-2">
-          <span class="font-medium truncate">{{ w.name }}</span>
+          <span class="font-medium truncate">{{ w.title || w.name }}</span>
           <StatusBadge :status="w.status" />
         </div>
-        <p class="text-sm text-neutral-300 line-clamp-2 mb-2">{{ w.goal }}</p>
+        <p v-if="w.goal" class="text-sm text-neutral-300 line-clamp-2 mb-2">{{ w.goal }}</p>
         <p v-if="w.description" class="text-xs text-neutral-500 line-clamp-3 mb-2">
           {{ w.description }}
         </p>

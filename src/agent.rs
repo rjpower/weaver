@@ -10,21 +10,27 @@ use tokio::process::Command;
 
 /// The command run inside the tmux pane for a given agent kind.
 ///
-/// `claude` launches the interactive TUI seeded with the goal; `shell`/`none`
-/// just drop into a shell; anything else is treated as a custom command that
-/// receives the goal file's path as its single argument.
-fn inner_command(agent_kind: &str, goal_file: &Path) -> String {
-    let goal_file = goal_file.display();
+/// `claude` launches the interactive TUI, seeded with the goal when one was
+/// given (otherwise plain `claude`); `shell`/`none` just drop into a shell;
+/// anything else is treated as a custom command that receives the goal file's
+/// path as its single argument.
+fn inner_command(agent_kind: &str, goal_file: Option<&Path>) -> String {
     match agent_kind {
         "shell" | "none" => String::new(),
-        "claude" => format!("claude \"$(cat '{goal_file}')\""),
-        other => format!("{other} '{goal_file}'"),
+        "claude" => match goal_file {
+            Some(f) => format!("claude \"$(cat '{}')\"", f.display()),
+            None => "claude".to_string(),
+        },
+        other => match goal_file {
+            Some(f) => format!("{other} '{}'", f.display()),
+            None => other.to_string(),
+        },
     }
 }
 
 /// Full `sh -c` script for the workspace's tmux session: exports env, runs the
 /// agent, then drops to an interactive shell so the pane survives agent exit.
-pub fn launch_script(agent_kind: &str, goal_file: &Path, env: &[(&str, &str)]) -> String {
+pub fn launch_script(agent_kind: &str, goal_file: Option<&Path>, env: &[(&str, &str)]) -> String {
     let mut script = String::new();
     for (k, v) in env {
         script.push_str(&format!("export {k}='{v}'; "));
@@ -118,7 +124,7 @@ mod tests {
 
     #[test]
     fn shell_script_just_execs_a_shell() {
-        let script = launch_script("shell", Path::new("/x/goal.txt"), &[]);
+        let script = launch_script("shell", None, &[]);
         assert_eq!(script, "exec \"${SHELL:-/bin/sh}\"");
     }
 
@@ -126,12 +132,18 @@ mod tests {
     fn claude_script_exports_env_and_runs_claude() {
         let script = launch_script(
             "claude",
-            Path::new("/x/goal.txt"),
+            Some(Path::new("/x/goal.txt")),
             &[("WEAVER_API", "http://h:1")],
         );
         assert!(script.contains("export WEAVER_API='http://h:1'; "));
         assert!(script.contains("claude \"$(cat '/x/goal.txt')\"; "));
         assert!(script.ends_with("exec \"${SHELL:-/bin/sh}\""));
+    }
+
+    #[test]
+    fn claude_script_without_a_goal_runs_claude_bare() {
+        let script = launch_script("claude", None, &[]);
+        assert_eq!(script, "claude; exec \"${SHELL:-/bin/sh}\"");
     }
 
     #[test]
