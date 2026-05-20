@@ -32,10 +32,18 @@ const groups = computed(() => {
 async function load() {
   try {
     const res = (await get('/settings')) as SettingsEnvelope;
+    // Validate the shape before touching reactive state. A stale server — one
+    // built before the settings endpoint existed — answers `{}`; assigning its
+    // missing `settings` to the ref would crash the render (the `groups`
+    // computed iterates it) and leave a blank page instead of this message.
+    if (!Array.isArray(res?.settings)) {
+      throw new Error('Unexpected /api/settings response — the server may be out of date.');
+    }
     settings.value = res.settings;
     drafts.value = Object.fromEntries(res.settings.map((s) => [s.key, s.value]));
     error.value = '';
   } catch (e) {
+    settings.value = [];
     error.value = (e as Error).message;
   }
 }

@@ -1,14 +1,29 @@
 use std::path::Path;
 use std::process::Command;
+use std::time::SystemTime;
+
+/// Modification time of `path`, or the epoch when it cannot be read (so a
+/// missing file always counts as "older" than anything that exists).
+fn mtime(path: &Path) -> SystemTime {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
 
 // Builds the Vue frontend into `static/dist`. Skipped (with a placeholder page
 // written instead) when `WEAVER_SKIP_FRONTEND` is set, npm is unavailable, or
 // the frontend sources do not exist yet — so the backend can be built/tested
 // without a Node toolchain.
 fn main() {
+    // Every file that feeds the frontend build: changing any of them reruns
+    // this script (and therefore rspack). `frontend/src` covers the Vue/TS
+    // sources and the HTML template; the rest are build-config inputs.
     println!("cargo:rerun-if-changed=frontend/src");
     println!("cargo:rerun-if-changed=frontend/package.json");
+    println!("cargo:rerun-if-changed=frontend/package-lock.json");
     println!("cargo:rerun-if-changed=frontend/rspack.config.js");
+    println!("cargo:rerun-if-changed=frontend/postcss.config.mjs");
+    println!("cargo:rerun-if-changed=frontend/tsconfig.json");
     println!("cargo:rerun-if-env-changed=WEAVER_SKIP_FRONTEND");
 
     let dist = Path::new("static/dist");
@@ -40,7 +55,12 @@ fn main() {
         return;
     }
 
-    if !frontend.join("node_modules").exists() {
+    // Install deps when `node_modules` is missing, or when `package-lock.json`
+    // is newer than npm's record of the last install — so a dependency bump
+    // is actually installed, not just rebuilt against stale `node_modules`.
+    let installed_marker = frontend.join("node_modules/.package-lock.json");
+    let lockfile = frontend.join("package-lock.json");
+    if !frontend.join("node_modules").exists() || mtime(&lockfile) > mtime(&installed_marker) {
         let status = Command::new("npm")
             .arg("install")
             .current_dir(frontend)
