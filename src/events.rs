@@ -71,6 +71,7 @@ pub async fn record(
         data,
         created_at: row.get("created_at"),
     };
+    tracing::debug!(workspace_id, kind, id = event.id, "recorded event");
     bus.publish(event.clone());
     Ok(event)
 }

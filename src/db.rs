@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS workspaces (
     created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     last_activity_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-    summary_updated_at TEXT
+    summary_updated_at TEXT,
+    pending_prompt     TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_workspaces_status ON workspaces(status);
 
@@ -83,6 +84,7 @@ pub fn now_iso() -> String {
 }
 
 pub async fn connect(path: &Path) -> Result<Db> {
+    tracing::info!(path = %path.display(), "opening database");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating db directory {}", parent.display()))?;
@@ -97,10 +99,12 @@ pub async fn connect(path: &Path) -> Result<Db> {
         .await
         .with_context(|| format!("opening database {}", path.display()))?;
     migrate(&pool).await?;
+    tracing::info!(path = %path.display(), "database ready");
     Ok(pool)
 }
 
 pub async fn connect_in_memory() -> Result<Db> {
+    tracing::info!("opening in-memory database");
     let options = SqliteConnectOptions::new()
         .in_memory(true)
         .journal_mode(SqliteJournalMode::Wal);
@@ -113,11 +117,14 @@ pub async fn connect_in_memory() -> Result<Db> {
 }
 
 async fn migrate(pool: &Db) -> Result<()> {
-    for statement in SCHEMA.split(';') {
-        let trimmed = statement.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+    let statements: Vec<&str> = SCHEMA
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    tracing::info!(statements = statements.len(), "applying schema");
+    for trimmed in &statements {
+        tracing::debug!(statement = %trimmed, "running migration");
         sqlx::query(trimmed)
             .execute(pool)
             .await
@@ -125,9 +132,16 @@ async fn migrate(pool: &Db) -> Result<()> {
     }
     // Idempotent column additions for databases created by older versions.
     // A "duplicate column" error on a fresh database is expected and ignored.
-    const ALTERS: &[&str] = &["ALTER TABLE workspaces ADD COLUMN title TEXT NOT NULL DEFAULT ''"];
+    const ALTERS: &[&str] = &[
+        "ALTER TABLE workspaces ADD COLUMN title TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE workspaces ADD COLUMN pending_prompt TEXT NOT NULL DEFAULT ''",
+    ];
     for stmt in ALTERS {
-        let _ = sqlx::query(stmt).execute(pool).await;
+        if let Err(e) = sqlx::query(stmt).execute(pool).await {
+            // Expected on a fresh database (column already exists). Logged at
+            // debug so a genuinely unexpected failure is still visible.
+            tracing::debug!(error = %e, statement = %stmt, "idempotent alter skipped");
+        }
     }
     Ok(())
 }

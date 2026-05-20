@@ -13,6 +13,7 @@ pub struct DiffStat {
 }
 
 async fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    tracing::debug!(?args, dir = %dir.display(), "running git");
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -21,13 +22,30 @@ async fn git(dir: &Path, args: &[&str]) -> Result<String> {
         .await
         .context("failed to spawn git")?;
     if !out.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        tracing::warn!(
+            args = %args.join(" "),
+            dir = %dir.display(),
+            code = out.status.code().unwrap_or(-1),
+            stderr = %truncate(stderr.trim(), 500),
+            stdout = %truncate(stdout.trim(), 500),
+            "git failed"
         );
+        bail!("git {} failed: {}", args.join(" "), stderr.trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+/// Truncate a string to `max` chars for log output, appending an ellipsis when cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max).collect();
+        t.push_str("...[truncated]");
+        t
+    }
 }
 
 /// Absolute path to the **main** working tree of the repository containing
@@ -92,17 +110,20 @@ pub async fn worktree_add(repo_root: &Path, path: &Path, branch: &str, base: &st
         &["worktree", "add", "-b", branch, &path, base],
     )
     .await?;
+    tracing::info!(%branch, base, path = %path, "worktree created");
     Ok(())
 }
 
 pub async fn worktree_remove(repo_root: &Path, path: &Path) -> Result<()> {
     let path = path.to_string_lossy();
     git(repo_root, &["worktree", "remove", "--force", &path]).await?;
+    tracing::info!(path = %path, "worktree removed");
     Ok(())
 }
 
 pub async fn delete_branch(repo_root: &Path, branch: &str) -> Result<()> {
     git(repo_root, &["branch", "-D", branch]).await?;
+    tracing::info!(%branch, "branch deleted");
     Ok(())
 }
 
@@ -112,6 +133,12 @@ pub async fn merge_base(work_dir: &Path, base: &str) -> Result<String> {
 }
 
 async fn git_with_index(work_dir: &Path, index: &Path, args: &[&str]) -> Result<String> {
+    tracing::debug!(
+        ?args,
+        dir = %work_dir.display(),
+        index = %index.display(),
+        "running git (temp index)"
+    );
     let out = Command::new("git")
         .arg("-C")
         .arg(work_dir)
@@ -121,11 +148,17 @@ async fn git_with_index(work_dir: &Path, index: &Path, args: &[&str]) -> Result<
         .await
         .context("failed to spawn git")?;
     if !out.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        tracing::warn!(
+            args = %args.join(" "),
+            dir = %work_dir.display(),
+            code = out.status.code().unwrap_or(-1),
+            stderr = %truncate(stderr.trim(), 500),
+            stdout = %truncate(stdout.trim(), 500),
+            "git failed (temp index)"
         );
+        bail!("git {} failed: {}", args.join(" "), stderr.trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
@@ -174,7 +207,14 @@ async fn inclusive_diff(work_dir: &Path, args: &[&str]) -> Result<String> {
 pub async fn diff(work_dir: &Path, since: &str) -> Result<String> {
     let mut args = vec!["diff", "--cached", since, "--"];
     args.extend_from_slice(DIFF_PATHSPEC);
-    inclusive_diff(work_dir, &args).await
+    let out = inclusive_diff(work_dir, &args).await?;
+    tracing::debug!(
+        dir = %work_dir.display(),
+        since,
+        diff_chars = out.len(),
+        "computed diff"
+    );
+    Ok(out)
 }
 
 /// Aggregate diff stats since `since`, including untracked files.
@@ -201,5 +241,7 @@ pub async fn is_clean(dir: &Path) -> Result<bool> {
 
 /// Merge `branch` into the current branch of `repo_root` (no fast-forward).
 pub async fn merge(repo_root: &Path, branch: &str) -> Result<String> {
-    git(repo_root, &["merge", "--no-ff", branch]).await
+    let out = git(repo_root, &["merge", "--no-ff", branch]).await?;
+    tracing::info!(%branch, repo = %repo_root.display(), "branch merged");
+    Ok(out)
 }

@@ -14,15 +14,32 @@ async fn raw(args: &[&str]) -> Result<Output> {
 }
 
 async fn run(args: &[&str]) -> Result<String> {
+    tracing::debug!(?args, "running tmux");
     let out = raw(args).await?;
     if !out.status.success() {
-        bail!(
-            "tmux {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        tracing::warn!(
+            args = %args.join(" "),
+            code = out.status.code().unwrap_or(-1),
+            stderr = %truncate(stderr.trim(), 500),
+            stdout = %truncate(stdout.trim(), 500),
+            "tmux failed"
         );
+        bail!("tmux {} failed: {}", args.join(" "), stderr.trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+/// Truncate a string to `max` chars for log output, appending an ellipsis when cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max).collect();
+        t.push_str("...[truncated]");
+        t
+    }
 }
 
 /// Whether a session with exactly this name exists.
@@ -40,6 +57,7 @@ pub async fn new_session(name: &str, cwd: &Path, script: &str) -> Result<()> {
         "new-session", "-d", "-s", name, "-c", &cwd, "sh", "-c", script,
     ])
     .await?;
+    tracing::info!(session = name, cwd = %cwd, "tmux session created");
     Ok(())
 }
 
@@ -64,7 +82,9 @@ pub async fn capture(name: &str, history: usize) -> Result<String> {
 
 pub async fn kill_session(name: &str) -> Result<()> {
     // Ignore "session not found"; the goal is just for it to be gone.
+    tracing::debug!(session = name, "running tmux kill-session");
     let _ = raw(&["kill-session", "-t", &format!("={name}")]).await;
+    tracing::info!(session = name, "tmux session killed");
     Ok(())
 }
 

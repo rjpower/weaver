@@ -9,6 +9,7 @@ const palette: Record<string, string> = {
   working: 'bg-emerald-800 text-emerald-100',
   waiting: 'bg-amber-700 text-amber-100',
   idle: 'bg-neutral-700 text-neutral-200',
+  orphaned: 'bg-amber-900 text-amber-200',
   done: 'bg-indigo-800 text-indigo-100',
   error: 'bg-red-800 text-red-100',
 };

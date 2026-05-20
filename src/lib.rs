@@ -7,6 +7,7 @@ pub mod agent;
 pub mod client;
 pub mod config;
 pub mod db;
+pub mod endpoint;
 pub mod events;
 pub mod git;
 pub mod github;

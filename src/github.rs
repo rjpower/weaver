@@ -16,18 +16,26 @@ pub struct Issue {
 }
 
 async fn gh(dir: &Path, args: &[&str]) -> Result<String> {
+    tracing::debug!(args = %args.join(" "), dir = %dir.display(), "running gh");
     let out = Command::new("gh")
         .args(args)
         .current_dir(dir)
         .output()
         .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "failed to spawn gh");
+            e
+        })
         .context("failed to spawn gh (is the GitHub CLI installed?)")?;
     if !out.status.success() {
-        bail!(
-            "gh {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        tracing::warn!(
+            args = %args.join(" "),
+            code = out.status.code().unwrap_or(-1),
+            stderr = %stderr.trim(),
+            "gh command failed"
         );
+        bail!("gh {} failed: {}", args.join(" "), stderr.trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -59,6 +67,7 @@ pub async fn fetch_issue(repo_root: &Path, number: i64) -> Result<Issue> {
 
 /// Open a pull request from the workspace branch; returns the PR URL.
 pub async fn create_pr(work_dir: &Path, base: &str, title: &str, body: &str) -> Result<String> {
+    tracing::debug!(base, title, body_len = body.len(), "creating pull request");
     gh(
         work_dir,
         &[

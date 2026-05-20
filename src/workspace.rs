@@ -17,7 +17,7 @@ pub struct Workspace {
     pub goal: String,
     /// Evolving summary of the workspace's current state.
     pub description: String,
-    /// One of: created, launching, working, waiting, idle, done, error.
+    /// One of: created, launching, working, waiting, idle, orphaned, done, error.
     pub status: String,
     pub repo_root: String,
     pub work_dir: String,
@@ -31,12 +31,18 @@ pub struct Workspace {
     pub updated_at: String,
     pub last_activity_at: String,
     pub summary_updated_at: Option<String>,
+    /// While the agent is `waiting`, a snapshot of the prompt it is blocked on;
+    /// empty otherwise.
+    pub pending_prompt: String,
 }
 
 pub const STATUSES: &[&str] = &[
-    "created", "launching", "working", "waiting", "idle", "done", "error",
+    "created", "launching", "working", "waiting", "idle", "orphaned", "done", "error",
 ];
 
+/// Whether a status is final. `orphaned` is deliberately non-terminal: a
+/// workspace whose tmux session died (e.g. after a reboot) is recoverable and
+/// can be adopted back into a running session.
 pub fn is_terminal(status: &str) -> bool {
     matches!(status, "done" | "error")
 }
@@ -110,6 +116,7 @@ pub struct NewWorkspace {
 }
 
 pub async fn insert(db: &Db, w: &NewWorkspace) -> Result<Workspace> {
+    tracing::debug!(id = %w.id, name = %w.name, status = %w.status, "creating workspace");
     sqlx::query(
         "INSERT INTO workspaces
          (id, name, title, goal, description, status, repo_root, work_dir, branch,
@@ -138,18 +145,31 @@ pub async fn insert(db: &Db, w: &NewWorkspace) -> Result<Workspace> {
 }
 
 pub async fn list(db: &Db) -> Result<Vec<Workspace>> {
-    Ok(
-        sqlx::query_as::<_, Workspace>("SELECT * FROM workspaces ORDER BY created_at DESC")
-            .fetch_all(db)
-            .await?,
-    )
+    let rows = sqlx::query_as::<_, Workspace>("SELECT * FROM workspaces ORDER BY created_at DESC")
+        .fetch_all(db)
+        .await
+        .map_err(|e| {
+            // A column-count mismatch here (old on-disk db missing newer
+            // columns) surfaces as a row-mapping error — log it so the cause
+            // is obvious rather than just a panic deep in sqlx.
+            tracing::error!(error = %e, "listing workspaces failed: row mapping error (schema mismatch?)");
+            e
+        })?;
+    tracing::debug!(count = rows.len(), "listed workspaces");
+    Ok(rows)
 }
 
 pub async fn get(db: &Db, id: &str) -> Result<Option<Workspace>> {
-    Ok(sqlx::query_as::<_, Workspace>("SELECT * FROM workspaces WHERE id = ?")
+    let row = sqlx::query_as::<_, Workspace>("SELECT * FROM workspaces WHERE id = ?")
         .bind(id)
         .fetch_optional(db)
-        .await?)
+        .await
+        .map_err(|e| {
+            tracing::error!(%id, error = %e, "getting workspace failed: row mapping error (schema mismatch?)");
+            e
+        })?;
+    tracing::debug!(%id, found = row.is_some(), "got workspace");
+    Ok(row)
 }
 
 /// Resolve a workspace by exact id, exact name, or unambiguous id prefix.
@@ -168,12 +188,19 @@ pub async fn resolve(db: &Db, key: &str) -> Result<Option<Workspace>> {
 }
 
 pub async fn set_status(db: &Db, id: &str, status: &str) -> Result<()> {
+    let old: Option<String> =
+        sqlx::query_scalar("SELECT status FROM workspaces WHERE id = ?")
+            .bind(id)
+            .fetch_optional(db)
+            .await
+            .unwrap_or(None);
     sqlx::query("UPDATE workspaces SET status = ?, updated_at = ? WHERE id = ?")
         .bind(status)
         .bind(now_iso())
         .bind(id)
         .execute(db)
         .await?;
+    tracing::info!(%id, old = old.as_deref().unwrap_or("?"), new = %status, "workspace status changed");
     Ok(())
 }
 
@@ -219,8 +246,20 @@ pub async fn set_description(db: &Db, id: &str, description: &str) -> Result<()>
     Ok(())
 }
 
+/// Store (or, with an empty string, clear) the prompt the agent is waiting on.
+pub async fn set_pending_prompt(db: &Db, id: &str, prompt: &str) -> Result<()> {
+    tracing::debug!(%id, len = prompt.len(), "set pending prompt");
+    sqlx::query("UPDATE workspaces SET pending_prompt = ? WHERE id = ?")
+        .bind(prompt)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 /// Record a fresh summary: updates the description and the summary timestamp.
 pub async fn set_summary(db: &Db, id: &str, description: &str) -> Result<()> {
+    tracing::debug!(%id, len = description.len(), "set summary");
     let now = now_iso();
     sqlx::query(
         "UPDATE workspaces SET description = ?, summary_updated_at = ?, updated_at = ? WHERE id = ?",
@@ -246,6 +285,7 @@ pub async fn mark_summarized(db: &Db, id: &str) -> Result<()> {
 }
 
 pub async fn delete(db: &Db, id: &str) -> Result<()> {
+    tracing::info!(%id, "deleting workspace and its events/summaries");
     sqlx::query("DELETE FROM events WHERE workspace_id = ?")
         .bind(id)
         .execute(db)

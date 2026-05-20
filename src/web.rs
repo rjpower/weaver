@@ -58,10 +58,19 @@ impl AppError {
     fn not_found() -> Self {
         Self::new(StatusCode::NOT_FOUND, "workspace not found")
     }
+    /// The human-readable error message (for logging by non-HTTP callers).
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if self.status.is_server_error() {
+            tracing::error!(status = %self.status.as_u16(), message = %self.message, "request failed");
+        } else {
+            tracing::warn!(status = %self.status.as_u16(), message = %self.message, "request rejected");
+        }
         (self.status, Json(json!({ "error": self.message }))).into_response()
     }
 }
@@ -107,6 +116,7 @@ pub fn router(state: AppState) -> Router {
         .route("/workspaces/{id}/note", post(note_workspace))
         .route("/workspaces/{id}/summarize", post(summarize_workspace))
         .route("/workspaces/{id}/merge", post(merge_workspace))
+        .route("/workspaces/{id}/adopt", post(adopt_workspace))
         .route("/workspaces/{id}/diff", get(diff_workspace))
         .route("/workspaces/{id}/pane", get(pane_workspace))
         .route("/workspaces/{id}/log", get(log_workspace))
@@ -252,25 +262,22 @@ async fn create_workspace(
         Some(f)
     };
 
-    // Install Claude Code status hooks for claude-backed workspaces.
-    let weaver_bin = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "weaver".to_string());
-    if agent == "claude" {
-        agent::install_hooks(&work_dir, &weaver_bin, &id).await.ok();
-    }
-
-    // Launch the agent in a detached tmux session.
+    // Launch the agent in a detached tmux session via the shared launch path
+    // (installs Claude Code hooks, sets env, starts tmux).
     let session = format!("weaver-{id}");
-    let api_url = format!("http://{}", st.addr);
-    let env = [
-        ("WEAVER_API", api_url.as_str()),
-        ("WEAVER_WORKSPACE", id.as_str()),
-    ];
-    let script = agent::launch_script(&agent, goal_file.as_deref(), &env);
-    tmux::new_session(&session, &work_dir, &script)
-        .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("tmux: {e}")))?;
+    agent::launch(
+        &agent::LaunchSpec {
+            workspace_id: &id,
+            agent_kind: &agent,
+            work_dir: &work_dir,
+            tmux_session: &session,
+            goal_file: goal_file.as_deref(),
+            server_addr: &st.addr,
+        },
+        agent::LaunchMode::Fresh,
+    )
+    .await
+    .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let status = if matches!(agent.as_str(), "shell" | "none") {
         "idle"
@@ -306,6 +313,7 @@ async fn create_workspace(
     )
     .await
     .ok();
+    tracing::info!(workspace = %ws.id, name = %ws.name, status = %ws.status, agent = %ws.agent_kind, "workspace created");
     Ok(Json(ws))
 }
 
@@ -390,6 +398,10 @@ async fn delete_workspace(
     }
     tokio::fs::remove_dir_all(db::run_dir(&ws.id)).await.ok();
     workspace::delete(&st.db, &ws.id).await?;
+    if !warnings.is_empty() {
+        tracing::warn!(workspace = %ws.id, warnings = warnings.len(), "workspace removed with warnings");
+    }
+    tracing::info!(workspace = %ws.id, name = %ws.name, keep_branch = q.keep_branch, "workspace removed");
     Ok(Json(json!({ "deleted": true, "warnings": warnings })))
 }
 
@@ -411,6 +423,7 @@ async fn send_workspace(
     tmux::send_text(&ws.tmux_session, &req.text)
         .await
         .map_err(|e| AppError::bad_request(e.to_string()))?;
+    tracing::debug!(workspace = %ws.id, text_len = req.text.len(), "text sent to agent");
     workspace::touch(&st.db, &ws.id).await.ok();
     events::record(
         &st.db,
@@ -447,7 +460,11 @@ async fn summarize_workspace(
     let ws = require(&st.db, &key).await?;
     let description = crate::summary::summarize_workspace(&st, &ws)
         .await
-        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(workspace = %ws.id, error = %e, "claude summary failed");
+            AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+    tracing::info!(workspace = %ws.id, description_len = description.len(), "workspace summarized");
     Ok(Json(json!({ "description": description })))
 }
 
@@ -482,7 +499,73 @@ async fn merge_workspace(
     )
     .await
     .ok();
+    tracing::info!(workspace = %ws.id, branch = %ws.branch, base = %ws.base_branch, "workspace merged");
     Ok(Json(json!({ "merged": true, "branch": ws.branch, "output": output })))
+}
+
+/// Recreate an orphaned workspace's tmux session and resume its agent.
+///
+/// Shared by the `POST /workspaces/{id}/adopt` handler and the server's
+/// startup reconcile step. Fails if a session is already running for the
+/// workspace or if its worktree no longer exists on disk; on success it
+/// relaunches the agent in [`agent::LaunchMode::Adopt`], sets the status to
+/// `launching`, and records a `status` event.
+pub async fn adopt(st: &AppState, ws: &Workspace) -> Result<(), AppError> {
+    if tmux::has_session(&ws.tmux_session).await {
+        return Err(AppError::conflict(
+            "workspace already has a running tmux session",
+        ));
+    }
+    let work_dir = PathBuf::from(&ws.work_dir);
+    if !work_dir.exists() {
+        return Err(AppError::bad_request(format!(
+            "worktree {} no longer exists on disk — cannot adopt",
+            ws.work_dir
+        )));
+    }
+    let goal_file = {
+        let f = db::run_dir(&ws.id).join("goal.txt");
+        if f.exists() {
+            Some(f)
+        } else {
+            None
+        }
+    };
+    agent::launch(
+        &agent::LaunchSpec {
+            workspace_id: &ws.id,
+            agent_kind: &ws.agent_kind,
+            work_dir: &work_dir,
+            tmux_session: &ws.tmux_session,
+            goal_file: goal_file.as_deref(),
+            server_addr: &st.addr,
+        },
+        agent::LaunchMode::Adopt,
+    )
+    .await
+    .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    workspace::set_status(&st.db, &ws.id, "launching").await?;
+    events::record(
+        &st.db,
+        &st.bus,
+        &ws.id,
+        "status",
+        json!({ "status": "launching", "reason": "workspace adopted" }),
+    )
+    .await
+    .ok();
+    tracing::info!(workspace = %ws.id, name = %ws.name, "workspace adopted");
+    Ok(())
+}
+
+async fn adopt_workspace(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<Workspace>> {
+    let ws = require(&st.db, &key).await?;
+    adopt(&st, &ws).await?;
+    Ok(Json(require(&st.db, &ws.id).await?))
 }
 
 async fn diff_workspace(
@@ -557,14 +640,25 @@ async fn hook(State(st): State<AppState>, Json(req): Json<HookReq>) -> ApiResult
     };
     workspace::set_status(&st.db, &ws.id, status).await?;
     workspace::touch(&st.db, &ws.id).await?;
-    events::record(
-        &st.db,
-        &st.bus,
-        &ws.id,
-        "status",
-        json!({ "status": status, "source": "hook" }),
-    )
-    .await?;
+
+    // On `waiting`, snapshot the tmux pane so the dashboard can show what the
+    // agent is blocked on; clear it again as soon as the agent moves on.
+    let prompt = if status == "waiting" {
+        tmux::capture(&ws.tmux_session, 0)
+            .await
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    workspace::set_pending_prompt(&st.db, &ws.id, &prompt).await?;
+
+    let mut data = json!({ "status": status, "source": "hook" });
+    if !prompt.is_empty() {
+        data["prompt"] = json!(prompt);
+    }
+    events::record(&st.db, &st.bus, &ws.id, "status", data).await?;
+    tracing::debug!(workspace = %ws.id, event = %req.event, status = %status, "hook handled");
     Ok(Json(json!({ "ok": true, "status": status })))
 }
 
@@ -588,5 +682,6 @@ async fn set_setting(
     Json(req): Json<SettingReq>,
 ) -> ApiResult<Json<Value>> {
     config::set(&st.db, &req.key, &req.value).await?;
+    tracing::debug!(key = %req.key, "setting updated");
     Ok(Json(json!({ "ok": true })))
 }

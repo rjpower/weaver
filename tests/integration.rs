@@ -130,6 +130,31 @@ async fn workspace_lifecycle() {
         .unwrap();
     assert!(diff["patch"].is_string());
 
+    // Adoption: kill the tmux session out from under weaver (as a reboot
+    // would), then adopt the workspace and confirm the session is recreated.
+    tmux::kill_session(&session).await.unwrap();
+    assert!(
+        !tmux::has_session(&session).await,
+        "session should be gone after kill"
+    );
+    let adopted = client
+        .post(&format!("/api/workspaces/{id}/adopt"), json!({}))
+        .await
+        .unwrap();
+    assert_eq!(adopted["status"], "launching", "adopt sets status launching");
+    assert!(
+        tmux::has_session(&session).await,
+        "adopt should recreate the tmux session"
+    );
+    // Adopting a workspace that already has a live session is rejected.
+    assert!(
+        client
+            .post(&format!("/api/workspaces/{id}/adopt"), json!({}))
+            .await
+            .is_err(),
+        "adopting a live workspace should fail"
+    );
+
     // A workspace can be created with no goal at all (agent starts unprompted).
     let bare = client
         .post(

@@ -17,10 +17,8 @@ impl Default for Client {
 
 impl Client {
     pub fn new() -> Self {
-        let base = std::env::var("WEAVER_API")
-            .unwrap_or_else(|_| "http://127.0.0.1:7878".to_string());
         Self {
-            base: base.trim_end_matches('/').to_string(),
+            base: crate::endpoint::base_url(),
             http: reqwest::Client::new(),
         }
     }

@@ -17,6 +17,7 @@ export interface Workspace {
   updated_at: string;
   last_activity_at: string;
   summary_updated_at: string | null;
+  pending_prompt: string;
 }
 
 export interface WeaverEvent {

@@ -17,6 +17,7 @@ const IDLE_TICKS: u32 = 10;
 pub async fn run(state: AppState) {
     let mut screen_hash: HashMap<String, u64> = HashMap::new();
     let mut still_ticks: HashMap<String, u32> = HashMap::new();
+    tracing::info!(tick_ms = TICK.as_millis() as u64, "monitor loop started");
 
     loop {
         tokio::time::sleep(TICK).await;
@@ -27,6 +28,7 @@ pub async fn run(state: AppState) {
                 continue;
             }
         };
+        tracing::debug!(workspaces = workspaces.len(), "monitor tick");
         let mut alive: HashSet<String> = HashSet::new();
 
         for ws in &workspaces {
@@ -35,15 +37,23 @@ pub async fn run(state: AppState) {
                 continue;
             }
             if !tmux::has_session(&ws.tmux_session).await {
-                let _ = workspace::set_status(&state.db, &ws.id, "done").await;
-                let _ = events::record(
-                    &state.db,
-                    &state.bus,
-                    &ws.id,
-                    "status",
-                    json!({ "status": "done", "reason": "tmux session ended" }),
-                )
-                .await;
+                // A missing session is recoverable (e.g. the tmux daemon died
+                // on reboot): mark the workspace `orphaned` so it can later be
+                // adopted. Only record this once — re-recording every tick
+                // would spam the event log.
+                if ws.status != "orphaned" {
+                    tracing::info!(id = %ws.id, session = %ws.tmux_session, "tmux session ended; marking orphaned");
+                    let _ = workspace::set_status(&state.db, &ws.id, "orphaned").await;
+                    let _ = workspace::set_pending_prompt(&state.db, &ws.id, "").await;
+                    let _ = events::record(
+                        &state.db,
+                        &state.bus,
+                        &ws.id,
+                        "status",
+                        json!({ "status": "orphaned", "reason": "tmux session ended" }),
+                    )
+                    .await;
+                }
                 continue;
             }
 
@@ -60,6 +70,7 @@ pub async fn run(state: AppState) {
                 // Agents without hooks (anything but claude) get stillness-based
                 // idle detection so the UI still reflects reality.
                 if ws.agent_kind != "claude" && ws.status == "working" && *ticks >= IDLE_TICKS {
+                    tracing::info!(id = %ws.id, still_ticks = *ticks, "screen idle; marking idle");
                     let _ = workspace::set_status(&state.db, &ws.id, "idle").await;
                     let _ = events::record(
                         &state.db,

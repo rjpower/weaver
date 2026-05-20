@@ -13,6 +13,7 @@ use crate::workspace::Workspace;
 use crate::{agent, config, events, git, workspace};
 
 pub async fn run(state: AppState) {
+    tracing::info!("summary loop started");
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
         let interval = config::get_i64(
@@ -22,15 +23,20 @@ pub async fn run(state: AppState) {
         )
         .await;
         let workspaces = workspace::list(&state.db).await.unwrap_or_default();
-        for ws in workspaces {
-            if workspace::is_terminal(&ws.status) || !is_due(&ws, interval) {
-                continue;
-            }
-            if let Err(e) = summarize_workspace(&state, &ws).await {
-                tracing::warn!("summary for {} failed: {e}", ws.id);
-                // Mark it summarized anyway so a broken workspace is not retried
-                // every single minute.
-                let _ = workspace::mark_summarized(&state.db, &ws.id).await;
+        let due: Vec<Workspace> = workspaces
+            .into_iter()
+            .filter(|ws| !workspace::is_terminal(&ws.status) && is_due(ws, interval))
+            .collect();
+        tracing::debug!(interval_secs = interval, due = due.len(), "summary tick");
+        for ws in due {
+            match summarize_workspace(&state, &ws).await {
+                Ok(_) => tracing::info!(id = %ws.id, "summarized workspace"),
+                Err(e) => {
+                    tracing::warn!("summary for {} failed: {e}", ws.id);
+                    // Mark it summarized anyway so a broken workspace is not retried
+                    // every single minute.
+                    let _ = workspace::mark_summarized(&state.db, &ws.id).await;
+                }
             }
         }
     }
@@ -66,10 +72,17 @@ pub async fn summarize_workspace(state: &AppState, ws: &Workspace) -> Result<Str
     let base = git::merge_base(&work_dir, &ws.base_branch).await?;
     let patch = git::diff(&work_dir, &base).await?;
     if patch.trim().is_empty() {
+        tracing::debug!(id = %ws.id, "no diff to summarize");
         workspace::mark_summarized(&state.db, &ws.id).await?;
         return Ok(ws.description.clone());
     }
     let stat = git::diff_stat(&work_dir, &base).await?;
+    tracing::debug!(
+        id = %ws.id,
+        patch_len = patch.len(),
+        files_changed = stat.files_changed,
+        "summarizing workspace diff"
+    );
     let description = agent::summarize(&work_dir, &patch).await?;
 
     sqlx::query(

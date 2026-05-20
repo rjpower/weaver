@@ -138,6 +138,13 @@ const remove = () =>
     router.push('/');
   });
 
+const adopt = () =>
+  act('adopt', async () => {
+    await post(`/workspaces/${props.id}/adopt`);
+    notice.value = 'Workspace adopted — tmux session recreated.';
+    await loadWorkspace();
+  });
+
 function eventLine(ev: WeaverEvent): string {
   const d = ev.data || {};
   if (ev.kind === 'status') return `status → ${d.status ?? '?'}`;
@@ -168,6 +175,21 @@ onUnmounted(() => source?.close());
 
     <p v-if="error" class="mb-3 text-sm text-red-400">{{ error }}</p>
     <p v-if="notice" class="mb-3 text-sm text-emerald-400">{{ notice }}</p>
+
+    <section
+      v-if="ws.pending_prompt"
+      class="mb-5 rounded border border-amber-700/60 bg-amber-950/40 p-4"
+    >
+      <div class="mb-2 text-xs font-medium text-amber-300">
+        Waiting for input — the agent is blocked on this prompt:
+      </div>
+      <pre
+        class="max-h-72 overflow-auto rounded bg-black p-3 text-xs leading-snug text-neutral-200 whitespace-pre-wrap"
+      >{{ ws.pending_prompt }}</pre>
+      <p class="mt-2 text-xs text-neutral-500">
+        Answer it with the send box below, or <code>weaver attach {{ ws.id }}</code>.
+      </p>
+    </section>
 
     <div class="grid gap-5 lg:grid-cols-3">
       <!-- Left: goal, description, actions -->
@@ -231,6 +253,14 @@ onUnmounted(() => source?.close());
         </section>
 
         <section class="rounded border border-neutral-800 bg-neutral-900 p-4 flex gap-2">
+          <button
+            v-if="ws.status === 'orphaned'"
+            class="rounded bg-amber-700 hover:bg-amber-600 px-3 py-1.5 text-sm"
+            :disabled="busy === 'adopt'"
+            @click="adopt"
+          >
+            {{ busy === 'adopt' ? 'Adopting…' : 'Adopt' }}
+          </button>
           <button
             class="rounded bg-indigo-700 hover:bg-indigo-600 px-3 py-1.5 text-sm"
             :disabled="busy === 'merge'"

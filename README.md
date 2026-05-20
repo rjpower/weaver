@@ -38,6 +38,7 @@ weaver attach <id>                    # attach to the agent's tmux session
 weaver send <id> "use port 8081"      # send a line to an idle agent
 weaver summary <id>                   # force a state summary now
 weaver merge <id>                     # merge the branch into its base
+weaver adopt <id>                     # recreate the tmux session for an orphaned workspace
 weaver rm <id>                        # remove the worktree + tmux session
 weaver open                           # open the web UI
 ```
@@ -50,14 +51,56 @@ weaver description "wired up routes"  # set the current-state description
 weaver note "blocked on the DB schema"
 ```
 
+The `weaver` binary is put on the agent's `PATH` automatically, and a
+SessionStart hook primes each session with these commands and the expectation
+to record decisions and keep going rather than block on the user. The primer
+text lives in [`primer.md`](primer.md).
+
 `weaver new --issue 123` seeds the goal/description from a GitHub issue (via the
 `gh` CLI).
 
 ## Status detection
 
+A workspace's status is one of `created`, `launching`, `working`, `waiting`,
+`idle`, `orphaned`, `done`, or `error`. `done` and `error` are terminal;
+the rest, including `orphaned`, are recoverable.
+
 claude-backed workspaces report status via Claude Code hooks installed into
 `.claude/settings.local.json` (`working` / `waiting` / `idle`). Other agents
-fall back to tmux screen-stillness detection.
+fall back to tmux screen-stillness detection. When a workspace goes `waiting`,
+weaver snapshots the agent's tmux pane into `pending_prompt` so the dashboard
+(and `weaver status <id>`) can show what it is blocked on.
+
+## Adoption
+
+A workspace's tmux session is independent of the weaver server: it does not
+survive a machine reboot, though the SQLite rows and git worktrees do. When the
+monitor finds a workspace whose tmux session has vanished, it marks it
+`orphaned` rather than `done`.
+
+An orphaned workspace can be **adopted** — its tmux session recreated and its
+agent resumed (`claude --continue`, which continues the most recent
+conversation rather than restarting from the goal):
+
+```sh
+weaver adopt <id>                     # or the "Adopt" button in the web UI
+```
+
+Set `server.auto_adopt` to have the server adopt every recoverable workspace
+automatically on startup (off by default):
+
+```sh
+weaver config set server.auto_adopt true
+```
+
+## Server address
+
+`weaver serve` binds `127.0.0.1:7878` by default. Set `WEAVER_API` (e.g.
+`WEAVER_API=http://127.0.0.1:9000`) to point the server *and* every CLI client
+at a different address — it configures both sides. The running server records
+the address it actually bound in `~/.weaver/server.json`, so clients find it
+with no configuration in the common case. An explicit `weaver serve --addr
+<host:port>` overrides `WEAVER_API`.
 
 ## Building
 
