@@ -2,17 +2,17 @@ import { test, expect } from '../fixtures/weaver';
 import { writeFileSync } from 'fs';
 import { join } from 'path';
 
-test.describe('workspace diff', () => {
+test.describe('session diff', () => {
   test('Load diff shows a newly created file in the worktree', async ({ page, weaver }) => {
-    const ws = await weaver.seedWorkspace({ goal: 'Produce a diff', name: 'diff-task' });
+    const s = await weaver.seedSession({ goal: 'Produce a diff', name: 'diff-task' });
 
     // The diff endpoint includes untracked files; drop one into the worktree.
     writeFileSync(
-      join(ws.work_dir, 'NEW_FILE.txt'),
+      join(s.work_dir, 'NEW_FILE.txt'),
       'this file was added by the e2e diff test\n',
     );
 
-    await page.goto(`${weaver.baseUrl}/#/w/${ws.id}`);
+    await page.goto(`${weaver.baseUrl}/#/s/${s.id}`);
 
     await page.getByRole('button', { name: 'Load diff' }).click();
 

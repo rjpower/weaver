@@ -918,6 +918,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "loom"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "weaver-core",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1926,22 +1950,32 @@ name = "weaver"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "axum",
  "chrono",
  "clap",
  "clap_complete",
- "rand",
- "reqwest",
  "serde",
  "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
- "tokio-stream",
- "tokio-util",
- "tower-http",
  "tracing",
  "tracing-subscriber",
+ "weaver-core",
+]
+
+[[package]]
+name = "weaver-core"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rand",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

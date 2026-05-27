@@ -6,119 +6,186 @@ Engineer-facing notes for hacking on weaver itself. For user-facing docs read
 
 ## Mental model
 
-weaver = **server + thin CLI client + Vue SPA**, all talking over a local
-HTTP+SSE API. There is no peer-to-peer logic and no task DAG: a **workspace** is
-one git worktree + one tmux session running one agent, with a `goal` and an
-evolving `description`. Workspaces are independent.
+weaver ships **two binaries** and a **shared sqlite database**:
+
+- **`weaver`** is the **agent-facing CLI**. It is database-direct (no daemon,
+  no HTTP) and resolves "the current branch" from `$WEAVER_BRANCH` or, failing
+  that, the git checkout under cwd. Cold start is sub-50ms; the binary
+  intentionally has no `axum` / `reqwest` / SPA dependencies. Agents call
+  `weaver` to read and update the goal, append notes, add and triage issues,
+  and emit hook events. **`weaver` works fine whether or not `loom` is
+  running** — that decoupling is the whole point of the split.
+
+- **`loom`** is the **optional orchestrator**. It runs the REST + SSE server,
+  hosts the Vue web UI, owns the per-branch tmux + agent process via the
+  `sessions` table, runs the background monitor and periodic summarizer, and
+  shells out to `git worktree` / `tmux`. Without loom, branches and issues
+  still work; tmux orchestration, the dashboard, and the live screen do not.
 
 ```
-weaver CLI ──HTTP──▶ weaver server (axum, 127.0.0.1:7878)
-                       ├─ SQLite (~/.weaver/weaver.db)
-                       ├─ tmux + git subprocess wrappers
-                       ├─ agent launcher + headless summarizer
-                       └─ background monitor (status, orphan detection)
-Claude Code hooks ──HTTP──▶ server
-Vue SPA ──REST + SSE──▶ server
+weaver CLI ──sqlite──┐
+                     ├─ ~/.weaver/weaver.db   (shared, WAL)
+loom serve  ─────────┘    │
+  │                       │
+  ├─ axum REST + SSE      │
+  ├─ tmux + git wrappers  │
+  ├─ agent launcher       │
+  ├─ monitor (consumes    │
+  │   `events` rows that  │
+  │   `weaver hook` wrote)│
+  └─ Vue SPA              │
+                          │
+  Vue SPA ──REST + SSE────┘
 ```
 
-The server owns all state. The CLI is a thin client over `weaver::client`. The
-only CLI command that *doesn't* go through HTTP is `weaver attach`, which
-`exec`s `tmux attach`. Add new functionality as a REST endpoint first; the CLI
-and SPA both consume it.
+Both binaries open the sqlite file directly. The monitor watches the `events`
+table for new `hook` rows — that is how `weaver hook` reports status without
+needing the daemon to be reachable.
 
 ## Layout
 
 | Path | What's in it |
 |---|---|
-| `src/bin/weaver.rs` | CLI: clap subcommands, dispatches into `client` |
-| `src/client.rs` | HTTP client used by the CLI |
-| `src/server.rs` | Server bootstrap (bind, write `server.json`, spawn bg tasks) |
-| `src/web.rs` | axum routes, request/response types, SSE — **the API surface** |
-| `src/workspace.rs` | `Workspace` model + sqlx queries |
-| `src/db.rs` | Pool setup + schema (inline `CREATE TABLE IF NOT EXISTS`) |
-| `src/config.rs` | Settings registry (label, type, default per key) |
-| `src/agent.rs` | Launching agents into tmux, headless summary command |
-| `src/tmux.rs` | `tmux new-session / send-keys / capture-pane / kill-session` |
-| `src/git.rs` | `git worktree`, `merge-base`, diff, merge |
-| `src/github.rs` | `gh` CLI shell-out for issue seeding |
-| `src/monitor.rs` | Status detection + orphan marking |
-| `src/summary.rs` | Background summarizer loop |
-| `src/events.rs` | In-process broadcast bus that feeds SSE |
-| `src/endpoint.rs` | `WEAVER_API` / default addr resolution (shared CLI + server) |
-| `src/repo.rs` | Current-repo / current-workspace detection from `cwd` |
-| `frontend/` | Vue 3 SPA, rspack, Tailwind. Single `api.ts`, views in `views/` |
-| `static/dist/` | Build output (committed placeholder, real build overwrites) |
-| `tests/integration.rs` | Spins a real server + git repo; needs `git` + `tmux` |
-| `e2e/` | Playwright; talks to a real server. Separate `package.json` |
-| `build.rs` | Runs `npm run build` in `frontend/`. Honors `WEAVER_SKIP_FRONTEND` |
+| `crates/weaver-core/` | lib: `branches`, `issues`, `notes`, `events`, `db`, `git`, `config`, agent helpers. Pure logic; used by both binaries. |
+| `crates/weaver/src/bin/weaver.rs` | the slim agent-facing CLI (`goal`, `describe`, `note`, `issue …`, `where`, `log`, `hook`, `status`, `config`) |
+| `crates/loom/src/web.rs` | axum routes, request/response types, SSE — **the API surface** |
+| `crates/loom/src/server.rs` | bind, write `server.json`, spawn bg tasks |
+| `crates/loom/src/monitor.rs` | status detection, orphan marking, hook-event consumer |
+| `crates/loom/src/summary.rs` | background summarizer |
+| `crates/loom/src/agent.rs` | launching agents into tmux + installing `.claude/settings.local.json` hooks |
+| `crates/loom/src/session.rs` | `Session` row + sqlx queries |
+| `crates/loom/src/tmux.rs` | `tmux new-session / send-keys / capture-pane / kill-session` |
+| `crates/loom/src/github.rs` | `gh` CLI shell-out for issue seeding |
+| `crates/loom/src/client.rs` | HTTP client used by the `loom` CLI to talk to its own daemon |
+| `crates/loom/src/bin/loom.rs` | the orchestrator CLI (`serve`, `launch`, `ps`, `attach`, …) |
+| `crates/loom/frontend/` | Vue 3 SPA, rspack, Tailwind. `api.ts` + views in `views/` |
+| `crates/loom/static/dist/` | Build output (placeholder; real build overwrites) |
+| `crates/loom/tests/` | integration tests (need `git` + `tmux`) |
+| `e2e/` | Playwright; talks to a real `loom serve`. Separate `package.json` |
+| `crates/loom/build.rs` | Runs `npm run build` in `frontend/`. Honors `WEAVER_SKIP_FRONTEND` |
 
 ## Build & test
 
 ```sh
-cargo build                           # also runs `npm run build` in frontend/
+cargo build                           # also runs `npm run build` in the SPA
 WEAVER_SKIP_FRONTEND=1 cargo build    # backend only — fastest iteration
-WEAVER_SKIP_FRONTEND=1 cargo test     # unit + integration; needs git & tmux
-cd frontend && npm run dev            # live-reloading SPA against a running server
+WEAVER_SKIP_FRONTEND=1 cargo test --workspace
+cd crates/loom/frontend && npm run dev  # live-reloading SPA against `loom serve`
 cd e2e && npm test                    # Playwright suite
 ```
 
-The integration test shells out to real `git` and `tmux`. If it hangs, look for
-stray `weaver-test-*` tmux sessions.
+The integration test shells out to real `git` and `tmux`. If it hangs, look
+for stray `weaver-test-*` tmux sessions.
 
 ## Storage & state
 
-- **SQLite** at `$WEAVER_HOME/weaver.db` (default `~/.weaver/weaver.db`). Schema
-  is `CREATE TABLE IF NOT EXISTS` in `src/db.rs` — additive only, no migration
-  framework. Add columns with `ALTER TABLE ... ADD COLUMN` guarded against the
-  existing-column error.
-- **`server.json`** in `$WEAVER_HOME`: pid + bound addr, written when the
-  listener comes up. Clients use it to find the server when `WEAVER_API` is
+- **SQLite** at `$WEAVER_HOME/weaver.db` (default `~/.weaver/weaver.db`),
+  shared by `weaver` and `loom`. WAL mode handles concurrency.
+  - Core tables (`weaver-core/src/db.rs`): `branches`, `issues`, `notes`,
+    `events`, `settings`.
+  - Loom tables (`crates/loom/src/db.rs`): `sessions`, `summaries`,
+    `recent_repos`.
+- **`server.json`** in `$WEAVER_HOME`: pid + bound addr, written when `loom`
+  comes up. The `loom` CLI uses it to find the daemon when `WEAVER_API` is
   unset.
-- **Settings** live in a `settings` table; each key is declared in
-  `config::registry()` with label/help/type/default. Never written ⇒ default.
-- **Worktrees** live under `<repo>/.worktrees/<slug>` on the branch
-  `weaver/<slug>` (unless `--branch` reused an existing branch).
+- **Settings** live in the `settings` table; each key is declared in
+  `weaver-core::config::registry()`. Both binaries read it.
+- **Worktrees** live under `<repo>/.worktrees/<slug>` on `weaver/<slug>`
+  (unless `--branch` reused an existing branch).
+
+## REST API
+
+All routes live under `/api`. The Vue SPA is the primary consumer.
+
+| Method + path | What it does |
+|---|---|
+| `GET /api/health` | liveness probe |
+| `GET /api/sessions` / `POST /api/sessions` | list / create sessions |
+| `GET PATCH DELETE /api/sessions/{id}` | session CRUD (status, title, goal, description) |
+| `POST /api/sessions/{id}/{send,interrupt,note,summarize,merge,adopt}` | actions |
+| `GET /api/sessions/{id}/{diff,pane,log,events}` | reads + SSE stream |
+| `GET /api/branches` / `GET PATCH /api/branches/{id}` | list / inspect / edit tracked branches |
+| `GET POST /api/branches/{id}/issues` | issue list / create |
+| `GET PATCH DELETE /api/issues/{id}` | per-issue CRUD |
+| `GET /api/repos/recent` / `GET /api/repos/branches?cwd=…` | recent repos / branches in a repo |
+| `GET PATCH /api/settings` | settings registry |
+
+`SessionView` (`/api/sessions[/...]`) returns session-specific fields
+top-level (`id`, `status`, `work_dir`, `tmux_session`, `agent_kind`,
+`pending_prompt`, `github_repo`, `last_activity_at`, `summary_updated_at`,
+`created_at`, `updated_at`) plus a nested `branch: BranchView`
+(`id`, `name`, `title`, `goal`, `description`, `repo_root`, `branch`,
+`base_branch`, `created_at`, `updated_at`, `open_issue_count`).
+
+There is **no** `/api/hook` endpoint — see "Status detection" below.
 
 ## Conventions
 
-- **API-first.** New features land as a REST endpoint in `web.rs` and a
-  client method in `client.rs`; the CLI and SPA are both consumers. Don't put
-  business logic in `bin/weaver.rs` or in the Vue layer.
-- **Errors:** server returns `AppError` (status + message + optional
-  `details` map of per-field reasons); CLI uses `anyhow` and prints
+- **API-first.** New features land as a REST endpoint in `web.rs` first; the
+  SPA and the `loom` CLI both consume it. Don't put business logic in
+  `bin/loom.rs` or in the Vue layer.
+- **Errors:** the server returns `AppError` (status + message + optional
+  `details` map of per-field reasons); the `loom` CLI uses `anyhow` and prints
   `error: {e:#}`.
-- **Async:** tokio everywhere. Long-running subprocesses (tmux, git, gh, the
-  agent) go through `tokio::process::Command`.
-- **Events:** state changes that the SPA needs to see push through `EventBus`
-  in `events.rs`; SSE handler in `web.rs` fans them out.
-- **No tracking-branch state:** the server can be killed and restarted at any
-  time. tmux sessions and worktrees survive; "orphaned" is a first-class
-  status, recovered via `adopt`.
+- **Async:** tokio everywhere on the server side. Long-running subprocesses
+  (tmux, git, gh, the agent) go through `tokio::process::Command`. The
+  `weaver` CLI is synchronous-feeling (just a few `sqlx` calls per command).
+- **Events:** state changes flow through `EventBus`; the SSE handler in
+  `web.rs` fans them out. `weaver hook` writes directly to the `events`
+  table, and loom's monitor tick promotes the new row into a session status
+  change and a fresh `EventBus` notification.
+- **No tracking-branch state in the server:** loom can be killed and restarted
+  at any time. tmux sessions and worktrees survive; "orphaned" is a
+  first-class status, recovered via `loom adopt` (or the Adopt button in the
+  UI).
 
 ## Status detection
 
 Two paths, picked per agent kind:
 
-1. **Claude Code hooks** — installed into the worktree's
-   `.claude/settings.local.json`, they POST `working` / `waiting` / `idle` to
-   `/hook` (see `Cmd::Hook` in the CLI, dispatched by Claude). On `waiting`,
-   the server snapshots the tmux pane into `pending_prompt`.
-2. **Tmux stillness** — for non-Claude agents, the monitor diffs pane captures
-   over time.
+1. **Claude Code hooks** — `loom launch` installs them into the worktree's
+   `.claude/settings.local.json`. Each hook shells out to
+   `weaver hook --event {working|waiting|idle|session-start}`, which writes
+   an `events` row keyed on the branch resolved from `$WEAVER_BRANCH` (set by
+   the launcher). Loom's monitor consumes new `hook` rows on its next tick
+   and flips `sessions.status` accordingly. On `waiting`, the monitor
+   snapshots the tmux pane into `pending_prompt`.
+2. **Tmux stillness** — for non-Claude agents the monitor diffs pane captures
+   over time and demotes `working` → `idle` after enough still ticks.
 
-Orphan detection is independent of either: if `tmux has-session` says no, the
-workspace becomes `orphaned` and is eligible for `adopt`.
+Orphan detection is independent: if `tmux has-session` says no, the session
+becomes `orphaned` and is eligible for `loom adopt`.
+
+## Agent-facing commands
+
+When working inside a worktree the agent can run, with no daemon required:
+
+```sh
+weaver goal "ship the feature"          # set the branch's goal
+weaver goal                             # print the goal
+weaver describe "Wired up routes; tests pass"
+weaver note   "blocked on the DB schema"
+weaver issue add "Backfill old rows" --body "ETA after the schema change"
+weaver issue ls                         # default: open only; --all shows closed too
+weaver issue close 7
+weaver where                            # debug: print resolved repo / branch / branch-id
+weaver log --limit 50                   # recent events for the current branch
+weaver status                           # title + goal + open-issue count
+weaver hook --event working             # (used by Claude Code hooks)
+```
+
+These are all `weaver-core` calls against the sqlite database. They write
+`events` rows so that loom (if running) can react on its next monitor tick.
 
 ## Frontend notes
 
 - Vue 3 + `<script setup>` + Vue Router. Tailwind v4 via PostCSS.
-- All server calls go through `frontend/src/api.ts`. Don't fetch inline in
-  components.
-- Types in `frontend/src/types.ts` mirror serde structs in `web.rs` — keep them
-  in sync by hand (no codegen).
-- No client-only state worth persisting; the server is the source of truth.
-  Saved [[ui-built-on-rest-api]] applies: don't invent browser-local features
-  that the CLI can't observe.
+- All server calls go through `crates/loom/frontend/src/api.ts`. Don't fetch
+  inline in components.
+- Types in `frontend/src/types.ts` mirror the serde structs in `web.rs` —
+  keep them in sync by hand (no codegen).
+- The SPA is a thin client of the REST API ([[ui-built-on-rest-api]]). Don't
+  invent browser-local features the `loom` CLI cannot observe.
 
 ## Environment
 
@@ -126,6 +193,7 @@ workspace becomes `orphaned` and is eligible for `adopt`.
 |---|---|---|
 | `WEAVER_HOME` | state directory | `~/.weaver` |
 | `WEAVER_DB` | sqlite path | `$WEAVER_HOME/weaver.db` |
-| `WEAVER_API` | server URL (both sides — server binds here, CLI talks here) | `http://127.0.0.1:7878` |
+| `WEAVER_API` | loom URL (both sides — server binds, CLI talks) | `http://127.0.0.1:7878` |
+| `WEAVER_BRANCH` | override the branch resolver (set by `loom launch` in the worktree) | — |
 | `WEAVER_SKIP_FRONTEND` | skip `npm run build` in `build.rs` | unset |
-| `RUST_LOG` / `EnvFilter` | tracing filter | `weaver=info,tower_http=warn` |
+| `RUST_LOG` / `EnvFilter` | tracing filter | `loom=info,weaver_core=info,tower_http=warn` |

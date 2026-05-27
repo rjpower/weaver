@@ -6,30 +6,40 @@ import { join } from 'path';
 
 // Repo layout: this file lives at <weaver>/e2e/fixtures/weaver.ts
 const WEAVER_ROOT = join(__dirname, '..', '..');
-const BINARY = join(WEAVER_ROOT, 'target', 'debug', 'weaver');
-const FRONTEND_DIR = join(WEAVER_ROOT, 'frontend');
-const DIST_INDEX = join(WEAVER_ROOT, 'static', 'dist', 'index.html');
+const LOOM_BINARY = join(WEAVER_ROOT, 'target', 'debug', 'loom');
+const WEAVER_BINARY = join(WEAVER_ROOT, 'target', 'debug', 'weaver');
+const FRONTEND_DIR = join(WEAVER_ROOT, 'crates', 'loom', 'frontend');
+const DIST_INDEX = join(WEAVER_ROOT, 'crates', 'loom', 'static', 'dist', 'index.html');
 
-/** A workspace object as returned by the weaver REST API. */
-export interface Workspace {
+/** The branch-level fields embedded in a SessionView. */
+export interface Branch {
   id: string;
   name: string;
   title: string;
   goal: string;
   description: string;
-  status: string;
   repo_root: string;
-  work_dir: string;
   branch: string;
   base_branch: string;
-  tmux_session: string;
-  agent_kind: string;
-  github_repo: string | null;
-  github_issue: number | null;
   created_at: string;
   updated_at: string;
+  open_issue_count: number;
+}
+
+/** A session as returned by `/api/sessions[/...]`. */
+export interface Session {
+  id: string;
+  status: string;
+  work_dir: string;
+  tmux_session: string;
+  agent_kind: string;
+  pending_prompt: string;
+  github_repo: string | null;
   last_activity_at: string;
   summary_updated_at: string | null;
+  created_at: string;
+  updated_at: string;
+  branch: Branch;
 }
 
 export interface SeedOpts {
@@ -41,25 +51,25 @@ export interface SeedOpts {
 }
 
 export interface WeaverFixture {
-  /** Base URL of the running weaver server, e.g. http://127.0.0.1:NNNN */
+  /** Base URL of the running loom server, e.g. http://127.0.0.1:NNNN */
   baseUrl: string;
   /** Path to the throwaway git repo (one commit on `main`) used as `cwd`. */
   repoPath: string;
-  /** Create a workspace directly via the API using the `shell` agent. */
-  seedWorkspace(opts: SeedOpts): Promise<Workspace>;
-  /** GET /api/workspaces/{id}. */
-  getWorkspace(id: string): Promise<Workspace>;
-  /** GET /api/workspaces. */
-  listWorkspaces(): Promise<Workspace[]>;
-  /** POST /api/hook to flip a workspace status (working|waiting|idle). */
-  hook(id: string, event: 'working' | 'waiting' | 'idle'): Promise<void>;
-  /** Poll /api/workspaces/{id}/pane until `marker` appears (or throw). */
+  /** Create a session directly via the API using the `shell` agent. */
+  seedSession(opts: SeedOpts): Promise<Session>;
+  /** GET /api/sessions/{id}. */
+  getSession(id: string): Promise<Session>;
+  /** GET /api/sessions. */
+  listSessions(): Promise<Session[]>;
+  /** Flip a session's status by writing a hook event row via `weaver hook`. */
+  hook(session: Session, event: 'working' | 'waiting' | 'idle'): Promise<void>;
+  /** Poll /api/sessions/{id}/pane until `marker` appears (or throw). */
   waitForPane(id: string, marker: string, timeoutMs?: number): Promise<string>;
 }
 
-/** Ensure the weaver binary and the Vue frontend bundle both exist. */
+/** Ensure the loom binary and the Vue frontend bundle both exist. */
 function ensureBuilt() {
-  const needBinary = !existsSync(BINARY);
+  const needBinary = !existsSync(LOOM_BINARY) || !existsSync(WEAVER_BINARY);
   const needFrontend = !existsSync(DIST_INDEX);
   if (needBinary || needFrontend) {
     // A full `cargo build` also builds the frontend into static/dist.
@@ -69,8 +79,11 @@ function ensureBuilt() {
       env: process.env,
     });
   }
-  if (!existsSync(BINARY)) {
-    throw new Error(`weaver binary missing after build: ${BINARY}`);
+  if (!existsSync(LOOM_BINARY)) {
+    throw new Error(`loom binary missing after build: ${LOOM_BINARY}`);
+  }
+  if (!existsSync(WEAVER_BINARY)) {
+    throw new Error(`weaver binary missing after build: ${WEAVER_BINARY}`);
   }
   if (!existsSync(DIST_INDEX)) {
     // Binary built with WEAVER_SKIP_FRONTEND, or stale: build the SPA directly.
@@ -118,14 +131,18 @@ export const test = base.extend<{ weaver: WeaverFixture }>({
     mkdirSync(weaverHome, { recursive: true });
     makeRepo(repoPath);
 
+    // Per-test env: every spawned process (loom + weaver hooks) sees the same
+    // WEAVER_HOME / WEAVER_DB so they read and write the same database.
+    const childEnv = {
+      ...process.env,
+      WEAVER_HOME: weaverHome,
+      WEAVER_DB: dbPath,
+      RUST_LOG: 'loom=warn,weaver_core=warn',
+    };
+
     // Bind to a random free port (0) and parse the actual port from stdout.
-    const server: ChildProcess = spawn(BINARY, ['server', 'run', '--addr', '127.0.0.1:0'], {
-      env: {
-        ...process.env,
-        WEAVER_HOME: weaverHome,
-        WEAVER_DB: dbPath,
-        RUST_LOG: 'weaver=warn',
-      },
+    const server: ChildProcess = spawn(LOOM_BINARY, ['serve', '--addr', '127.0.0.1:0'], {
+      env: childEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -133,7 +150,7 @@ export const test = base.extend<{ weaver: WeaverFixture }>({
     let serverLog = '';
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
-        () => reject(new Error(`weaver did not start in 20s. Output:\n${serverLog}`)),
+        () => reject(new Error(`loom did not start in 20s. Output:\n${serverLog}`)),
         20_000,
       );
       const onData = (chunk: Buffer) => {
@@ -154,7 +171,7 @@ export const test = base.extend<{ weaver: WeaverFixture }>({
       server.on('exit', (code) => {
         if (!baseUrl) {
           clearTimeout(timer);
-          reject(new Error(`weaver exited with code ${code} before listening:\n${serverLog}`));
+          reject(new Error(`loom exited with code ${code} before listening:\n${serverLog}`));
         }
       });
     });
@@ -173,9 +190,9 @@ export const test = base.extend<{ weaver: WeaverFixture }>({
       }
       await new Promise((r) => setTimeout(r, 100));
     }
-    if (!healthy) throw new Error(`weaver /api/health never returned ok:\n${serverLog}`);
+    if (!healthy) throw new Error(`loom /api/health never returned ok:\n${serverLog}`);
 
-    // UI-created workspaces should use a plain shell, never the real claude CLI.
+    // UI-created sessions should use a plain shell, never the real claude CLI.
     await fetchJson(`${baseUrl}/api/settings`, {
       method: 'PATCH',
       body: JSON.stringify({ 'agent.default': 'shell' }),
@@ -185,8 +202,8 @@ export const test = base.extend<{ weaver: WeaverFixture }>({
       baseUrl,
       repoPath,
 
-      async seedWorkspace(opts) {
-        return (await fetchJson(`${baseUrl}/api/workspaces`, {
+      async seedSession(opts) {
+        return (await fetchJson(`${baseUrl}/api/sessions`, {
           method: 'POST',
           body: JSON.stringify({
             goal: opts.goal,
@@ -196,21 +213,23 @@ export const test = base.extend<{ weaver: WeaverFixture }>({
             name: opts.name,
             base: opts.base,
           }),
-        })) as Workspace;
+        })) as Session;
       },
 
-      async getWorkspace(id) {
-        return (await fetchJson(`${baseUrl}/api/workspaces/${id}`)) as Workspace;
+      async getSession(id) {
+        return (await fetchJson(`${baseUrl}/api/sessions/${id}`)) as Session;
       },
 
-      async listWorkspaces() {
-        return (await fetchJson(`${baseUrl}/api/workspaces`)) as Workspace[];
+      async listSessions() {
+        return (await fetchJson(`${baseUrl}/api/sessions`)) as Session[];
       },
 
-      async hook(id, event) {
-        await fetchJson(`${baseUrl}/api/hook`, {
-          method: 'POST',
-          body: JSON.stringify({ workspace: id, event }),
+      async hook(session, event) {
+        // `weaver hook` writes an `events` row keyed on the branch resolved
+        // from $WEAVER_BRANCH; the loom monitor consumes it on its next tick.
+        execFileSync(WEAVER_BINARY, ['hook', '--event', event], {
+          env: { ...childEnv, WEAVER_BRANCH: session.branch.id },
+          stdio: 'pipe',
         });
       },
 
@@ -219,7 +238,7 @@ export const test = base.extend<{ weaver: WeaverFixture }>({
         let content = '';
         while (Date.now() - start < timeoutMs) {
           try {
-            const pane = (await fetchJson(`${baseUrl}/api/workspaces/${id}/pane`)) as {
+            const pane = (await fetchJson(`${baseUrl}/api/sessions/${id}/pane`)) as {
               content: string;
             };
             content = pane.content ?? '';
@@ -237,13 +256,13 @@ export const test = base.extend<{ weaver: WeaverFixture }>({
 
     await use(fixture);
 
-    // --- Teardown: delete every workspace (kills machine-global tmux sessions),
+    // --- Teardown: delete every session (kills machine-global tmux sessions),
     // then stop the server and remove temp dirs.
     try {
-      const all = (await fetchJson(`${baseUrl}/api/workspaces`)) as Workspace[];
-      for (const ws of all) {
+      const all = (await fetchJson(`${baseUrl}/api/sessions`)) as Session[];
+      for (const s of all) {
         try {
-          await fetch(`${baseUrl}/api/workspaces/${ws.id}?keep_branch=false`, {
+          await fetch(`${baseUrl}/api/sessions/${s.id}?keep_branch=false`, {
             method: 'DELETE',
           });
         } catch {
