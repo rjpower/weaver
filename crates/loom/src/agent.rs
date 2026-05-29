@@ -11,6 +11,41 @@ use tokio::process::Command;
 use crate::tmux;
 use weaver_core::agent::hooks_json;
 
+/// Accepted per-session reasoning effort levels, increasing. Orthogonal to the
+/// model: any model can run at any effort.
+pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// Accepted per-session model tiers.
+pub const MODELS: &[&str] = &["haiku", "sonnet", "opus"];
+
+/// `--effort <level>` for a known level, else empty (inherit the configured
+/// `agent.claude_args`).
+pub fn effort_args(effort: &str) -> String {
+    match effort.trim() {
+        "" => String::new(),
+        e => format!("--effort {e}"),
+    }
+}
+
+/// `--model <tier>` for a chosen model, else empty.
+pub fn model_args(model: &str) -> String {
+    match model.trim() {
+        "" => String::new(),
+        m => format!("--model {m}"),
+    }
+}
+
+/// Combine the configured base `agent.claude_args` with the per-session model
+/// and effort selections. Each non-empty part is appended in turn, so a session
+/// layers its model/effort on top of the global flags.
+pub fn combine_args(base: &str, model: &str, effort: &str) -> String {
+    [base.trim(), &model_args(model), &effort_args(effort)]
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Whether a session's tmux session is being created for the first time or
 /// recreated to recover ("adopt") an existing worktree whose session died.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +274,27 @@ mod tests {
         assert!(script.contains("export WEAVER_API='http://h:1'; "));
         assert!(script.contains("claude \"$(cat '/x/goal.txt')\"; "));
         assert!(script.ends_with("exec \"${SHELL:-/bin/sh}\""));
+    }
+
+    #[test]
+    fn effort_and_model_args() {
+        assert_eq!(effort_args("xhigh"), "--effort xhigh");
+        assert_eq!(effort_args(""), "");
+        assert_eq!(model_args("opus"), "--model opus");
+        assert_eq!(model_args(""), "");
+    }
+
+    #[test]
+    fn combine_args_layers_model_and_effort_onto_base() {
+        assert_eq!(combine_args("", "opus", "high"), "--model opus --effort high");
+        assert_eq!(combine_args("--verbose", "", ""), "--verbose");
+        assert_eq!(combine_args("", "", "max"), "--effort max");
+        assert_eq!(combine_args("", "haiku", ""), "--model haiku");
+        assert_eq!(
+            combine_args("--verbose", "sonnet", "low"),
+            "--verbose --model sonnet --effort low"
+        );
+        assert_eq!(combine_args("", "", ""), "");
     }
 
     #[test]

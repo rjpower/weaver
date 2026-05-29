@@ -52,6 +52,14 @@ enum Cmd {
         /// Attach to this existing branch rather than creating a new one.
         #[arg(long)]
         branch: Option<String>,
+        /// Model tier: haiku, sonnet, or opus. Omit to inherit the configured
+        /// `agent.claude_args`.
+        #[arg(long)]
+        model: Option<String>,
+        /// Reasoning effort: low, medium, high, xhigh, or max. Omit to inherit
+        /// the configured `agent.claude_args`.
+        #[arg(long)]
+        effort: Option<String>,
     },
     /// List active sessions.
     Ps,
@@ -109,7 +117,9 @@ async fn run() -> Result<()> {
             title,
             issue,
             branch,
-        } => cmd_launch(name, agent, base, goal, title, issue, branch).await,
+            model,
+            effort,
+        } => cmd_launch(name, agent, base, goal, title, issue, branch, model, effort).await,
         Cmd::Ps => cmd_ps().await,
         Cmd::Show { branch } => cmd_show(branch).await,
         Cmd::Attach { branch } => cmd_attach(branch).await,
@@ -314,6 +324,7 @@ async fn cmd_restart() -> Result<()> {
 // Session commands (HTTP)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_launch(
     name: Option<String>,
     agent: Option<String>,
@@ -322,6 +333,8 @@ async fn cmd_launch(
     title: Option<String>,
     issue: Option<i64>,
     branch: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> Result<()> {
     let client = Client::new();
     let cwd = std::env::current_dir()?;
@@ -338,6 +351,8 @@ async fn cmd_launch(
                 "name": name,
                 "existing_branch": branch,
                 "issue": issue,
+                "model": model,
+                "effort": effort,
             }),
         )
         .await?;
@@ -354,6 +369,14 @@ async fn cmd_launch(
         }
     );
     println!("  branch: {}", branch_str(&ws, "branch"));
+    let model = str_field(&ws, "model");
+    if !model.is_empty() {
+        println!("  model:  {model}");
+    }
+    let effort = str_field(&ws, "effort");
+    if !effort.is_empty() {
+        println!("  effort: {effort}");
+    }
     println!("  dir:    {}", str_field(&ws, "work_dir"));
     println!("  attach: loom attach {id}");
     Ok(())
@@ -398,6 +421,14 @@ fn print_session(ws: &Value) {
         println!("  summary:  {description}");
     }
     println!("  agent:    {}", str_field(ws, "agent_kind"));
+    let model = str_field(ws, "model");
+    if !model.is_empty() {
+        println!("  model:    {model}");
+    }
+    let effort = str_field(ws, "effort");
+    if !effort.is_empty() {
+        println!("  effort:   {effort}");
+    }
     println!(
         "  branch:   {} (base {})",
         branch_str(ws, "branch"),

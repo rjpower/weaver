@@ -19,6 +19,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     work_dir           TEXT NOT NULL,
     tmux_session       TEXT NOT NULL,
     agent_kind         TEXT NOT NULL DEFAULT 'claude',
+    -- Per-session model tier ('', 'haiku', 'sonnet', 'opus') and reasoning
+    -- effort ('', 'low', 'medium', 'high', 'xhigh', 'max'), spliced into the
+    -- Claude launch as `--model` / `--effort`. Empty inherits the global
+    -- `agent.claude_args`.
+    model              TEXT NOT NULL DEFAULT '',
+    effort             TEXT NOT NULL DEFAULT '',
     status             TEXT NOT NULL,
     pending_prompt     TEXT NOT NULL DEFAULT '',
     github_repo        TEXT,
@@ -83,7 +89,25 @@ async fn migrate_loom(pool: &Db) -> Result<()> {
             .await
             .with_context(|| format!("running loom migration: {trimmed}"))?;
     }
+    // Additive column migrations for databases created before the column
+    // existed. `CREATE TABLE IF NOT EXISTS` above is a no-op on such DBs, so we
+    // add the column explicitly and ignore the "duplicate column" error.
+    add_column_if_missing(pool, "sessions", "model", "TEXT NOT NULL DEFAULT ''").await?;
+    add_column_if_missing(pool, "sessions", "effort", "TEXT NOT NULL DEFAULT ''").await?;
     Ok(())
+}
+
+/// Run `ALTER TABLE … ADD COLUMN`, treating an already-present column as success.
+async fn add_column_if_missing(pool: &Db, table: &str, column: &str, decl: &str) -> Result<()> {
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {decl}");
+    match sqlx::query(&sql).execute(pool).await {
+        Ok(_) => {
+            tracing::info!(%table, %column, "added column");
+            Ok(())
+        }
+        Err(e) if e.to_string().contains("duplicate column name") => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("adding column {table}.{column}")),
+    }
 }
 
 #[cfg(test)]

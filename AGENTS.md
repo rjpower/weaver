@@ -111,8 +111,8 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `GET PATCH /api/settings` | settings registry |
 
 `SessionView` (`/api/sessions[/...]`) returns session-specific fields
-top-level (`id`, `status`, `work_dir`, `tmux_session`, `agent_kind`,
-`pending_prompt`, `github_repo`, `last_activity_at`, `summary_updated_at`,
+top-level (`id`, `status`, `work_dir`, `tmux_session`, `agent_kind`, `model`,
+`effort`, `pending_prompt`, `github_repo`, `last_activity_at`, `summary_updated_at`,
 `created_at`, `updated_at`) plus a nested `branch: BranchView`
 (`id`, `name`, `title`, `goal`, `description`, `repo_root`, `branch`,
 `base_branch`, `created_at`, `updated_at`, `open_issue_count`).

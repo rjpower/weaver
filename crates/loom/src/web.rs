@@ -204,6 +204,8 @@ pub struct SessionView {
     pub work_dir: String,
     pub tmux_session: String,
     pub agent_kind: String,
+    pub model: String,
+    pub effort: String,
     pub pending_prompt: String,
     pub github_repo: Option<String>,
     pub last_activity_at: String,
@@ -222,6 +224,8 @@ impl SessionView {
             work_dir: session.work_dir.clone(),
             tmux_session: session.tmux_session.clone(),
             agent_kind: session.agent_kind.clone(),
+            model: session.model.clone(),
+            effort: session.effort.clone(),
             pending_prompt: session.pending_prompt.clone(),
             github_repo: session.github_repo.clone(),
             last_activity_at: session
@@ -382,6 +386,14 @@ struct CreateReq {
     issue: Option<i64>,
     #[serde(default)]
     existing_branch: Option<String>,
+    /// Model tier ('haiku' | 'sonnet' | 'opus'); blank/absent inherits the
+    /// configured `agent.claude_args`.
+    #[serde(default)]
+    model: Option<String>,
+    /// Reasoning effort ('low' | 'medium' | 'high' | 'xhigh' | 'max');
+    /// blank/absent inherits the configured `agent.claude_args`.
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 async fn create_session(
@@ -397,6 +409,23 @@ async fn create_session(
         Some(a) => a,
         None => config::get_or(&st.db, "agent.default", config::DEFAULT_AGENT).await,
     };
+
+    // Normalize and validate the model / effort selections. Blank means
+    // "inherit the configured default"; anything non-blank must be known.
+    let model = req.model.as_deref().map(str::trim).unwrap_or("").to_string();
+    if !model.is_empty() && !agent::MODELS.contains(&model.as_str()) {
+        return Err(AppError::bad_request(format!(
+            "unknown model '{model}' — expected one of {}",
+            agent::MODELS.join(", ")
+        )));
+    }
+    let effort = req.effort.as_deref().map(str::trim).unwrap_or("").to_string();
+    if !effort.is_empty() && !agent::EFFORTS.contains(&effort.as_str()) {
+        return Err(AppError::bad_request(format!(
+            "unknown effort '{effort}' — expected one of {}",
+            agent::EFFORTS.join(", ")
+        )));
+    }
 
     // Build title/goal/description; an optional GitHub issue seeds all three.
     let mut goal = req.goal.unwrap_or_default().trim().to_string();
@@ -543,7 +572,8 @@ async fn create_session(
     };
 
     let tmux_session = format!("weaver-{session_id}");
-    let claude_args = config::get_or(&st.db, "agent.claude_args", "").await;
+    let base_args = config::get_or(&st.db, "agent.claude_args", "").await;
+    let claude_args = agent::combine_args(&base_args, &model, &effort);
     agent::launch(
         &agent::LaunchSpec {
             branch_id: &branch.id,
@@ -572,6 +602,8 @@ async fn create_session(
             work_dir: work_dir.display().to_string(),
             tmux_session,
             agent_kind: agent,
+            model,
+            effort,
             status: status.to_string(),
             github_repo,
         },
@@ -840,7 +872,8 @@ pub async fn adopt(st: &AppState, session: &Session, branch: &Branch) -> Result<
             None
         }
     };
-    let claude_args = config::get_or(&st.db, "agent.claude_args", "").await;
+    let base_args = config::get_or(&st.db, "agent.claude_args", "").await;
+    let claude_args = agent::combine_args(&base_args, &session.model, &session.effort);
     agent::launch(
         &agent::LaunchSpec {
             branch_id: &branch.id,
