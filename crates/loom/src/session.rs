@@ -15,6 +15,10 @@ pub struct Session {
     pub work_dir: String,
     pub tmux_session: String,
     pub agent_kind: String,
+    /// Model tier ('', 'haiku', 'sonnet', 'opus') — spliced in as `--model`.
+    pub model: String,
+    /// Reasoning effort ('', 'low', 'medium', 'high', 'xhigh', 'max') — `--effort`.
+    pub effort: String,
     pub status: String,
     pub pending_prompt: String,
     pub github_repo: Option<String>,
@@ -37,6 +41,8 @@ pub struct NewSession {
     pub work_dir: String,
     pub tmux_session: String,
     pub agent_kind: String,
+    pub model: String,
+    pub effort: String,
     pub status: String,
     pub github_repo: Option<String>,
 }
@@ -45,15 +51,17 @@ pub async fn insert(db: &Db, s: &NewSession) -> Result<Session> {
     let now = now_iso();
     sqlx::query(
         "INSERT INTO sessions
-         (id, branch_id, work_dir, tmux_session, agent_kind, status,
+         (id, branch_id, work_dir, tmux_session, agent_kind, model, effort, status,
           github_repo, last_activity_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&s.id)
     .bind(&s.branch_id)
     .bind(&s.work_dir)
     .bind(&s.tmux_session)
     .bind(&s.agent_kind)
+    .bind(&s.model)
+    .bind(&s.effort)
     .bind(&s.status)
     .bind(&s.github_repo)
     .bind(&now)

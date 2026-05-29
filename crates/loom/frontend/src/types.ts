@@ -25,6 +25,10 @@ export interface Session {
   work_dir: string;
   tmux_session: string;
   agent_kind: string;
+  /** Model tier ('', 'haiku', 'sonnet', 'opus') — spliced in as `--model`. */
+  model: string;
+  /** Reasoning effort ('', 'low', 'medium', 'high', 'xhigh', 'max') — `--effort`. */
+  effort: string;
   pending_prompt: string;
   github_repo: string | null;
   last_activity_at: string;

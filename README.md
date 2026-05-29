@@ -42,6 +42,7 @@ key decoupling — the agent CLI never speaks HTTP.
 # Orchestrator (optional)
 loom serve                            # run the daemon (REST + UI + tmux + monitor)
 loom launch "add-health-endpoint"     # new worktree + tmux + agent
+loom launch "big-refactor" --model opus --effort high   # pick model tier + reasoning effort
 loom ps                               # list active sessions
 loom show <branch>                    # session detail
 loom attach <branch>                  # exec tmux attach (or use the browser terminal)
@@ -66,6 +67,13 @@ weaver log --limit 50                 # recent events for the current branch
 
 `loom launch --issue 123` seeds the branch's title / goal / description from a
 GitHub issue (via the `gh` CLI).
+
+`loom launch --model <haiku|sonnet|opus> --effort <low|medium|high|xhigh|max>`
+(both also selectors in the web create form) pin the session's Claude model
+tier and reasoning effort. They are orthogonal — any model runs at any effort —
+and spliced into the launch as `--model` / `--effort`. Both are stored per
+session, so adopting a recovered session resumes with the same settings. Omit
+either to inherit `agent.claude_args`.
 
 ## Status detection
 

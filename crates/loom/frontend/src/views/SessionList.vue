@@ -12,6 +12,8 @@ const repo = ref('');
 const repoFocused = ref(false);
 const title = ref('');
 const goal = ref('');
+const model = ref('');
+const effort = ref('');
 const name = ref('');
 const nameEdited = ref(false);
 const creating = ref(false);
@@ -113,6 +115,8 @@ async function create() {
       cwd: repo.value,
       title: title.value || undefined,
       goal: goal.value,
+      model: model.value || undefined,
+      effort: effort.value || undefined,
     };
     if (branchMode.value === 'existing') {
       body.existing_branch = existingBranch.value.trim();
@@ -122,6 +126,8 @@ async function create() {
     await post('/sessions', body);
     title.value = '';
     goal.value = '';
+    model.value = '';
+    effort.value = '';
     name.value = '';
     existingBranch.value = '';
     nameEdited.value = false;
@@ -215,11 +221,44 @@ onUnmounted(() => clearInterval(timer));
         <label class="block text-xs text-neutral-400 mb-1">
           Goal — optional; leave blank to start the agent with no prompt
         </label>
-        <input
+        <textarea
           v-model="goal"
+          rows="4"
           placeholder="Add a /health endpoint that returns 200"
-          class="w-full rounded bg-neutral-800 px-2 py-1.5 text-sm outline-none focus:ring-1 ring-emerald-600"
-        />
+          class="w-full rounded bg-neutral-800 px-2 py-1.5 text-sm outline-none focus:ring-1 ring-emerald-600 resize-y"
+        ></textarea>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs text-neutral-400 mb-1">Model</label>
+          <select
+            v-model="model"
+            class="w-full rounded bg-neutral-800 px-2 py-1.5 text-sm outline-none focus:ring-1 ring-emerald-600"
+          >
+            <option value="">Default</option>
+            <option value="haiku">Haiku</option>
+            <option value="sonnet">Sonnet</option>
+            <option value="opus">Opus</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs text-neutral-400 mb-1">Effort</label>
+          <select
+            v-model="effort"
+            class="w-full rounded bg-neutral-800 px-2 py-1.5 text-sm outline-none focus:ring-1 ring-emerald-600"
+          >
+            <option value="">Default</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+            <option value="xhigh">X-High</option>
+            <option value="max">Max</option>
+          </select>
+        </div>
+        <p class="col-span-2 -mt-1 text-xs text-neutral-600">
+          Model tier and reasoning effort for the Claude agent. Leave as Default
+          to inherit the configured launch args.
+        </p>
       </div>
       <div>
         <div class="inline-flex rounded border border-neutral-700 text-xs overflow-hidden mb-2">
@@ -313,36 +352,58 @@ onUnmounted(() => clearInterval(timer));
       No sessions yet.
     </p>
 
-    <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-      <router-link
-        v-for="s in sessions"
-        :key="s.id"
-        :to="`/s/${s.id}`"
-        data-testid="session-card"
-        :data-session-id="s.id"
-        class="block rounded border border-neutral-800 bg-neutral-900 p-4 hover:border-neutral-600 transition"
-      >
-        <div class="flex items-center justify-between gap-2 mb-2">
-          <span class="font-medium truncate">{{ s.branch.title || s.branch.name }}</span>
-          <StatusBadge :status="s.status" />
-        </div>
-        <p v-if="s.branch.goal" class="text-sm text-neutral-300 line-clamp-2 mb-2">
-          {{ s.branch.goal }}
-        </p>
-        <p v-if="s.branch.description" class="text-xs text-neutral-500 line-clamp-3 mb-2">
-          {{ s.branch.description }}
-        </p>
-        <div class="flex items-center justify-between text-xs text-neutral-600 font-mono">
-          <span>{{ s.id }} · {{ s.branch.branch }}</span>
-          <span
-            v-if="s.branch.open_issue_count"
-            class="rounded bg-neutral-800 px-1.5 py-0.5 text-neutral-300"
-            :title="`${s.branch.open_issue_count} open issue(s)`"
+    <div v-if="sessions.length" class="overflow-x-auto rounded border border-neutral-800">
+      <table class="w-full border-collapse text-sm">
+        <thead>
+          <tr class="border-b border-neutral-800 bg-neutral-900 text-left text-xs uppercase tracking-wide text-neutral-500">
+            <th class="px-3 py-2 font-medium">Status</th>
+            <th class="px-3 py-2 font-medium">Title</th>
+            <th class="px-3 py-2 font-medium">Goal</th>
+            <th class="px-3 py-2 font-medium">Latest status</th>
+            <th class="px-3 py-2 font-medium">Ref</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="s in sessions"
+            :key="s.id"
+            data-testid="session-card"
+            :data-session-id="s.id"
+            class="border-b border-neutral-800 last:border-0 hover:bg-neutral-900 cursor-pointer"
+            @click="$router.push(`/s/${s.id}`)"
           >
-            {{ s.branch.open_issue_count }} issue{{ s.branch.open_issue_count === 1 ? '' : 's' }}
-          </span>
-        </div>
-      </router-link>
+            <td class="px-3 py-2 align-top">
+              <router-link :to="`/s/${s.id}`" class="inline-block" @click.stop>
+                <StatusBadge :status="s.status" />
+              </router-link>
+            </td>
+            <td class="px-3 py-2 align-top">
+              <router-link
+                :to="`/s/${s.id}`"
+                class="block max-w-[16rem] truncate font-medium text-neutral-100 hover:text-emerald-400"
+                @click.stop
+              >
+                {{ s.branch.title || s.branch.name }}
+              </router-link>
+            </td>
+            <td class="px-3 py-2 align-top">
+              <span class="block max-w-[20rem] truncate text-neutral-300">{{ s.branch.goal }}</span>
+            </td>
+            <td class="px-3 py-2 align-top">
+              <span class="block max-w-[24rem] truncate text-neutral-500">{{ s.branch.description }}</span>
+            </td>
+            <td class="px-3 py-2 align-top">
+              <div class="font-mono text-xs text-neutral-600">
+                <span class="block truncate">{{ s.id }}</span>
+                <span class="block truncate">{{ s.branch.branch }}</span>
+                <span v-if="s.branch.open_issue_count" class="text-neutral-400">
+                  {{ s.branch.open_issue_count }} open issue{{ s.branch.open_issue_count === 1 ? '' : 's' }}
+                </span>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
   </div>
 </template>
