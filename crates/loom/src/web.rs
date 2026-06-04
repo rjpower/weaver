@@ -5,7 +5,7 @@
 //! * `/api/sessions` — list + create active sessions (each session is one
 //!   tmux + one agent attached to a branch).
 //! * `/api/sessions/{id}` — GET / PATCH / DELETE a single session, plus the
-//!   action subroutes `/note`, `/summarize`, `/merge`, `/adopt`, `/diff`,
+//!   action subroutes `/note`, `/summarize`, `/merge`, `/adopt`,
 //!   `/log`, `/events`, and `/terminal` (a WebSocket bridged to the session's
 //!   tmux via a PTY — see `crate::terminal`). Interacting with the agent
 //!   (keystrokes, keys, TUIs) happens entirely over `/terminal`.
@@ -334,7 +334,6 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/summarize", post(summarize_session))
         .route("/sessions/{id}/merge", post(merge_session))
         .route("/sessions/{id}/adopt", post(adopt_session))
-        .route("/sessions/{id}/diff", get(diff_session))
         .route("/sessions/{id}/tree", get(tree_session))
         .route("/sessions/{id}/file", get(file_session))
         .route("/sessions/{id}/raw", get(raw_session))
@@ -965,22 +964,6 @@ async fn adopt_session(
     adopt(&st, &session, &branch).await?;
     let (session, branch) = require_session(&st.db, &session.id).await?;
     Ok(Json(SessionView::build(&st.db, &session, &branch).await?))
-}
-
-async fn diff_session(
-    State(st): State<AppState>,
-    Path(key): Path<String>,
-) -> ApiResult<Json<Value>> {
-    let (session, branch) = require_session(&st.db, &key).await?;
-    let work_dir = PathBuf::from(&session.work_dir);
-    let base = git::merge_base(&work_dir, &branch.base_branch).await?;
-    let patch = git::diff(&work_dir, &base).await?;
-    let stat = git::diff_stat(&work_dir, &base).await?;
-    Ok(Json(json!({
-        "base": branch.base_branch,
-        "stat": stat,
-        "patch": patch,
-    })))
 }
 
 // ---------------------------------------------------------------------------

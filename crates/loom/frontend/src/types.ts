@@ -79,12 +79,6 @@ export interface WeaverEvent {
   created_at: string;
 }
 
-export interface DiffStat {
-  files_changed: number;
-  insertions: number;
-  deletions: number;
-}
-
 /** A file dropped into the worktree's `scratch/` directory. */
 export interface ScratchFile {
   name: string;

@@ -24,6 +24,8 @@ const expanded = reactive(new Set<string>());
 const search = ref('');
 const selected = ref('');
 const loadError = ref('');
+const showChanges = ref(true);
+const showFiles = ref(true);
 
 const session = ref<Session | null>(null);
 
@@ -100,6 +102,17 @@ function statusOf(path: string): string | undefined {
 }
 
 const changedCount = computed(() => Object.keys(tree.value?.changed ?? {}).length);
+
+// Just the changed files, flat and sorted, for the pinned Changes list — the
+// review surface, reachable without hunting through the full tree. Honours the
+// same filter box as the tree so typing narrows both.
+const changedList = computed(() => {
+  const q = search.value.trim().toLowerCase();
+  return Object.entries(tree.value?.changed ?? {})
+    .filter(([path]) => !q || path.toLowerCase().includes(q))
+    .map(([path, status]) => ({ path, status, name: path.slice(path.lastIndexOf('/') + 1) }))
+    .sort((a, b) => a.path.localeCompare(b.path));
+});
 
 // Status → single-letter badge + colour class.
 function badge(status: string): { letter: string; cls: string } {
@@ -374,7 +387,46 @@ onUnmounted(teardownEditors);
             class="w-full rounded bg-input px-2 py-1 text-xs outline-none"
           />
         </div>
-        <div class="min-h-0 flex-1 overflow-auto py-1 text-sm">
+        <!-- Changes: a flat, pinned list of just the changed files, so the
+             review surface is reachable without hunting through the tree.
+             Clicking a row opens it in the Monaco diff editor. -->
+        <div v-if="changedList.length" class="shrink-0 border-b border-line">
+          <button
+            class="flex w-full items-center gap-1 px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-faint hover:text-muted"
+            @click="showChanges = !showChanges"
+          >
+            <span class="w-3 shrink-0">{{ showChanges ? '▾' : '▸' }}</span>
+            <span>Changes</span>
+            <span class="text-faint">({{ changedList.length }})</span>
+          </button>
+          <div v-show="showChanges" class="max-h-48 overflow-auto pb-1 text-sm">
+            <div
+              v-for="c in changedList"
+              :key="c.path"
+              class="flex cursor-pointer items-center gap-1 py-0.5 pl-5 pr-2 hover:bg-subtle/60"
+              :class="selected === c.path ? 'bg-subtle' : ''"
+              :title="c.path"
+              @click="open(c.path)"
+            >
+              <span class="shrink-0 font-mono text-[10px]" :class="badge(c.status).cls">
+                {{ badge(c.status).letter }}
+              </span>
+              <span class="min-w-0 truncate" :class="selected === c.path ? 'text-fg' : 'text-muted'">
+                {{ c.name }}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <!-- All files -->
+        <button
+          class="flex shrink-0 items-center gap-1 px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-faint hover:text-muted"
+          @click="showFiles = !showFiles"
+        >
+          <span class="w-3 shrink-0">{{ showFiles ? '▾' : '▸' }}</span>
+          <span>Files</span>
+        </button>
+        <div v-show="showFiles" class="min-h-0 flex-1 overflow-auto pb-1 text-sm">
           <div
             v-for="row in rows"
             :key="row.node.path"

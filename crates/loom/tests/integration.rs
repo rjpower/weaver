@@ -277,13 +277,6 @@ async fn session_lifecycle() {
     }
     assert!(working, "monitor should have flipped status to working");
 
-    // The diff endpoint responds (no changes yet).
-    let diff = client
-        .get(&format!("/api/sessions/{id}/diff"))
-        .await
-        .unwrap();
-    assert!(diff["patch"].is_string());
-
     // Scratch files: empty to start, then an upload lands at scratch/<name> in
     // the worktree, is listed, and can be deleted. Path-traversal names are
     // rejected.

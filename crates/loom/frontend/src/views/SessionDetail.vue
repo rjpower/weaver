@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { get, post, patch, del } from '../api';
-import type { Session, WeaverEvent, DiffStat, Issue } from '../types';
+import type { Session, WeaverEvent, Issue } from '../types';
 import StatusBadge from '../components/StatusBadge.vue';
 import AgentTerminal from '../components/AgentTerminal.vue';
 import ScratchPanel from '../components/ScratchPanel.vue';
@@ -21,7 +21,6 @@ const titleDraft = ref('');
 const goalDraft = ref('');
 const descDraft = ref('');
 
-const diff = ref<{ stat: DiffStat; patch: string } | null>(null);
 const busy = ref('');
 
 let source: EventSource | null = null;
@@ -116,14 +115,6 @@ const summarize = () =>
     descDraft.value = res.description;
     notice.value = 'Summary updated.';
     await loadSession();
-  });
-
-const loadDiff = () =>
-  act('diff', async () => {
-    diff.value = (await get(`/sessions/${props.id}/diff`)) as {
-      stat: DiffStat;
-      patch: string;
-    };
   });
 
 const merge = () =>
@@ -340,7 +331,7 @@ onUnmounted(() => source?.close());
         </section>
       </div>
 
-      <!-- Right: live terminal, events, diff -->
+      <!-- Right: live terminal, events -->
       <div class="space-y-5 lg:col-span-2">
         <section class="rounded border border-line bg-surface p-4">
           <div class="text-xs text-muted mb-2">Terminal</div>
@@ -360,28 +351,6 @@ onUnmounted(() => source?.close());
           </ul>
         </section>
 
-        <section class="rounded border border-line bg-surface p-4">
-          <div class="flex items-center justify-between mb-2">
-            <span class="text-xs text-muted">Diff vs {{ ws.branch.base_branch }}</span>
-            <button
-              class="rounded bg-subtle hover:bg-subtle-hover px-2 py-0.5 text-xs"
-              :disabled="busy === 'diff'"
-              @click="loadDiff"
-            >
-              {{ busy === 'diff' ? 'Loading…' : 'Load diff' }}
-            </button>
-          </div>
-          <div v-if="diff">
-            <p class="text-xs text-muted mb-2">
-              {{ diff.stat.files_changed }} files ·
-              <span class="text-green-600 dark:text-green-400">+{{ diff.stat.insertions }}</span> ·
-              <span class="text-red-400">-{{ diff.stat.deletions }}</span>
-            </p>
-            <pre
-              class="max-h-96 overflow-auto rounded bg-code p-3 text-xs text-code-fg whitespace-pre-wrap"
-            >{{ diff.patch || '(no changes)' }}</pre>
-          </div>
-        </section>
       </div>
     </div>
   </div>
