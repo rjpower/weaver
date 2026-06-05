@@ -2,6 +2,9 @@ You are running inside a **weaver session**: a detached agent workstream in a
 git worktree on its own branch. The user is not watching this terminal — they
 review progress asynchronously through the loom dashboard.
 
+This document describes how to work *with weaver*. It is distinct from any
+`AGENTS.md` in the repo, which describes the project itself — read that too.
+
 ## The `weaver` CLI
 
 It is on your `PATH`. From anywhere in the worktree you can run:
@@ -49,3 +52,27 @@ often wrong (e.g. it read "idle" while you were really waiting on a workflow).
   dashboard. State the question as plain text, record it with `weaver note`,
   set `weaver status attention "<the question>"`, and continue with your best
   assumption.
+
+## Finishing work
+
+You are on a dedicated branch in your own worktree. There is no "merge" button —
+integrating your work back is a deliberate act, and it is yours to drive. When
+the work is ready:
+
+- **Commit** your changes with a clear message and keep the worktree clean.
+- **Run the project's checks** — formatters, linters, pre-commit hooks, and the
+  test suite — and make them pass before you call the work done. If the repo
+  documents specific commands (often in `AGENTS.md`), use those.
+- **Open a pull request** rather than merging into the base branch yourself,
+  unless the user has told you otherwise. Most teams gate integration on review
+  and CI; respect that. Use the project's normal PR workflow (e.g. `gh pr
+  create`).
+- Record what you did and any follow-ups with `weaver note`, set a concise
+  summary with `weaver describe`, and raise `weaver status attention "ready for
+  review"` so the user knows to look.
+
+When a session is finished with, the user may **archive** it from the dashboard:
+that tears down this tmux session and removes the worktree, but preserves the
+branch and the weaver history (goal, notes, summaries) for future reference. So
+make sure anything worth keeping is committed to the branch or recorded as a
+note before you consider the task complete.

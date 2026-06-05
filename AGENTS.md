@@ -1,8 +1,9 @@
 # AGENTS.md
 
 Engineer-facing notes for hacking on weaver itself. For user-facing docs read
-[README.md](README.md); for the prompt the in-workspace agent sees, read
-[crates/weaver-core/primer.md](crates/weaver-core/primer.md).
+[README.md](README.md); for the prompt the in-workspace agent sees, read the
+builtin [crates/weaver-core/WEAVER.md](crates/weaver-core/WEAVER.md) (a repo can
+ship its own `WEAVER.md` to override it).
 
 ## Mental model
 
@@ -103,7 +104,7 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `GET /api/health` | liveness probe |
 | `GET /api/sessions` / `POST /api/sessions` | list / create sessions |
 | `GET PATCH DELETE /api/sessions/{id}` | session CRUD (status, title, goal, description) |
-| `POST /api/sessions/{id}/{note,summarize,merge,adopt}` | actions |
+| `POST /api/sessions/{id}/{note,summarize,archive,adopt}` | actions |
 | `GET /api/sessions/{id}/{diff,log,events}` | reads + SSE stream |
 | `GET /api/sessions/{id}/terminal` | WebSocket: xterm.js ⇄ PTY ⇄ tmux (the interaction surface) |
 | `GET /api/branches` / `GET PATCH /api/branches/{id}` | list / inspect / edit tracked branches |
@@ -160,7 +161,7 @@ block into the worktree's `.claude/settings.local.json` (see
 
 | Claude hook event | shells out to |
 |---|---|
-| `SessionStart` | `weaver hook --event session-start` (also injects [[crates/weaver-core/primer.md]] as `additionalContext`) |
+| `SessionStart` | `weaver hook --event session-start` (also injects the repo's `WEAVER.md`, or the builtin [[crates/weaver-core/WEAVER.md]], as `additionalContext`) |
 | `UserPromptSubmit` | `weaver hook --event working` |
 | `Notification` | `weaver hook --event waiting` |
 | `Stop` | `weaver hook --event idle` |

@@ -47,7 +47,7 @@ loom ps                               # list active sessions
 loom show <branch>                    # session detail
 loom attach <branch>                  # exec tmux attach (or use the browser terminal)
 loom summary <branch>                 # force a fresh summary now
-loom merge <branch>                   # merge the branch into its base
+loom archive <branch>                 # tear down tmux + worktree, keep branch + history
 loom adopt <branch>                   # recreate tmux for an orphaned session
 loom rm <branch>                      # remove worktree + tmux + db row
 loom open                             # open the web UI
@@ -131,7 +131,7 @@ Loom serves a JSON API under `/api`; the Vue SPA is the primary consumer.
 
 - `GET /api/health`
 - `GET POST /api/sessions`, `GET PATCH DELETE /api/sessions/{id}`,
-  `POST /api/sessions/{id}/{note,summarize,merge,adopt}`,
+  `POST /api/sessions/{id}/{note,summarize,archive,adopt}`,
   `GET /api/sessions/{id}/{diff,log,events}`,
   `GET /api/sessions/{id}/terminal` (WebSocket: xterm.js ⇄ PTY ⇄ tmux)
 - `GET /api/branches`, `GET PATCH /api/branches/{id}`,

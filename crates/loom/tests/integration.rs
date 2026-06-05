@@ -600,6 +600,67 @@ async fn session_lifecycle() {
         .await
         .unwrap();
 
+    // ---- Archive -------------------------------------------------------------
+    // Archiving tears down tmux + worktree but, unlike delete, keeps the session
+    // row (marked `archived`), the git branch, and the weaver history.
+    let arch = client
+        .post(
+            "/api/sessions",
+            json!({
+                "goal": "archive me",
+                "cwd": repo.path().to_string_lossy(),
+                "agent": "shell",
+            }),
+        )
+        .await
+        .unwrap();
+    let arch_id = arch["id"].as_str().unwrap().to_string();
+    let arch_session = arch["tmux_session"].as_str().unwrap().to_string();
+    let arch_work_dir = arch["work_dir"].as_str().unwrap().to_string();
+    assert!(tmux::has_session(&arch_session).await, "archive session missing");
+    assert!(Path::new(&arch_work_dir).exists(), "archive worktree missing");
+    // A note proves the weaver history survives the archive.
+    client
+        .post(
+            &format!("/api/sessions/{arch_id}/note"),
+            json!({ "text": "decision: keep going" }),
+        )
+        .await
+        .unwrap();
+
+    let res = client
+        .post(&format!("/api/sessions/{arch_id}/archive"), json!({}))
+        .await
+        .unwrap();
+    assert_eq!(res["archived"], true);
+    assert!(
+        !tmux::has_session(&arch_session).await,
+        "archive should kill the tmux session"
+    );
+    assert!(
+        !Path::new(&arch_work_dir).exists(),
+        "archive should remove the worktree"
+    );
+    // The session row persists, now terminal/`archived`.
+    let view = client.get(&format!("/api/sessions/{arch_id}")).await.unwrap();
+    assert_eq!(view["status"], "archived");
+    // The git branch is left intact for future reference.
+    assert!(
+        weaver_core::git::branch_exists(repo.path(), "weaver/archive-me").await,
+        "archive must not delete the branch"
+    );
+    // The note history survives in the branch log.
+    let log = client.get(&format!("/api/sessions/{arch_id}/log")).await.unwrap();
+    assert!(
+        serde_json::to_string(&log).unwrap().contains("keep going"),
+        "note history should survive archive"
+    );
+    // An archived session can still be fully removed afterwards.
+    client
+        .delete(&format!("/api/sessions/{arch_id}"))
+        .await
+        .unwrap();
+
     // Deleting the session tears down the tmux session and the DB row.
     client.delete(&format!("/api/sessions/{id}")).await.unwrap();
     assert!(

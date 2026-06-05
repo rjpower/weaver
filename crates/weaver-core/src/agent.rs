@@ -1,5 +1,5 @@
 //! Agent-facing helpers that are pure (no tmux, no process spawning): the
-//! Claude Code hook config and the SessionStart primer.
+//! Claude Code hook config and the SessionStart primer (a WEAVER.md).
 
 use serde_json::{json, Value};
 
@@ -27,17 +27,26 @@ pub fn hooks_json(weaver_bin: &str) -> Value {
     })
 }
 
-/// The session primer, kept as a standalone markdown doc and catted in at
-/// build time so `weaver hook` stays self-contained wherever it runs.
-const PRIMER: &str = include_str!("../primer.md");
+/// The builtin WEAVER.md — how an agent works inside a weaver session — kept as
+/// a standalone markdown doc and catted in at build time so `weaver hook` stays
+/// self-contained wherever it runs. A repo may ship its own `WEAVER.md` to
+/// override this; see [`session_primer`].
+const BUILTIN_WEAVER_MD: &str = include_str!("../WEAVER.md");
 
-/// Context injected at SessionStart (via the `session-start` weaver hook): tells
-/// the agent it is in a weaver session and how it is expected to behave.
-pub fn session_primer() -> String {
+/// The builtin WEAVER.md, used when the repo doesn't ship its own.
+pub fn builtin_weaver_md() -> &'static str {
+    BUILTIN_WEAVER_MD
+}
+
+/// Context injected at SessionStart (via the `session-start` weaver hook): a
+/// WEAVER.md telling the agent it is in a weaver session and how it is expected
+/// to behave. `weaver_md` is the repo's own WEAVER.md when present, else
+/// [`builtin_weaver_md`].
+pub fn session_primer(weaver_md: &str) -> String {
     json!({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": PRIMER,
+            "additionalContext": weaver_md,
         }
     })
     .to_string()
@@ -66,12 +75,19 @@ mod tests {
     }
 
     #[test]
-    fn session_primer_is_session_start_additional_context() {
-        let v: Value = serde_json::from_str(&session_primer()).unwrap();
+    fn session_primer_wraps_the_builtin_weaver_md() {
+        let v: Value = serde_json::from_str(&session_primer(builtin_weaver_md())).unwrap();
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
         assert!(v["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap()
             .contains("weaver note"));
+    }
+
+    #[test]
+    fn session_primer_passes_a_repo_override_through_verbatim() {
+        let custom = "# Our team's weaver workflow\nrun `make ci` before any PR.";
+        let v: Value = serde_json::from_str(&session_primer(custom)).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], custom);
     }
 }

@@ -89,7 +89,7 @@ a separate query (`open_count_for_repo`).
 ## The default: branch vs repo
 
 `weaver issue ls`'s dominant caller is the **in-worktree agent** (see
-[primer.md](../crates/weaver-core/primer.md): "the branch's issue list"). Its
+[WEAVER.md](../crates/weaver-core/WEAVER.md): "the branch's issue list"). Its
 mental model and its context budget are branch-local. A repo-wide dump (dozens
 of items from unrelated workstreams) is noise that pollutes the agent's context
 and invites scope creep ("I see #42 about the logger, let me fix that too" while
@@ -160,5 +160,6 @@ Repo backlog (5 unclaimed, showing 5):
 - **Removing a session (`loom rm`) clears `claimed_branch`** on its issues — the
   issue returns *open* to the unclaimed backlog, ready to be re-picked.
 - *Interaction to watch:* an issue worked-but-not-closed before teardown
-  reappears in the backlog. That's intended — merge isn't "resolved"; close is.
+  reappears in the backlog. That's intended — shipping the work isn't
+  "resolved"; close is.
   The fix is simply to `close` when actually done.

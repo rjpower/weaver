@@ -488,6 +488,25 @@ async fn ensure_issue_in_repo(db: &db::Db, id: i64, repo_root: &str) -> Result<i
     Ok(i)
 }
 
+/// The WEAVER.md to inject at session start: the repo's own copy when it ships
+/// one, else the builtin. We look in the worktree the hook is actually running
+/// in (its cwd at launch is the worktree root) and then in the primary checkout,
+/// so a `WEAVER.md` committed on the base branch is picked up either way.
+fn weaver_md_for_branch(branch: &branch::Branch) -> String {
+    let candidates = std::env::current_dir()
+        .ok()
+        .into_iter()
+        .chain(std::iter::once(std::path::PathBuf::from(&branch.repo_root)));
+    for dir in candidates {
+        if let Ok(md) = std::fs::read_to_string(dir.join("WEAVER.md")) {
+            if !md.trim().is_empty() {
+                return md;
+            }
+        }
+    }
+    weaver_core::agent::builtin_weaver_md().to_string()
+}
+
 async fn cmd_hook(event: String) -> Result<()> {
     // Hooks must never break the agent: best-effort, swallow errors.
     let result: Result<()> = (async {
@@ -496,7 +515,8 @@ async fn cmd_hook(event: String) -> Result<()> {
         events::record_local(&db, &b.id, "hook", json!({ "event": event })).await?;
         match event.as_str() {
             "session-start" => {
-                print!("{}", weaver_core::agent::session_primer());
+                let weaver_md = weaver_md_for_branch(&b);
+                print!("{}", weaver_core::agent::session_primer(&weaver_md));
             }
             "idle" => {
                 // Claude Code's Stop hook pipes a JSON payload on stdin that

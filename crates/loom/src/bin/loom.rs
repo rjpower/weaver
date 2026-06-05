@@ -1,7 +1,7 @@
 //! loom — the orchestration CLI.
 //!
 //! Most subcommands talk to the running loom daemon over HTTP (session
-//! lifecycle, summary, merge, adopt). `serve` runs the daemon itself;
+//! lifecycle, summary, archive, adopt). `serve` runs the daemon itself;
 //! `start`/`stop`/`restart`/`status` manage its background lifecycle. To
 //! interact with an agent, `attach` to its tmux (the browser terminal is the
 //! other interaction surface).
@@ -88,8 +88,8 @@ enum Cmd {
     Attach { branch: String },
     /// Force a fresh summary of a session.
     Summary { branch: String },
-    /// Merge a session's branch into its base branch.
-    Merge { branch: String },
+    /// Archive a session: tear down tmux + worktree, keep branch + history.
+    Archive { branch: String },
     /// Recreate the tmux session for an orphaned session.
     Adopt { branch: String },
     /// Remove a session (worktree + tmux + DB row).
@@ -141,7 +141,7 @@ async fn run() -> Result<()> {
         Cmd::Show { branch } => cmd_show(branch).await,
         Cmd::Attach { branch } => cmd_attach(branch).await,
         Cmd::Summary { branch } => cmd_summary(branch).await,
-        Cmd::Merge { branch } => cmd_merge(branch).await,
+        Cmd::Archive { branch } => cmd_archive(branch).await,
         Cmd::Adopt { branch } => cmd_adopt(branch).await,
         Cmd::Rm {
             branch,
@@ -572,15 +572,21 @@ async fn cmd_summary(key: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_merge(key: String) -> Result<()> {
+async fn cmd_archive(key: String) -> Result<()> {
     let client = Client::new();
     let res = client
-        .post(&format!("/api/sessions/{key}/merge"), json!({}))
+        .post(&format!("/api/sessions/{key}/archive"), json!({}))
         .await?;
-    println!("merged {}", str_field(&res, "branch"));
-    let output = str_field(&res, "output");
-    if !output.is_empty() {
-        println!("{output}");
+    println!(
+        "archived {} (tmux + worktree removed; branch and history kept)",
+        str_field(&res, "branch")
+    );
+    if let Some(warnings) = res.get("warnings").and_then(Value::as_array) {
+        for w in warnings {
+            if let Some(w) = w.as_str() {
+                eprintln!("  warning: {w}");
+            }
+        }
     }
     Ok(())
 }
