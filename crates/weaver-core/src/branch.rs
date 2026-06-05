@@ -16,11 +16,11 @@ pub struct Branch {
     pub base_branch: String,
     pub goal: String,
     pub title: String,
+    /// The agent's current-state message, set together with [`Branch::attention`]
+    /// via `weaver set-status`. Free-form ("Wired up routes; tests pass").
     pub description: String,
     /// Agent-declared attention level: one of [`ATTENTION_LEVELS`].
     pub attention: String,
-    /// Short free-text reason for the current attention level.
-    pub attention_note: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -210,18 +210,17 @@ pub async fn set_description(db: &Db, id: &str, description: &str) -> Result<()>
     Ok(())
 }
 
-/// Set the agent-declared attention level and its short note in one write.
-/// `level` is assumed already validated by the caller (see [`is_valid_attention`]).
-pub async fn set_attention(db: &Db, id: &str, level: &str, note: &str) -> Result<()> {
-    sqlx::query(
-        "UPDATE branches SET attention = ?, attention_note = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(level)
-    .bind(note)
-    .bind(now_iso())
-    .bind(id)
-    .execute(db)
-    .await?;
+/// Set the agent-declared attention level. The accompanying current-state
+/// message lives in [`Branch::description`] (see [`set_description`]); the two
+/// are written together by `weaver set-status`. `level` is assumed already
+/// validated by the caller (see [`is_valid_attention`]).
+pub async fn set_attention(db: &Db, id: &str, level: &str) -> Result<()> {
+    sqlx::query("UPDATE branches SET attention = ?, updated_at = ? WHERE id = ?")
+        .bind(level)
+        .bind(now_iso())
+        .bind(id)
+        .execute(db)
+        .await?;
     Ok(())
 }
 

@@ -17,10 +17,10 @@ export interface Branch {
   name: string;
   title: string;
   goal: string;
+  /** Current-state message, set with `attention` via `weaver set-status`. */
   description: string;
   /** Agent-declared attention level: 'ok' | 'attention' | 'blocked'. */
   attention: string;
-  attention_note: string;
   repo_root: string;
   branch: string;
   base_branch: string;
@@ -39,7 +39,6 @@ export interface Session {
   pending_prompt: string;
   github_repo: string | null;
   last_activity_at: string;
-  summary_updated_at: string | null;
   created_at: string;
   updated_at: string;
   branch: Branch;
@@ -66,11 +65,11 @@ export interface WeaverFixture {
   listSessions(): Promise<Session[]>;
   /** Flip a session's status by writing a hook event row via `weaver hook`. */
   hook(session: Session, event: 'working' | 'waiting' | 'idle'): Promise<void>;
-  /** Declare the agent's attention level + note via `weaver status`. */
+  /** Declare the agent's status (level + message) via `weaver set-status`. */
   setStatus(
     session: Session,
     level: 'ok' | 'attention' | 'blocked',
-    note?: string,
+    message?: string,
   ): Promise<void>;
 }
 
@@ -240,10 +239,11 @@ export const test = base.extend<{ weaver: WeaverFixture }>({
         });
       },
 
-      async setStatus(session, level, note) {
-        // `weaver status <level> [note]` writes the branch's attention fields
-        // directly and records an `attention` event the monitor re-broadcasts.
-        const args = ['status', level, ...(note ? [note] : [])];
+      async setStatus(session, level, message) {
+        // `weaver set-status <level> [message]` writes the branch's attention
+        // level (and message) directly and records an `attention` event the
+        // monitor re-broadcasts.
+        const args = ['set-status', level, ...(message ? [message] : [])];
         execFileSync(WEAVER_BINARY, args, {
           env: { ...childEnv, WEAVER_BRANCH: session.branch.id },
           stdio: 'pipe',

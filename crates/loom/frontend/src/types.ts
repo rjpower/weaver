@@ -8,13 +8,12 @@ export interface Branch {
   name: string;
   title: string;
   goal: string;
+  /** The agent's current-state message, set together with `attention` via
+   *  `weaver set-status` (e.g. "Wired up routes; tests pass"). */
   description: string;
   /** Agent-declared attention level: 'ok' | 'attention' | 'blocked'. The
-   *  "does this need me?" signal, set by the agent via `weaver status`. */
+   *  "does this need me?" signal, set by the agent via `weaver set-status`. */
   attention: string;
-  /** Short free-text reason for the attention level, e.g. "Waiting for PR
-   *  review feedback". */
-  attention_note: string;
   repo_root: string;
   branch: string;
   base_branch: string;
@@ -38,7 +37,6 @@ export interface Session {
   pending_prompt: string;
   github_repo: string | null;
   last_activity_at: string;
-  summary_updated_at: string | null;
   created_at: string;
   updated_at: string;
   branch: Branch;

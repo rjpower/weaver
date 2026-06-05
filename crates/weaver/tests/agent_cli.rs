@@ -147,7 +147,7 @@ fn issue_ls_separates_branch_work_from_repo_backlog() {
     );
 
     // The badge counts only this branch's claimed work, not the backlog.
-    let out = run(&env, &["status"]);
+    let out = run(&env, &["set-status"]);
     assert!(out.contains("open issues: 1"), "status: {out}");
 }
 
@@ -175,44 +175,59 @@ fn hook_writes_an_event_row() {
 }
 
 #[test]
-fn status_with_no_id_reports_current_branch() {
+fn set_status_with_no_id_reports_current_branch() {
     let env = setup();
     run(&env, &["goal", "do", "the", "thing"]);
     run(&env, &["issue", "add", "step", "one"]);
-    let out = run(&env, &["status"]);
+    let out = run(&env, &["set-status"]);
     assert!(out.contains("branch:      feature-test"), "status: {out}");
     assert!(out.contains("goal:        do the thing"), "status: {out}");
     assert!(out.contains("open issues: 1"), "status: {out}");
     // A fresh branch defaults to the calm `ok` attention level.
-    assert!(out.contains("attention:   ok"), "status: {out}");
+    assert!(out.contains("status:      ok"), "status: {out}");
 }
 
 #[test]
-fn status_set_attention_level_and_note() {
+fn set_status_sets_level_and_message() {
     let env = setup();
-    // Declare an attention level with a note, then read it back.
+    // Declare a level with a message, then read it back.
     let out = run(
         &env,
-        &["status", "attention", "Waiting", "for", "PR", "feedback"],
+        &[
+            "set-status",
+            "attention",
+            "Waiting",
+            "for",
+            "PR",
+            "feedback",
+        ],
     );
     assert!(
         out.contains("attention — Waiting for PR feedback"),
         "set output: {out}"
     );
 
-    let out = run(&env, &["status"]);
+    let out = run(&env, &["set-status"]);
     assert!(
-        out.contains("attention:   attention — Waiting for PR feedback"),
+        out.contains("status:      attention — Waiting for PR feedback"),
         "status read: {out}"
     );
 
-    // Setting a level with no note clears the note.
-    run(&env, &["status", "ok"]);
-    let out = run(&env, &["status"]);
-    assert!(out.contains("attention:   ok"), "status read: {out}");
+    // A new message replaces the old one.
+    run(&env, &["set-status", "ok", "back", "to", "work"]);
+    let out = run(&env, &["set-status"]);
     assert!(
-        !out.contains("Waiting for PR feedback"),
-        "note should be cleared: {out}"
+        out.contains("status:      ok — back to work"),
+        "status read: {out}"
+    );
+
+    // A bare level change keeps the last message (the message is the persistent
+    // current-state note; only the level is volatile).
+    run(&env, &["set-status", "blocked"]);
+    let out = run(&env, &["set-status"]);
+    assert!(
+        out.contains("status:      blocked — back to work"),
+        "message should persist across a bare level change: {out}"
     );
 
     // The set also writes an `attention` event to the branch log.
@@ -224,10 +239,10 @@ fn status_set_attention_level_and_note() {
 }
 
 #[test]
-fn status_set_rejects_unknown_level() {
+fn set_status_rejects_unknown_level() {
     let env = setup();
     let out = Command::new(weaver_bin())
-        .args(["status", "bogus"])
+        .args(["set-status", "bogus"])
         .current_dir(&env.repo_path)
         .env("WEAVER_HOME", &env.home_path)
         .env("WEAVER_API", "http://127.0.0.1:1")

@@ -14,10 +14,6 @@ use sqlx::Row;
 use crate::db::{now_iso, Db};
 
 pub const DEFAULT_AGENT: &str = "claude";
-/// Command used for headless diff summaries. `-p <prompt>` is appended and the
-/// diff is piped to stdin; extra flags here pick a model class.
-pub const DEFAULT_SUMMARY_COMMAND: &str = "claude";
-pub const DEFAULT_SUMMARY_INTERVAL_SECS: i64 = 600;
 /// Whether the server adopts orphaned sessions on startup. Off by default:
 /// the operator opts in via `weaver config set server.auto_adopt true`.
 pub const DEFAULT_AUTO_ADOPT: bool = false;
@@ -81,27 +77,6 @@ pub const REGISTRY: &[SettingSpec] = &[
         kind: SettingKind::String,
         default: "",
         group: "Agents",
-    },
-    SettingSpec {
-        key: "agent.summary_command",
-        label: "Summary agent command",
-        description: "Command run for the headless diff summaries shown on the \
-            dashboard. The branch diff is piped to its stdin and `-p \
-            <prompt>` is appended. Add flags to choose a cheaper model, e.g. \
-            `claude --model claude-haiku-4-5`.",
-        kind: SettingKind::String,
-        default: DEFAULT_SUMMARY_COMMAND,
-        group: "Agents",
-    },
-    SettingSpec {
-        key: "summary.interval_secs",
-        label: "Summary interval (seconds)",
-        description: "How long the background summarizer waits before \
-            revisiting a session that has had activity since its last \
-            summary.",
-        kind: SettingKind::Int,
-        default: "600",
-        group: "Summaries",
     },
     SettingSpec {
         key: "server.auto_adopt",
@@ -196,13 +171,6 @@ pub async fn get_or(db: &Db, key: &str, default: &str) -> String {
     get(db, key).await.unwrap_or_else(|| default.to_string())
 }
 
-pub async fn get_i64(db: &Db, key: &str, default: i64) -> i64 {
-    get(db, key)
-        .await
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
 /// Read a boolean setting. Accepts `true`/`1`/`yes`/`on` (case-insensitively)
 /// as true and `false`/`0`/`no`/`off` as false; anything else falls back to
 /// `default`.
@@ -291,8 +259,7 @@ mod tests {
 
     #[test]
     fn validate_checks_kinds_and_ignores_unknown_keys() {
-        assert!(validate("summary.interval_secs", "300").is_ok());
-        assert!(validate("summary.interval_secs", "soon").is_err());
+        // Bool-kind validation: only true/false-ish values pass.
         assert!(validate("server.auto_adopt", "yes").is_ok());
         assert!(validate("server.auto_adopt", "maybe").is_err());
         // Unregistered keys are free-form.

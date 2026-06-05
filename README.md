@@ -47,7 +47,6 @@ loom launch "Big refactor" --model opus --effort high      # pick model tier + r
 loom ps                               # list active sessions
 loom show <branch>                    # session detail
 loom attach <branch>                  # exec tmux attach (or use the browser terminal)
-loom summary <branch>                 # force a fresh summary now
 loom archive <branch>                 # tear down tmux + worktree, keep branch + history
 loom adopt <branch>                   # recreate tmux for an orphaned session
 loom rm <branch>                      # remove worktree + tmux + db row
@@ -56,16 +55,15 @@ loom open                             # open the web UI
 # Agent-facing (run from inside the worktree, no daemon required)
 weaver goal "ship the feature"
 weaver goal                           # print the current goal
-weaver describe "Wired up routes; tests pass."
 weaver note    "blocked on the DB schema"
-weaver status attention "ready for review"   # how the agent is doing (ok|attention|blocked)
+weaver set-status attention "ready for review"   # level (ok|attention|blocked) + current-state message
 weaver issue add "Backfill old rows" --body "ETA after the schema change"
 weaver issue add "Audit the logger" --repo   # unclaimed repo backlog item
 weaver issue ls                       # this branch's work + the repo backlog
 weaver issue ls --mine                # just this branch's claimed issues
 weaver issue ls --repo                # the whole repo, grouped by branch
 weaver issue close 7
-weaver status                         # goal + attention + open-issue count
+weaver set-status                     # read: goal + status + open-issue count
 weaver where                          # debug: print resolved repo / branch / branch-id
 weaver log --limit 50                 # recent events for the current branch
 ```
@@ -109,10 +107,13 @@ show what the agent is waiting on.
 The **attention** axis is the agent's own signal of whether it needs you:
 `ok` (going fine, or blocked on something external like a CI run or PR review),
 `attention` (a question, a decision, "ready for review"), or `blocked` (stuck,
-needs help). Agents set it with `weaver status <level> "<note>"`; the dashboard
-shows it and lets you filter for sessions that need a human. It replaces the old
-guessed working/waiting/idle indicator, which was often wrong — e.g. it read
-"idle" while the agent was actually waiting on a background workflow.
+needs help). Agents set it with `weaver set-status <level> "<message>"`, which
+records both the level and a one-line current-state message; a bare
+`weaver set-status <level>` changes the level and keeps the last message. The
+dashboard shows both and lets you filter for sessions that need a human. It
+replaces the old guessed working/waiting/idle indicator, which was often wrong —
+e.g. it read "idle" while the agent was actually waiting on a background
+workflow.
 
 ## Adoption
 
@@ -171,7 +172,7 @@ Edit them in the **Settings** pane of the web UI, or from the CLI:
 
 ```sh
 weaver config list
-weaver config get agent.summary_command
+weaver config get agent.default
 weaver config set agent.claude_args "--model claude-opus-4-7"
 weaver config unset agent.claude_args
 ```
@@ -182,9 +183,6 @@ Notable settings:
   is given no `--agent` (`claude`, `shell`, or a custom command).
 - `agent.claude_args` — extra arguments spliced into the Claude TUI launch,
   e.g. `--model claude-opus-4-7`.
-- `agent.summary_command` — command used for the headless diff summaries.
-- `summary.interval_secs` — how often the background summarizer revisits an
-  active session.
 - `server.auto_adopt` — adopt every recoverable session on daemon startup.
 
 ## Building
