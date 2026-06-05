@@ -12,6 +12,7 @@ const palette: Record<string, string> = {
   orphaned: 'bg-amber-900 text-amber-200',
   done: 'bg-indigo-800 text-indigo-100',
   error: 'bg-red-800 text-red-100',
+  archived: 'bg-subtle text-muted',
 };
 
 const cls = computed(() => palette[props.status] ?? 'bg-subtle text-fg');

@@ -320,7 +320,7 @@ function resizeFrame(cols: number, rows: number): Uint8Array {
 - Remove: the `screen` ref, the `screen` branch of the SSE `onStream` handler, the
   `/pane` fetch in `loadAll`, and the `send()` / `stop()` functions.
 - Keep: everything else (title/goal/description editing, status/summary/note/issue
-  SSE handling, diff, merge, remove, adopt).
+  SSE handling, diff, archive, remove, adopt).
 
 ## 9. CLI (`crates/loom/src/bin/loom.rs`)
 

@@ -132,11 +132,17 @@ const summarize = () =>
     await loadSession();
   });
 
-const merge = () =>
-  act('merge', async () => {
-    if (!confirm('Merge this branch into its base branch?')) return;
-    const res = (await post(`/sessions/${props.id}/merge`)) as { branch: string };
-    notice.value = `Merged ${res.branch}.`;
+const archive = () =>
+  act('archive', async () => {
+    if (
+      !confirm(
+        'Archive this session? This tears down its tmux and removes the worktree, ' +
+          'but keeps the branch and its weaver history for reference.',
+      )
+    )
+      return;
+    const res = (await post(`/sessions/${props.id}/archive`)) as { branch: string };
+    notice.value = `Archived ${res.branch}.`;
     await loadSession();
   });
 
@@ -369,11 +375,12 @@ onUnmounted(() => source?.close());
             {{ busy === 'adopt' ? 'Adopting…' : 'Adopt' }}
           </button>
           <button
+            v-if="ws.status !== 'archived'"
             class="rounded bg-indigo-700 hover:bg-indigo-600 px-3 py-1.5 text-sm"
-            :disabled="busy === 'merge'"
-            @click="merge"
+            :disabled="busy === 'archive'"
+            @click="archive"
           >
-            Merge
+            {{ busy === 'archive' ? 'Archiving…' : 'Archive' }}
           </button>
           <button
             class="rounded bg-red-800 hover:bg-red-700 px-3 py-1.5 text-sm"

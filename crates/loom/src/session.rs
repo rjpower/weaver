@@ -38,11 +38,11 @@ pub struct Session {
 /// "idle"). Liveness is all the orchestrator can know for sure; the agent
 /// reports the rest via `weaver status`.
 pub const STATUSES: &[&str] = &[
-    "created", "launching", "running", "orphaned", "done", "error",
+    "created", "launching", "running", "orphaned", "done", "error", "archived",
 ];
 
 pub fn is_terminal(status: &str) -> bool {
-    matches!(status, "done" | "error")
+    matches!(status, "done" | "error" | "archived")
 }
 
 pub struct NewSession {

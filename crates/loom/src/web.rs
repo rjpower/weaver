@@ -5,7 +5,7 @@
 //! * `/api/sessions` — list + create active sessions (each session is one
 //!   tmux + one agent attached to a branch).
 //! * `/api/sessions/{id}` — GET / PATCH / DELETE a single session, plus the
-//!   action subroutes `/note`, `/summarize`, `/merge`, `/adopt`,
+//!   action subroutes `/note`, `/summarize`, `/archive`, `/adopt`,
 //!   `/log`, `/events`, and `/terminal` (a WebSocket bridged to the session's
 //!   tmux via a PTY — see `crate::terminal`). Interacting with the agent
 //!   (keystrokes, keys, TUIs) happens entirely over `/terminal`.
@@ -340,7 +340,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/sessions/{id}/note", post(note_session))
         .route("/sessions/{id}/summarize", post(summarize_session))
-        .route("/sessions/{id}/merge", post(merge_session))
+        .route("/sessions/{id}/archive", post(archive_session))
         .route("/sessions/{id}/adopt", post(adopt_session))
         .route("/sessions/{id}/tree", get(tree_session))
         .route("/sessions/{id}/file", get(file_session))
@@ -921,39 +921,42 @@ async fn summarize_session(
     Ok(Json(json!({ "description": description })))
 }
 
-async fn merge_session(
+/// Archive a session: tear down its tmux and remove the worktree, but keep the
+/// branch (and its commits), the session row, notes, summaries and run history.
+/// This is the "I'm done with this workstream" action — unlike delete, the
+/// weaver/loom record is preserved for future reference, and the git branch is
+/// left intact so the work can be revisited or a worktree recreated later.
+async fn archive_session(
     State(st): State<AppState>,
     Path(key): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let (session, branch) = require_session(&st.db, &key).await?;
+    let mut warnings: Vec<String> = Vec::new();
+
+    tmux::kill_session(&session.tmux_session).await.ok();
     let repo_root = PathBuf::from(&branch.repo_root);
-    if !git::is_clean(&repo_root).await? {
-        return Err(AppError::conflict(
-            "main checkout has uncommitted changes; commit or stash, then merge",
-        ));
+    let work_dir = PathBuf::from(&session.work_dir);
+    if work_dir.exists() {
+        if let Err(e) = git::worktree_remove(&repo_root, &work_dir).await {
+            warnings.push(format!("worktree remove: {e}"));
+            tokio::fs::remove_dir_all(&work_dir).await.ok();
+        }
     }
-    let current = git::current_branch(&repo_root).await?;
-    if current != branch.base_branch {
-        return Err(AppError::conflict(format!(
-            "repo is on '{current}', expected base branch '{}'",
-            branch.base_branch
-        )));
-    }
-    let output = git::merge(&repo_root, &branch.branch)
-        .await
-        .map_err(|e| AppError::conflict(e.to_string()))?;
-    session_mod::set_status(&st.db, &session.id, "done").await?;
+    session_mod::set_status(&st.db, &session.id, "archived").await?;
     events::record(
         &st.db,
         &st.bus,
         &branch.id,
         "status",
-        json!({ "status": "done", "reason": "merged" }),
+        json!({ "status": "archived", "reason": "session archived" }),
     )
     .await
     .ok();
+    if !warnings.is_empty() {
+        tracing::warn!(branch = %branch.id, warnings = warnings.len(), "session archived with warnings");
+    }
     Ok(Json(
-        json!({ "merged": true, "branch": branch.branch, "output": output }),
+        json!({ "archived": true, "branch": branch.branch, "warnings": warnings }),
     ))
 }
 

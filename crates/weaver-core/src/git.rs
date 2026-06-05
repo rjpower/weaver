@@ -278,18 +278,6 @@ pub async fn diff_stat(work_dir: &Path, since: &str) -> Result<DiffStat> {
     Ok(stat)
 }
 
-/// True when the working tree has no uncommitted changes.
-pub async fn is_clean(dir: &Path) -> Result<bool> {
-    Ok(git(dir, &["status", "--porcelain"]).await?.is_empty())
-}
-
-/// Merge `branch` into the current branch of `repo_root` (no fast-forward).
-pub async fn merge(repo_root: &Path, branch: &str) -> Result<String> {
-    let out = git(repo_root, &["merge", "--no-ff", branch]).await?;
-    tracing::info!(%branch, repo = %repo_root.display(), "branch merged");
-    Ok(out)
-}
-
 // ---------------------------------------------------------------------------
 // Worktree browsing — file listing, change detection, and blob reads, used by
 // loom's file-viewer endpoints.
