@@ -22,10 +22,11 @@ function levelOf(s: Session): string {
   return s.branch.attention || 'ok';
 }
 
-// The attention reason to show in the list — suppressed for archived sessions
-// so a torn-down workstream doesn't keep displaying "Waiting for input".
-function noteOf(s: Session): string {
-  return s.status === 'archived' ? '' : s.branch.attention_note;
+// The agent's current-state message (set with the level via `weaver set-status`)
+// shown beside the attention badge — suppressed for archived sessions so a
+// torn-down workstream doesn't keep displaying a stale message.
+function messageOf(s: Session): string {
+  return s.status === 'archived' ? '' : s.branch.description;
 }
 
 const counts = computed(() => {
@@ -434,18 +435,18 @@ onUnmounted(() => clearInterval(timer));
 
     <!--
       Two orthogonal status axes, one column each, no stacking:
-        · Attention — the agent's single "does this need me?" signal (weaver status)
-        · State     — the mechanical lifecycle: is the session working or not
-      Session (title + goal) and Summary describe the work itself.
+        · Status — the agent's single "does this need me?" signal: the
+          attention level plus its current-state message (weaver set-status)
+        · State  — the mechanical lifecycle: is the session working or not
+      Session (title + goal) describes the work itself.
     -->
     <div v-if="sessions.length" class="overflow-x-auto rounded border border-line">
       <table class="w-full border-collapse text-sm">
         <thead>
           <tr class="border-b border-line bg-surface text-left text-xs uppercase tracking-wide text-muted">
-            <th class="px-3 py-2 font-medium">Attention</th>
+            <th class="px-3 py-2 font-medium">Status</th>
             <th class="px-3 py-2 font-medium">State</th>
             <th class="px-3 py-2 font-medium">Session</th>
-            <th class="px-3 py-2 font-medium">Summary</th>
             <th class="px-3 py-2 font-medium">Ref</th>
           </tr>
         </thead>
@@ -459,9 +460,9 @@ onUnmounted(() => clearInterval(timer));
             @click="$router.push(`/s/${s.id}`)"
           >
             <td class="px-3 py-2 align-top">
-              <AttentionBadge :level="levelOf(s)" :note="noteOf(s)" />
-              <span v-if="noteOf(s)" class="mt-1 block max-w-[14rem] truncate text-xs text-muted">
-                {{ noteOf(s) }}
+              <AttentionBadge :level="levelOf(s)" :note="messageOf(s)" />
+              <span v-if="messageOf(s)" class="mt-1 block max-w-[22rem] truncate text-xs text-muted">
+                {{ messageOf(s) }}
               </span>
             </td>
             <td class="px-3 py-2 align-top">
@@ -470,17 +471,14 @@ onUnmounted(() => clearInterval(timer));
             <td class="px-3 py-2 align-top">
               <router-link
                 :to="`/s/${s.id}`"
-                class="block max-w-[20rem] truncate font-medium text-fg hover:text-accent"
+                class="block max-w-[24rem] truncate font-medium text-fg hover:text-accent"
                 @click.stop
               >
                 {{ s.branch.title || s.branch.name }}
               </router-link>
-              <span v-if="s.branch.goal" class="block max-w-[20rem] truncate text-xs text-muted">
+              <span v-if="s.branch.goal" class="block max-w-[24rem] truncate text-xs text-muted">
                 {{ s.branch.goal }}
               </span>
-            </td>
-            <td class="px-3 py-2 align-top">
-              <span class="block max-w-[24rem] truncate text-muted">{{ s.branch.description }}</span>
             </td>
             <td class="px-3 py-2 align-top">
               <div class="font-mono text-xs text-faint">

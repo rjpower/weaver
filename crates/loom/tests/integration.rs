@@ -688,7 +688,7 @@ async fn session_lifecycle() {
     client
         .patch(
             &format!("/api/sessions/{arch_id}"),
-            json!({ "attention": "attention", "attention_note": "Waiting for input" }),
+            json!({ "attention": "attention", "description": "Waiting for input" }),
         )
         .await
         .unwrap();
@@ -712,14 +712,11 @@ async fn session_lifecycle() {
         .await
         .unwrap();
     assert_eq!(view["status"], "archived");
-    // Archiving cleared the attention signal so the dashboard stops flagging it.
+    // Archiving cleared the attention level so the dashboard stops flagging it.
+    // The message (description) is kept as history.
     assert_eq!(
         view["branch"]["attention"], "ok",
         "archive should clear attention"
-    );
-    assert_eq!(
-        view["branch"]["attention_note"], "",
-        "archive should clear the attention note"
     );
     // The git branch is left intact for future reference.
     assert!(

@@ -121,7 +121,7 @@ async fn hook_event_drives_session_status() {
     );
 
     // A `waiting` hook (Claude blocked asking the user) raises the agent-declared
-    // attention axis to `attention` with a note — the dashboard's "needs me" flag.
+    // attention axis to `attention` — the dashboard's "needs me" flag.
     weaver_core::events::record_local(&pool, &branch_id, "hook", json!({ "event": "waiting" }))
         .await
         .unwrap();
@@ -131,7 +131,6 @@ async fn hook_event_drives_session_status() {
         let ws = client.get(&format!("/api/sessions/{id}")).await.unwrap();
         attention = ws["branch"]["attention"].as_str().unwrap_or("").to_string();
         if attention == "attention" {
-            assert_eq!(ws["branch"]["attention_note"], "Waiting for input");
             break;
         }
     }

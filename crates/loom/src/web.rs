@@ -5,7 +5,7 @@
 //! * `/api/sessions` — list + create active sessions (each session is one
 //!   tmux + one agent attached to a branch).
 //! * `/api/sessions/{id}` — GET / PATCH / DELETE a single session, plus the
-//!   action subroutes `/note`, `/summarize`, `/archive`, `/adopt`,
+//!   action subroutes `/note`, `/archive`, `/adopt`,
 //!   `/log`, `/events`, and `/terminal` (a WebSocket bridged to the session's
 //!   tmux via a PTY — see `crate::terminal`). Interacting with the agent
 //!   (keystrokes, keys, TUIs) happens entirely over `/terminal`.
@@ -34,7 +34,6 @@
 //!   "pending_prompt": "",
 //!   "github_repo": null,
 //!   "last_activity_at": "...",
-//!   "summary_updated_at": null,
 //!   "created_at": "...",
 //!   "updated_at": "...",
 //!   "branch": {
@@ -42,9 +41,8 @@
 //!     "name": "feature-x",            // short label (weaver/<slug> with prefix stripped)
 //!     "title": "...",
 //!     "goal": "...",
-//!     "description": "...",
+//!     "description": "...",         // current-state message (weaver set-status)
 //!     "attention": "ok",            // agent-declared: ok|attention|blocked
-//!     "attention_note": "",         // short reason, e.g. "Waiting for PR feedback"
 //!     "repo_root": "/path/to/repo",
 //!     "branch": "weaver/feature-x",
 //!     "base_branch": "main",
@@ -166,11 +164,13 @@ pub struct BranchView {
     pub name: String,
     pub title: String,
     pub goal: String,
+    /// The agent's current-state message, set with `attention` via
+    /// `weaver set-status`.
     pub description: String,
-    /// Agent-declared attention level (`ok` | `attention` | `blocked`) and its
-    /// short note — the "does this need me?" signal the dashboard filters on.
+    /// Agent-declared attention level (`ok` | `attention` | `blocked`) — the
+    /// "does this need me?" signal the dashboard filters on. The accompanying
+    /// message is `description`.
     pub attention: String,
-    pub attention_note: String,
     pub repo_root: String,
     pub branch: String,
     pub base_branch: String,
@@ -201,7 +201,6 @@ impl BranchView {
             goal: branch.goal.clone(),
             description: branch.description.clone(),
             attention: branch.attention.clone(),
-            attention_note: branch.attention_note.clone(),
             repo_root: branch.repo_root.clone(),
             branch: branch.branch.clone(),
             base_branch: branch.base_branch.clone(),
@@ -225,7 +224,6 @@ pub struct SessionView {
     pub pending_prompt: String,
     pub github_repo: Option<String>,
     pub last_activity_at: String,
-    pub summary_updated_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub branch: BranchView,
@@ -248,7 +246,6 @@ impl SessionView {
                 .last_activity_at
                 .clone()
                 .unwrap_or_else(|| branch.updated_at.clone()),
-            summary_updated_at: session.summary_updated_at.clone(),
             created_at: session.created_at.clone(),
             updated_at: branch.updated_at.clone(),
             branch: bv,
@@ -341,7 +338,6 @@ pub fn router(state: AppState) -> Router {
             get(get_session).patch(patch_session).delete(delete_session),
         )
         .route("/sessions/{id}/note", post(note_session))
-        .route("/sessions/{id}/summarize", post(summarize_session))
         .route("/sessions/{id}/archive", post(archive_session))
         .route("/sessions/{id}/adopt", post(adopt_session))
         .route("/sessions/{id}/tree", get(tree_session))
@@ -786,47 +782,41 @@ struct PatchSessionReq {
     // the underlying branch row).
     title: Option<String>,
     goal: Option<String>,
+    /// The agent's current-state message — the note shown beside the level.
+    /// Set together with `attention` via `weaver set-status`; the dashboard's
+    /// status editor patches both.
     description: Option<String>,
-    /// Agent-declared attention level (`ok` | `attention` | `blocked`) and note.
-    /// Branch-level; lets the dashboard set/clear what the agent set via
-    /// `weaver status`.
+    /// Agent-declared attention level (`ok` | `attention` | `blocked`).
+    /// Branch-level; lets the dashboard set what the agent set via
+    /// `weaver set-status`.
     attention: Option<String>,
-    attention_note: Option<String>,
 }
 
-/// Apply an attention patch to a branch: validate the level, update the branch
-/// fields, and broadcast an `attention` event. A missing `level`/`note` keeps the
-/// branch's current value, so a caller can change one without clobbering the
-/// other. No-op when neither is supplied.
+/// Apply an attention-level patch to a branch: validate it, update the branch,
+/// and broadcast an `attention` event. No-op when no level is supplied. The
+/// accompanying message lives in `description` and is patched separately.
 async fn apply_attention_patch(
     st: &AppState,
     branch: &Branch,
     level: Option<&str>,
-    note: Option<&str>,
 ) -> ApiResult<()> {
-    if level.is_none() && note.is_none() {
+    let Some(level) = level else {
         return Ok(());
-    }
-    let level = level
-        .map(str::trim)
-        .unwrap_or(branch.attention.as_str())
-        .to_ascii_lowercase();
+    };
+    let level = level.trim().to_ascii_lowercase();
     if !branch_mod::is_valid_attention(&level) {
         return Err(AppError::bad_request(format!(
             "invalid attention '{level}' — expected one of {}",
             branch_mod::ATTENTION_LEVELS.join(", ")
         )));
     }
-    let note = note
-        .map(str::trim)
-        .unwrap_or(branch.attention_note.as_str());
-    branch_mod::set_attention(&st.db, &branch.id, &level, note).await?;
+    branch_mod::set_attention(&st.db, &branch.id, &level).await?;
     events::record(
         &st.db,
         &st.bus,
         &branch.id,
         "attention",
-        json!({ "level": level, "note": note, "source": "manual" }),
+        json!({ "level": level, "source": "manual" }),
     )
     .await
     .ok();
@@ -839,13 +829,7 @@ async fn patch_session(
     Json(req): Json<PatchSessionReq>,
 ) -> ApiResult<Json<SessionView>> {
     let (session, branch) = require_session(&st.db, &key).await?;
-    apply_attention_patch(
-        &st,
-        &branch,
-        req.attention.as_deref(),
-        req.attention_note.as_deref(),
-    )
-    .await?;
+    apply_attention_patch(&st, &branch, req.attention.as_deref()).await?;
     if let Some(title) = &req.title {
         branch_mod::set_title(&st.db, &branch.id, title).await?;
     }
@@ -957,22 +941,8 @@ async fn note_session(
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn summarize_session(
-    State(st): State<AppState>,
-    Path(key): Path<String>,
-) -> ApiResult<Json<Value>> {
-    let (session, branch) = require_session(&st.db, &key).await?;
-    let description = crate::summary::summarize_session(&st, &session, &branch)
-        .await
-        .map_err(|e| {
-            tracing::error!(session = %session.id, error = %e, "claude summary failed");
-            AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-    Ok(Json(json!({ "description": description })))
-}
-
 /// Archive a session: tear down its tmux and remove the worktree, but keep the
-/// branch (and its commits), the session row, notes, summaries and run history.
+/// branch (and its commits), the session row, notes and run history.
 /// This is the "I'm done with this workstream" action — unlike delete, the
 /// weaver/loom record is preserved for future reference, and the git branch is
 /// left intact so the work can be revisited or a worktree recreated later.
@@ -997,9 +967,9 @@ async fn archive_session(
     // longer "need me". Clear any lingering attention (and the snapshotted
     // pending prompt) so the dashboard stops flagging a torn-down workstream.
     // Attention is the agent's live "does this need a human?" signal; nothing
-    // is live here any more. The history (goal, notes, summaries) is kept.
-    if branch.attention != branch_mod::DEFAULT_ATTENTION || !branch.attention_note.is_empty() {
-        branch_mod::set_attention(&st.db, &branch.id, branch_mod::DEFAULT_ATTENTION, "").await?;
+    // is live here any more. The history (goal, notes, description) is kept.
+    if branch.attention != branch_mod::DEFAULT_ATTENTION {
+        branch_mod::set_attention(&st.db, &branch.id, branch_mod::DEFAULT_ATTENTION).await?;
     }
     if !session.pending_prompt.is_empty() {
         session_mod::set_pending_prompt(&st.db, &session.id, "")
@@ -1466,7 +1436,6 @@ struct PatchBranchReq {
     goal: Option<String>,
     description: Option<String>,
     attention: Option<String>,
-    attention_note: Option<String>,
 }
 
 async fn patch_branch(
@@ -1475,13 +1444,7 @@ async fn patch_branch(
     Json(req): Json<PatchBranchReq>,
 ) -> ApiResult<Json<BranchView>> {
     let branch = require_branch(&st.db, &key).await?;
-    apply_attention_patch(
-        &st,
-        &branch,
-        req.attention.as_deref(),
-        req.attention_note.as_deref(),
-    )
-    .await?;
+    apply_attention_patch(&st, &branch, req.attention.as_deref()).await?;
     if let Some(title) = &req.title {
         branch_mod::set_title(&st.db, &branch.id, title).await?;
     }

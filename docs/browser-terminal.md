@@ -78,7 +78,7 @@ The terminal is a parallel, purely-interactive channel.
 
 | Concern | Plane | Keep? |
 |---|---|---|
-| Status (working/waiting/idle), pending prompt, notes, summary, issues, diff | hooks → events → SSE | **keep** |
+| Status (lifecycle + agent-declared attention), pending prompt, notes, issues, diff | hooks → events → SSE | **keep** |
 | Idle/orphan detection (screen stillness hash) | monitor `capture-pane` | **keep** (internal heartbeat) |
 | Interacting with the agent (keystrokes, keys, TUIs) | new PTY WebSocket | **add** |
 | Line input box (`POST /send`) | degraded interaction | **remove** |
@@ -319,7 +319,7 @@ function resizeFrame(cols: number, rows: number): Uint8Array {
   form with `<AgentTerminal :id="id" />`.
 - Remove: the `screen` ref, the `screen` branch of the SSE `onStream` handler, the
   `/pane` fetch in `loadAll`, and the `send()` / `stop()` functions.
-- Keep: everything else (title/goal/description editing, status/summary/note/issue
+- Keep: everything else (title/goal/status editing, status/note/issue
   SSE handling, diff, archive, remove, adopt).
 
 ## 9. CLI (`crates/loom/src/bin/loom.rs`)

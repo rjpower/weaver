@@ -27,23 +27,23 @@ struct Cli {
 enum Cmd {
     /// Print or set the goal of the current branch.
     Goal { text: Vec<String> },
-    /// Show the current branch's status, or set the agent's attention level.
+    /// Report the agent's status, or read it back.
     ///
-    /// With no arguments it prints the title, goal, attention, and open-issue
-    /// count. Given a level (`ok`, `attention`, or `blocked`) and an optional
-    /// note, it declares how the agent is doing — what the dashboard surfaces
-    /// and filters on. Use `attention` to ask the user to look ("ready for
-    /// review", a question) and `blocked` when stuck and needing help; `ok`
+    /// This is the agent's single channel for telling the dashboard how it is
+    /// doing. With no arguments it prints the title, goal, status, and
+    /// open-issue count. Given a level (`ok`, `attention`, or `blocked`) and an
+    /// optional message, it sets both at once: the level drives what the
+    /// dashboard surfaces and filters on, and the message is the current-state
+    /// note shown beside it. Use `attention` to ask the user to look ("ready
+    /// for review", a question) and `blocked` when stuck and needing help; `ok`
     /// covers both progressing normally and being blocked on something external
     /// (a CI run, a PR review) that is not the user.
-    Status {
-        /// Attention level to set: `ok`, `attention`, or `blocked`. Omit to read.
+    SetStatus {
+        /// Attention level: `ok`, `attention`, or `blocked`. Omit to read.
         level: Option<String>,
-        /// Short reason shown beside the level, e.g. "Waiting for PR feedback".
-        note: Vec<String>,
+        /// Current-state message, e.g. "Wired up routes; tests pass".
+        message: Vec<String>,
     },
-    /// Set the description of the current branch.
-    Describe { text: Vec<String> },
     /// Append a note to the current branch.
     Note { text: Vec<String> },
     /// Manage the current branch's issue list.
@@ -133,8 +133,7 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Goal { text } => cmd_goal(text.join(" ")).await,
-        Cmd::Status { level, note } => cmd_status(level, note.join(" ")).await,
-        Cmd::Describe { text } => cmd_describe(text.join(" ")).await,
+        Cmd::SetStatus { level, message } => cmd_set_status(level, message.join(" ")).await,
         Cmd::Note { text } => cmd_note(text.join(" ")).await,
         Cmd::Issue { cmd } => cmd_issue(cmd).await,
         Cmd::Where => cmd_where().await,
@@ -171,18 +170,6 @@ async fn cmd_goal(text: String) -> Result<()> {
     }
     events::record_local(&db, &b.id, "goal_set", json!({ "goal": text })).await?;
     println!("goal updated");
-    Ok(())
-}
-
-async fn cmd_describe(text: String) -> Result<()> {
-    if text.is_empty() {
-        bail!("description text is required");
-    }
-    let db = open_db().await?;
-    let b = branch::resolve(&db).await?;
-    branch::set_description(&db, &b.id, &text).await?;
-    events::record_local(&db, &b.id, "note", json!({ "text": "description updated" })).await?;
-    println!("description updated");
     Ok(())
 }
 
@@ -243,11 +230,11 @@ async fn cmd_log(limit: i64) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_status(level: Option<String>, note: String) -> Result<()> {
+async fn cmd_set_status(level: Option<String>, message: String) -> Result<()> {
     let db = open_db().await?;
     let b = branch::resolve(&db).await?;
     if let Some(level) = level {
-        return cmd_status_set(&db, &b, &level, &note).await;
+        return cmd_set_status_write(&db, &b, &level, &message).await;
     }
     let open = issue::open_count_for_branch(&db, &b.repo_root, &b.branch)
         .await
@@ -262,23 +249,28 @@ async fn cmd_status(level: Option<String>, note: String) -> Result<()> {
         "goal:        {}",
         if b.goal.is_empty() { "(none)" } else { &b.goal }
     );
-    if !b.description.is_empty() {
-        println!("summary:     {}", b.description);
-    }
-    let attention = if b.attention_note.is_empty() {
+    let status = if b.description.is_empty() {
         b.attention.clone()
     } else {
-        format!("{} — {}", b.attention, b.attention_note)
+        format!("{} — {}", b.attention, b.description)
     };
-    println!("attention:   {attention}");
+    println!("status:      {status}");
     println!("open issues: {open}");
     Ok(())
 }
 
-/// Declare the agent's attention level (and optional note) on the branch. Writes
+/// Report the agent's status: set the attention level and, when a message is
+/// given, the accompanying current-state note (the branch `description`). Writes
 /// the branch fields directly (daemon-less) and an `attention` event so a
-/// running loom can push the change to the dashboard on its next tick.
-async fn cmd_status_set(db: &db::Db, b: &branch::Branch, level: &str, note: &str) -> Result<()> {
+/// running loom can push the change to the dashboard on its next tick. An empty
+/// message leaves the previous message in place — `set-status ok` just lowers
+/// the level without wiping what the agent last said.
+async fn cmd_set_status_write(
+    db: &db::Db,
+    b: &branch::Branch,
+    level: &str,
+    message: &str,
+) -> Result<()> {
     let level = level.trim().to_ascii_lowercase();
     if !branch::is_valid_attention(&level) {
         bail!(
@@ -286,19 +278,22 @@ async fn cmd_status_set(db: &db::Db, b: &branch::Branch, level: &str, note: &str
             branch::ATTENTION_LEVELS.join(", ")
         );
     }
-    let note = note.trim();
-    branch::set_attention(db, &b.id, &level, note).await?;
+    let message = message.trim();
+    branch::set_attention(db, &b.id, &level).await?;
+    if !message.is_empty() {
+        branch::set_description(db, &b.id, message).await?;
+    }
     events::record_local(
         db,
         &b.id,
         "attention",
-        json!({ "level": level, "note": note }),
+        json!({ "level": level, "note": message }),
     )
     .await?;
-    if note.is_empty() {
+    if message.is_empty() {
         println!("status: {level}");
     } else {
-        println!("status: {level} — {note}");
+        println!("status: {level} — {message}");
     }
     Ok(())
 }
@@ -533,22 +528,9 @@ async fn cmd_hook(event: String) -> Result<()> {
         let db = open_db().await?;
         let b = branch::resolve(&db).await?;
         events::record_local(&db, &b.id, "hook", json!({ "event": event })).await?;
-        match event.as_str() {
-            "session-start" => {
-                let weaver_md = weaver_md_for_branch(&b);
-                print!("{}", weaver_core::agent::session_primer(&weaver_md));
-            }
-            "idle" => {
-                // Claude Code's Stop hook pipes a JSON payload on stdin that
-                // includes `transcript_path`. Pull the last assistant message
-                // out of the transcript and persist it as the branch summary —
-                // the agent's own framing of what just happened, no extra
-                // headless agent invocation required.
-                if let Some(text) = read_last_assistant_text_from_stdin() {
-                    branch::set_description(&db, &b.id, &text).await?;
-                }
-            }
-            _ => {}
+        if event == "session-start" {
+            let weaver_md = weaver_md_for_branch(&b);
+            print!("{}", weaver_core::agent::session_primer(&weaver_md));
         }
         Ok(())
     })
@@ -557,50 +539,6 @@ async fn cmd_hook(event: String) -> Result<()> {
         eprintln!("weaver hook: {e}");
     }
     Ok(())
-}
-
-/// Best-effort: read the Stop-hook stdin payload, locate `transcript_path`,
-/// and pull the text of the last assistant message out of the JSONL file.
-/// Any failure (no stdin, malformed JSON, missing file) returns `None`.
-fn read_last_assistant_text_from_stdin() -> Option<String> {
-    use std::io::Read;
-    let mut buf = String::new();
-    if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
-        return None;
-    }
-    let payload: Value = serde_json::from_str(&buf).ok()?;
-    let path = payload.get("transcript_path")?.as_str()?;
-    let contents = std::fs::read_to_string(path).ok()?;
-    for line in contents.lines().rev() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(record) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if record.get("type").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        let content = record.pointer("/message/content")?.as_array()?;
-        let mut text = String::new();
-        for chunk in content {
-            if chunk.get("type").and_then(Value::as_str) == Some("text") {
-                if let Some(s) = chunk.get("text").and_then(Value::as_str) {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(s);
-                }
-            }
-        }
-        let text = text.trim();
-        if text.is_empty() {
-            continue;
-        }
-        return Some(truncate(text, 600));
-    }
-    None
 }
 
 async fn cmd_config(cmd: ConfigCmd) -> Result<()> {

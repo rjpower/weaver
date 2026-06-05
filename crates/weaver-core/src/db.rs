@@ -16,12 +16,13 @@ CREATE TABLE IF NOT EXISTS branches (
     base_branch  TEXT NOT NULL DEFAULT 'main',
     goal         TEXT NOT NULL DEFAULT '',
     title        TEXT NOT NULL DEFAULT '',
+    -- The agent's current-state message, set together with `attention` via
+    -- `weaver set-status` ("Wired up routes; tests pass").
     description  TEXT NOT NULL DEFAULT '',
-    -- Agent-declared attention: an urgency level (ok | attention | blocked) and
-    -- a short free-text reason ("Waiting for PR review feedback"). This is the
-    -- agent's own signal of whether it needs the user, set via `weaver status`.
-    attention      TEXT NOT NULL DEFAULT 'ok',
-    attention_note TEXT NOT NULL DEFAULT '',
+    -- Agent-declared attention: an urgency level (ok | attention | blocked) —
+    -- the agent's own signal of whether it needs the user, set via
+    -- `weaver set-status`. The reason rides in `description`.
+    attention    TEXT NOT NULL DEFAULT 'ok',
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     UNIQUE(repo_root, branch)
@@ -193,13 +194,6 @@ async fn migrate(pool: &Db) -> Result<()> {
     // existed. `CREATE TABLE IF NOT EXISTS` above is a no-op on such DBs, so we
     // add the column explicitly and ignore the "duplicate column" error.
     add_column_if_missing(pool, "branches", "attention", "TEXT NOT NULL DEFAULT 'ok'").await?;
-    add_column_if_missing(
-        pool,
-        "branches",
-        "attention_note",
-        "TEXT NOT NULL DEFAULT ''",
-    )
-    .await?;
     Ok(())
 }
 

@@ -1,6 +1,6 @@
 //! Loom database setup: opens the shared `~/.weaver/weaver.db` via
-//! `weaver-core`, then adds loom-owned tables (`sessions`, `summaries`,
-//! `recent_repos`) on top.
+//! `weaver-core`, then adds loom-owned tables (`sessions`, `recent_repos`) on
+//! top.
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -28,22 +28,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     pending_prompt     TEXT NOT NULL DEFAULT '',
     github_repo        TEXT,
     last_activity_at   TEXT,
-    summary_updated_at TEXT,
     created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_active_branch
     ON sessions(branch_id) WHERE status NOT IN ('done', 'error');
-
-CREATE TABLE IF NOT EXISTS summaries (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    description   TEXT NOT NULL,
-    files_changed INTEGER NOT NULL DEFAULT 0,
-    insertions    INTEGER NOT NULL DEFAULT 0,
-    deletions     INTEGER NOT NULL DEFAULT 0,
-    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-);
-CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id, id);
 
 CREATE TABLE IF NOT EXISTS recent_repos (
     repo_root    TEXT PRIMARY KEY,

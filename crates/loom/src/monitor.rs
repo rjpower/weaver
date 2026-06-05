@@ -1,7 +1,7 @@
 //! Background task: detects when a session's tmux has ended and consumes the
 //! event rows the `weaver` CLI writes — `hook` events (Claude lifecycle) and
-//! `attention` events (`weaver status`) — reflecting them onto the session and
-//! the dashboard.
+//! `attention` events (`weaver set-status`) — reflecting them onto the session
+//! and the dashboard.
 //!
 //! The browser terminal (xterm.js over a PTY) is the live-screen surface; this
 //! loop no longer pushes a `screen` mirror to clients. It still `capture`s the
@@ -35,8 +35,8 @@ pub async fn run(state: AppState) {
                 for ev in new_events {
                     last_event = last_event.max(ev.id);
                     match ev.kind.as_str() {
-                        // `weaver status` wrote the branch's attention fields
-                        // directly (daemon-less) but, going through the CLI,
+                        // `weaver set-status` wrote the branch's attention
+                        // fields directly (daemon-less) but, via the CLI,
                         // never touched the bus. Re-broadcast so live dashboards
                         // refresh; nothing else to do.
                         "attention" => {
@@ -102,7 +102,7 @@ pub async fn run(state: AppState) {
 
             // Hash the pane to detect activity and bump `last_activity_at`.
             // Inferred working→idle demotion is gone: liveness is all we can
-            // know, and the agent reports the rest via `weaver status`.
+            // know, and the agent reports the rest via `weaver set-status`.
             let screen = tmux::capture(&session.tmux_session, 0)
                 .await
                 .unwrap_or_default();
@@ -132,16 +132,18 @@ pub async fn run(state: AppState) {
 ///   `attention` and snapshots the pane as the pending prompt.
 /// * `idle` (a turn ended) leaves attention untouched — a finished-but-fine
 ///   agent must not be mistaken for one that needs the user. If it actually
-///   needs something it will have said so via `weaver status`.
+///   needs something it will have said so via `weaver set-status`.
 async fn apply_hook(state: &AppState, branch_id: &str, kind: &str) -> Option<i64> {
     enum Prompt {
         Capture,
         Clear,
         Leave,
     }
-    let (attention, prompt): (Option<(&str, &str)>, Prompt) = match kind {
-        "working" => (Some(("ok", "")), Prompt::Clear),
-        "waiting" => (Some(("attention", "Waiting for input")), Prompt::Capture),
+    let (attention, prompt): (Option<&str>, Prompt) = match kind {
+        "working" => (Some("ok"), Prompt::Clear),
+        // The captured pane (the pending prompt) is what conveys "waiting for
+        // input"; the hook just raises the level.
+        "waiting" => (Some("attention"), Prompt::Capture),
         "idle" => (None, Prompt::Leave),
         // `session-start` and anything unknown carry no status signal.
         _ => return None,
@@ -173,13 +175,13 @@ async fn apply_hook(state: &AppState, branch_id: &str, kind: &str) -> Option<i64
         Prompt::Leave => {}
     }
 
-    // Attention, only when the hook carries a signal and the value differs.
-    let mut attention_changed: Option<(&str, &str)> = None;
-    if let Some((level, note)) = attention {
+    // Attention, only when the hook carries a signal and the level differs.
+    let mut attention_changed: Option<&str> = None;
+    if let Some(level) = attention {
         if let Ok(Some(branch)) = branch_mod::get(&state.db, branch_id).await {
-            if branch.attention != level || branch.attention_note != note {
-                let _ = branch_mod::set_attention(&state.db, branch_id, level, note).await;
-                attention_changed = Some((level, note));
+            if branch.attention != level {
+                let _ = branch_mod::set_attention(&state.db, branch_id, level).await;
+                attention_changed = Some(level);
             }
         }
     }
@@ -194,13 +196,13 @@ async fn apply_hook(state: &AppState, branch_id: &str, kind: &str) -> Option<i64
         )
         .await;
     }
-    if let Some((level, note)) = attention_changed {
+    if let Some(level) = attention_changed {
         let _ = events::record(
             &state.db,
             &state.bus,
             branch_id,
             "attention",
-            json!({ "level": level, "note": note, "source": "hook" }),
+            json!({ "level": level, "source": "hook" }),
         )
         .await;
     }

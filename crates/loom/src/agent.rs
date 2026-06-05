@@ -1,12 +1,8 @@
-//! Launching coding agents into tmux panes, installing status hooks, and
-//! running headless summary passes.
+//! Launching coding agents into tmux panes and installing status hooks.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::path::Path;
-use std::process::Stdio;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use crate::tmux;
 use weaver_core::agent::hooks_json;
@@ -179,78 +175,6 @@ pub async fn install_hooks(work_dir: &Path, weaver_bin: &str) -> Result<()> {
     tokio::fs::write(&path, serde_json::to_string_pretty(&root)?).await?;
     tracing::debug!(path = %path.display(), "claude hooks installed");
     Ok(())
-}
-
-const SUMMARY_PROMPT: &str = "You are summarizing the current state of a coding session for a \
-status dashboard. The git diff of all work-in-progress is provided on stdin. Reply with 2-4 \
-plain sentences describing what has changed so far and the apparent state of the work. No \
-preamble, no markdown, no bullet points.";
-
-const MAX_DIFF_CHARS: usize = 80_000;
-
-pub async fn summarize(work_dir: &Path, command: &str, diff: &str) -> Result<String> {
-    let mut diff = diff.to_string();
-    if diff.len() > MAX_DIFF_CHARS {
-        diff.truncate(MAX_DIFF_CHARS);
-        diff.push_str("\n...[diff truncated]");
-    }
-    let mut parts = command.split_whitespace();
-    let program = parts.next().unwrap_or("claude");
-    let leading: Vec<&str> = parts.collect();
-    tracing::debug!(
-        dir = %work_dir.display(),
-        diff_chars = diff.len(),
-        %program,
-        "running summary agent"
-    );
-    let mut child = Command::new(program)
-        .args(&leading)
-        .args(["-p", SUMMARY_PROMPT])
-        .current_dir(work_dir)
-        .env_remove("ANTHROPIC_API_KEY")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn '{program}' (is it installed and on PATH?)"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(diff.as_bytes()).await;
-    }
-    let out = tokio::time::timeout(
-        std::time::Duration::from_secs(180),
-        child.wait_with_output(),
-    )
-    .await
-    .context("claude summary timed out")??;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let detail = match (stderr.trim(), stdout.trim()) {
-            ("", "") => "no output".to_string(),
-            ("", out) => out.to_string(),
-            (err, "") => err.to_string(),
-            (err, out) => format!("{err} | {out}"),
-        };
-        let code = out
-            .status
-            .code()
-            .map_or_else(|| "signal".to_string(), |c| c.to_string());
-        let snippet: String = detail.chars().take(500).collect();
-        tracing::warn!(
-            dir = %work_dir.display(),
-            code = %code,
-            detail = %snippet,
-            "claude summary failed"
-        );
-        anyhow::bail!("claude summary failed (exit {code}): {detail}");
-    }
-    let summary = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    tracing::info!(
-        dir = %work_dir.display(),
-        summary_chars = summary.len(),
-        "claude summary complete"
-    );
-    Ok(summary)
 }
 
 #[cfg(test)]

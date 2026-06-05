@@ -18,7 +18,7 @@ test.describe('status reflects hook and attention events', () => {
     await expect(attention).toHaveText(/attention/i);
   });
 
-  test('detail view: weaver status sets attention + note via SSE', async ({ page, weaver }) => {
+  test('detail view: weaver set-status sets level + message via SSE', async ({ page, weaver }) => {
     const s = await weaver.seedSession({ goal: 'Declare my status', name: 'status-detail' });
 
     await page.goto(`${weaver.baseUrl}/#/s/${s.id}`);
@@ -27,7 +27,7 @@ test.describe('status reflects hook and attention events', () => {
 
     await weaver.setStatus(s, 'blocked', 'tests failing, need help');
     await expect(attention).toHaveText(/blocked/i);
-    await expect(page.getByTestId('attention-note')).toHaveText(/tests failing, need help/i);
+    await expect(page.getByTestId('status-message')).toHaveText(/tests failing, need help/i);
   });
 
   test('list view: attention filter narrows to sessions that need a human', async ({

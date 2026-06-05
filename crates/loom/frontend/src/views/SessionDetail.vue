@@ -20,9 +20,11 @@ const notice = ref('');
 
 const titleDraft = ref('');
 const goalDraft = ref('');
-const descDraft = ref('');
+// The agent's status: an attention level plus a current-state message. The two
+// are one signal (set together via `weaver set-status`), so the dashboard edits
+// them together too.
 const attnLevelDraft = ref('ok');
-const attnNoteDraft = ref('');
+const statusMsgDraft = ref('');
 
 const busy = ref('');
 
@@ -32,9 +34,8 @@ async function loadSession() {
   ws.value = (await get(`/sessions/${props.id}`)) as Session;
   titleDraft.value = ws.value.branch.title;
   goalDraft.value = ws.value.branch.goal;
-  descDraft.value = ws.value.branch.description;
   attnLevelDraft.value = ws.value.branch.attention || 'ok';
-  attnNoteDraft.value = ws.value.branch.attention_note;
+  statusMsgDraft.value = ws.value.branch.description;
 }
 
 async function loadIssues() {
@@ -64,19 +65,19 @@ async function loadAll() {
   }
 }
 
-const saveAttention = () =>
-  act('attention', async () => {
+const saveStatus = () =>
+  act('status', async () => {
     await patch(`/sessions/${props.id}`, {
       attention: attnLevelDraft.value,
-      attention_note: attnNoteDraft.value,
+      description: statusMsgDraft.value,
     });
-    notice.value = 'Attention updated.';
+    notice.value = 'Status updated.';
     await loadSession();
   });
 
 function openStream() {
   source = new EventSource(`/api/sessions/${props.id}/events`);
-  for (const kind of ['status', 'attention', 'summary', 'note']) {
+  for (const kind of ['status', 'attention', 'note']) {
     source.addEventListener(kind, (e) => {
       const ev = JSON.parse((e as MessageEvent).data) as WeaverEvent;
       events.value.push(ev);
@@ -117,21 +118,6 @@ const saveGoal = () =>
     await loadSession();
   });
 
-const saveDesc = () =>
-  act('desc', async () => {
-    await patch(`/sessions/${props.id}`, { description: descDraft.value });
-    notice.value = 'Description saved.';
-    await loadSession();
-  });
-
-const summarize = () =>
-  act('summary', async () => {
-    const res = (await post(`/sessions/${props.id}/summarize`)) as { description: string };
-    descDraft.value = res.description;
-    notice.value = 'Summary updated.';
-    await loadSession();
-  });
-
 const archive = () =>
   act('archive', async () => {
     if (
@@ -164,8 +150,7 @@ function eventLine(ev: WeaverEvent): string {
   const d = ev.data || {};
   if (ev.kind === 'status') return `status → ${d.status ?? '?'}`;
   if (ev.kind === 'attention')
-    return `attention → ${d.level ?? '?'}${d.note ? ` (${d.note})` : ''}`;
-  if (ev.kind === 'summary') return `summary: ${d.description ?? ''}`;
+    return `status → ${d.level ?? '?'}${d.note ? ` (${d.note})` : ''}`;
   if (ev.kind === 'note') return String(d.text ?? '');
   if (ev.kind === 'issue_added') return `issue added: ${d.title ?? ''}`;
   if (ev.kind === 'issue_closed') return `issue closed: #${d.id ?? '?'}`;
@@ -185,15 +170,15 @@ onUnmounted(() => source?.close());
     <div class="flex items-center gap-3 mb-1">
       <router-link to="/" class="text-muted hover:text-muted text-sm">← all</router-link>
       <h1 class="text-xl font-semibold">{{ ws.branch.title || ws.branch.name }}</h1>
-      <AttentionBadge :level="ws.branch.attention || 'ok'" :note="ws.branch.attention_note" />
+      <AttentionBadge :level="ws.branch.attention || 'ok'" :note="ws.branch.description" />
       <StatusBadge :status="ws.status" />
     </div>
     <p
-      v-if="ws.branch.attention_note"
+      v-if="ws.branch.description"
       class="text-sm text-muted mb-1"
-      data-testid="attention-note"
+      data-testid="status-message"
     >
-      {{ ws.branch.attention_note }}
+      {{ ws.branch.description }}
     </p>
     <div class="text-xs text-faint font-mono mb-1">
       {{ ws.id }} · {{ ws.branch.branch }} (base {{ ws.branch.base_branch }}) ·
@@ -224,7 +209,7 @@ onUnmounted(() => source?.close());
     </section>
 
     <div class="grid gap-5 lg:grid-cols-3">
-      <!-- Left: goal, description, issues, actions -->
+      <!-- Left: title, goal, status, issues, actions -->
       <div class="space-y-5 lg:col-span-1">
         <section class="rounded border border-line bg-surface p-4">
           <label class="block text-xs text-muted mb-1">Title</label>
@@ -261,55 +246,30 @@ onUnmounted(() => source?.close());
 
         <section class="rounded border border-line bg-surface p-4">
           <label class="block text-xs text-muted mb-1">
-            Attention — the agent's signal, set via <code>weaver status</code>
+            Status — the agent's signal, set via <code>weaver set-status</code>:
+            an attention level plus a current-state message
           </label>
-          <div class="flex gap-2">
-            <select
-              v-model="attnLevelDraft"
-              data-testid="attention-select"
-              class="rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
-            >
-              <option value="ok">OK</option>
-              <option value="attention">Attention</option>
-              <option value="blocked">Blocked</option>
-            </select>
-            <input
-              v-model="attnNoteDraft"
-              placeholder="Waiting for PR review feedback"
-              class="min-w-0 flex-1 rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
-            />
-          </div>
-          <button
-            class="mt-2 rounded bg-subtle hover:bg-subtle-hover px-2 py-1 text-xs"
-            :disabled="busy === 'attention'"
-            @click="saveAttention"
+          <select
+            v-model="attnLevelDraft"
+            data-testid="attention-select"
+            class="rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
           >
-            Save attention
-          </button>
-        </section>
-
-        <section class="rounded border border-line bg-surface p-4">
-          <div class="flex items-center justify-between mb-1">
-            <label class="text-xs text-muted">Description / current state</label>
-            <button
-              class="rounded bg-subtle hover:bg-subtle-hover px-2 py-0.5 text-xs"
-              :disabled="busy === 'summary'"
-              @click="summarize"
-            >
-              {{ busy === 'summary' ? 'Summarizing…' : 'Summarize now' }}
-            </button>
-          </div>
+            <option value="ok">OK</option>
+            <option value="attention">Attention</option>
+            <option value="blocked">Blocked</option>
+          </select>
           <textarea
-            v-model="descDraft"
-            rows="6"
-            class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none"
+            v-model="statusMsgDraft"
+            rows="4"
+            placeholder="Wired up routes; tests pass. Remaining: update the docs."
+            class="mt-2 w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
           ></textarea>
           <button
             class="mt-2 rounded bg-subtle hover:bg-subtle-hover px-2 py-1 text-xs"
-            :disabled="busy === 'desc'"
-            @click="saveDesc"
+            :disabled="busy === 'status'"
+            @click="saveStatus"
           >
-            Save description
+            Save status
           </button>
         </section>
 

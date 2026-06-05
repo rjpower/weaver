@@ -1,7 +1,7 @@
 //! loom — the orchestration CLI.
 //!
 //! Most subcommands talk to the running loom daemon over HTTP (session
-//! lifecycle, summary, archive, adopt). `serve` runs the daemon itself;
+//! lifecycle, archive, adopt). `serve` runs the daemon itself;
 //! `start`/`stop`/`restart`/`status` manage its background lifecycle. To
 //! interact with an agent, `attach` to its tmux (the browser terminal is the
 //! other interaction surface).
@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run the loom server (REST API + Vue UI + monitor + summary loops).
+    /// Run the loom server (REST API + Vue UI + monitor loop).
     Serve {
         #[arg(long)]
         addr: Option<String>,
@@ -107,8 +107,6 @@ enum Cmd {
     Show { branch: String },
     /// Attach your terminal to a session's tmux.
     Attach { branch: String },
-    /// Force a fresh summary of a session.
-    Summary { branch: String },
     /// Archive a session: tear down tmux + worktree, keep branch + history.
     Archive { branch: String },
     /// Recreate the tmux session for an orphaned session.
@@ -175,7 +173,6 @@ async fn run() -> Result<()> {
         Cmd::Issues { all, backlog } => cmd_issues(all, backlog).await,
         Cmd::Show { branch } => cmd_show(branch).await,
         Cmd::Attach { branch } => cmd_attach(branch).await,
-        Cmd::Summary { branch } => cmd_summary(branch).await,
         Cmd::Archive { branch } => cmd_archive(branch).await,
         Cmd::Adopt { branch } => cmd_adopt(branch).await,
         Cmd::Rm {
@@ -577,12 +574,14 @@ fn print_session(ws: &Value) {
     );
     println!("  title:    {}", branch_str(ws, "title"));
     println!("  status:   {}", str_field(ws, "status"));
+    // Agent-declared attention level plus its current-state message (the
+    // branch `description`), shown together — one signal.
     let attention = branch_str(ws, "attention");
-    let attention_note = branch_str(ws, "attention_note");
-    let attention = if attention_note.is_empty() {
+    let message = branch_str(ws, "description");
+    let attention = if message.is_empty() {
         attention.to_string()
     } else {
-        format!("{attention} — {attention_note}")
+        format!("{attention} — {message}")
     };
     println!("  attention: {attention}");
     let goal = branch_str(ws, "goal");
@@ -590,10 +589,6 @@ fn print_session(ws: &Value) {
         "  goal:     {}",
         if goal.is_empty() { "(none)" } else { goal }
     );
-    let description = branch_str(ws, "description");
-    if !description.is_empty() {
-        println!("  summary:  {description}");
-    }
     println!("  agent:    {}", str_field(ws, "agent_kind"));
     let model = str_field(ws, "model");
     if !model.is_empty() {
@@ -638,16 +633,6 @@ async fn cmd_attach(key: String) -> Result<()> {
         .args(["attach-session", "-t", &target])
         .exec();
     Err(anyhow!("failed to exec tmux: {err}"))
-}
-
-async fn cmd_summary(key: String) -> Result<()> {
-    let client = Client::new();
-    println!("summarizing… (this runs a headless agent and may take a moment)");
-    let res = client
-        .post(&format!("/api/sessions/{key}/summarize"), json!({}))
-        .await?;
-    println!("{}", str_field(&res, "description"));
-    Ok(())
 }
 
 async fn cmd_archive(key: String) -> Result<()> {

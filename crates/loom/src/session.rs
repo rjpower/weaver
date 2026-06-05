@@ -23,7 +23,6 @@ pub struct Session {
     pub pending_prompt: String,
     pub github_repo: Option<String>,
     pub last_activity_at: Option<String>,
-    pub summary_updated_at: Option<String>,
     pub created_at: String,
 }
 
@@ -36,7 +35,7 @@ pub struct Session {
 /// guessed at the agent's state from hooks and screen stillness and were
 /// frequently wrong (e.g. an agent waiting on a background workflow looked
 /// "idle"). Liveness is all the orchestrator can know for sure; the agent
-/// reports the rest via `weaver status`.
+/// reports the rest via `weaver set-status`.
 pub const STATUSES: &[&str] = &[
     "created",
     "launching",
@@ -161,15 +160,6 @@ pub async fn touch(db: &Db, id: &str) -> Result<()> {
 pub async fn set_pending_prompt(db: &Db, id: &str, prompt: &str) -> Result<()> {
     sqlx::query("UPDATE sessions SET pending_prompt = ? WHERE id = ?")
         .bind(prompt)
-        .bind(id)
-        .execute(db)
-        .await?;
-    Ok(())
-}
-
-pub async fn mark_summarized(db: &Db, id: &str) -> Result<()> {
-    sqlx::query("UPDATE sessions SET summary_updated_at = ? WHERE id = ?")
-        .bind(now_iso())
         .bind(id)
         .execute(db)
         .await?;
