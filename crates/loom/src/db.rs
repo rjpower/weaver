@@ -36,6 +36,27 @@ CREATE TABLE IF NOT EXISTS recent_repos (
     repo_root    TEXT PRIMARY KEY,
     last_used_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+-- The latest GitHub snapshot for a branch: the pull request loom found for it
+-- (via the `gh` CLI) plus its review/check rollup. One row per branch, replaced
+-- on each poll; it is optional context, gone the moment the branch row is.
+CREATE TABLE IF NOT EXISTS branch_github (
+    branch_id        TEXT PRIMARY KEY REFERENCES branches(id) ON DELETE CASCADE,
+    pr_number        INTEGER,
+    pr_url           TEXT,
+    -- 'OPEN' | 'CLOSED' | 'MERGED'.
+    pr_state         TEXT,
+    pr_title         TEXT,
+    is_draft         INTEGER NOT NULL DEFAULT 0,
+    -- 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED' | NULL.
+    review_decision  TEXT,
+    -- Rolled-up checks: 'passing' | 'failing' | 'pending' | NULL (no checks).
+    checks           TEXT,
+    -- 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' | NULL.
+    mergeable        TEXT,
+    merged_at        TEXT,
+    fetched_at       TEXT NOT NULL
+);
 "#;
 
 /// Open the shared database and apply loom's additional tables on top of the

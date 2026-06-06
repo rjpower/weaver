@@ -178,6 +178,11 @@ async fn session_lifecycle() {
         ws["branch"]["title"], "integration test goal",
         "title derived from goal"
     );
+    // The launch hands back a tracking issue id — the caller's handle on it.
+    assert!(
+        ws["tracking_issue"].as_i64().is_some(),
+        "launch returns a tracking issue id, got {ws}"
+    );
     assert!(tmux::has_session(&session).await, "tmux session missing");
 
     let list = client.get("/api/sessions").await.unwrap();
@@ -456,6 +461,61 @@ async fn session_lifecycle() {
             .await
             .unwrap();
         assert_eq!(bad.status().as_u16(), 400, "absolute raw path rejected");
+
+        // Diff baseline selector: commit the current edits, then make one more
+        // uncommitted change. `base=branch` (the default) shows everything the
+        // branch introduced; `base=uncommitted` shows only what's not committed.
+        let wt = Path::new(&work_dir);
+        sh(wt, "git", &["add", "-A"]);
+        sh(wt, "git", &["commit", "-q", "-m", "branch work"]);
+        std::fs::write(wt.join("README.md"), "hello world again\n").unwrap();
+
+        let branch_scope = client
+            .get(&format!("/api/sessions/{id}/tree?base=branch"))
+            .await
+            .unwrap();
+        let changed = branch_scope["changed"].as_object().unwrap();
+        assert_eq!(branch_scope["base"], "branch");
+        assert_eq!(changed["README.md"], "modified");
+        assert_eq!(
+            changed["new.txt"], "added",
+            "branch scope still shows the committed addition"
+        );
+
+        let uncommitted = client
+            .get(&format!("/api/sessions/{id}/tree?base=uncommitted"))
+            .await
+            .unwrap();
+        let changed = uncommitted["changed"].as_object().unwrap();
+        assert_eq!(uncommitted["base"], "uncommitted");
+        assert_eq!(changed["README.md"], "modified");
+        assert!(
+            !changed.contains_key("new.txt"),
+            "uncommitted scope hides the already-committed addition, got {changed:?}"
+        );
+
+        // The `base` ref read honours the scope too: vs HEAD the original is the
+        // committed README; vs the branch fork point it's the pre-branch one.
+        let head_side = client
+            .get(&format!(
+                "/api/sessions/{id}/file?path=README.md&ref=base&base=uncommitted"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            head_side["content"], "hello world\n",
+            "uncommitted base reads the committed (HEAD) version"
+        );
+        let fork_side = client
+            .get(&format!(
+                "/api/sessions/{id}/file?path=README.md&ref=base&base=branch"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            fork_side["content"], "hello\n",
+            "branch base reads the fork-point version"
+        );
     }
 
     // Branches endpoint lists this branch with the right metadata.
@@ -463,7 +523,26 @@ async fn session_lifecycle() {
     let arr = branches.as_array().unwrap();
     assert_eq!(arr.len(), 1, "one branch tracked");
     assert_eq!(arr[0]["branch"], "weaver/integration-test-goal");
-    assert_eq!(arr[0]["open_issue_count"], 0);
+    // The launch opened one tracking issue, claimed by the new branch. With no
+    // parent agent it is self-sourced (source_branch == claimed_branch).
+    assert_eq!(
+        arr[0]["open_issue_count"], 1,
+        "launch opens a tracking issue"
+    );
+    let tracking = client
+        .get(&format!("/api/branches/{branch_id}/issues"))
+        .await
+        .unwrap();
+    let tracking = tracking.as_array().unwrap();
+    assert_eq!(tracking.len(), 1, "exactly the tracking issue");
+    assert_eq!(
+        tracking[0]["claimed_branch"],
+        "weaver/integration-test-goal"
+    );
+    assert_eq!(
+        tracking[0]["source_branch"], "weaver/integration-test-goal",
+        "self-sourced when no parent launched it"
+    );
 
     // Branch issues are claimed by the branch; the repo-wide board lives at
     // /api/repos/issues.
@@ -484,18 +563,22 @@ async fn session_lifecycle() {
         .get(&format!("/api/branches/{branch_id}/issues"))
         .await
         .unwrap();
-    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(
+        listed.as_array().unwrap().len(),
+        2,
+        "the tracking issue plus the hand-created one"
+    );
     let branch_view = client
         .get(&format!("/api/branches/{branch_id}"))
         .await
         .unwrap();
-    assert_eq!(branch_view["open_issue_count"], 1);
-    // The repo board sees the claimed issue; the unclaimed backlog does not.
+    assert_eq!(branch_view["open_issue_count"], 2);
+    // The repo board sees both claimed issues; the unclaimed backlog does not.
     let board = client
         .get(&format!("/api/repos/issues?repo_root={repo_root}"))
         .await
         .unwrap();
-    assert_eq!(board.as_array().unwrap().len(), 1);
+    assert_eq!(board.as_array().unwrap().len(), 2);
     let backlog = client
         .get(&format!(
             "/api/repos/issues?repo_root={repo_root}&scope=backlog"
@@ -747,18 +830,24 @@ async fn session_lifecycle() {
     let list = client.get("/api/sessions").await.unwrap();
     assert_eq!(list.as_array().unwrap().len(), 0);
 
-    // The claimed issue is repo-owned: it outlives its session, returning to
-    // the unclaimed backlog rather than being deleted with the branch.
+    // Issues are repo-owned: they outlive their sessions, returning to the
+    // unclaimed backlog rather than being deleted with the branch. Every launch
+    // with a task sourced a tracking issue (integration-test-goal, feature/x,
+    // feature/y, archive-me — the bare no-goal session opens none), plus the
+    // "fix it" issue created by hand: five in all, every claim released.
     let board = client
         .get(&format!("/api/repos/issues?repo_root={repo_root}&all=true"))
         .await
         .unwrap();
     let board = board.as_array().unwrap();
-    assert_eq!(board.len(), 1, "issue survived teardown");
-    assert_eq!(board[0]["id"].as_i64().unwrap(), issue_id);
+    assert_eq!(board.len(), 5, "tracking + manual issues survived teardown");
     assert!(
-        board[0]["claimed_branch"].is_null(),
-        "claim was released on teardown"
+        board.iter().all(|i| i["claimed_branch"].is_null()),
+        "every claim was released on teardown"
+    );
+    assert!(
+        board.iter().any(|i| i["id"].as_i64() == Some(issue_id)),
+        "the hand-created issue survived"
     );
 
     let recent = client.get("/api/repos/recent").await.unwrap();

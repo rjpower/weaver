@@ -448,6 +448,12 @@ async fn cmd_launch(a: LaunchArgs) -> Result<()> {
     } = a;
     let client = Client::new();
     let cwd = std::env::current_dir()?;
+    // When an agent in a weaver session runs `loom launch`, `$WEAVER_BRANCH` is
+    // its own branch id — pass it so the tracking issue is attributed to the
+    // launching (parent) agent. A human shell launch leaves it unset.
+    let parent_branch = std::env::var("WEAVER_BRANCH")
+        .ok()
+        .filter(|s| !s.is_empty());
     let ws = client
         .post(
             "/api/sessions",
@@ -461,6 +467,7 @@ async fn cmd_launch(a: LaunchArgs) -> Result<()> {
                 "existing_branch": branch,
                 "issue": issue,
                 "claim_issue": claim,
+                "parent_branch": parent_branch,
                 "model": model,
                 "effort": effort,
             }),
@@ -488,6 +495,11 @@ async fn cmd_launch(a: LaunchArgs) -> Result<()> {
         println!("  effort: {effort}");
     }
     println!("  dir:    {}", str_field(&ws, "work_dir"));
+    if let Some(n) = ws.get("tracking_issue").and_then(Value::as_i64) {
+        // The handle the caller uses to follow this sub-tree: poll it with
+        // `weaver issue show <n>`, or block on it with `weaver issue wait <n>`.
+        println!("  track:  weaver issue #{n}  (weaver issue show {n} | wait {n})");
+    }
     println!("  attach: loom attach {id}");
     Ok(())
 }
@@ -608,6 +620,26 @@ fn print_session(ws: &Value) {
     if let Some(repo) = ws.get("github_repo").and_then(Value::as_str) {
         if !repo.is_empty() {
             println!("  github:   {repo}");
+        }
+    }
+    // The branch's PR snapshot, when loom has polled one (see `loom::github`).
+    if let Some(gh) = ws.get("branch").and_then(|b| b.get("github")) {
+        if let Some(url) = gh.get("pr_url").and_then(Value::as_str) {
+            let number = gh.get("pr_number").and_then(Value::as_i64).unwrap_or(0);
+            let state = gh
+                .get("pr_state")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_lowercase();
+            let mut bits = vec![state];
+            if let Some(review) = gh.get("review_decision").and_then(Value::as_str) {
+                bits.push(review.to_lowercase().replace('_', " "));
+            }
+            if let Some(checks) = gh.get("checks").and_then(Value::as_str) {
+                bits.push(format!("checks {checks}"));
+            }
+            let bits: Vec<String> = bits.into_iter().filter(|b| !b.is_empty()).collect();
+            println!("  pr:       #{number} {url} ({})", bits.join(", "));
         }
     }
     println!("  activity: {}", str_field(ws, "last_activity_at"));

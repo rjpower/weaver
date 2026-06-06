@@ -177,6 +177,11 @@ pub struct BranchView {
     pub created_at: String,
     pub updated_at: String,
     pub open_issue_count: i64,
+    /// The branch's latest GitHub pull-request snapshot (link, review decision,
+    /// check rollup), or `null` when GitHub polling is off, the repo has no
+    /// remote PR, or `gh` is unavailable. Maintained by the poll loop in
+    /// [`crate::github`].
+    pub github: Option<github::GithubStatus>,
 }
 
 impl BranchView {
@@ -185,10 +190,16 @@ impl BranchView {
         let open = weaver_core::issue::open_count_for_branch(db, &branch.repo_root, &branch.branch)
             .await
             .unwrap_or(0);
-        Ok(Self::from_parts(branch, open))
+        // Best-effort: a missing/erroring snapshot just renders as no GitHub info.
+        let github = github::get_status(db, &branch.id).await.ok().flatten();
+        Ok(Self::from_parts(branch, open, github))
     }
 
-    fn from_parts(branch: &Branch, open_issue_count: i64) -> Self {
+    fn from_parts(
+        branch: &Branch,
+        open_issue_count: i64,
+        github: Option<github::GithubStatus>,
+    ) -> Self {
         let name = branch
             .branch
             .strip_prefix("weaver/")
@@ -207,6 +218,7 @@ impl BranchView {
             created_at: branch.created_at.clone(),
             updated_at: branch.updated_at.clone(),
             open_issue_count,
+            github,
         }
     }
 }
@@ -225,6 +237,10 @@ pub struct SessionView {
     pub last_activity_at: String,
     pub created_at: String,
     pub updated_at: String,
+    /// The tracking issue opened for this session's task at launch (the handle
+    /// handed back to whoever launched it). Only populated on the create
+    /// response; `None` on the list/get/patch paths, which don't recompute it.
+    pub tracking_issue: Option<i64>,
     pub branch: BranchView,
 }
 
@@ -246,6 +262,7 @@ impl SessionView {
                 .unwrap_or_else(|| branch.updated_at.clone()),
             created_at: session.created_at.clone(),
             updated_at: branch.updated_at.clone(),
+            tracking_issue: None,
             branch: bv,
         })
     }
@@ -341,6 +358,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/note", post(note_session))
         .route("/sessions/{id}/archive", post(archive_session))
         .route("/sessions/{id}/adopt", post(adopt_session))
+        .route("/sessions/{id}/github", post(refresh_github_session))
         .route("/sessions/{id}/tree", get(tree_session))
         .route("/sessions/{id}/file", get(file_session).put(write_file))
         .route("/sessions/{id}/raw", get(raw_session))
@@ -425,6 +443,13 @@ struct CreateReq {
     claim_issue: Option<i64>,
     #[serde(default)]
     existing_branch: Option<String>,
+    /// The branch (id or name) of the agent launching this session, when it is
+    /// itself a weaver session delegating work. Recorded as the tracking
+    /// issue's `source_branch` so the parent's sub-trees are attributable. The
+    /// `loom` CLI fills this from `$WEAVER_BRANCH`; a human/dashboard launch
+    /// leaves it unset.
+    #[serde(default)]
+    parent_branch: Option<String>,
     /// Model tier ('haiku' | 'sonnet' | 'opus'); blank/absent inherits the
     /// configured `agent.claude_args`.
     #[serde(default)]
@@ -658,21 +683,59 @@ async fn create_session(
         .await?
         .ok_or_else(|| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "branch vanished"))?;
 
+    // Open this session's tracking issue before the launch prompt is written,
+    // so the agent can be told its issue number. When an agent delegated this
+    // work (`parent_branch`), the parent becomes the issue's `source_branch`.
+    let parent_branch_name = match req
+        .parent_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(key) => branch_mod::resolve_key(&st.db, key)
+            .await?
+            // Only attribute to a parent in *this* repo. `resolve_key` searches
+            // globally, and a stray `$WEAVER_BRANCH` from a checkout elsewhere
+            // must not misattribute `source_branch` to an unrelated branch.
+            .filter(|b| b.repo_root == branch.repo_root)
+            .map(|b| b.branch)
+            .filter(|name| name != &branch.branch),
+        None => None,
+    };
+    let tracking_issue = create_tracking_issue(
+        &st,
+        &branch,
+        parent_branch_name.as_deref(),
+        &title,
+        &goal,
+        &description,
+        github_repo.as_deref(),
+        github_issue,
+        claimed_issue_id,
+    )
+    .await?;
+
     let session_id = branch_mod::new_id();
     let run_dir = db::run_dir(&session_id);
     tokio::fs::create_dir_all(&run_dir).await?;
 
     // Drop any attached reference files into the worktree before the agent
     // launches, then tell the agent they are there. The branch goal stays the
-    // clean text the user typed; the scratch note rides on the launch prompt
-    // (goal.txt) only, so it reaches the agent without cluttering the dashboard.
+    // clean text the user typed; the scratch and tracking notes ride on the
+    // launch prompt (goal.txt) only, so they reach the agent without cluttering
+    // the dashboard.
     let scratch_names = write_initial_scratch(&work_dir, &req.scratch).await?;
-    let launch_prompt = match (goal.is_empty(), scratch_note(&scratch_names)) {
-        (true, None) => String::new(),
-        (false, None) => goal.clone(),
-        (true, Some(note)) => note,
-        (false, Some(note)) => format!("{goal}\n\n{note}"),
-    };
+    let mut prompt_parts: Vec<String> = Vec::new();
+    if !goal.is_empty() {
+        prompt_parts.push(goal.clone());
+    }
+    if let Some(note) = scratch_note(&scratch_names) {
+        prompt_parts.push(note);
+    }
+    if let Some(id) = tracking_issue {
+        prompt_parts.push(tracking_note(id));
+    }
+    let launch_prompt = prompt_parts.join("\n\n");
     let goal_file = if launch_prompt.is_empty() {
         None
     } else {
@@ -720,41 +783,6 @@ async fn create_session(
     )
     .await?;
 
-    // Track a seeding GitHub issue as a claimed issue row on this branch.
-    if let Some(number) = github_issue {
-        weaver_core::issue::add(
-            &st.db,
-            &weaver_core::issue::NewIssue {
-                repo_root: branch.repo_root.clone(),
-                github_repo: github_repo.clone(),
-                source_branch: Some(branch.branch.clone()),
-                claimed_branch: Some(branch.branch.clone()),
-                title: title.clone(),
-                body: description.clone(),
-                github_issue: Some(number),
-                plan_task: None,
-            },
-        )
-        .await
-        .ok();
-    }
-
-    // Fan-out pickup: a pre-existing weaver issue this session is claiming.
-    if let Some(issue_id) = claimed_issue_id {
-        weaver_core::issue::set_claim(&st.db, issue_id, Some(&branch.branch))
-            .await
-            .ok();
-        events::record(
-            &st.db,
-            &st.bus,
-            &branch.id,
-            "issue_claimed",
-            json!({ "id": issue_id }),
-        )
-        .await
-        .ok();
-    }
-
     if let Err(e) = repo::record_use(&st.db, &branch.repo_root).await {
         tracing::warn!(branch = %branch.id, error = %e, "failed to record recent repo");
     }
@@ -775,7 +803,124 @@ async fn create_session(
         "session created"
     );
 
-    Ok(Json(SessionView::build(&st.db, &session, &branch).await?))
+    let mut view = SessionView::build(&st.db, &session, &branch).await?;
+    view.tracking_issue = tracking_issue;
+    Ok(Json(view))
+}
+
+/// A line appended to a session's launch prompt telling the agent which weaver
+/// issue tracks its task, so it keeps the issue up to date and closes it when
+/// done. Mirrors [`scratch_note`]: it rides on the prompt only, never the
+/// stored goal.
+fn tracking_note(issue_id: i64) -> String {
+    format!(
+        "This session is tracked as weaver issue #{issue_id}. Keep your status \
+         current with `weaver set-status <level> \"<message>\"` as you work, and \
+         run `weaver issue close {issue_id}` once the task is complete (e.g. the \
+         PR is open) so whoever launched you knows you are done."
+    )
+}
+
+/// Open (or adopt) the tracking issue for a freshly-launched session: the one
+/// issue, claimed by the new branch, that represents its task. Whoever launched
+/// the session follows progress through it.
+///
+/// `--claim <id>` and `--issue <n>` (GitHub) reuse the issue they already
+/// imply, so a launch never opens a duplicate; a plain launch opens a fresh one
+/// from the task. An empty worktree with no task at all is untracked (`None`).
+/// `source_branch` records provenance — the parent branch when an agent
+/// delegated this work, else the new branch itself.
+#[allow(clippy::too_many_arguments)]
+async fn create_tracking_issue(
+    st: &AppState,
+    branch: &Branch,
+    parent_branch: Option<&str>,
+    title: &str,
+    goal: &str,
+    description: &str,
+    github_repo: Option<&str>,
+    github_issue: Option<i64>,
+    claim_issue: Option<i64>,
+) -> ApiResult<Option<i64>> {
+    let source = parent_branch.unwrap_or(&branch.branch).to_string();
+
+    // Claiming an existing weaver issue: that issue *is* the tracker, so the
+    // claim must actually land — otherwise we'd hand back a tracking id for an
+    // issue this branch never claimed. Propagate failures rather than swallow.
+    if let Some(id) = claim_issue {
+        weaver_core::issue::set_claim(&st.db, id, Some(&branch.branch)).await?;
+        events::record(
+            &st.db,
+            &st.bus,
+            &branch.id,
+            "issue_claimed",
+            json!({ "id": id }),
+        )
+        .await
+        .ok();
+        return Ok(Some(id));
+    }
+
+    // A GitHub-seeded launch tracks the imported issue row.
+    if let Some(number) = github_issue {
+        let issue = weaver_core::issue::add(
+            &st.db,
+            &weaver_core::issue::NewIssue {
+                repo_root: branch.repo_root.clone(),
+                github_repo: github_repo.map(str::to_string),
+                source_branch: Some(source),
+                claimed_branch: Some(branch.branch.clone()),
+                title: title.to_string(),
+                body: description.to_string(),
+                github_issue: Some(number),
+                plan_task: None,
+            },
+        )
+        .await?;
+        events::record(
+            &st.db,
+            &st.bus,
+            &branch.id,
+            "issue_added",
+            json!({ "id": issue.id, "title": issue.title }),
+        )
+        .await
+        .ok();
+        return Ok(Some(issue.id));
+    }
+
+    // No task to track (e.g. an empty `--agent shell` worktree).
+    if goal.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let body = if description.trim().is_empty() {
+        goal
+    } else {
+        description
+    };
+    let issue = weaver_core::issue::add(
+        &st.db,
+        &weaver_core::issue::NewIssue {
+            repo_root: branch.repo_root.clone(),
+            source_branch: Some(source),
+            claimed_branch: Some(branch.branch.clone()),
+            title: title.to_string(),
+            body: body.to_string(),
+            ..Default::default()
+        },
+    )
+    .await?;
+    events::record(
+        &st.db,
+        &st.bus,
+        &branch.id,
+        "issue_added",
+        json!({ "id": issue.id, "title": issue.title }),
+    )
+    .await
+    .ok();
+    Ok(Some(issue.id))
 }
 
 #[derive(Debug, Deserialize)]
@@ -950,11 +1095,15 @@ async fn note_session(
 /// This is the "I'm done with this workstream" action — unlike delete, the
 /// weaver/loom record is preserved for future reference, and the git branch is
 /// left intact so the work can be revisited or a worktree recreated later.
-async fn archive_session(
-    State(st): State<AppState>,
-    Path(key): Path<String>,
-) -> ApiResult<Json<Value>> {
-    let (session, branch) = require_session(&st.db, &key).await?;
+///
+/// Extracted from the route handler so the GitHub poller can archive a session
+/// the moment its PR merges (see [`crate::github::refresh`]). Returns any
+/// non-fatal teardown warnings.
+pub async fn archive(
+    st: &AppState,
+    session: &Session,
+    branch: &Branch,
+) -> Result<Vec<String>, AppError> {
     let mut warnings: Vec<String> = Vec::new();
 
     tmux::kill_session(&session.tmux_session).await.ok();
@@ -987,9 +1136,39 @@ async fn archive_session(
     if !warnings.is_empty() {
         tracing::warn!(branch = %branch.id, warnings = warnings.len(), "session archived with warnings");
     }
+    Ok(warnings)
+}
+
+async fn archive_session(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let (session, branch) = require_session(&st.db, &key).await?;
+    let warnings = archive(&st, &session, &branch).await?;
     Ok(Json(
         json!({ "archived": true, "branch": branch.branch, "warnings": warnings }),
     ))
+}
+
+/// Refresh a session's GitHub PR snapshot on demand (the dashboard's "refresh"
+/// affordance) and return the updated session. Manual refresh never
+/// auto-archives — that surprise is reserved for the background poller, which
+/// will pick a freshly-merged PR up within a tick.
+async fn refresh_github_session(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<SessionView>> {
+    let (session, branch) = require_session(&st.db, &key).await?;
+    if !github::gh_available().await {
+        return Err(AppError::bad_request(
+            "the GitHub CLI (`gh`) is not available on the server",
+        ));
+    }
+    github::refresh(&st, &session, &branch, false)
+        .await
+        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("gh: {e}")))?;
+    let (session, branch) = require_session(&st.db, &session.id).await?;
+    Ok(Json(SessionView::build(&st.db, &session, &branch).await?))
 }
 
 /// Recreate an orphaned session's tmux and resume its agent.
@@ -1063,12 +1242,22 @@ async fn adopt_session(
 /// of MB the browser editor stops being useful and starts being a memory hog.
 const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
 
+/// `base` selects the diff baseline: `branch` (default, the branch's fork point)
+/// or `uncommitted` (vs `HEAD`). Shared by the tree and file endpoints; absent
+/// or unknown values fall back to `branch` (see [`git::DiffBase::from_query`]).
+#[derive(Debug, Deserialize)]
+struct TreeQuery {
+    base: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct FileQuery {
     path: String,
-    /// `working` (default, read from disk) or `base` (read from the merge-base).
+    /// `working` (default, read from disk) or `base` (read from the diff base).
     #[serde(rename = "ref")]
     reference: Option<String>,
+    /// Which baseline the `base` ref resolves to — see [`TreeQuery`].
+    base: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1127,13 +1316,15 @@ fn content_type_for(path: &str) -> &'static str {
 async fn tree_session(
     State(st): State<AppState>,
     Path(key): Path<String>,
+    Query(q): Query<TreeQuery>,
 ) -> ApiResult<Json<Value>> {
     let (session, branch) = require_session(&st.db, &key).await?;
     let work_dir = PathBuf::from(&session.work_dir);
+    let mode = git::DiffBase::from_query(q.base.as_deref());
     let files = git::list_files(&work_dir).await?;
     // A missing/odd base shouldn't sink the whole tree — just show no badges.
-    let changed = match git::merge_base(&work_dir, &branch.base_branch).await {
-        Ok(base) => git::changed_files(&work_dir, &base)
+    let changed = match git::diff_since(&work_dir, &branch.base_branch, mode).await {
+        Ok(since) => git::changed_files(&work_dir, &since)
             .await
             .unwrap_or_default(),
         Err(_) => Vec::new(),
@@ -1142,7 +1333,9 @@ async fn tree_session(
         .into_iter()
         .map(|c| (c.path, Value::String(c.status)))
         .collect();
-    Ok(Json(json!({ "files": files, "changed": changed })))
+    Ok(Json(
+        json!({ "files": files, "changed": changed, "base": mode.as_str() }),
+    ))
 }
 
 /// Text content of a single worktree file for the editor. Binary and oversized
@@ -1159,8 +1352,9 @@ async fn file_session(
     let rel = rel_path(&q.path)?;
 
     let bytes: Vec<u8> = if q.reference.as_deref() == Some("base") {
-        match git::merge_base(&work_dir, &branch.base_branch).await {
-            Ok(base) => git::read_blob(&work_dir, &base, &rel)
+        let mode = git::DiffBase::from_query(q.base.as_deref());
+        match git::diff_since(&work_dir, &branch.base_branch, mode).await {
+            Ok(since) => git::read_blob(&work_dir, &since, &rel)
                 .await?
                 .unwrap_or_default(),
             // No base means nothing to compare against; treat as empty original.
@@ -2059,6 +2253,101 @@ mod tests {
 
     fn b64(s: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(s)
+    }
+
+    #[tokio::test]
+    async fn create_tracking_issue_sources_parent_and_reuses_claims() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let st = AppState {
+            db: db.clone(),
+            bus: crate::events::EventBus::new(),
+            addr: "127.0.0.1:0".to_string(),
+        };
+        let child = branch_mod::upsert(&db, "/r", "weaver/child", "main")
+            .await
+            .unwrap();
+
+        // A delegated launch names the parent as the issue's source.
+        let id = create_tracking_issue(
+            &st,
+            &child,
+            Some("weaver/parent"),
+            "do it",
+            "do it in detail",
+            "",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("a fresh tracking issue");
+        let issue = weaver_core::issue::get(&db, id).await.unwrap().unwrap();
+        assert_eq!(issue.claimed_branch.as_deref(), Some("weaver/child"));
+        assert_eq!(
+            issue.source_branch.as_deref(),
+            Some("weaver/parent"),
+            "a delegated launch is sourced from the parent"
+        );
+
+        // A non-delegated launch is self-sourced (matches a hand-authored issue).
+        let id2 =
+            create_tracking_issue(&st, &child, None, "solo", "solo task", "", None, None, None)
+                .await
+                .unwrap()
+                .unwrap();
+        let issue2 = weaver_core::issue::get(&db, id2).await.unwrap().unwrap();
+        assert_eq!(issue2.source_branch.as_deref(), Some("weaver/child"));
+
+        // No task at all → nothing to track.
+        let none = create_tracking_issue(&st, &child, None, "", "", "", None, None, None)
+            .await
+            .unwrap();
+        assert!(none.is_none(), "an empty task opens no tracking issue");
+
+        // Claiming an existing issue reuses it rather than opening a duplicate.
+        let existing = weaver_core::issue::add(
+            &db,
+            &weaver_core::issue::NewIssue {
+                repo_root: "/r".to_string(),
+                title: "preexisting".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let claimed = create_tracking_issue(
+            &st,
+            &child,
+            None,
+            "x",
+            "x",
+            "",
+            None,
+            None,
+            Some(existing.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed, Some(existing.id), "a claim reuses the issue id");
+        let reclaimed = weaver_core::issue::get(&db, existing.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reclaimed.claimed_branch.as_deref(),
+            Some("weaver/child"),
+            "claiming stamps the new branch"
+        );
+    }
+
+    #[test]
+    fn tracking_note_names_the_issue_and_how_to_close_it() {
+        let note = tracking_note(42);
+        assert!(note.contains("weaver issue #42"));
+        // It tells the agent exactly how to signal "done".
+        assert!(note.contains("weaver issue close 42"));
+        assert!(note.contains("weaver set-status"));
     }
 
     #[test]

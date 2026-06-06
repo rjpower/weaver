@@ -63,6 +63,8 @@ weaver issue ls                       # this branch's work + the repo backlog
 weaver issue ls --mine                # just this branch's claimed issues
 weaver issue ls --repo                # the whole repo, grouped by branch
 weaver issue close 7
+weaver issue show 7                   # an issue + the live status of the branch working it
+weaver issue wait 7                   # block until a sub-session finishes or needs you
 weaver set-status                     # read: goal + status + open-issue count
 weaver where                          # debug: print resolved repo / branch / branch-id
 weaver log --limit 50                 # recent events for the current branch
@@ -81,6 +83,17 @@ GitHub issue (via the `gh` CLI), `loom launch --claim 7` takes them from an
 existing weaver issue and moves it out of the repo backlog, and `loom launch
 --branch <name>` resumes an existing branch. `loom issues` prints the repo's
 board across branches.
+
+Every launch opens a **tracking issue** claimed by the new branch — the task as
+a weaver issue — and `loom launch` prints its number. That number is the handle
+for following the session: `weaver issue show <n>` reports the issue plus the
+live `set-status` of the branch working it, and `weaver issue wait <n>` blocks
+until the issue closes or that branch raises its attention. The launched agent
+is told to keep its status current and close the issue when the work is done.
+When an agent already inside a weaver session runs `loom launch`, the tracking
+issue is attributed to it (`source_branch`), so its sub-trees show up under
+"Delegated by this branch" in `weaver issue ls` — agents can fan work out into
+parallel sub-sessions and poll or block on them the same way a human does.
 
 `loom launch --model <haiku|sonnet|opus> --effort <low|medium|high|xhigh|max>`
 (both also selectors in the web create form) pin the session's Claude model
@@ -136,13 +149,36 @@ automatically on startup (off by default):
 weaver config set server.auto_adopt true
 ```
 
+## GitHub
+
+With the `gh` CLI installed and authenticated, loom tracks each active session's
+pull request. A background loop polls `gh pr view` for the branch every 30s and
+surfaces the result on the dashboard: a link straight to the PR, its state
+(open / draft / merged / closed), the review decision (approved / changes
+requested / review required), and a rolled-up CI verdict (checks passing /
+failing / pending). The session's Overview tab has a **Refresh** button to
+re-poll on demand.
+
+Once a branch's PR merges, loom archives the session automatically — tearing
+down its tmux and worktree while keeping the branch and its weaver history, the
+same as the Archive button. Turn either behaviour off in **Settings** or from
+the CLI:
+
+```sh
+weaver config set github.archive_on_merge false   # keep the worktree after merge
+weaver config set github.poll false               # stop polling GitHub entirely
+```
+
+Polling is a quiet no-op for repositories without a GitHub remote, or wherever
+`gh` is not installed — nothing to configure to opt out there.
+
 ## REST API (brief)
 
 Loom serves a JSON API under `/api`; the Vue SPA is the primary consumer.
 
 - `GET /api/health`
 - `GET POST /api/sessions`, `GET PATCH DELETE /api/sessions/{id}`,
-  `POST /api/sessions/{id}/{note,summarize,archive,adopt}`,
+  `POST /api/sessions/{id}/{note,archive,adopt,github}`,
   `GET /api/sessions/{id}/{diff,log,events}`,
   `GET /api/sessions/{id}/terminal` (WebSocket: xterm.js ⇄ PTY ⇄ tmux)
 - `GET /api/branches`, `GET PATCH /api/branches/{id}`,
@@ -184,6 +220,10 @@ Notable settings:
 - `agent.claude_args` — extra arguments spliced into the Claude TUI launch,
   e.g. `--model claude-opus-4-7`.
 - `server.auto_adopt` — adopt every recoverable session on daemon startup.
+- `github.poll` — poll GitHub (via `gh`) for each session's PR, review, and
+  check status (on by default; a no-op without `gh` or a GitHub remote).
+- `github.archive_on_merge` — archive a session automatically once its PR
+  merges (on by default).
 
 ## Building
 

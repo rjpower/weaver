@@ -20,6 +20,29 @@ export interface Branch {
   created_at: string;
   updated_at: string;
   open_issue_count: number;
+  /** Latest GitHub pull-request snapshot for the branch, or null when GitHub
+   *  polling is off, there's no PR, or `gh` is unavailable. Maintained
+   *  server-side by loom's poll loop. */
+  github: GithubStatus | null;
+}
+
+/** A point-in-time GitHub snapshot of a branch's pull request: its link plus
+ *  the review and check rollups loom read via the `gh` CLI. */
+export interface GithubStatus {
+  pr_number: number;
+  pr_url: string;
+  /** 'OPEN' | 'CLOSED' | 'MERGED'. */
+  pr_state: string;
+  pr_title: string;
+  is_draft: boolean;
+  /** 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED' | null. */
+  review_decision: string | null;
+  /** Rolled-up checks: 'passing' | 'failing' | 'pending' | null (no checks). */
+  checks: string | null;
+  /** 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' | null. */
+  mergeable: string | null;
+  merged_at: string | null;
+  fetched_at: string;
 }
 
 /** A session is loom's view: one tmux + one running agent attached to a
@@ -38,6 +61,9 @@ export interface Session {
   last_activity_at: string;
   created_at: string;
   updated_at: string;
+  /** The tracking issue opened for this session's task at launch (the handle
+   *  the launcher follows). Only set on the create response. */
+  tracking_issue: number | null;
   branch: Branch;
 }
 
@@ -146,12 +172,15 @@ export interface ScratchFile {
 }
 
 /** The worktree file tree: a flat list of repo-relative paths plus a
- *  `path → status` map of changes vs the base branch. Assembled into a tree
- *  client-side. Returned by `/api/sessions/{id}/tree`. */
+ *  `path → status` map of changes vs the chosen baseline. Assembled into a tree
+ *  client-side. Returned by `/api/sessions/{id}/tree`; the optional `base`
+ *  query param ("branch" | "uncommitted") selects the baseline, echoed back. */
 export interface FileTree {
   files: string[];
   /** status is one of "added" | "modified" | "deleted" | "renamed" | "copied". */
   changed: Record<string, string>;
+  /** The baseline these changes are measured against: "branch" | "uncommitted". */
+  base: string;
 }
 
 /** A single file's content for the editor. For binary or oversized files the

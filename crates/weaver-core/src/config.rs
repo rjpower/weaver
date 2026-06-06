@@ -17,6 +17,12 @@ pub const DEFAULT_AGENT: &str = "claude";
 /// Whether the server adopts orphaned sessions on startup. Off by default:
 /// the operator opts in via `weaver config set server.auto_adopt true`.
 pub const DEFAULT_AUTO_ADOPT: bool = false;
+/// Whether loom polls GitHub (via the `gh` CLI) for each session's PR, review,
+/// and check status. On by default, but a no-op wherever `gh` is missing.
+pub const DEFAULT_GITHUB_POLL: bool = true;
+/// Whether loom archives a session automatically once its pull request merges.
+/// On by default — a merged branch's worktree has served its purpose.
+pub const DEFAULT_GITHUB_ARCHIVE_ON_MERGE: bool = true;
 
 // ---------------------------------------------------------------------------
 // Setting registry
@@ -87,6 +93,29 @@ pub const REGISTRY: &[SettingSpec] = &[
         kind: SettingKind::Bool,
         default: "false",
         group: "Server",
+    },
+    SettingSpec {
+        key: "github.poll",
+        label: "Poll GitHub for PR status",
+        description: "When enabled, loom uses the `gh` CLI to fetch each \
+            active session's pull request — its link, review decision, and \
+            check rollup — and surfaces it on the dashboard. A no-op for \
+            repositories without a GitHub remote, or wherever `gh` is not \
+            installed.",
+        kind: SettingKind::Bool,
+        default: "true",
+        group: "GitHub",
+    },
+    SettingSpec {
+        key: "github.archive_on_merge",
+        label: "Archive on PR merge",
+        description: "When enabled, loom archives a session automatically once \
+            its pull request is merged — tearing down the tmux session and \
+            removing the worktree, while keeping the branch and its history. \
+            Requires GitHub polling.",
+        kind: SettingKind::Bool,
+        default: "true",
+        group: "GitHub",
     },
 ];
 
