@@ -40,7 +40,7 @@ test.describe('plan on the overview tab', () => {
     mkdirSync(join(session.work_dir, 'docs', 'plans'), { recursive: true });
     writeFileSync(join(session.work_dir, 'docs', 'plans', 'feature.md'), PLAN);
 
-    await page.goto(`${weaver.baseUrl}/#/s/${session.id}`);
+    await page.goto(`${weaver.baseUrl}/s/${session.id}`);
     await page.getByRole('button', { name: 'Overview' }).click();
 
     const plan = page.getByTestId('session-plan');

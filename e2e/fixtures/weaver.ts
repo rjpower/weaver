@@ -1,6 +1,6 @@
 import { test as base, expect } from '@playwright/test';
 import { type ChildProcess, execFileSync, spawn } from 'child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -8,7 +8,6 @@ import { join } from 'path';
 const WEAVER_ROOT = join(__dirname, '..', '..');
 const LOOM_BINARY = join(WEAVER_ROOT, 'target', 'debug', 'loom');
 const WEAVER_BINARY = join(WEAVER_ROOT, 'target', 'debug', 'weaver');
-const FRONTEND_DIR = join(WEAVER_ROOT, 'crates', 'loom', 'frontend');
 const DIST_INDEX = join(WEAVER_ROOT, 'crates', 'loom', 'static', 'dist', 'index.html');
 
 /** The branch-level fields embedded in a SessionView. */
@@ -73,32 +72,49 @@ export interface WeaverFixture {
   ): Promise<void>;
 }
 
-/** Ensure the loom binary and the Vue frontend bundle both exist. */
+let built = false;
+
+/**
+ * Build the loom + weaver binaries and the real frontend bundle from the
+ * current source, then sanity-check the outputs. Memoized per worker process.
+ *
+ * This always runs an (incremental) `cargo build` rather than checking only
+ * that the outputs *exist*: cargo's own freshness tracking rebuilds just what
+ * changed, and loom's `build.rs` re-runs rspack into `static/dist` whenever
+ * `frontend/src` changes. So editing a `.vue`/`.ts`/`.rs` file and re-running
+ * the suite always tests current code — no manual rebuild step. An
+ * existence-only check (the old behavior) would silently serve a stale or
+ * placeholder bundle, which is exactly the kind of ghost failure this avoids.
+ *
+ * `WEAVER_SKIP_FRONTEND` is forced off: the e2e suite drives the real UI, so
+ * the placeholder page that flag produces is never acceptable here. Flipping
+ * the var also makes cargo re-run `build.rs`, undoing any prior placeholder.
+ */
 function ensureBuilt() {
-  const needBinary = !existsSync(LOOM_BINARY) || !existsSync(WEAVER_BINARY);
-  const needFrontend = !existsSync(DIST_INDEX);
-  if (needBinary || needFrontend) {
-    // A full `cargo build` also builds the frontend into static/dist.
-    execFileSync('cargo', ['build'], {
-      cwd: WEAVER_ROOT,
-      stdio: 'inherit',
-      env: process.env,
-    });
+  if (built) return;
+
+  const env = { ...process.env };
+  delete env.WEAVER_SKIP_FRONTEND;
+  execFileSync('cargo', ['build'], { cwd: WEAVER_ROOT, stdio: 'inherit', env });
+
+  for (const [label, path] of [
+    ['loom binary', LOOM_BINARY],
+    ['weaver binary', WEAVER_BINARY],
+    ['frontend bundle', DIST_INDEX],
+  ] as const) {
+    if (!existsSync(path)) throw new Error(`${label} missing after build: ${path}`);
   }
-  if (!existsSync(LOOM_BINARY)) {
-    throw new Error(`loom binary missing after build: ${LOOM_BINARY}`);
+  // `build.rs` writes this placeholder when it can't build the real SPA (npm
+  // missing, or sources absent). Serving it would make every UI assertion time
+  // out mysteriously — fail loudly with the cause instead.
+  if (readFileSync(DIST_INDEX, 'utf8').includes('Frontend not built')) {
+    throw new Error(
+      `frontend bundle at ${DIST_INDEX} is the placeholder, not a real build ` +
+        `(is npm available?). The e2e suite needs the real SPA.`,
+    );
   }
-  if (!existsSync(WEAVER_BINARY)) {
-    throw new Error(`weaver binary missing after build: ${WEAVER_BINARY}`);
-  }
-  if (!existsSync(DIST_INDEX)) {
-    // Binary built with WEAVER_SKIP_FRONTEND, or stale: build the SPA directly.
-    execFileSync('npx', ['rspack', 'build'], {
-      cwd: FRONTEND_DIR,
-      stdio: 'inherit',
-      env: process.env,
-    });
-  }
+
+  built = true;
 }
 
 /** Create a throwaway git repo with a single commit on `main`. */
