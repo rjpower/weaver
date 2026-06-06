@@ -103,8 +103,26 @@ enum IssueCmd {
         #[arg(long)]
         branch: Option<String>,
     },
-    /// Show one issue.
+    /// Show one issue, including the live status of the branch working it.
     Show { id: i64 },
+    /// Block until an issue finishes or its sub-tree needs you.
+    ///
+    /// Polls the issue until it closes (the sub-agent's "done" signal) or — unless
+    /// `--closed-only` — until the branch working it raises its attention to
+    /// `attention`/`blocked` (it wants you). Prints why it woke. Exits non-zero
+    /// if `--timeout` elapses first with the issue still open.
+    Wait {
+        id: i64,
+        /// Give up after this many seconds (0 = wait indefinitely).
+        #[arg(long, default_value = "1800")]
+        timeout: u64,
+        /// Seconds between polls.
+        #[arg(long, default_value = "3")]
+        interval: u64,
+        /// Wake only when the issue closes; ignore the sub-agent's attention.
+        #[arg(long)]
+        closed_only: bool,
+    },
     /// Close an issue.
     Close { id: i64 },
     /// Reopen a closed issue.
@@ -357,6 +375,12 @@ async fn cmd_issue(cmd: IssueCmd) -> Result<()> {
                 "  claimed: {}",
                 i.claimed_branch.as_deref().unwrap_or("(backlog)")
             );
+            // Surface the live status of the branch working this issue — what
+            // makes `issue show` a poll of a delegated sub-tree, not just a
+            // record lookup.
+            if let Some(progress) = working_branch_status(&db, &i).await {
+                println!("  working: {progress}");
+            }
             if let Some(src) = &i.source_branch {
                 println!("  from:    {src}");
             }
@@ -371,6 +395,14 @@ async fn cmd_issue(cmd: IssueCmd) -> Result<()> {
                 println!();
                 println!("{}", i.body);
             }
+        }
+        IssueCmd::Wait {
+            id,
+            timeout,
+            interval,
+            closed_only,
+        } => {
+            cmd_issue_wait(&db, &b.repo_root, id, timeout, interval.max(1), closed_only).await?;
         }
         IssueCmd::Close { id } => {
             ensure_issue_in_repo(&db, id, &b.repo_root).await?;
@@ -417,6 +449,19 @@ async fn cmd_issue_ls_default(
         println!("On this branch ({}):", working.len());
         for i in &working {
             println!("  {}", issue_line(i));
+        }
+        printed = true;
+    }
+    // Sub-trees this branch launched: tracking issues it sourced but another
+    // branch is working. Each carries its sub-agent's live status.
+    let delegated = issue::list_delegated_by(db, repo_root, target, all).await?;
+    if !delegated.is_empty() {
+        println!("Delegated by this branch ({}):", delegated.len());
+        for i in &delegated {
+            let status = working_branch_status(db, i)
+                .await
+                .unwrap_or_else(|| i.claimed_branch.clone().unwrap_or_else(|| "?".to_string()));
+            println!("  {}  → {status}", issue_line(i));
         }
         printed = true;
     }
@@ -501,6 +546,80 @@ async fn ensure_issue_in_repo(db: &db::Db, id: i64, repo_root: &str) -> Result<i
         bail!("issue #{id} belongs to a different repo");
     }
     Ok(i)
+}
+
+/// The live status of the branch working `issue`, as `"<branch> · <attention>
+/// — <message>"`, or `None` when the issue is unclaimed or its branch row is
+/// gone. This is what turns an issue lookup into a poll of a delegated sub-tree.
+async fn working_branch_status(db: &db::Db, issue: &issue::Issue) -> Option<String> {
+    let claimed = issue.claimed_branch.as_deref()?;
+    let row = branch::find_by_repo_branch(db, &issue.repo_root, claimed)
+        .await
+        .ok()
+        .flatten()?;
+    let status = if row.description.is_empty() {
+        row.attention.clone()
+    } else {
+        format!("{} — {}", row.attention, row.description)
+    };
+    Some(format!("{claimed} · {status}"))
+}
+
+/// Block until issue `id` finishes (closes) or — unless `closed_only` — its
+/// claiming branch raises attention above `ok`. Polls every `interval` seconds;
+/// exits the process non-zero if `timeout` (when non-zero) elapses first.
+async fn cmd_issue_wait(
+    db: &db::Db,
+    repo_root: &str,
+    id: i64,
+    timeout: u64,
+    interval: u64,
+    closed_only: bool,
+) -> Result<()> {
+    let issue = ensure_issue_in_repo(db, id, repo_root).await?;
+    if issue.status != "open" {
+        println!("issue #{id} is {} — nothing to wait for", issue.status);
+        return Ok(());
+    }
+    match working_branch_status(db, &issue).await {
+        Some(s) => println!("waiting on #{id} ({}) — {s}", issue.title),
+        None => println!("waiting on #{id} ({})", issue.title),
+    }
+
+    let deadline =
+        (timeout > 0).then(|| std::time::Instant::now() + std::time::Duration::from_secs(timeout));
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        let cur = issue::get(db, id)
+            .await?
+            .ok_or_else(|| anyhow!("issue #{id} disappeared while waiting"))?;
+        if cur.status != "open" {
+            println!("issue #{id} closed — sub-tree finished");
+            return Ok(());
+        }
+        if !closed_only {
+            if let Some(name) = cur.claimed_branch.as_deref() {
+                if let Some(row) = branch::find_by_repo_branch(db, repo_root, name).await? {
+                    if row.attention != branch::DEFAULT_ATTENTION {
+                        let msg = if row.description.is_empty() {
+                            row.attention.clone()
+                        } else {
+                            format!("{} — {}", row.attention, row.description)
+                        };
+                        println!("issue #{id} needs you — {name} is {msg}");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            let progress = working_branch_status(db, &cur)
+                .await
+                .unwrap_or_else(|| "open".to_string());
+            println!("timed out after {timeout}s — #{id} still open ({progress})");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// The WEAVER.md to inject at session start: the repo's own copy when it ships

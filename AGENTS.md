@@ -141,7 +141,7 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | Method + path | What it does |
 |---|---|
 | `GET /api/health` | liveness probe |
-| `GET /api/sessions` / `POST /api/sessions` | list / create sessions (create takes optional `scratch: [{name, content_base64}]`) |
+| `GET /api/sessions` / `POST /api/sessions` | list / create sessions (create takes optional `scratch: [{name, content_base64}]` and `parent_branch`; opens a tracking issue and returns its id as `tracking_issue`) |
 | `GET PATCH DELETE /api/sessions/{id}` | session CRUD (status, title, goal, description, attention) |
 | `POST /api/sessions/{id}/{note,archive,adopt}` | actions |
 | `GET POST DELETE /api/sessions/{id}/scratch` | list / drop / remove worktree `scratch/` reference files |
@@ -157,7 +157,8 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 `SessionView` (`/api/sessions[/...]`) returns session-specific fields
 top-level (`id`, `status`, `work_dir`, `tmux_session`, `agent_kind`, `model`,
 `effort`, `pending_prompt`, `github_repo`, `last_activity_at`,
-`created_at`, `updated_at`) plus a nested `branch: BranchView`
+`created_at`, `updated_at`, and — on the create response only —
+`tracking_issue`) plus a nested `branch: BranchView`
 (`id`, `name`, `title`, `goal`, `description`, `attention`,
 `repo_root`, `branch`, `base_branch`, `created_at`, `updated_at`,
 `open_issue_count`).
@@ -265,6 +266,8 @@ weaver issue add "Audit the logger" --repo  # unclaimed repo backlog item
 weaver issue ls                         # this branch's work + unclaimed backlog
 weaver issue ls --mine --all            # just this branch, including closed
 weaver issue ls --repo                  # whole repo, grouped by branch
+weaver issue show 7                     # an issue + the live status of the branch working it
+weaver issue wait 7 --timeout 600       # block until a sub-tree closes #7 or raises attention
 weaver issue close 7
 weaver where                            # debug: print resolved repo / branch / branch-id
 weaver log --limit 50                   # recent events for the current branch

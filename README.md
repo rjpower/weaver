@@ -63,6 +63,8 @@ weaver issue ls                       # this branch's work + the repo backlog
 weaver issue ls --mine                # just this branch's claimed issues
 weaver issue ls --repo                # the whole repo, grouped by branch
 weaver issue close 7
+weaver issue show 7                   # an issue + the live status of the branch working it
+weaver issue wait 7                   # block until a sub-session finishes or needs you
 weaver set-status                     # read: goal + status + open-issue count
 weaver where                          # debug: print resolved repo / branch / branch-id
 weaver log --limit 50                 # recent events for the current branch
@@ -81,6 +83,17 @@ GitHub issue (via the `gh` CLI), `loom launch --claim 7` takes them from an
 existing weaver issue and moves it out of the repo backlog, and `loom launch
 --branch <name>` resumes an existing branch. `loom issues` prints the repo's
 board across branches.
+
+Every launch opens a **tracking issue** claimed by the new branch — the task as
+a weaver issue — and `loom launch` prints its number. That number is the handle
+for following the session: `weaver issue show <n>` reports the issue plus the
+live `set-status` of the branch working it, and `weaver issue wait <n>` blocks
+until the issue closes or that branch raises its attention. The launched agent
+is told to keep its status current and close the issue when the work is done.
+When an agent already inside a weaver session runs `loom launch`, the tracking
+issue is attributed to it (`source_branch`), so its sub-trees show up under
+"Delegated by this branch" in `weaver issue ls` — agents can fan work out into
+parallel sub-sessions and poll or block on them the same way a human does.
 
 `loom launch --model <haiku|sonnet|opus> --effort <low|medium|high|xhigh|max>`
 (both also selectors in the web create form) pin the session's Claude model

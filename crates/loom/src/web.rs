@@ -226,6 +226,10 @@ pub struct SessionView {
     pub last_activity_at: String,
     pub created_at: String,
     pub updated_at: String,
+    /// The tracking issue opened for this session's task at launch (the handle
+    /// handed back to whoever launched it). Only populated on the create
+    /// response; `None` on the list/get/patch paths, which don't recompute it.
+    pub tracking_issue: Option<i64>,
     pub branch: BranchView,
 }
 
@@ -248,6 +252,7 @@ impl SessionView {
                 .unwrap_or_else(|| branch.updated_at.clone()),
             created_at: session.created_at.clone(),
             updated_at: branch.updated_at.clone(),
+            tracking_issue: None,
             branch: bv,
         })
     }
@@ -422,6 +427,13 @@ struct CreateReq {
     claim_issue: Option<i64>,
     #[serde(default)]
     existing_branch: Option<String>,
+    /// The branch (id or name) of the agent launching this session, when it is
+    /// itself a weaver session delegating work. Recorded as the tracking
+    /// issue's `source_branch` so the parent's sub-trees are attributable. The
+    /// `loom` CLI fills this from `$WEAVER_BRANCH`; a human/dashboard launch
+    /// leaves it unset.
+    #[serde(default)]
+    parent_branch: Option<String>,
     /// Model tier ('haiku' | 'sonnet' | 'opus'); blank/absent inherits the
     /// configured `agent.claude_args`.
     #[serde(default)]
@@ -655,21 +667,55 @@ async fn create_session(
         .await?
         .ok_or_else(|| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "branch vanished"))?;
 
+    // Open this session's tracking issue before the launch prompt is written,
+    // so the agent can be told its issue number. When an agent delegated this
+    // work (`parent_branch`), the parent becomes the issue's `source_branch`.
+    let parent_branch_name = match req
+        .parent_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(key) => branch_mod::resolve_key(&st.db, key)
+            .await?
+            .map(|b| b.branch)
+            .filter(|name| name != &branch.branch),
+        None => None,
+    };
+    let tracking_issue = create_tracking_issue(
+        &st,
+        &branch,
+        parent_branch_name.as_deref(),
+        &title,
+        &goal,
+        &description,
+        github_repo.as_deref(),
+        github_issue,
+        claimed_issue_id,
+    )
+    .await?;
+
     let session_id = branch_mod::new_id();
     let run_dir = db::run_dir(&session_id);
     tokio::fs::create_dir_all(&run_dir).await?;
 
     // Drop any attached reference files into the worktree before the agent
     // launches, then tell the agent they are there. The branch goal stays the
-    // clean text the user typed; the scratch note rides on the launch prompt
-    // (goal.txt) only, so it reaches the agent without cluttering the dashboard.
+    // clean text the user typed; the scratch and tracking notes ride on the
+    // launch prompt (goal.txt) only, so they reach the agent without cluttering
+    // the dashboard.
     let scratch_names = write_initial_scratch(&work_dir, &req.scratch).await?;
-    let launch_prompt = match (goal.is_empty(), scratch_note(&scratch_names)) {
-        (true, None) => String::new(),
-        (false, None) => goal.clone(),
-        (true, Some(note)) => note,
-        (false, Some(note)) => format!("{goal}\n\n{note}"),
-    };
+    let mut prompt_parts: Vec<String> = Vec::new();
+    if !goal.is_empty() {
+        prompt_parts.push(goal.clone());
+    }
+    if let Some(note) = scratch_note(&scratch_names) {
+        prompt_parts.push(note);
+    }
+    if let Some(id) = tracking_issue {
+        prompt_parts.push(tracking_note(id));
+    }
+    let launch_prompt = prompt_parts.join("\n\n");
     let goal_file = if launch_prompt.is_empty() {
         None
     } else {
@@ -717,40 +763,6 @@ async fn create_session(
     )
     .await?;
 
-    // Track a seeding GitHub issue as a claimed issue row on this branch.
-    if let Some(number) = github_issue {
-        weaver_core::issue::add(
-            &st.db,
-            &weaver_core::issue::NewIssue {
-                repo_root: branch.repo_root.clone(),
-                github_repo: github_repo.clone(),
-                source_branch: Some(branch.branch.clone()),
-                claimed_branch: Some(branch.branch.clone()),
-                title: title.clone(),
-                body: description.clone(),
-                github_issue: Some(number),
-            },
-        )
-        .await
-        .ok();
-    }
-
-    // Fan-out pickup: a pre-existing weaver issue this session is claiming.
-    if let Some(issue_id) = claimed_issue_id {
-        weaver_core::issue::set_claim(&st.db, issue_id, Some(&branch.branch))
-            .await
-            .ok();
-        events::record(
-            &st.db,
-            &st.bus,
-            &branch.id,
-            "issue_claimed",
-            json!({ "id": issue_id }),
-        )
-        .await
-        .ok();
-    }
-
     if let Err(e) = repo::record_use(&st.db, &branch.repo_root).await {
         tracing::warn!(branch = %branch.id, error = %e, "failed to record recent repo");
     }
@@ -771,7 +783,123 @@ async fn create_session(
         "session created"
     );
 
-    Ok(Json(SessionView::build(&st.db, &session, &branch).await?))
+    let mut view = SessionView::build(&st.db, &session, &branch).await?;
+    view.tracking_issue = tracking_issue;
+    Ok(Json(view))
+}
+
+/// A line appended to a session's launch prompt telling the agent which weaver
+/// issue tracks its task, so it keeps the issue up to date and closes it when
+/// done. Mirrors [`scratch_note`]: it rides on the prompt only, never the
+/// stored goal.
+fn tracking_note(issue_id: i64) -> String {
+    format!(
+        "This session is tracked as weaver issue #{issue_id}. Keep your status \
+         current with `weaver set-status <level> \"<message>\"` as you work, and \
+         run `weaver issue close {issue_id}` once the task is complete (e.g. the \
+         PR is open) so whoever launched you knows you are done."
+    )
+}
+
+/// Open (or adopt) the tracking issue for a freshly-launched session: the one
+/// issue, claimed by the new branch, that represents its task. Whoever launched
+/// the session follows progress through it.
+///
+/// `--claim <id>` and `--issue <n>` (GitHub) reuse the issue they already
+/// imply, so a launch never opens a duplicate; a plain launch opens a fresh one
+/// from the task. An empty worktree with no task at all is untracked (`None`).
+/// `source_branch` records provenance — the parent branch when an agent
+/// delegated this work, else the new branch itself.
+#[allow(clippy::too_many_arguments)]
+async fn create_tracking_issue(
+    st: &AppState,
+    branch: &Branch,
+    parent_branch: Option<&str>,
+    title: &str,
+    goal: &str,
+    description: &str,
+    github_repo: Option<&str>,
+    github_issue: Option<i64>,
+    claim_issue: Option<i64>,
+) -> ApiResult<Option<i64>> {
+    let source = parent_branch.unwrap_or(&branch.branch).to_string();
+
+    // Claiming an existing weaver issue: that issue *is* the tracker.
+    if let Some(id) = claim_issue {
+        weaver_core::issue::set_claim(&st.db, id, Some(&branch.branch))
+            .await
+            .ok();
+        events::record(
+            &st.db,
+            &st.bus,
+            &branch.id,
+            "issue_claimed",
+            json!({ "id": id }),
+        )
+        .await
+        .ok();
+        return Ok(Some(id));
+    }
+
+    // A GitHub-seeded launch tracks the imported issue row.
+    if let Some(number) = github_issue {
+        let issue = weaver_core::issue::add(
+            &st.db,
+            &weaver_core::issue::NewIssue {
+                repo_root: branch.repo_root.clone(),
+                github_repo: github_repo.map(str::to_string),
+                source_branch: Some(source),
+                claimed_branch: Some(branch.branch.clone()),
+                title: title.to_string(),
+                body: description.to_string(),
+                github_issue: Some(number),
+            },
+        )
+        .await?;
+        events::record(
+            &st.db,
+            &st.bus,
+            &branch.id,
+            "issue_added",
+            json!({ "id": issue.id, "title": issue.title }),
+        )
+        .await
+        .ok();
+        return Ok(Some(issue.id));
+    }
+
+    // No task to track (e.g. an empty `--agent shell` worktree).
+    if goal.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let body = if description.trim().is_empty() {
+        goal
+    } else {
+        description
+    };
+    let issue = weaver_core::issue::add(
+        &st.db,
+        &weaver_core::issue::NewIssue {
+            repo_root: branch.repo_root.clone(),
+            source_branch: Some(source),
+            claimed_branch: Some(branch.branch.clone()),
+            title: title.to_string(),
+            body: body.to_string(),
+            ..Default::default()
+        },
+    )
+    .await?;
+    events::record(
+        &st.db,
+        &st.bus,
+        &branch.id,
+        "issue_added",
+        json!({ "id": issue.id, "title": issue.title }),
+    )
+    .await
+    .ok();
+    Ok(Some(issue.id))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1839,6 +1967,101 @@ mod tests {
 
     fn b64(s: &str) -> String {
         base64::engine::general_purpose::STANDARD.encode(s)
+    }
+
+    #[tokio::test]
+    async fn create_tracking_issue_sources_parent_and_reuses_claims() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let st = AppState {
+            db: db.clone(),
+            bus: crate::events::EventBus::new(),
+            addr: "127.0.0.1:0".to_string(),
+        };
+        let child = branch_mod::upsert(&db, "/r", "weaver/child", "main")
+            .await
+            .unwrap();
+
+        // A delegated launch names the parent as the issue's source.
+        let id = create_tracking_issue(
+            &st,
+            &child,
+            Some("weaver/parent"),
+            "do it",
+            "do it in detail",
+            "",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("a fresh tracking issue");
+        let issue = weaver_core::issue::get(&db, id).await.unwrap().unwrap();
+        assert_eq!(issue.claimed_branch.as_deref(), Some("weaver/child"));
+        assert_eq!(
+            issue.source_branch.as_deref(),
+            Some("weaver/parent"),
+            "a delegated launch is sourced from the parent"
+        );
+
+        // A non-delegated launch is self-sourced (matches a hand-authored issue).
+        let id2 =
+            create_tracking_issue(&st, &child, None, "solo", "solo task", "", None, None, None)
+                .await
+                .unwrap()
+                .unwrap();
+        let issue2 = weaver_core::issue::get(&db, id2).await.unwrap().unwrap();
+        assert_eq!(issue2.source_branch.as_deref(), Some("weaver/child"));
+
+        // No task at all → nothing to track.
+        let none = create_tracking_issue(&st, &child, None, "", "", "", None, None, None)
+            .await
+            .unwrap();
+        assert!(none.is_none(), "an empty task opens no tracking issue");
+
+        // Claiming an existing issue reuses it rather than opening a duplicate.
+        let existing = weaver_core::issue::add(
+            &db,
+            &weaver_core::issue::NewIssue {
+                repo_root: "/r".to_string(),
+                title: "preexisting".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let claimed = create_tracking_issue(
+            &st,
+            &child,
+            None,
+            "x",
+            "x",
+            "",
+            None,
+            None,
+            Some(existing.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed, Some(existing.id), "a claim reuses the issue id");
+        let reclaimed = weaver_core::issue::get(&db, existing.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reclaimed.claimed_branch.as_deref(),
+            Some("weaver/child"),
+            "claiming stamps the new branch"
+        );
+    }
+
+    #[test]
+    fn tracking_note_names_the_issue_and_how_to_close_it() {
+        let note = tracking_note(42);
+        assert!(note.contains("weaver issue #42"));
+        // It tells the agent exactly how to signal "done".
+        assert!(note.contains("weaver issue close 42"));
+        assert!(note.contains("weaver set-status"));
     }
 
     #[test]

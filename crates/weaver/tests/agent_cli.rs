@@ -151,6 +151,126 @@ fn issue_ls_separates_branch_work_from_repo_backlog() {
     assert!(out.contains("open issues: 1"), "status: {out}");
 }
 
+/// `issue show` surfaces the live status of the branch working the issue, which
+/// is what lets a parent agent poll a delegated sub-tree.
+#[test]
+fn issue_show_includes_the_working_branch_status() {
+    let env = setup();
+    run(&env, &["issue", "add", "the", "sub-task"]);
+    // The current branch claims it; give the branch a live status.
+    run(&env, &["set-status", "blocked", "build", "is", "broken"]);
+    let out = run(&env, &["issue", "show", "1"]);
+    assert!(
+        out.contains("working:"),
+        "show should report progress: {out}"
+    );
+    assert!(
+        out.contains("blocked — build is broken"),
+        "show should surface the claiming branch's status: {out}"
+    );
+}
+
+/// `issue wait` returns immediately (success) when the issue is already closed,
+/// and reports a closed issue rather than hanging.
+#[test]
+fn issue_wait_returns_when_already_closed() {
+    let env = setup();
+    run(&env, &["issue", "add", "done", "already"]);
+    run(&env, &["issue", "close", "1"]);
+    let out = run(&env, &["issue", "wait", "1", "--timeout", "1"]);
+    assert!(
+        out.contains("nothing to wait for"),
+        "wait on a closed issue should return at once: {out}"
+    );
+}
+
+/// `issue wait` on a still-open issue gives up at the timeout with a non-zero
+/// exit, so a caller can tell "still running" from "finished".
+#[test]
+fn issue_wait_times_out_on_an_open_issue() {
+    let env = setup();
+    run(&env, &["issue", "add", "still", "going"]);
+    let out = Command::new(weaver_bin())
+        .args(["issue", "wait", "1", "--timeout", "1", "--interval", "1"])
+        .current_dir(&env.repo_path)
+        .env("WEAVER_HOME", &env.home_path)
+        .env("WEAVER_API", "http://127.0.0.1:1")
+        .output()
+        .expect("failed to spawn weaver");
+    assert!(
+        !out.status.success(),
+        "an unmet wait should exit non-zero so callers can branch on it"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("timed out"), "stdout: {stdout}");
+}
+
+/// A tracking issue sourced from this branch but claimed by another shows up
+/// under "Delegated by this branch", with the sub-agent's status.
+#[test]
+fn issue_ls_shows_delegated_sub_trees() {
+    let env = setup();
+    // Simulate a delegation: an issue this branch (feature-test) sourced, now
+    // claimed by a child branch with a live status. We seed it straight into
+    // the db the same way the launcher would.
+    seed_delegated_issue(&env, "feature-test", "weaver/child", "attention", "ready");
+
+    let out = run(&env, &["issue", "ls"]);
+    assert!(
+        out.contains("Delegated by this branch"),
+        "ls should list delegated sub-trees: {out}"
+    );
+    assert!(out.contains("weaver/child"), "ls: {out}");
+    assert!(
+        out.contains("attention — ready"),
+        "delegated rows show the sub-agent status: {out}"
+    );
+}
+
+/// Insert a delegated tracking issue (sourced by `parent`, claimed by `child`)
+/// and give `child` a branch row with the supplied attention/description —
+/// reproducing the state a `loom launch` from inside `parent` would create.
+fn seed_delegated_issue(env: &Env, parent: &str, child: &str, attention: &str, description: &str) {
+    let db_path = env.home_path.join("weaver.db");
+    // Make sure the parent branch row exists first (a write resolves it).
+    run(env, &["goal", "parent", "goal"]);
+    let repo_root = canonical_repo_root(&env.repo_path);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let db = weaver_core::db::connect(&db_path).await.unwrap();
+        let child_id = weaver_core::branch::new_id();
+        weaver_core::branch::insert(&db, &child_id, &repo_root, child, "main")
+            .await
+            .unwrap();
+        weaver_core::branch::set_attention(&db, &child_id, attention)
+            .await
+            .unwrap();
+        weaver_core::branch::set_description(&db, &child_id, description)
+            .await
+            .unwrap();
+        weaver_core::issue::add(
+            &db,
+            &weaver_core::issue::NewIssue {
+                repo_root: repo_root.clone(),
+                source_branch: Some(parent.to_string()),
+                claimed_branch: Some(child.to_string()),
+                title: "the delegated task".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+}
+
+/// The canonical repo_root weaver keys on (matches `branch::resolve_from_path`).
+fn canonical_repo_root(repo: &Path) -> String {
+    repo.canonicalize()
+        .unwrap_or_else(|_| repo.to_path_buf())
+        .display()
+        .to_string()
+}
+
 #[test]
 fn note_writes_an_event() {
     let env = setup();

@@ -448,6 +448,12 @@ async fn cmd_launch(a: LaunchArgs) -> Result<()> {
     } = a;
     let client = Client::new();
     let cwd = std::env::current_dir()?;
+    // When an agent in a weaver session runs `loom launch`, `$WEAVER_BRANCH` is
+    // its own branch id — pass it so the tracking issue is attributed to the
+    // launching (parent) agent. A human shell launch leaves it unset.
+    let parent_branch = std::env::var("WEAVER_BRANCH")
+        .ok()
+        .filter(|s| !s.is_empty());
     let ws = client
         .post(
             "/api/sessions",
@@ -461,6 +467,7 @@ async fn cmd_launch(a: LaunchArgs) -> Result<()> {
                 "existing_branch": branch,
                 "issue": issue,
                 "claim_issue": claim,
+                "parent_branch": parent_branch,
                 "model": model,
                 "effort": effort,
             }),
@@ -488,6 +495,11 @@ async fn cmd_launch(a: LaunchArgs) -> Result<()> {
         println!("  effort: {effort}");
     }
     println!("  dir:    {}", str_field(&ws, "work_dir"));
+    if let Some(n) = ws.get("tracking_issue").and_then(Value::as_i64) {
+        // The handle the caller uses to follow this sub-tree: poll it with
+        // `weaver issue show <n>`, or block on it with `weaver issue wait <n>`.
+        println!("  track:  weaver issue #{n}  (weaver issue show {n} | wait {n})");
+    }
     println!("  attach: loom attach {id}");
     Ok(())
 }

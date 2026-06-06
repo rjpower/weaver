@@ -107,6 +107,32 @@ pub async fn list_for_branch(
     Ok(rows)
 }
 
+/// Issues this branch **delegated**: created from `branch` (it is the
+/// `source_branch`) but claimed by a *different* branch — i.e. the tracking
+/// issues a parent agent opened when it launched sub-sessions. This is the
+/// parent's view of its parallel sub-trees.
+pub async fn list_delegated_by(
+    db: &Db,
+    repo_root: &str,
+    branch: &str,
+    include_closed: bool,
+) -> Result<Vec<Issue>> {
+    let sql = format!(
+        "SELECT * FROM issues
+         WHERE repo_root = ? AND source_branch = ?
+           AND claimed_branch IS NOT NULL AND claimed_branch != ?{}
+         ORDER BY id ASC",
+        status_clause(include_closed)
+    );
+    let rows = sqlx::query_as::<_, Issue>(&sql)
+        .bind(repo_root)
+        .bind(branch)
+        .bind(branch)
+        .fetch_all(db)
+        .await?;
+    Ok(rows)
+}
+
 /// The unclaimed repo backlog (`claimed_branch IS NULL`).
 pub async fn list_backlog(db: &Db, repo_root: &str, include_closed: bool) -> Result<Vec<Issue>> {
     let sql = format!(
@@ -314,6 +340,37 @@ mod tests {
         );
         assert_eq!(list_backlog(&db, "/r", false).await.unwrap().len(), 2);
         assert_eq!(list_for_repo(&db, "/r", false).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delegated_lists_sub_trees_only() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        // `parent` delegated a task to `child` (source=parent, claimed=child).
+        let delegated = add(
+            &db,
+            &NewIssue {
+                repo_root: "/r".to_string(),
+                source_branch: Some("parent".to_string()),
+                claimed_branch: Some("child".to_string()),
+                title: "do the sub-task".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A self-claimed issue on `parent` is its own work, not a delegation.
+        add(&db, &claimed("/r", "parent", "my own work"))
+            .await
+            .unwrap();
+
+        let mine = list_delegated_by(&db, "/r", "parent", false).await.unwrap();
+        assert_eq!(mine.len(), 1, "only the cross-branch issue is delegated");
+        assert_eq!(mine[0].id, delegated.id);
+        // The child sees nothing delegated *by* it.
+        assert!(list_delegated_by(&db, "/r", "child", false)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
