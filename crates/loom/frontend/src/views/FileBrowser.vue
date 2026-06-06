@@ -5,8 +5,19 @@ import { get } from '../api';
 import type { Session, FileTree, FileContent } from '../types';
 import { theme } from '../theme';
 import { loadMonaco, monacoTheme, languageForPath } from '../monaco';
+import { useRouter } from 'vue-router';
+import SessionTabs from '../components/SessionTabs.vue';
+import MarkdownView from '../components/MarkdownView.vue';
 
 const props = defineProps<{ id: string }>();
+const router = useRouter();
+
+// Selecting a non-Files tab from the file browser returns to the session page,
+// which always lands on its default (Terminal) surface — cross-surface tab
+// memory isn't worth a query param.
+function selectTab() {
+  router.push(`/s/${props.id}`);
+}
 
 // ---------------------------------------------------------------------------
 // Tree model — a flat path list from the API assembled into a folder tree.
@@ -138,13 +149,24 @@ const IMAGE_EXTS = new Set([
   'png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'svg', 'bmp', 'ico',
 ]);
 
-type Kind = 'none' | 'text' | 'image' | 'binary' | 'toolarge' | 'error';
+type Kind = 'none' | 'text' | 'markdown' | 'image' | 'binary' | 'toolarge' | 'error';
+// How the selected file is shown: rendered markdown 'preview', Monaco 'source',
+// or the Monaco 'diff' against the base. Markdown files default to 'preview';
+// changed files to 'diff'; everything else to 'source'.
+type ViewMode = 'preview' | 'source' | 'diff';
 const kind = ref<Kind>('none');
-const mode = ref<'view' | 'diff'>('view');
+const viewMode = ref<ViewMode>('source');
 const sideBySide = ref(true);
 const loading = ref(false);
 const viewError = ref('');
 const fileBytes = ref(0);
+const mdSource = ref('');
+
+// Extensions that get the rendered-markdown Preview mode.
+const MD_EXTS = new Set(['md', 'markdown', 'mdown', 'mkd', 'mkdn', 'mdwn']);
+function isMarkdown(path: string): boolean {
+  return MD_EXTS.has(extOf(path));
+}
 
 const host = ref<HTMLElement | null>(null);
 
@@ -240,7 +262,9 @@ async function open(path: string) {
     kind.value = 'image';
     return;
   }
-  mode.value = statusOf(path) ? 'diff' : 'view';
+  // Markdown opens rendered; other changed files open to their diff; the rest
+  // to plain source.
+  viewMode.value = isMarkdown(path) ? 'preview' : statusOf(path) ? 'diff' : 'source';
   await render();
 }
 
@@ -250,7 +274,19 @@ async function render() {
   viewError.value = '';
   try {
     const path = selected.value;
-    if (mode.value === 'diff') {
+    if (viewMode.value === 'preview') {
+      const res = await getFile(path);
+      fileBytes.value = res.bytes;
+      if (res.binary || res.too_large) {
+        kind.value = res.binary ? 'binary' : 'toolarge';
+        teardownEditors();
+        return;
+      }
+      // The rendered preview is its own component, not Monaco.
+      teardownEditors();
+      mdSource.value = res.content ?? '';
+      kind.value = 'markdown';
+    } else if (viewMode.value === 'diff') {
       const status = statusOf(path);
       const [base, work] = await Promise.all([
         getFile(path, 'base'),
@@ -291,9 +327,33 @@ async function render() {
   }
 }
 
-function setMode(m: 'view' | 'diff') {
-  if (mode.value === m) return;
-  mode.value = m;
+// The view-mode buttons offered for the current file: Preview only for
+// markdown, Source always, Diff only for changed files.
+const modeOptions = computed<ViewMode[]>(() => {
+  const path = selected.value;
+  if (!path || IMAGE_EXTS.has(extOf(path))) return [];
+  const opts: ViewMode[] = [];
+  if (isMarkdown(path)) opts.push('preview');
+  opts.push('source');
+  if (statusOf(path)) opts.push('diff');
+  return opts;
+});
+
+// Show the toggle only when there's a real choice and the file is actually
+// renderable (binary/oversized files just get the raw link).
+const showModeToggle = computed(
+  () => modeOptions.value.length > 1 && (kind.value === 'text' || kind.value === 'markdown'),
+);
+
+function modeLabel(m: ViewMode): string {
+  if (m === 'preview') return 'Preview';
+  if (m === 'diff') return 'Diff';
+  return isMarkdown(selected.value) ? 'Source' : 'File';
+}
+
+function setMode(m: ViewMode) {
+  if (viewMode.value === m) return;
+  viewMode.value = m;
   render();
 }
 
@@ -358,13 +418,13 @@ onUnmounted(teardownEditors);
 
 <template>
   <div class="flex flex-col">
-    <!-- Header -->
+    <!-- Header — the shared session sub-nav (Files active) over the title row. -->
+    <SessionTabs :tab="'files'" :id="props.id" :issue-count="0" @select="selectTab" />
     <div class="flex items-center gap-3 mb-3">
-      <router-link :to="`/s/${props.id}`" class="text-muted hover:text-fg text-sm">← session</router-link>
       <h1 class="text-lg font-semibold truncate">
         {{ session?.branch.title || session?.branch.name || 'Files' }}
       </h1>
-      <span v-if="changedCount" class="text-xs text-amber-500">{{ changedCount }} changed</span>
+      <span v-if="changedCount" class="text-xs text-attn">{{ changedCount }} changed</span>
       <button
         class="ml-auto rounded bg-subtle hover:bg-subtle-hover px-2 py-1 text-xs"
         @click="refresh"
@@ -469,24 +529,19 @@ onUnmounted(teardownEditors);
         <div class="flex items-center gap-3 border-b border-line px-3 py-1.5 text-xs">
           <span class="truncate font-mono text-muted">{{ selected || 'No file selected' }}</span>
 
-          <template v-if="selected && statusOf(selected) && kind === 'text'">
+          <template v-if="showModeToggle">
             <div class="ml-auto flex items-center overflow-hidden rounded border border-line">
               <button
+                v-for="m in modeOptions"
+                :key="m"
                 class="px-2 py-0.5"
-                :class="mode === 'view' ? 'bg-subtle text-fg' : 'text-muted hover:bg-subtle/60'"
-                @click="setMode('view')"
+                :class="viewMode === m ? 'bg-subtle text-fg' : 'text-muted hover:bg-subtle/60'"
+                @click="setMode(m)"
               >
-                File
-              </button>
-              <button
-                class="px-2 py-0.5"
-                :class="mode === 'diff' ? 'bg-subtle text-fg' : 'text-muted hover:bg-subtle/60'"
-                @click="setMode('diff')"
-              >
-                Diff
+                {{ modeLabel(m) }}
               </button>
             </div>
-            <label v-if="mode === 'diff'" class="flex items-center gap-1 text-muted">
+            <label v-if="viewMode === 'diff'" class="flex items-center gap-1 text-muted">
               <input v-model="sideBySide" type="checkbox" class="accent-accent" />
               Side&#8209;by&#8209;side
             </label>
@@ -498,7 +553,7 @@ onUnmounted(teardownEditors);
             target="_blank"
             rel="noopener"
             class="text-muted hover:text-fg"
-            :class="!(statusOf(selected) && kind === 'text') ? 'ml-auto' : ''"
+            :class="showModeToggle ? '' : 'ml-auto'"
           >
             Open raw ↗
           </a>
@@ -508,6 +563,14 @@ onUnmounted(teardownEditors);
         <div class="relative min-h-0 flex-1 bg-code">
           <!-- Monaco host is always mounted (v-show) so its ref survives. -->
           <div v-show="kind === 'text'" ref="host" class="h-full w-full"></div>
+
+          <MarkdownView
+            v-if="kind === 'markdown'"
+            :id="props.id"
+            :path="selected"
+            :source="mdSource"
+            class="h-full w-full"
+          />
 
           <div
             v-if="kind === 'image'"
