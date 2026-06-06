@@ -3,6 +3,11 @@ import { ref, onMounted } from 'vue';
 import { get, upload, del } from '../api';
 import type { ScratchFile } from '../types';
 
+// Scratch attachments for a session, as a slim strip that sits in the working
+// zone right under the terminal — drop a file here and reference it from the
+// agent as `scratch/<name>`. Deliberately one quiet row (not a tall card): the
+// terminal is the surface, this is just the side door for handing the agent a
+// file. Files show as removable chips inline.
 const props = defineProps<{ id: string }>();
 
 const files = ref<ScratchFile[]>([]);
@@ -65,48 +70,41 @@ onMounted(refresh);
 </script>
 
 <template>
-  <section class="rounded border border-line bg-surface p-4" data-testid="scratch-panel">
-    <div class="flex items-center justify-between mb-2">
-      <label class="text-xs text-muted">Scratch files</label>
-      <span class="text-xs text-faint">reference as <code>scratch/&lt;name&gt;</code></span>
-    </div>
-
+  <section data-testid="scratch-panel">
     <div
-      class="rounded border border-dashed px-3 py-6 text-center text-sm transition-colors cursor-pointer"
-      :class="dragging ? 'border-accent bg-accent/10 text-fg' : 'border-line text-muted hover:border-accent'"
+      class="flex flex-wrap items-center gap-x-2 gap-y-1.5 rounded border border-dashed px-3 py-2 text-xs transition-colors cursor-pointer"
+      :class="dragging ? 'border-accent bg-accent/10' : 'border-line hover:border-accent/60'"
       data-testid="scratch-dropzone"
       @dragover.prevent="dragging = true"
       @dragleave.prevent="dragging = false"
       @drop.prevent="onDrop"
       @click="fileInput?.click()"
     >
-      <span v-if="busy">Uploading…</span>
-      <span v-else>Drop files here, or click to browse</span>
+      <span class="text-faint">📎</span>
+      <span :class="dragging ? 'text-fg' : 'text-muted'">
+        {{ busy ? 'Uploading…' : 'Drop a file or click to attach' }}
+      </span>
+      <span class="text-faint">·</span>
+      <span class="font-mono text-faint">reference as <code>scratch/&lt;name&gt;</code></span>
+
+      <ul v-if="files.length" class="ml-auto flex flex-wrap items-center gap-1.5" @click.stop>
+        <li v-for="f in files" :key="f.name" class="meta-chip text-fg">
+          <span class="truncate">{{ f.name }}</span>
+          <span class="text-faint">{{ fmtBytes(f.bytes) }}</span>
+          <button
+            type="button"
+            class="text-faint hover:text-block"
+            title="Remove"
+            @click.stop="remove(f.name)"
+          >
+            ✕
+          </button>
+        </li>
+      </ul>
+
       <input ref="fileInput" type="file" multiple class="hidden" @change="onPick" />
     </div>
 
-    <p v-if="error" class="mt-2 text-xs text-red-400">{{ error }}</p>
-
-    <ul v-if="files.length" class="mt-3 space-y-1 text-sm">
-      <li
-        v-for="f in files"
-        :key="f.name"
-        class="flex items-center justify-between gap-2 rounded bg-canvas/60 px-2 py-1"
-      >
-        <span class="min-w-0 flex items-baseline gap-2">
-          <span class="truncate font-mono text-xs text-fg">{{ f.name }}</span>
-          <span class="shrink-0 text-xs text-faint">{{ fmtBytes(f.bytes) }}</span>
-        </span>
-        <button
-          type="button"
-          class="shrink-0 rounded px-1.5 py-0.5 text-xs text-muted hover:text-red-400 hover:bg-subtle"
-          title="Remove"
-          @click="remove(f.name)"
-        >
-          ✕
-        </button>
-      </li>
-    </ul>
-    <p v-else class="mt-3 text-xs text-faint">No scratch files yet.</p>
+    <p v-if="error" class="mt-1 text-xs text-block">{{ error }}</p>
   </section>
 </template>
