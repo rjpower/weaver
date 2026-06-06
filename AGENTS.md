@@ -9,13 +9,12 @@ ship its own `WEAVER.md` to override it).
 
 weaver ships **two binaries** and a **shared sqlite database**:
 
-- **`weaver`** is the **agent-facing CLI**. It is database-direct (no daemon,
-  no HTTP) and resolves "the current branch" from `$WEAVER_BRANCH` or, failing
-  that, the git checkout under cwd. Cold start is sub-50ms; the binary
-  intentionally has no `axum` / `reqwest` / SPA dependencies. Agents call
-  `weaver` to read and update the goal, append notes, add and triage issues,
-  and emit hook events. **`weaver` works fine whether or not `loom` is
-  running** — that decoupling is the whole point of the split.
+- **`weaver`** is the **agent-facing CLI**: database-direct (no daemon, no
+  HTTP), resolving "the current branch" from `$WEAVER_BRANCH` else the git
+  checkout under cwd. Cold start is sub-50ms; it carries no `axum` / `reqwest` /
+  SPA dependencies. Agents call it to read and update the goal, append notes,
+  add and triage issues, and emit hook events. It **works whether or not `loom`
+  is running** — that decoupling is the point of the split.
 
 - **`loom`** is the **optional orchestrator**. It runs the REST + SSE server,
   hosts the Vue web UI, owns the per-branch tmux + agent process via the
@@ -93,24 +92,24 @@ core.hooksPath .githooks`.
 
 ### Don't spin up your own `loom` — it shares the user's tmux + db
 
-A real `loom serve` and the agent sessions it owns are **machine-global**: one
-default tmux server (the `weaver-<id>` sessions) and one `~/.weaver/weaver.db`.
-The user is normally running loom there with live agents inside it — including
-the one running *you*. So, unless the user explicitly asks for it:
+A real `loom serve` and the sessions it owns are **machine-global**: one default
+tmux server (the `weaver-<id>` sessions) and one `~/.weaver/weaver.db`. The user
+is normally running loom there with live agents inside it — including the one
+running *you*. So, unless the user explicitly asks:
 
 - **Don't** start your own `loom serve` / `loom launch`, create or kill
   `weaver-*` tmux sessions on the default socket, or run broad tmux cleanup
   (`tmux kill-server`, `pkill -f weaver-…`, `tmux -L 'weaver*' kill-server`).
-  Each of these tears down the user's running agents at a stroke.
+  Each tears down the user's running agents at a stroke.
 - **If a task seems to need a live loom session, ask the user first.**
 
 To exercise loom or tmux behaviour, use the test infrastructure instead. Both
-test suites pin tmux to a throwaway server via `WEAVER_TMUX_SOCKET`
-(→ `tmux -L <name>`, see `tmux::socket_args`) and a temp `WEAVER_HOME`, so they
-can never see — let alone kill — the user's real sessions: the Rust integration
-tests (`crates/loom/tests/`) and the Playwright `e2e/` suite each use their own
-private socket. Extend them rather than driving a real server by hand. If you
-genuinely must run loom ad-hoc, isolate it the same way:
+suites pin tmux to a throwaway server via `WEAVER_TMUX_SOCKET` (→ `tmux -L
+<name>`, see `tmux::socket_args`) and a temp `WEAVER_HOME`, so they can never
+see — let alone kill — the user's real sessions: the Rust integration tests
+(`crates/loom/tests/`) and the Playwright `e2e/` suite each use a private
+socket. Extend them rather than driving a real server by hand. If you must run
+loom ad-hoc, isolate it the same way:
 
 ```sh
 WEAVER_TMUX_SOCKET=loom-dev-$$ WEAVER_HOME=$(mktemp -d) loom serve --addr 127.0.0.1:0
@@ -150,15 +149,28 @@ PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 npm test
 
 ## Landing changes
 
-**Open a pull request by default.** Don't push to or merge into `main` directly.
-Work on a branch, run the checks above (formatters, `cargo clippy`, and
-`cargo test --workspace`), make them pass, then
-`gh pr create` and let review + CI gate the merge. This holds for every change —
-features, fixes, docs, refactors — unless the user explicitly tells you to
-commit straight to the base branch. Agents working in a weaver worktree are
-already on their own branch; finishing the work means committing it and opening
-the PR, not integrating it yourself (see the builtin
+**Open a pull request by default.** Don't push to or merge into `main`
+directly. Work on a branch, run the checks above (`./scripts/pre-commit.sh` for
+fmt + clippy, then `cargo test --workspace`), make them pass, then `gh pr
+create`. This holds for every change — features, fixes, docs, refactors —
+unless the user tells you to commit straight to the base branch. A weaver
+worktree is already on its own branch; finishing the work means committing and
+opening the PR, not integrating it yourself (see the builtin
 [crates/weaver-core/WEAVER.md](crates/weaver-core/WEAVER.md)).
+
+**Don't credit yourself.** Write commit messages and PR descriptions in the
+project's voice — no "Generated with …", "Co-Authored-By: <tool>", or similar
+self-attribution.
+
+Then drive the PR to a mergeable state — don't open it and walk away:
+
+- **Keep it current with `main`.** When the branch falls behind or conflicts,
+  rebase or merge `main` (whichever keeps the history sane) and resolve the
+  conflicts yourself.
+- **Watch CI and review comments.** Poll the PR's checks and comments; fix
+  failing checks and address feedback as they land. Use your own judgement on
+  the response, and when a call is genuinely unclear, flag the user —
+  `weaver set-status attention "<question>"` — rather than guessing.
 
 ## Storage & state
 
@@ -275,9 +287,8 @@ block into the worktree's `.claude/settings.local.json` (see
 `$WEAVER_BRANCH` (set by the launcher) — no HTTP. Loom's monitor (`apply_hook`)
 consumes new `hook` rows on its next tick. Any hook means the agent process is
 alive, so all three set `status = running` (this also promotes a freshly
-`launching` session). The orchestrator no longer guesses working/waiting/idle:
-liveness is all it can know for sure, so there is no stillness-based idle
-demotion any more.
+`launching` session). Liveness is all a hook proves, so that is all the
+orchestrator tracks — it does not infer working/waiting/idle from stillness.
 
 The hooks also nudge the **attention** level where they carry a genuine signal:
 `working` clears it to `ok` and drops any pending prompt (the user is engaged);
