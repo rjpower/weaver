@@ -26,9 +26,11 @@ cargo test --workspace   # backend unit + integration (needs git, tmux)
 cd e2e && npm test       # Playwright UI suite against a real loom
 ```
 
-Run `./scripts/pre-commit.sh` before committing — it is the fmt + clippy gate CI
-enforces (wire it up with `git config core.hooksPath .githooks`). Build/test
-internals and the Playwright setup live in
+Run `./scripts/pre-commit.sh` before committing — the fmt + clippy gate CI
+enforces, plus an [agent lint review](docs/lint.md): a headless `claude`
+sub-agent that errors on the slop fmt/clippy can't catch, and self-skips when
+`claude` is absent (so CI runs only fmt+clippy). Wire it up with `git config
+core.hooksPath .githooks`. Build/test internals and the Playwright setup live in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Don't disturb the user's live loom

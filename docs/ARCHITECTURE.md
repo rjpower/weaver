@@ -74,6 +74,33 @@ the build level.
 The integration tests shell out to real `git` and `tmux`. If one hangs, look
 for stray `weaver-test-*` tmux sessions.
 
+### Agent lint review
+
+After the fmt + clippy gate, `scripts/pre-commit.sh` runs
+`scripts/lint-review.py` — a self-contained `uv run` script (the call is gated on
+`uv` being on PATH, so the CI lint job, which has neither `uv` nor an agent, runs
+only fmt + clippy). It catches the *agent slop* fmt and clippy can't — the
+judgement calls: naming, API shape, dead/speculative code, duplication, and
+comment/test quality. It builds one prompt from the [`docs/lint.md`](lint.md)
+catalog (`wl-...` rules) plus the diff and pipes it to a headless `claude -p`
+sub-agent, run as a fresh session — the calling session's `CLAUDE_CODE_*` /
+`ANTHROPIC_API_KEY` markers are stripped so it neither nests in the caller's
+transcript nor bills the metered API. It parses the findings and **errors on any
+at or above a confidence threshold**; the rest print as advisory.
+
+`pre-commit.sh` reviews the **staged** diff (`--staged`); run `lint-review.py`
+bare to review the whole branch against its merge-base with `main`. It
+**self-skips** (exit 0, never blocks a commit) when `claude` isn't on PATH, when
+there are no Rust/TS/Vue changes, or when the agent times out or errors — so CI,
+which has no agent, runs only the fmt+clippy gate, and a flaky agent can't wedge
+every commit. Only real findings block.
+
+Knobs: `WEAVER_SKIP_AGENT_LINT=1` to skip a run, `WEAVER_LINT_MIN_CONFIDENCE`
+(default `0.9`), `WEAVER_LINT_AGENT_CMD` (default `claude -p`), and
+`WEAVER_LINT_TIMEOUT` (default `600`s). Suppress a false positive with a trailing
+`// wl-allow: <code>` on the cited line; bypass the whole hook once with `git
+commit --no-verify`.
+
 ### End-to-end (Playwright)
 
 The `e2e/` suite drives the real UI against a real server. It boots **one**
