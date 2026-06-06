@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue';
 import type * as Monaco from 'monaco-editor';
 import { getPlan, syncPlan, writeFile } from '../api';
 import type { PlanView, PlanTask, PlanSyncResult } from '../types';
@@ -185,6 +185,12 @@ function actionLine(a: PlanSyncResult['actions'][number]): string {
       return `! flag #${a.issue_id} (${a.task} ← ${a.branch}): ${a.reason}`;
   }
 }
+
+// Keep an open Monaco editor in step with a live light/dark toggle, matching
+// FileBrowser. The markdown preview re-themes itself via its own watcher.
+watch(theme, () => {
+  if (editor) loadMonaco().then((m) => m.editor.setTheme(monacoTheme(theme.value === 'dark')));
+});
 
 onMounted(() => load());
 onUnmounted(teardownEditor);

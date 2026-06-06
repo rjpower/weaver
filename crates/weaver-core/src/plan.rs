@@ -315,12 +315,18 @@ pub fn diff(slug: &str, tasks: &[PlanTask], issues: &[Issue]) -> SyncPlan {
         .collect();
     let task_keys: HashSet<String> = tasks.iter().map(|t| t.key(slug)).collect();
 
-    // Tasks → issues.
+    // Tasks → issues. A plan with a duplicated task id (two `### T1` headings)
+    // must not emit the same action twice — the first occurrence wins, so a
+    // dup can never spawn two issues sharing one `plan_task` key.
+    let mut handled: HashSet<String> = HashSet::new();
     for t in tasks {
         if !t.materializes() {
             continue;
         }
         let key = t.key(slug);
+        if !handled.insert(key.clone()) {
+            continue;
+        }
         match by_key.get(key.as_str()) {
             None => actions.push(SyncAction::Create {
                 task: t.id.clone(),
@@ -566,6 +572,29 @@ Just do it now.
             .collect();
         // T1 and T2 (session), but not T3 (inline).
         assert_eq!(created, vec!["T1", "T2"]);
+    }
+
+    #[test]
+    fn diff_dedups_a_duplicated_task_id() {
+        // A malformed plan with two `T1` headings must not spawn two issues
+        // sharing one plan_task key — the first occurrence wins.
+        let dup = PlanTask {
+            id: "T1".into(),
+            title: "First".into(),
+            exec: "session".into(),
+            value: String::new(),
+            deps: vec![],
+            body: String::new(),
+        };
+        let mut dup2 = dup.clone();
+        dup2.title = "Second".into();
+        let d = diff("pl", &[dup, dup2], &[]);
+        let creates = d
+            .actions
+            .iter()
+            .filter(|a| matches!(a, SyncAction::Create { task, .. } if task == "T1"))
+            .count();
+        assert_eq!(creates, 1, "duplicate id must create exactly one issue");
     }
 
     #[test]

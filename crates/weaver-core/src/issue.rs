@@ -93,6 +93,21 @@ fn status_clause(include_closed: bool) -> &'static str {
     }
 }
 
+/// Escape the LIKE metacharacters (`\`, `%`, `_`) in a literal so it matches
+/// itself rather than acting as a pattern. Pair with `LIKE ? ESCAPE '\'`.
+/// Plan slugs are slugified and shouldn't contain these, but the prefix match in
+/// [`list_for_plan`] would otherwise widen silently if one ever did.
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Issues claimed by `branch` in `repo_root` — the branch's working set.
 pub async fn list_for_branch(
     db: &Db,
@@ -171,12 +186,12 @@ pub async fn list_for_plan(
     include_closed: bool,
 ) -> Result<Vec<Issue>> {
     let sql = format!(
-        "SELECT * FROM issues WHERE repo_root = ? AND plan_task LIKE ?{} ORDER BY id ASC",
+        "SELECT * FROM issues WHERE repo_root = ? AND plan_task LIKE ? ESCAPE '\\'{} ORDER BY id ASC",
         status_clause(include_closed)
     );
     let rows = sqlx::query_as::<_, Issue>(&sql)
         .bind(repo_root)
-        .bind(format!("{slug}#%"))
+        .bind(format!("{}#%", like_escape(slug)))
         .fetch_all(db)
         .await?;
     Ok(rows)
@@ -368,5 +383,24 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn list_for_plan_treats_slug_literally() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        // Two plans whose slugs differ only at a LIKE metacharacter position:
+        // unescaped, `a_b#%` would also match `axb#...` (`_` = any char).
+        let mk = |slug: &str| NewIssue {
+            repo_root: "/r".to_string(),
+            title: format!("from {slug}"),
+            plan_task: Some(format!("{slug}#T1")),
+            ..Default::default()
+        };
+        add(&db, &mk("a_b")).await.unwrap();
+        add(&db, &mk("axb")).await.unwrap();
+
+        let got = list_for_plan(&db, "/r", "a_b", true).await.unwrap();
+        assert_eq!(got.len(), 1, "must not match the `axb` plan");
+        assert_eq!(got[0].plan_task.as_deref(), Some("a_b#T1"));
     }
 }

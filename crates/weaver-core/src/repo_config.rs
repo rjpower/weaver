@@ -18,7 +18,7 @@
 //! minimal until more conventions need it. Reads are best-effort — a missing,
 //! blank, or malformed file falls back to the builtin defaults, never an error.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -49,17 +49,30 @@ pub fn load(dir: &Path) -> RepoConfig {
 
 /// Resolve the plan directory, checking each candidate worktree/checkout in
 /// order (a config committed on the base branch is picked up either way), and
-/// falling back to [`DEFAULT_PLAN_DIR`] when none sets a non-empty value.
+/// falling back to [`DEFAULT_PLAN_DIR`] when none sets a usable value.
+///
+/// The configured value is **constrained to a worktree-relative path** with no
+/// `..`/absolute components: callers join it onto the worktree and read/list it,
+/// so an unconstrained value (e.g. `../../etc`) committed in a hostile repo's
+/// `.weaver/config.toml` would let the server escape the worktree. An invalid
+/// value falls back to the builtin default rather than erroring.
 pub fn plan_dir(candidates: &[PathBuf]) -> String {
     for dir in candidates {
         if let Some(d) = load(dir).plan.dir {
             let d = d.trim();
-            if !d.is_empty() {
+            if !d.is_empty() && is_safe_relative(d) {
                 return d.to_string();
             }
         }
     }
     DEFAULT_PLAN_DIR.to_string()
+}
+
+/// A path that stays inside the worktree: relative, with only normal segments
+/// (no `.`/`..`/absolute/prefix).
+fn is_safe_relative(s: &str) -> bool {
+    let p = Path::new(s);
+    !p.is_absolute() && p.components().all(|c| matches!(c, Component::Normal(_)))
 }
 
 #[cfg(test)]
@@ -98,6 +111,35 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_config(tmp.path(), "this is not = valid = toml [[[");
         assert_eq!(plan_dir(&[tmp.path().to_path_buf()]), DEFAULT_PLAN_DIR);
+    }
+
+    #[test]
+    fn escaping_dir_falls_back_to_default() {
+        // A hostile committed config must not steer reads outside the worktree.
+        for bad in [
+            "../../etc",
+            "/etc/passwd",
+            "foo/../../bar",
+            "./docs/plans",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_config(tmp.path(), &format!("[plan]\ndir = \"{bad}\"\n"));
+            assert_eq!(
+                plan_dir(&[tmp.path().to_path_buf()]),
+                DEFAULT_PLAN_DIR,
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_relative_dir_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), "[plan]\ndir = \"design/specs/plans\"\n");
+        assert_eq!(
+            plan_dir(&[tmp.path().to_path_buf()]),
+            "design/specs/plans"
+        );
     }
 
     #[test]
