@@ -4,6 +4,7 @@ import { get, post } from '../api';
 import type { Session, RecentRepo, RepoBranch } from '../types';
 import StatusBadge from '../components/StatusBadge.vue';
 import AttentionBadge from '../components/AttentionBadge.vue';
+import GithubStatus from '../components/GithubStatus.vue';
 import ScratchPicker from '../components/ScratchPicker.vue';
 import { timeAgo } from '../lib/time';
 import { levelOf, messageOf } from '../lib/sessionState';
@@ -531,10 +532,12 @@ onUnmounted(() => clearInterval(timer));
         <!-- Ref: machine identity, mono, pushed far-right and receding. -->
         <div class="shrink-0 text-right">
           <span class="block truncate font-mono text-xs text-faint">{{ s.branch.branch }}</span>
+          <!-- PR snapshot (if any) — a quiet link straight to the GitHub PR. -->
+          <GithubStatus v-if="s.branch.github" :gh="s.branch.github" compact class="mt-0.5 justify-end" />
           <router-link
             v-if="s.branch.open_issue_count"
             :to="`/s/${s.id}?tab=issues`"
-            class="font-mono text-xs text-muted hover:text-accent"
+            class="block font-mono text-xs text-muted hover:text-accent"
             @click.stop
           >
             {{ s.branch.open_issue_count }} open issue{{ s.branch.open_issue_count === 1 ? '' : 's' }}

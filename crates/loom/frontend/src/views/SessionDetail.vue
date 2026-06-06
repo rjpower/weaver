@@ -70,7 +70,7 @@ async function loadAll() {
 
 function openStream() {
   source = new EventSource(`/api/sessions/${props.id}/events`);
-  for (const kind of ['status', 'attention', 'note']) {
+  for (const kind of ['status', 'attention', 'note', 'github']) {
     source.addEventListener(kind, (e) => {
       const ev = JSON.parse((e as MessageEvent).data) as WeaverEvent;
       events.value.push(ev);
@@ -144,12 +144,21 @@ const adopt = () =>
     await loadSession();
   });
 
+const refreshGithub = () =>
+  act('refreshGithub', async () => {
+    await post(`/sessions/${props.id}/github`);
+    notice.value = 'GitHub status refreshed.';
+    await loadSession();
+  });
+
 function eventLine(ev: WeaverEvent): string {
   const d = ev.data || {};
   if (ev.kind === 'status') return `status → ${d.status ?? '?'}`;
   if (ev.kind === 'attention')
     return `status → ${d.level ?? '?'}${d.note ? ` (${d.note})` : ''}`;
   if (ev.kind === 'note') return String(d.text ?? '');
+  if (ev.kind === 'github')
+    return `PR #${d.pr ?? '?'} → ${d.state ?? '?'}${d.checks ? ` · checks ${d.checks}` : ''}`;
   if (ev.kind === 'issue_added') return `issue added: ${d.title ?? ''}`;
   if (ev.kind === 'issue_closed') return `issue closed: #${d.id ?? '?'}`;
   if (ev.kind === 'issue_reopened') return `issue reopened: #${d.id ?? '?'}`;
@@ -191,6 +200,7 @@ onUnmounted(() => source?.close());
       @adopt="adopt"
       @archive="archive"
       @remove="remove"
+      @refresh-github="refreshGithub"
     />
 
     <!-- Issues — claimed work + repo backlog. -->

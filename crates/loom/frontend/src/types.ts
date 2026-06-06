@@ -20,6 +20,29 @@ export interface Branch {
   created_at: string;
   updated_at: string;
   open_issue_count: number;
+  /** Latest GitHub pull-request snapshot for the branch, or null when GitHub
+   *  polling is off, there's no PR, or `gh` is unavailable. Maintained
+   *  server-side by loom's poll loop. */
+  github: GithubStatus | null;
+}
+
+/** A point-in-time GitHub snapshot of a branch's pull request: its link plus
+ *  the review and check rollups loom read via the `gh` CLI. */
+export interface GithubStatus {
+  pr_number: number;
+  pr_url: string;
+  /** 'OPEN' | 'CLOSED' | 'MERGED'. */
+  pr_state: string;
+  pr_title: string;
+  is_draft: boolean;
+  /** 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED' | null. */
+  review_decision: string | null;
+  /** Rolled-up checks: 'passing' | 'failing' | 'pending' | null (no checks). */
+  checks: string | null;
+  /** 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' | null. */
+  mergeable: string | null;
+  merged_at: string | null;
+  fetched_at: string;
 }
 
 /** A session is loom's view: one tmux + one running agent attached to a

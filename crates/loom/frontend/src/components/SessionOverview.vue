@@ -2,12 +2,14 @@
 import type { Session, WeaverEvent } from '../types';
 import SessionActivity from './SessionActivity.vue';
 import ScratchPanel from './ScratchPanel.vue';
+import GithubStatus from './GithubStatus.vue';
+import { timeAgo } from '../lib/time';
 
 // The Overview tab: read-only context for a session, plus its lifecycle
 // actions. Goal and the status message are authored by the AGENT (the launch
 // prompt, `weaver set-status`) — shown here as prose, never as editable forms.
-// The only writes on this page are acknowledging attention (the status strip)
-// and lifecycle (Adopt / Archive / Remove, below).
+// The only writes on this page are acknowledging attention (the status strip),
+// refreshing the GitHub snapshot, and lifecycle (Adopt / Archive / Remove).
 const props = defineProps<{
   ws: Session;
   events: WeaverEvent[];
@@ -15,7 +17,7 @@ const props = defineProps<{
   busy: string;
 }>();
 
-const emit = defineEmits<{ adopt: []; archive: []; remove: [] }>();
+const emit = defineEmits<{ adopt: []; archive: []; remove: []; refreshGithub: [] }>();
 </script>
 
 <template>
@@ -25,6 +27,31 @@ const emit = defineEmits<{ adopt: []; archive: []; remove: [] }>();
       <div class="mb-1 text-xs font-medium uppercase tracking-wide text-faint">Goal</div>
       <p v-if="ws.branch.goal" class="whitespace-pre-wrap text-sm text-fg">{{ ws.branch.goal }}</p>
       <p v-else class="text-sm text-faint">No goal set.</p>
+    </section>
+
+    <!-- GitHub — the branch's PR snapshot, polled server-side via `gh`. Shown
+         only once a snapshot exists; the Refresh button forces a re-poll. -->
+    <section class="rounded border border-line bg-surface p-4">
+      <div class="mb-2 flex items-center justify-between">
+        <div class="text-xs font-medium uppercase tracking-wide text-faint">GitHub</div>
+        <button
+          class="rounded bg-subtle px-2 py-1 text-xs text-muted hover:bg-subtle-hover disabled:opacity-50"
+          :disabled="busy === 'refreshGithub'"
+          @click="emit('refreshGithub')"
+        >
+          {{ busy === 'refreshGithub' ? 'Refreshing…' : 'Refresh' }}
+        </button>
+      </div>
+      <template v-if="ws.branch.github">
+        <GithubStatus :gh="ws.branch.github" />
+        <p class="mt-2 text-xs text-faint">
+          Snapshot {{ timeAgo(ws.branch.github.fetched_at) }}.
+        </p>
+      </template>
+      <p v-else class="text-sm text-faint">
+        No pull request found for this branch yet. loom polls automatically while
+        the session is active.
+      </p>
     </section>
 
     <!-- Activity — de-noised event feed (read-only context). -->
