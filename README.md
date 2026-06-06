@@ -136,13 +136,36 @@ automatically on startup (off by default):
 weaver config set server.auto_adopt true
 ```
 
+## GitHub
+
+With the `gh` CLI installed and authenticated, loom tracks each active session's
+pull request. A background loop polls `gh pr view` for the branch every 30s and
+surfaces the result on the dashboard: a link straight to the PR, its state
+(open / draft / merged / closed), the review decision (approved / changes
+requested / review required), and a rolled-up CI verdict (checks passing /
+failing / pending). The session's Overview tab has a **Refresh** button to
+re-poll on demand.
+
+Once a branch's PR merges, loom archives the session automatically — tearing
+down its tmux and worktree while keeping the branch and its weaver history, the
+same as the Archive button. Turn either behaviour off in **Settings** or from
+the CLI:
+
+```sh
+weaver config set github.archive_on_merge false   # keep the worktree after merge
+weaver config set github.poll false               # stop polling GitHub entirely
+```
+
+Polling is a quiet no-op for repositories without a GitHub remote, or wherever
+`gh` is not installed — nothing to configure to opt out there.
+
 ## REST API (brief)
 
 Loom serves a JSON API under `/api`; the Vue SPA is the primary consumer.
 
 - `GET /api/health`
 - `GET POST /api/sessions`, `GET PATCH DELETE /api/sessions/{id}`,
-  `POST /api/sessions/{id}/{note,summarize,archive,adopt}`,
+  `POST /api/sessions/{id}/{note,archive,adopt,github}`,
   `GET /api/sessions/{id}/{diff,log,events}`,
   `GET /api/sessions/{id}/terminal` (WebSocket: xterm.js ⇄ PTY ⇄ tmux)
 - `GET /api/branches`, `GET PATCH /api/branches/{id}`,
@@ -184,6 +207,10 @@ Notable settings:
 - `agent.claude_args` — extra arguments spliced into the Claude TUI launch,
   e.g. `--model claude-opus-4-7`.
 - `server.auto_adopt` — adopt every recoverable session on daemon startup.
+- `github.poll` — poll GitHub (via `gh`) for each session's PR, review, and
+  check status (on by default; a no-op without `gh` or a GitHub remote).
+- `github.archive_on_merge` — archive a session automatically once its PR
+  merges (on by default).
 
 ## Building
 

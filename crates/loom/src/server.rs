@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use crate::events::EventBus;
 use crate::session as session_mod;
 use crate::web::AppState;
-use crate::{config, db, monitor, tmux, web};
+use crate::{config, db, github, monitor, tmux, web};
 use weaver_core::branch as branch_mod;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,7 +114,11 @@ async fn reconcile_sessions(state: &AppState) {
 
 pub async fn serve(state: AppState, listener: TcpListener) -> Result<()> {
     tokio::spawn(monitor::run(state.clone()));
-    tracing::debug!("background tasks spawned (monitor)");
+    // The GitHub poller is always spawned; it self-gates on the `github.poll`
+    // setting and on `gh` being available, so it idles cheaply when GitHub
+    // integration is off or unavailable.
+    tokio::spawn(github::poll(state.clone()));
+    tracing::debug!("background tasks spawned (monitor, github poll)");
     axum::serve(listener, web::router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;

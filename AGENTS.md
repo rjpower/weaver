@@ -56,7 +56,7 @@ needing the daemon to be reachable.
 | `crates/loom/src/session.rs` | `Session` row + sqlx queries |
 | `crates/loom/src/tmux.rs` | `tmux new-session / capture-pane / kill-session / attach` (exact-match `=name:` targets) |
 | `crates/loom/src/terminal.rs` | WebSocket ⇄ PTY bridge: xterm.js ⇄ `tmux attach` (the live terminal) |
-| `crates/loom/src/github.rs` | `gh` CLI shell-out for issue seeding |
+| `crates/loom/src/github.rs` | `gh` CLI shell-out: issue seeding, PR opening, and the PR-status poll loop (snapshots each branch's PR; archives on merge) |
 | `crates/loom/src/client.rs` | HTTP client used by the `loom` CLI to talk to its own daemon |
 | `crates/loom/src/bin/loom.rs` | the orchestrator CLI (`serve`, `launch`, `ps`, `attach`, …) |
 | `crates/loom/frontend/` | Vue 3 SPA, rspack, Tailwind. `api.ts` + views in `views/` |
@@ -124,8 +124,8 @@ the PR, not integrating it yourself (see the builtin
   shared by `weaver` and `loom`. WAL mode handles concurrency.
   - Core tables (`weaver-core/src/db.rs`): `branches`, `issues`, `notes`,
     `events`, `settings`.
-  - Loom tables (`crates/loom/src/db.rs`): `sessions`, `summaries`,
-    `recent_repos`.
+  - Loom tables (`crates/loom/src/db.rs`): `sessions`, `recent_repos`,
+    `branch_github` (per-branch PR snapshot).
 - **`server.json`** in `$WEAVER_HOME`: pid + bound addr, written when `loom`
   comes up. The `loom` CLI uses it to find the daemon when `WEAVER_API` is
   unset.
@@ -144,6 +144,7 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `GET /api/sessions` / `POST /api/sessions` | list / create sessions (create takes optional `scratch: [{name, content_base64}]`) |
 | `GET PATCH DELETE /api/sessions/{id}` | session CRUD (status, title, goal, description, attention) |
 | `POST /api/sessions/{id}/{note,archive,adopt}` | actions |
+| `POST /api/sessions/{id}/github` | re-poll the branch's GitHub PR now and return the updated session |
 | `GET POST DELETE /api/sessions/{id}/scratch` | list / drop / remove worktree `scratch/` reference files |
 | `GET /api/sessions/{id}/{diff,log,events}` | reads + SSE stream |
 | `GET /api/sessions/{id}/terminal` | WebSocket: xterm.js ⇄ PTY ⇄ tmux (the interaction surface) |
@@ -160,7 +161,12 @@ top-level (`id`, `status`, `work_dir`, `tmux_session`, `agent_kind`, `model`,
 `created_at`, `updated_at`) plus a nested `branch: BranchView`
 (`id`, `name`, `title`, `goal`, `description`, `attention`,
 `repo_root`, `branch`, `base_branch`, `created_at`, `updated_at`,
-`open_issue_count`).
+`open_issue_count`, `github`).
+
+`BranchView::github` is the branch's latest GitHub pull-request snapshot
+(`pr_number`, `pr_url`, `pr_state`, `pr_title`, `is_draft`, `review_decision`,
+`checks`, `mergeable`, `merged_at`, `fetched_at`), or `null` when GitHub polling
+is off, there is no PR, or `gh` is unavailable. See "GitHub integration" below.
 
 Status is two orthogonal axes. The session's `status` is the **lifecycle**
 (orchestrator-owned, mechanical): `created` / `launching` / `running` /
@@ -247,6 +253,41 @@ session as `ok` regardless of a stale attention value left on the branch.
 
 Orphan detection is independent: if `tmux has-session` says no, the session
 becomes `orphaned` and is eligible for `loom adopt`.
+
+## GitHub integration
+
+When the `gh` CLI is installed and authenticated, loom keeps a per-branch
+pull-request snapshot alongside the session. A second background loop
+(`github::poll`, sibling of the monitor, spawned in `server::serve`) ticks every
+30s and, for each active session, runs `gh pr view <branch> --json …` from the
+repo root. The result — PR number, URL, state (`OPEN`/`CLOSED`/`MERGED`), draft
+flag, `reviewDecision`, a rolled-up `checks` verdict (`passing`/`failing`/
+`pending`), and mergeability — is written to the loom-owned `branch_github`
+table (one row per branch, keyed `branch_id`) and served as `BranchView.github`.
+The dashboard renders it on the session list and overview; `POST
+/api/sessions/{id}/github` forces an immediate re-poll.
+
+The loop self-gates and degrades quietly: it is always spawned but does nothing
+while the `github.poll` setting is off, `gh` is missing (probed once, cached via
+`gh_available`), or the repo has no GitHub remote (a per-branch `gh` error that
+is logged at debug and skipped). So it is a no-op on non-GitHub repos rather
+than a failure.
+
+**Archive on merge.** When a poll finds a branch's PR has merged and
+`github.archive_on_merge` is on (the default), loom archives the session
+automatically — the same teardown as the Archive button (`web::archive`, shared
+code): tmux killed, worktree removed, branch and weaver history kept. The
+worktree is removed with `--force`, so any uncommitted work in it is discarded;
+a merged PR is taken to mean the workstream is done. Turn the behaviour off with
+`weaver config set github.archive_on_merge false` (or in the settings pane).
+Both settings live in `weaver-core::config::registry()` under the **GitHub**
+group.
+
+`gh`-touching logic lives in `crate::github`: `fetch_pr` (the shell-out +
+JSON parse + check rollup), `refresh` (fetch → store → announce → maybe
+archive, behind both the poller and the refresh endpoint), and `poll` (the
+loop). The merge-archive decision is split into `apply_snapshot` so it is
+testable without invoking `gh`.
 
 ## Agent-facing commands
 

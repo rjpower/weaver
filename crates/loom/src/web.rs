@@ -176,6 +176,11 @@ pub struct BranchView {
     pub created_at: String,
     pub updated_at: String,
     pub open_issue_count: i64,
+    /// The branch's latest GitHub pull-request snapshot (link, review decision,
+    /// check rollup), or `null` when GitHub polling is off, the repo has no
+    /// remote PR, or `gh` is unavailable. Maintained by the poll loop in
+    /// [`crate::github`].
+    pub github: Option<github::GithubStatus>,
 }
 
 impl BranchView {
@@ -184,10 +189,16 @@ impl BranchView {
         let open = weaver_core::issue::open_count_for_branch(db, &branch.repo_root, &branch.branch)
             .await
             .unwrap_or(0);
-        Ok(Self::from_parts(branch, open))
+        // Best-effort: a missing/erroring snapshot just renders as no GitHub info.
+        let github = github::get_status(db, &branch.id).await.ok().flatten();
+        Ok(Self::from_parts(branch, open, github))
     }
 
-    fn from_parts(branch: &Branch, open_issue_count: i64) -> Self {
+    fn from_parts(
+        branch: &Branch,
+        open_issue_count: i64,
+        github: Option<github::GithubStatus>,
+    ) -> Self {
         let name = branch
             .branch
             .strip_prefix("weaver/")
@@ -206,6 +217,7 @@ impl BranchView {
             created_at: branch.created_at.clone(),
             updated_at: branch.updated_at.clone(),
             open_issue_count,
+            github,
         }
     }
 }
@@ -337,6 +349,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/note", post(note_session))
         .route("/sessions/{id}/archive", post(archive_session))
         .route("/sessions/{id}/adopt", post(adopt_session))
+        .route("/sessions/{id}/github", post(refresh_github_session))
         .route("/sessions/{id}/tree", get(tree_session))
         .route("/sessions/{id}/file", get(file_session))
         .route("/sessions/{id}/raw", get(raw_session))
@@ -943,11 +956,15 @@ async fn note_session(
 /// This is the "I'm done with this workstream" action — unlike delete, the
 /// weaver/loom record is preserved for future reference, and the git branch is
 /// left intact so the work can be revisited or a worktree recreated later.
-async fn archive_session(
-    State(st): State<AppState>,
-    Path(key): Path<String>,
-) -> ApiResult<Json<Value>> {
-    let (session, branch) = require_session(&st.db, &key).await?;
+///
+/// Extracted from the route handler so the GitHub poller can archive a session
+/// the moment its PR merges (see [`crate::github::refresh`]). Returns any
+/// non-fatal teardown warnings.
+pub async fn archive(
+    st: &AppState,
+    session: &Session,
+    branch: &Branch,
+) -> Result<Vec<String>, AppError> {
     let mut warnings: Vec<String> = Vec::new();
 
     tmux::kill_session(&session.tmux_session).await.ok();
@@ -980,9 +997,39 @@ async fn archive_session(
     if !warnings.is_empty() {
         tracing::warn!(branch = %branch.id, warnings = warnings.len(), "session archived with warnings");
     }
+    Ok(warnings)
+}
+
+async fn archive_session(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let (session, branch) = require_session(&st.db, &key).await?;
+    let warnings = archive(&st, &session, &branch).await?;
     Ok(Json(
         json!({ "archived": true, "branch": branch.branch, "warnings": warnings }),
     ))
+}
+
+/// Refresh a session's GitHub PR snapshot on demand (the dashboard's "refresh"
+/// affordance) and return the updated session. Manual refresh never
+/// auto-archives — that surprise is reserved for the background poller, which
+/// will pick a freshly-merged PR up within a tick.
+async fn refresh_github_session(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<SessionView>> {
+    let (session, branch) = require_session(&st.db, &key).await?;
+    if !github::gh_available().await {
+        return Err(AppError::bad_request(
+            "the GitHub CLI (`gh`) is not available on the server",
+        ));
+    }
+    github::refresh(&st, &session, &branch, false)
+        .await
+        .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("gh: {e}")))?;
+    let (session, branch) = require_session(&st.db, &session.id).await?;
+    Ok(Json(SessionView::build(&st.db, &session, &branch).await?))
 }
 
 /// Recreate an orphaned session's tmux and resume its agent.

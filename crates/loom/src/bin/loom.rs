@@ -610,6 +610,26 @@ fn print_session(ws: &Value) {
             println!("  github:   {repo}");
         }
     }
+    // The branch's PR snapshot, when loom has polled one (see `loom::github`).
+    if let Some(gh) = ws.get("branch").and_then(|b| b.get("github")) {
+        if let Some(url) = gh.get("pr_url").and_then(Value::as_str) {
+            let number = gh.get("pr_number").and_then(Value::as_i64).unwrap_or(0);
+            let state = gh
+                .get("pr_state")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_lowercase();
+            let mut bits = vec![state];
+            if let Some(review) = gh.get("review_decision").and_then(Value::as_str) {
+                bits.push(review.to_lowercase().replace('_', " "));
+            }
+            if let Some(checks) = gh.get("checks").and_then(Value::as_str) {
+                bits.push(format!("checks {checks}"));
+            }
+            let bits: Vec<String> = bits.into_iter().filter(|b| !b.is_empty()).collect();
+            println!("  pr:       #{number} {url} ({})", bits.join(", "));
+        }
+    }
     println!("  activity: {}", str_field(ws, "last_activity_at"));
 }
 
