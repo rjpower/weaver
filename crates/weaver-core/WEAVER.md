@@ -20,10 +20,48 @@ It is on your `PATH`. From anywhere in the worktree you can run:
   files it in the shared repo backlog instead).
 - `weaver issue ls` — this branch's tasks plus the unclaimed repo backlog
   (`--mine` for just yours, `--repo` for the whole repo). `weaver issue close N`.
+- `weaver issue show N` — an issue plus the live status of the branch working
+  it; `weaver issue wait N` blocks until it closes or that branch needs you
+  (see "Launching and tracking sub-sessions" below).
 - `weaver set-status` — with no argument, show the goal, status, and open-issue
   count.
 
 These talk directly to the weaver database — no daemon required.
+
+## Your tracking issue
+
+This branch has a **tracking issue** — a weaver issue claimed by your branch
+that represents the task you were launched for. `weaver issue ls --mine` shows
+it. It is how the agent (or human) that launched you watches your progress
+without reading this terminal:
+
+- Keep your status honest with `weaver set-status` as you work — that is the
+  live signal whoever launched you polls.
+- When the task is genuinely complete (the PR is open, the work is done), run
+  `weaver issue close <id>` on the tracking issue. Closing it is the
+  unambiguous "this sub-tree is finished" signal; leaving it open means "still
+  in flight". Do not close it early.
+
+## Launching and tracking sub-sessions
+
+You can fan work out into its own detached session — a parallel sub-tree on its
+own branch and worktree — and track it the same way someone tracks you:
+
+- `loom launch "<what the sub-agent should do>"` — spawn a sub-session. It
+  prints the new branch and a **tracking issue number** for the task; that
+  issue is your handle on the sub-tree.
+- `weaver issue show <id>` — poll the sub-tree: its tracking issue's
+  open/closed state plus the sub-agent's live `set-status` (attention +
+  current-state message).
+- `weaver issue wait <id>` — block until the sub-tree finishes (its tracking
+  issue closes) or needs you (the sub-agent raises its attention to
+  `attention`/`blocked`). Takes `--timeout <secs>`; prints why it woke.
+- `weaver issue ls` lists the sub-tasks you have delegated under
+  "Delegated by this branch", each with its sub-agent's current status.
+
+This duplicates some of a coding agent's builtin sub-agents, but a weaver
+sub-session is fully decoupled: it survives independently, has its own git
+history, and you can hand it off or revisit it later.
 
 ## Signalling your status
 

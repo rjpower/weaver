@@ -61,6 +61,9 @@ export interface Session {
   last_activity_at: string;
   created_at: string;
   updated_at: string;
+  /** The tracking issue opened for this session's task at launch (the handle
+   *  the launcher follows). Only set on the create response. */
+  tracking_issue: number | null;
   branch: Branch;
 }
 
