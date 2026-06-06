@@ -76,29 +76,48 @@ async fn ensure_indicator(pool: &Db) -> Result<()> {
 
 /// Run every migration whose version is not yet recorded, each in its own
 /// transaction, recording it on success.
+///
+/// Safe to run from two processes at once (e.g. `loom` and a `weaver` CLI
+/// invocation both first-opening a fresh database): each migration *claims* its
+/// version with `INSERT OR IGNORE` as the transaction's first write, which takes
+/// the write lock atomically. The claimer (rows affected = 1) runs the SQL and
+/// commits the claim and the change together; a concurrent runner that finds the
+/// version already claimed (rows affected = 0) skips it rather than re-applying
+/// and colliding on the primary key.
 async fn apply_pending(pool: &Db) -> Result<()> {
     let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM schema_migrations")
         .fetch_all(pool)
         .await
         .context("reading schema_migrations")?;
     for (version, name, sql) in MIGRATIONS {
+        // Fast path: a plain read, no lock. The claim below is the real guard.
         if applied.contains(version) {
             continue;
         }
-        tracing::info!(version, name, "applying migration");
         let mut tx = pool.begin().await?;
+        // Claim first, before any read in this transaction, so the INSERT (not a
+        // stale-snapshot read) is what acquires the write lock.
+        let claimed = sqlx::query(
+            "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+        )
+        .bind(version)
+        .bind(*name)
+        .bind(now_iso())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if claimed == 0 {
+            // Another runner has this version in hand; leave it to them.
+            tx.rollback().await?;
+            continue;
+        }
+        tracing::info!(version, name, "applying migration");
         for stmt in split_statements(sql) {
             sqlx::query(&stmt)
                 .execute(&mut *tx)
                 .await
                 .with_context(|| format!("migration {version} ({name}): {stmt}"))?;
         }
-        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
-            .bind(version)
-            .bind(*name)
-            .bind(now_iso())
-            .execute(&mut *tx)
-            .await?;
         tx.commit().await?;
     }
     Ok(())
@@ -301,6 +320,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, MIGRATIONS.len() as i64);
+    }
+
+    /// A version already recorded — as if a concurrent runner claimed and applied
+    /// it — is skipped (the `INSERT OR IGNORE` claim affects 0 rows, no PK
+    /// conflict), while the remaining migrations still apply.
+    #[tokio::test]
+    async fn already_claimed_versions_are_skipped() {
+        let pool = empty_pool().await;
+        ensure_indicator(&pool).await.unwrap();
+        // Stand up the baseline and record it, mimicking another process having
+        // applied migration 1 already.
+        for stmt in split_statements(MIGRATIONS[0].2) {
+            sqlx::query(&stmt).execute(&pool).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO schema_migrations (version, name, applied_at)
+             VALUES (1, 'baseline', '2026-01-01T00:00:00.000Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Must not error on the already-recorded version, and must still run 0002.
+        run(&pool).await.unwrap();
+
+        let versions: Vec<i64> =
+            sqlx::query_scalar("SELECT version FROM schema_migrations ORDER BY version")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(versions, vec![1, 2]);
+        assert!(
+            table_columns(&pool, "notes").await.unwrap().is_empty(),
+            "0002 should still drop the notes table"
+        );
     }
 
     /// An existing database with a populated `notes` table (the pre-framework
