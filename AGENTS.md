@@ -318,7 +318,7 @@ weaver issue show 7                     # an issue + the live status of the bran
 weaver issue wait 7 --timeout 600       # block until a sub-tree closes #7 or raises attention
 weaver issue close 7
 weaver plan new "Search rewrite"        # scaffold docs/plans/<slug>.md (large efforts)
-weaver plan ls                          # plans in this repo
+weaver plan ls                          # plans on this branch
 weaver plan show search-rewrite         # tasks + status projected from issues
 weaver plan sync search-rewrite --apply # reconcile plan tasks ↔ issue ledger
 weaver where                            # debug: print resolved repo / branch / branch-id

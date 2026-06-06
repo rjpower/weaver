@@ -7,12 +7,15 @@ import { loadMonaco, monacoTheme, languageForPath } from '../monaco';
 import { theme } from '../theme';
 import MarkdownView from './MarkdownView.vue';
 
-// The plan surface on a session's Overview: the structured project plan rendered
-// read-first (design + architecture diagram), a task list whose status is
-// PROJECTED from the issue ledger (never the file), a dependency graph, and an
-// explicit Edit mode that flips the rendered plan to Monaco — reusing the file
-// browser's preview⇄source pattern. Reconcile diffs the plan against its issues.
-const props = defineProps<{ id: string }>();
+// The plan surface on a session's Overview, and the only place the goal is
+// shown — a plan is the branch goal grown up. With no plan file the panel
+// degrades to the goal (the degenerate plan); a real plan renders read-first
+// (design + architecture diagram), a task list whose status is PROJECTED from
+// the issue ledger (never the file), a dependency graph, and an explicit Edit
+// mode that flips to Monaco. Reconcile diffs the plan against its issues. The
+// goal seeds a new plan's Problem section (`weaver plan new`), so the two never
+// duplicate: goal-only until a plan exists, then folded into the plan.
+const props = defineProps<{ id: string; goal?: string }>();
 
 const plan = ref<PlanView | null>(null);
 const loaded = ref(false);
@@ -251,10 +254,15 @@ onUnmounted(teardownEditor);
     </p>
     <p v-if="notice" class="mx-4 mt-3 text-sm text-accent">{{ notice }}</p>
 
-    <!-- Empty state: a repo with no plan. -->
-    <div v-if="loaded && !plan && !error" class="px-4 py-6 text-sm text-muted">
-      No plan for this session.
-      <span class="text-faint">Create one with <code>weaver plan new "&lt;title&gt;"</code>.</span>
+    <!-- No plan file yet: the panel degrades to the branch goal — a plan is the
+         goal grown up, and `weaver plan new` seeds its Problem from this goal. -->
+    <div v-if="loaded && !plan && !error" class="px-4 py-5">
+      <p v-if="goal" class="whitespace-pre-wrap text-sm text-fg">{{ goal }}</p>
+      <p v-else class="text-sm text-faint">No goal set.</p>
+      <p class="mt-3 text-xs text-faint">
+        Scaffold a structured plan with <code>weaver plan new "&lt;title&gt;"</code>
+        for multi-session work — it starts from this goal.
+      </p>
     </div>
 
     <!-- Reconcile preview: the delta, applied on confirm. -->

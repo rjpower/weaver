@@ -212,7 +212,19 @@ fn parse_deps(raw: &str) -> Vec<String> {
 
 /// A starter plan file: frontmatter, the four standard sections, and one
 /// example task showing the heading-annotation format.
-pub fn scaffold(slug: &str, title: &str) -> String {
+///
+/// `goal` seeds the *Problem & goal* section — a plan is the branch goal grown
+/// up, so the launch instruction becomes the starting problem statement rather
+/// than an empty prompt. An empty goal falls back to the prompt.
+pub fn scaffold(slug: &str, title: &str, goal: &str) -> String {
+    let problem = if goal.trim().is_empty() {
+        "_What are we building, and why? What does \"done\" look like?_".to_string()
+    } else {
+        format!(
+            "{}\n\n_Refine the launch goal above into the problem and what \"done\" looks like._",
+            goal.trim()
+        )
+    };
     format!(
         r#"---
 plan: {slug}
@@ -223,7 +235,7 @@ status: draft
 
 ## Problem & goal
 
-_What are we building, and why? What does "done" look like?_
+{problem}
 
 ## Architecture
 
@@ -498,13 +510,22 @@ Just do it now.
 
     #[test]
     fn scaffold_round_trips_through_the_parser() {
-        let src = scaffold("my-plan", "My Plan");
+        let src = scaffold("my-plan", "My Plan", "");
         let p = parse("my-plan", &src);
         assert_eq!(p.title, "My Plan");
         assert_eq!(p.status, "draft");
         assert_eq!(p.tasks.len(), 1);
         assert_eq!(p.tasks[0].id, "T1");
         assert_eq!(p.tasks[0].exec, "session");
+    }
+
+    #[test]
+    fn scaffold_seeds_problem_from_goal() {
+        let with = scaffold("p", "P", "  Rewrite search to use the new index  ");
+        assert!(with.contains("Rewrite search to use the new index"));
+        assert!(!with.contains("What are we building")); // prompt replaced
+        // Empty goal keeps the prompt.
+        assert!(scaffold("p", "P", "   ").contains("What are we building"));
     }
 
     /// An issue linked to `slug#task`, optionally claimed/closed.

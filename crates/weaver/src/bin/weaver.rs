@@ -150,7 +150,7 @@ enum PlanCmd {
         #[arg(long)]
         slug: Option<String>,
     },
-    /// List the plans in this repo.
+    /// List the plans on this branch.
     Ls,
     /// Show a plan: its tasks, each with status projected from the issue ledger.
     Show { slug: String },
@@ -673,7 +673,7 @@ async fn cmd_plan(cmd: PlanCmd) -> Result<()> {
             }
             std::fs::create_dir_all(&dir)
                 .map_err(|e| anyhow!("creating {}: {e}", dir.display()))?;
-            std::fs::write(&path, plan::scaffold(&slug, &title))?;
+            std::fs::write(&path, plan::scaffold(&slug, &title, &b.goal))?;
             events::record_local(&db, &b.id, "plan_created", json!({ "slug": slug })).await?;
             println!("created {}", path.display());
             println!("edit it, then `weaver plan sync {slug} --apply` to materialize its tasks");

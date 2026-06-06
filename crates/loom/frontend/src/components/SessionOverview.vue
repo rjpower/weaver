@@ -23,16 +23,10 @@ const emit = defineEmits<{ adopt: []; archive: []; remove: []; refreshGithub: []
 
 <template>
   <div class="space-y-5">
-    <!-- Plan — the structured project plan (when one exists), with task status
-         projected from the issue ledger. Read-first, with an explicit Edit mode. -->
-    <SessionPlan :id="ws.id" />
-
-    <!-- Goal — the agent's launch prompt. Read-only. -->
-    <section class="rounded border border-line bg-surface p-4">
-      <div class="mb-1 text-xs font-medium uppercase tracking-wide text-faint">Goal</div>
-      <p v-if="ws.branch.goal" class="whitespace-pre-wrap text-sm text-fg">{{ ws.branch.goal }}</p>
-      <p v-else class="text-sm text-faint">No goal set.</p>
-    </section>
+    <!-- Plan — one surface for "what this branch is doing": the agent's launch
+         goal at minimum, growing into the structured plan (tasks, diagram, live
+         status projected from the issue ledger) once one is scaffolded. -->
+    <SessionPlan :id="ws.id" :goal="ws.branch.goal" />
 
     <!-- GitHub — the branch's PR snapshot, polled server-side via `gh`. Shown
          only once a snapshot exists; the Refresh button forces a re-poll. -->
