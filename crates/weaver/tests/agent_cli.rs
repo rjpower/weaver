@@ -201,8 +201,9 @@ fn issue_wait_times_out_on_an_open_issue() {
         !out.status.success(),
         "an unmet wait should exit non-zero so callers can branch on it"
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("timed out"), "stdout: {stdout}");
+    // The timeout is reported through the normal error path (stderr).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("timed out"), "stderr: {stderr}");
 }
 
 /// A tracking issue sourced from this branch but claimed by another shows up

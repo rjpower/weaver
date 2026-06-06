@@ -586,10 +586,17 @@ async fn cmd_issue_wait(
         None => println!("waiting on #{id} ({})", issue.title),
     }
 
+    let interval = std::time::Duration::from_secs(interval);
     let deadline =
         (timeout > 0).then(|| std::time::Instant::now() + std::time::Duration::from_secs(timeout));
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        // Never nap past the deadline: a long `--interval` must not stretch a
+        // short `--timeout`.
+        let nap = match deadline {
+            Some(d) => interval.min(d.saturating_duration_since(std::time::Instant::now())),
+            None => interval,
+        };
+        tokio::time::sleep(nap).await;
         let cur = issue::get(db, id)
             .await?
             .ok_or_else(|| anyhow!("issue #{id} disappeared while waiting"))?;
@@ -612,12 +619,14 @@ async fn cmd_issue_wait(
                 }
             }
         }
+        // Timing out is a real "not done" outcome: report it as an error so the
+        // process exits non-zero (callers branch on it) without an ad-hoc
+        // `process::exit` that bypasses normal error handling.
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             let progress = working_branch_status(db, &cur)
                 .await
                 .unwrap_or_else(|| "open".to_string());
-            println!("timed out after {timeout}s — #{id} still open ({progress})");
-            std::process::exit(1);
+            bail!("timed out after {timeout}s — #{id} still open ({progress})");
         }
     }
 }

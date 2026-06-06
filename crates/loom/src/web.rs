@@ -678,6 +678,10 @@ async fn create_session(
     {
         Some(key) => branch_mod::resolve_key(&st.db, key)
             .await?
+            // Only attribute to a parent in *this* repo. `resolve_key` searches
+            // globally, and a stray `$WEAVER_BRANCH` from a checkout elsewhere
+            // must not misattribute `source_branch` to an unrelated branch.
+            .filter(|b| b.repo_root == branch.repo_root)
             .map(|b| b.branch)
             .filter(|name| name != &branch.branch),
         None => None,
@@ -824,11 +828,11 @@ async fn create_tracking_issue(
 ) -> ApiResult<Option<i64>> {
     let source = parent_branch.unwrap_or(&branch.branch).to_string();
 
-    // Claiming an existing weaver issue: that issue *is* the tracker.
+    // Claiming an existing weaver issue: that issue *is* the tracker, so the
+    // claim must actually land — otherwise we'd hand back a tracking id for an
+    // issue this branch never claimed. Propagate failures rather than swallow.
     if let Some(id) = claim_issue {
-        weaver_core::issue::set_claim(&st.db, id, Some(&branch.branch))
-            .await
-            .ok();
+        weaver_core::issue::set_claim(&st.db, id, Some(&branch.branch)).await?;
         events::record(
             &st.db,
             &st.bus,
