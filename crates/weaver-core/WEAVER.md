@@ -23,6 +23,14 @@ It is on your `PATH`. From anywhere in the worktree you can run:
 - `weaver issue show N` — an issue plus the live status of the branch working
   it; `weaver issue wait N` blocks until it closes or that branch needs you
   (see "Launching and tracking sub-sessions" below).
+- `weaver plan new "<title>"` — for a large, multi-step effort, scaffold a
+  structured plan (a markdown file under `docs/plans/`) holding the design, an
+  architecture diagram, and a task breakdown with stable ids. `weaver plan show
+  <slug>` prints it with each task's live status; `weaver plan sync <slug>
+  --apply` reconciles the plan's tasks into weaver issues (and flags, never
+  rewrites, work already in flight). Reach for this only when the work spans
+  many sessions; a small task stays goal-plus-issues. See
+  `docs/structured-projects.md`.
 - `weaver set-status` — with no argument, show the goal, status, and open-issue
   count.
 

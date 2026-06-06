@@ -4,11 +4,13 @@ import { post } from '../api';
 import type { Session, WeaverEvent, Issue } from '../types';
 import SessionActivity from './SessionActivity.vue';
 import SessionIssues from './SessionIssues.vue';
+import SessionPlan from './SessionPlan.vue';
 import GithubStatus from './GithubStatus.vue';
 import { timeAgo } from '../lib/time';
 
-// The Overview tab: the read-only context for a session — goal, the GitHub PR
-// snapshot, claimed work + repo backlog, and the de-noised activity feed.
+// The Overview tab: the read-only context for a session — the plan (the launch
+// goal at minimum, growing into tasks), the GitHub PR snapshot, claimed work +
+// repo backlog, and the de-noised activity feed.
 // Everything here is authored by the AGENT (the launch prompt, `weaver
 // set-status`, `weaver issue`) or polled server-side (the PR snapshot); the
 // page's writes (acknowledge attention, rename, lifecycle) all live in the
@@ -43,16 +45,11 @@ async function refreshGithub() {
 
 <template>
   <div class="space-y-5">
-    <!-- Goal — the agent's launch prompt. Read-only. -->
-    <section class="rounded border border-line bg-surface p-4">
-      <div class="mb-1 text-xs font-medium uppercase tracking-wide text-faint">Goal</div>
-      <p
-        v-if="ws.branch.goal"
-        data-testid="session-goal"
-        class="whitespace-pre-wrap text-sm text-fg"
-      >{{ ws.branch.goal }}</p>
-      <p v-else class="text-sm text-faint">No goal set.</p>
-    </section>
+    <!-- Plan — one surface for "what this branch is doing": the agent's launch
+         goal at minimum, growing into the structured plan (tasks, diagram, live
+         status projected from the issue ledger) once one is scaffolded. The goal
+         element carries `session-goal` for the detail/list specs. -->
+    <SessionPlan :id="ws.id" :goal="ws.branch.goal" />
 
     <!-- GitHub — the branch's PR snapshot, polled server-side via `gh`. Shown
          for GitHub-backed repos; the Refresh button forces an immediate re-poll. -->
