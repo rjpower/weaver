@@ -83,7 +83,7 @@ mod tests {
         assert!(v["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap()
-            .contains("weaver note"));
+            .contains("weaver set-status"));
     }
 
     #[test]
