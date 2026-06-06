@@ -63,7 +63,7 @@ pub struct SettingSpec {
     pub default: &'static str,
     /// Heading the setting is grouped under in the UI.
     pub group: &'static str,
-    /// The allowed values for an [`SettingKind::Enum`] setting, in display
+    /// The allowed values for a [`SettingKind::Enum`] setting, in display
     /// order. Empty for every other kind.
     pub options: &'static [&'static str],
 }

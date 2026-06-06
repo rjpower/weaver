@@ -74,9 +74,16 @@ function themeFor(name: string | undefined): ITheme {
   return name === 'light' ? LIGHT_THEME : DARK_THEME;
 }
 
+// How long to wait for the theme fetch before opening the terminal with the
+// dark default anyway. Same-origin localhost answers in single-digit ms; this
+// ceiling only matters if the request stalls, so the terminal never hangs
+// closed waiting on it.
+const THEME_FETCH_TIMEOUT_MS = 1000;
+
 // Best-effort fetch of the configured terminal theme. Any failure (offline,
-// stale server without the setting) falls back to the dark default rather than
-// blocking the terminal from opening.
+// stale server without the setting) falls back to the dark default. The caller
+// races this against a timeout so a *slow* (not just failed) request can't hold
+// the terminal closed either.
 async function loadTheme(): Promise<ITheme> {
   try {
     const res = (await get('/settings')) as { settings?: SettingView[] };
@@ -189,8 +196,15 @@ function onVisible() {
 onMounted(async () => {
   if (!host.value) return;
   // Resolve the configured palette before constructing the terminal so it
-  // paints in the right theme from the first frame (no dark→light flash).
-  const theme = await loadTheme();
+  // paints in the right theme from the first frame (no dark→light flash on the
+  // common fast path). But never let a slow/stalled request hold the terminal
+  // closed: race the fetch against a short timeout, open with the dark default
+  // if it loses, and upgrade to the configured palette once it lands.
+  const themePromise = loadTheme();
+  const initialTheme = await Promise.race([
+    themePromise,
+    new Promise<ITheme>((resolve) => setTimeout(() => resolve(DARK_THEME), THEME_FETCH_TIMEOUT_MS)),
+  ]);
   if (disposed || !host.value) return; // unmounted while the fetch was in flight
   term = new Terminal({
     convertEol: false,
@@ -198,7 +212,7 @@ onMounted(async () => {
     fontSize: 13,
     scrollback: 5000,
     allowProposedApi: true, // required to activate the unicode11 addon
-    theme,
+    theme: initialTheme,
     // Constrain agent-supplied OSC 8 hyperlinks to http(s); reject
     // javascript:/data:/file: which an untrusted agent could otherwise emit.
     linkHandler: {
@@ -215,6 +229,14 @@ onMounted(async () => {
     },
   });
   term.open(host.value);
+
+  // If the timeout won the race above, apply the real palette once the fetch
+  // resolves. Reference equality holds because the palettes are module-level
+  // singletons, so a no-op (configured theme === fallback) doesn't churn the
+  // renderer.
+  themePromise.then((t) => {
+    if (!disposed && term && t !== initialTheme) term.options.theme = t;
+  });
 
   fit = new FitAddon();
   term.loadAddon(fit);
