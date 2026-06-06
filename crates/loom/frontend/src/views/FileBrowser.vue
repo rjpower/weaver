@@ -495,8 +495,10 @@ onUnmounted(teardownEditors);
             class="min-w-0 flex-1 rounded bg-input px-2 py-1 text-xs outline-none"
           />
           <button
+            type="button"
             class="shrink-0 rounded bg-subtle px-2 py-1 text-xs text-muted hover:bg-subtle-hover hover:text-fg"
             title="Refresh file tree"
+            aria-label="Refresh file tree"
             @click="refresh"
           >
             ⟳

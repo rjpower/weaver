@@ -71,31 +71,40 @@ onMounted(refresh);
 
 <template>
   <section data-testid="scratch-panel">
+    <!-- The whole strip is a drop target; the labelled affordance is a real
+         <button> so click AND keyboard (Enter/Space) both open the file picker.
+         The chips' remove buttons sit as siblings, never nested in another
+         control. -->
     <div
-      class="flex flex-wrap items-center gap-x-2 gap-y-1.5 rounded border border-dashed px-3 py-2 text-xs transition-colors cursor-pointer"
-      :class="dragging ? 'border-accent bg-accent/10' : 'border-line hover:border-accent/60'"
+      class="flex flex-wrap items-center gap-x-2 gap-y-1.5 rounded border border-dashed px-3 py-2 text-xs transition-colors"
+      :class="dragging ? 'border-accent bg-accent/10' : 'border-line'"
       data-testid="scratch-dropzone"
       @dragover.prevent="dragging = true"
       @dragleave.prevent="dragging = false"
       @drop.prevent="onDrop"
-      @click="fileInput?.click()"
     >
-      <span class="text-faint">📎</span>
-      <span :class="dragging ? 'text-fg' : 'text-muted'">
-        {{ busy ? 'Uploading…' : 'Drop a file or click to attach' }}
-      </span>
+      <button
+        type="button"
+        class="flex cursor-pointer items-center gap-2 rounded text-left hover:text-fg focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+        :class="dragging ? 'text-fg' : 'text-muted'"
+        @click="fileInput?.click()"
+      >
+        <span class="text-faint">📎</span>
+        <span>{{ busy ? 'Uploading…' : 'Drop a file or click to attach' }}</span>
+      </button>
       <span class="text-faint">·</span>
       <span class="font-mono text-faint">reference as <code>scratch/&lt;name&gt;</code></span>
 
-      <ul v-if="files.length" class="ml-auto flex flex-wrap items-center gap-1.5" @click.stop>
+      <ul v-if="files.length" class="ml-auto flex flex-wrap items-center gap-1.5">
         <li v-for="f in files" :key="f.name" class="meta-chip text-fg">
           <span class="truncate">{{ f.name }}</span>
           <span class="text-faint">{{ fmtBytes(f.bytes) }}</span>
           <button
             type="button"
             class="text-faint hover:text-block"
-            title="Remove"
-            @click.stop="remove(f.name)"
+            :title="`Remove ${f.name}`"
+            :aria-label="`Remove ${f.name}`"
+            @click="remove(f.name)"
           >
             ✕
           </button>

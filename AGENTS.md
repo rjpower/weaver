@@ -91,13 +91,14 @@ the one running *you*. So, unless the user explicitly asks for it:
   Each of these tears down the user's running agents at a stroke.
 - **If a task seems to need a live loom session, ask the user first.**
 
-To exercise loom or tmux behaviour, use the test infrastructure instead. It
-pins tmux to a throwaway server via `WEAVER_TMUX_SOCKET` (→ `tmux -L <name>`,
-see `tmux::socket_args`) and a temp `WEAVER_HOME`, so it can never see — let
-alone kill — the user's real sessions. The integration tests
-(`crates/loom/tests/`) and the Playwright `e2e/` fixtures already set this up;
-extend them rather than driving a real server by hand. If you genuinely must
-run loom ad-hoc, isolate it the same way:
+To exercise loom or tmux behaviour, use the test infrastructure instead. The
+Rust integration tests (`crates/loom/tests/`) pin tmux to a throwaway server via
+`WEAVER_TMUX_SOCKET` (→ `tmux -L <name>`, see `tmux::socket_args`) and a temp
+`WEAVER_HOME`, so they can never see — let alone kill — the user's real
+sessions; extend them rather than driving a real server by hand. (The Playwright
+`e2e/` suite does **not** yet isolate its tmux socket — it still drives a server
+on the machine-global default socket; that's tracked in #22.) If you genuinely
+must run loom ad-hoc, isolate it the same way:
 
 ```sh
 WEAVER_TMUX_SOCKET=loom-dev-$$ WEAVER_HOME=$(mktemp -d) loom serve --addr 127.0.0.1:0
