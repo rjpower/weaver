@@ -47,7 +47,7 @@ needing the daemon to be reachable.
 
 | Path | What's in it |
 |---|---|
-| `crates/weaver-core/` | lib: `branches`, `issues`, `notes`, `events`, `db`, `git`, `config`, agent helpers. Pure logic; used by both binaries. |
+| `crates/weaver-core/` | lib: `branches`, `issues`, `notes`, `events`, `db`, `git`, `config`, `plan` (parser + reconcile), `repo_config` (`.weaver/config.toml`), agent helpers. Pure logic; used by both binaries. |
 | `crates/weaver/src/bin/weaver.rs` | the slim agent-facing CLI (`goal`, `note`, `set-status` [read or set level + message], `issue …`, `where`, `log`, `hook`, `config`) |
 | `crates/loom/src/web.rs` | axum routes, request/response types, SSE — **the API surface** |
 | `crates/loom/src/server.rs` | bind, write `server.json`, spawn bg tasks |
@@ -130,7 +130,11 @@ the PR, not integrating it yourself (see the builtin
   comes up. The `loom` CLI uses it to find the daemon when `WEAVER_API` is
   unset.
 - **Settings** live in the `settings` table; each key is declared in
-  `weaver-core::config::registry()`. Both binaries read it.
+  `weaver-core::config::registry()`. Both binaries read it. This is the
+  **global** (machine/user) store; **per-repo** conventions instead live in a
+  committed `.weaver/config.toml` read by `weaver-core::repo_config` (today just
+  `[plan].dir`, default `docs/plans`) — distinct from the settings table, and
+  resolved repo-file → builtin-default like a repo's own `WEAVER.md`.
 - **Worktrees** live under `<repo>/.worktrees/<slug>` on `weaver/<slug>`
   (unless `--branch` reused an existing branch).
 
@@ -145,6 +149,9 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `GET PATCH DELETE /api/sessions/{id}` | session CRUD (status, title, goal, description, attention) |
 | `POST /api/sessions/{id}/{note,archive,adopt}` | actions |
 | `GET POST DELETE /api/sessions/{id}/scratch` | list / drop / remove worktree `scratch/` reference files |
+| `PUT /api/sessions/{id}/file?path=…` | write raw bytes to a worktree file (the editor save primitive) |
+| `GET /api/sessions/{id}/plan` | a [structured project plan](../docs/structured-projects.md), parsed + task status joined from issues |
+| `POST /api/sessions/{id}/plan/sync` | reconcile a plan against the issue ledger (`apply` to write) |
 | `GET /api/sessions/{id}/{diff,log,events}` | reads + SSE stream |
 | `GET /api/sessions/{id}/terminal` | WebSocket: xterm.js ⇄ PTY ⇄ tmux (the interaction surface) |
 | `GET /api/branches` / `GET PATCH /api/branches/{id}` | list / inspect / edit tracked branches |
@@ -266,6 +273,10 @@ weaver issue ls                         # this branch's work + unclaimed backlog
 weaver issue ls --mine --all            # just this branch, including closed
 weaver issue ls --repo                  # whole repo, grouped by branch
 weaver issue close 7
+weaver plan new "Search rewrite"        # scaffold docs/plans/<slug>.md (large efforts)
+weaver plan ls                          # plans in this repo
+weaver plan show search-rewrite         # tasks + status projected from issues
+weaver plan sync search-rewrite --apply # reconcile plan tasks ↔ issue ledger
 weaver where                            # debug: print resolved repo / branch / branch-id
 weaver log --limit 50                   # recent events for the current branch
 weaver hook --event working             # (used by Claude Code hooks)

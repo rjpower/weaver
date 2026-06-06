@@ -191,7 +191,7 @@ onUnmounted(teardownEditor);
 </script>
 
 <template>
-  <section class="rounded border border-line bg-surface">
+  <section class="rounded border border-line bg-surface" data-testid="session-plan">
     <header class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-2.5">
       <div class="text-xs font-medium uppercase tracking-wide text-faint">Plan</div>
       <template v-if="plan">

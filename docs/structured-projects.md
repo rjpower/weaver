@@ -1,10 +1,22 @@
 # Structuring larger projects
 
-Status: **proposal / design sketch** (issue
+Status: **implemented** (issue
 [#14](https://github.com/rjpower/weaver/issues/14)). This doc surveys how the
 field handles spec-driven, multi-step agent work, then argues for a weaver-shaped
-answer. It is a thinking document, not an implementation spec — the open
-questions at the end are real.
+answer; the design it argues for now ships. What landed:
+
+- **weaver-core** — a `plan` module (tolerant parser, scaffold, and the
+  `diff`/`apply` reconcile that flags-but-never-rewrites in-flight work), a
+  `repo_config` module (`.weaver/config.toml` `[plan].dir`), and the
+  `issues.plan_task` link column with `issue::list_for_plan` / `set_title`.
+- **`weaver` CLI** — `weaver plan new | ls | show | sync [--apply]`, with task
+  status projected from the issue ledger.
+- **loom** — `GET /api/sessions/{id}/plan`, `POST /api/sessions/{id}/plan/sync`,
+  and the `PUT /api/sessions/{id}/file` write primitive; a `SessionPlan`
+  component renders the plan on the Overview tab (read-first, projected status,
+  dependency graph) with an Edit-in-Monaco mode and Reconcile.
+
+The rest is the original design argument, kept as the rationale of record.
 
 ## The problem
 
@@ -391,6 +403,9 @@ sub-question only: `.weaver/config.toml` (namespaced dir) vs a flat
 `.weaver.toml` — a coin-flip; I lean on the dir for room to grow.
 
 ## Incremental delivery
+
+All four steps shipped (✅); the sequence below is how they were staged, each
+independently useful.
 
 1. **Plan file + parser + `weaver plan show`.** Just the artifact and a stable
    parse (frontmatter, tasks, IDs, `exec`/`value`/`deps`). No DB changes. Useful
