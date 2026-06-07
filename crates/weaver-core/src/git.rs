@@ -109,6 +109,79 @@ pub async fn branch_exists(dir: &Path, branch: &str) -> bool {
     .is_ok()
 }
 
+/// Whether a remote named `name` is configured (`git remote get-url`).
+async fn has_remote(dir: &Path, name: &str) -> bool {
+    git(dir, &["remote", "get-url", name]).await.is_ok()
+}
+
+/// Whether `rev` resolves to a commit in this repo.
+async fn commit_exists(dir: &Path, rev: &str) -> bool {
+    git(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )
+    .await
+    .is_ok()
+}
+
+/// The default branch on `origin` (e.g. `main`), resolved locally and cheaply:
+/// the recorded `origin/HEAD` symref, else a probe of the usual names against
+/// the existing remote-tracking refs. `None` when none of those resolve (a
+/// fresh clone with no `origin/HEAD` and no `main`/`master` tracking ref).
+async fn origin_default_branch(dir: &Path) -> Option<String> {
+    if let Ok(out) = git(
+        dir,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .await
+    {
+        if let Some(name) = out.strip_prefix("origin/") {
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    for cand in ["main", "master"] {
+        if commit_exists(dir, &format!("origin/{cand}")).await {
+            return Some(cand.to_string());
+        }
+    }
+    None
+}
+
+/// The base a freshly-launched session should fork from: the repo's default
+/// branch on `origin`, **fetched fresh**, so new work always starts from the
+/// latest mainline rather than whatever the launching checkout happens to have
+/// checked out (and possibly stale). Returns the `origin/<default>` ref, which
+/// the diff machinery already treats as a first-class base (see
+/// [`merge_base_fresh`]).
+///
+/// Degrades gracefully: with no `origin` remote (a local-only repo, or the test
+/// harness) it falls back to the local current branch, the historical default.
+/// A failed fetch (offline) is non-fatal — the existing `origin/<default>`
+/// tracking ref is used as-is; only if that ref doesn't resolve at all do we
+/// fall back to the current branch.
+pub async fn default_base(dir: &Path) -> Result<String> {
+    if !has_remote(dir, "origin").await {
+        return current_branch(dir).await;
+    }
+    if let Some(default) = origin_default_branch(dir).await {
+        // Best-effort: refresh the tracking ref so the fork point is current.
+        // Ignore network failures — a stale ref still beats the local branch.
+        let _ = git(dir, &["fetch", "origin", &default]).await;
+        let remote_ref = format!("origin/{default}");
+        if commit_exists(dir, &remote_ref).await {
+            return Ok(remote_ref);
+        }
+    }
+    current_branch(dir).await
+}
+
 /// Create a new worktree at `path` on a new `branch` forked from `base`.
 pub async fn worktree_add(repo_root: &Path, path: &Path, branch: &str, base: &str) -> Result<()> {
     let path = path.to_string_lossy();
@@ -509,6 +582,42 @@ mod tests {
         let clean = changed_files(dir, &since).await.unwrap();
         assert_eq!(clean.len(), 1);
         assert_eq!(clean[0].path, "mine.txt");
+    }
+
+    /// With no `origin` remote, the launch base degrades to the local current
+    /// branch — the historical behaviour, kept for remote-less repos.
+    #[tokio::test]
+    async fn default_base_without_remote_uses_current_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        run(dir, &["init", "-q", "-b", "main"]).await;
+        run(dir, &["config", "user.email", "t@t.t"]).await;
+        run(dir, &["config", "user.name", "t"]).await;
+        commit(dir, "T0").await;
+        assert_eq!(default_base(dir).await.unwrap(), "main");
+    }
+
+    /// With an `origin` remote, the launch base is the remote's default branch
+    /// (`origin/main`) so new work forks from the fetched mainline.
+    #[tokio::test]
+    async fn default_base_prefers_origin_default() {
+        let remote = tempfile::tempdir().unwrap();
+        run(remote.path(), &["init", "-q", "--bare", "-b", "main"]).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        run(dir, &["init", "-q", "-b", "main"]).await;
+        run(dir, &["config", "user.email", "t@t.t"]).await;
+        run(dir, &["config", "user.name", "t"]).await;
+        commit(dir, "T0").await;
+        let remote_url = remote.path().to_string_lossy().to_string();
+        run(dir, &["remote", "add", "origin", &remote_url]).await;
+        run(dir, &["push", "-q", "origin", "main"]).await;
+        // Populate the remote-tracking refs (origin/main, origin/HEAD).
+        run(dir, &["fetch", "-q", "origin"]).await;
+        run(dir, &["remote", "set-head", "origin", "main"]).await;
+
+        assert_eq!(default_base(dir).await.unwrap(), "origin/main");
     }
 
     /// `DiffBase::Uncommitted` scopes to working-tree changes vs `HEAD`, ignoring

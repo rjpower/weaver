@@ -20,7 +20,7 @@ The rest is the original design argument, kept as the rationale of record.
 
 ## The problem
 
-A single `loom launch "fix the bug"` is the easy case: one goal, one branch, one
+A single `loom session launch "fix the bug"` is the easy case: one goal, one branch, one
 agent, a handful of `weaver issue`s. It falls apart for the
 [marin #6178](https://github.com/marin-community/marin/issues/6178)-class task —
 a dozen interacting components, work that spans many sessions and days, where the
@@ -236,7 +236,7 @@ This is the missing front-end for the fan-out that
 [repo-scoped issues](repo-scoped-issues.md) was explicitly designed to enable —
 "create N issues up front, then launch one session per issue." Today a human
 hand-writes those N issues; the plan *generates* them from the design, keeps
-them linked, and gives the board something to group by. `loom launch --claim N`
+them linked, and gives the board something to group by. `loom session launch --claim N`
 already turns an issue into a session and stamps `claimed_branch`; nothing in
 that path changes. The plan just sits one level above it as the index and the
 source of the breakdown.
@@ -279,7 +279,7 @@ applies it.
 "Iterate on the design loop until satisfied, *then* break out into the working
 session." In weaver terms there is no special mode — a **planning session is
 just a normal session whose deliverable is the plan file.** You
-`loom launch "Plan the search rewrite" --plan search-rewrite`; the agent drafts
+`loom session launch "Plan the search rewrite" --plan search-rewrite`; the agent drafts
 `docs/plans/search-rewrite.md`, the user reviews it *through the dashboard*
 (rendered, with diagrams) and iterates — asynchronously, the way they already
 review everything. Because the agent never blocks on a TUI prompt (per
@@ -326,7 +326,7 @@ generalizes: the same file-write path makes the Files tab editable for free.
   plan becomes the single index into a sprawling fan-out — the thing that's
   missing today when ten sessions are in flight.
 - **Actions**: *Reconcile* (`plan sync`, show the delta), *Launch* (per ready
-  task → `loom launch --claim`).
+  task → `loom session launch --claim`).
 
 The one genuinely new backend piece is a **file-write endpoint** (today
 `/sessions/{id}/raw` and `/file` are read-only; Monaco is `readOnly: true`).
@@ -361,7 +361,7 @@ This is the field's unsolved problem, so be explicit: **the plan is opt-in and
 for large work only.** Heuristics — reach for a plan when the work will span
 multiple sessions/branches, has internal dependencies a diagram would clarify,
 or needs user sign-off on shape before code. Otherwise stay with the existing
-goal + issues; a typo fix must never cost a `requirements.md`. `loom launch`
+goal + issues; a typo fix must never cost a `requirements.md`. `loom session launch`
 stays single-goal by default; `--plan` is the deliberate escalation.
 
 ## Non-goals
@@ -394,7 +394,7 @@ stays single-goal by default; `--plan` is the deliberate escalation.
   tasks joined to issue status), `POST /api/sessions/{id}/plan/sync`, and a
   **file-write** endpoint (e.g. `PUT /api/sessions/{id}/file`) backing the Edit
   mode — the one new primitive, useful well beyond plans.
-- **Launch:** `loom launch --plan <slug>` (planning session);
+- **Launch:** `loom session launch --plan <slug>` (planning session);
   reuse `--claim` for the fan-out.
 
 ## Per-repo configuration

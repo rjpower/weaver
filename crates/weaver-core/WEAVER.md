@@ -62,9 +62,10 @@ without reading this terminal:
 You can fan work out into its own detached session — a parallel sub-tree on its
 own branch and worktree — and track it the same way someone tracks you:
 
-- `loom launch "<what the sub-agent should do>"` — spawn a sub-session. It
-  prints the new branch and a **tracking issue number** for the task; that
-  issue is your handle on the sub-tree.
+- `loom session launch "<what the sub-agent should do>"` — spawn a sub-session.
+  It prints the new branch and a **tracking issue number** for the task; that
+  issue is your handle on the sub-tree. The new branch forks from a
+  freshly-fetched `origin/<default branch>` unless you pass `--base <branch>`.
 - `weaver issue show <id>` — poll the sub-tree: its tracking issue's
   open/closed state plus the sub-agent's live `set-status` (attention +
   current-state message).
@@ -73,6 +74,20 @@ own branch and worktree — and track it the same way someone tracks you:
   `attention`/`blocked`). Takes `--timeout <secs>`; prints why it woke.
 - `weaver issue ls` lists the sub-tasks you have delegated under
   "Delegated by this branch", each with its sub-agent's current status.
+
+The tracking issue is the high-level handle; `loom session` also drives a child
+session's terminal directly, so you can nudge it without attaching:
+
+- `loom session poll <session>` — one-shot status (lifecycle + attention).
+- `loom session wait <session>` — block on the session itself (not its issue)
+  until it finishes, is lost, or raises attention. `--timeout <secs>`.
+- `loom session send <session> "<message>"` — type a message into the
+  sub-agent's pane and submit it, triggering an agent round (e.g. to answer a
+  question it asked or redirect it).
+- `loom session break <session>` — send Escape to interrupt its current turn.
+- `loom session preview <session>` — print its recent tmux screen, to see what
+  it's doing right now. A session key is an id, branch id, branch name, or
+  `repo:branch`.
 
 This duplicates some of a coding agent's builtin sub-agents, but a weaver
 sub-session is fully decoupled: it survives independently, has its own git

@@ -176,6 +176,9 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `POST /api/sessions/{id}/plan/sync` | reconcile a plan against the issue ledger (`apply` to write) |
 | `GET /api/sessions/{id}/{diff,log,events}` | reads + SSE stream |
 | `GET /api/sessions/{id}/terminal` | WebSocket: xterm.js ⇄ PTY ⇄ tmux (the interaction surface) |
+| `POST /api/sessions/{id}/send` | type `{text}` into the agent's tmux pane; `submit` (default true) follows it with Enter to trigger a round |
+| `POST /api/sessions/{id}/interrupt` | send a break (Escape) to the pane — stop the current turn |
+| `GET /api/sessions/{id}/preview?lines=N` | capture the pane as `{screen}`; `lines` adds scrollback above the visible screen |
 | `GET /api/branches` / `GET PATCH /api/branches/{id}` | list / inspect / edit tracked branches |
 | `GET POST /api/branches/{id}/issues` | issues claimed by the branch / create one |
 | `GET PATCH DELETE /api/issues/{id}` | per-issue CRUD |
@@ -215,6 +218,20 @@ written *before* the agent launches, with a note appended to the launch prompt
 so a fresh agent knows the files are there. The stored branch goal stays the
 clean text the user typed.
 
+**Launch base.** A new session's worktree forks from `base`. When the create
+request omits it, `git::default_base` resolves the repo's default branch on
+`origin` and fetches it, so the branch starts from a fresh `origin/<default>`
+rather than the launching checkout's current branch. A remote-less repo (no
+`origin`) degrades to the local current branch. The caller — the CLI's `--base`
+or the create form's base field — can pin any ref instead.
+
+**Driving the pane.** `send` / `interrupt` / `preview` are one-shot HTTP
+primitives over `tmux send-keys` and `capture-pane` (see `tmux::send_literal`,
+`send_key`, `capture`), distinct from the interactive terminal WebSocket: they
+let an agent or script type into, interrupt, or read back a child session
+uniformly. Each requires a live tmux (else 409). The CLI's `loom session
+{send,break,preview}` wrap them.
+
 ## Runtime conventions
 
 - **API-first.** New features land as a REST endpoint in `web.rs` first; the
@@ -240,7 +257,7 @@ clean text the user typed.
 Two distinct axes (see the SessionView note above): the mechanical **lifecycle**
 `sessions.status`, and the agent-declared **attention** on the branch.
 
-**Lifecycle** is driven by Claude Code hooks. `loom launch` merges a `hooks`
+**Lifecycle** is driven by Claude Code hooks. `loom session launch` merges a `hooks`
 block into the worktree's `.claude/settings.local.json` (see
 `loom::agent::install_hooks` and `weaver_core::agent::hooks_json`):
 
@@ -325,6 +342,6 @@ testable without invoking `gh`.
 | `WEAVER_HOME` | state directory | `~/.weaver` |
 | `WEAVER_DB` | sqlite path | `$WEAVER_HOME/weaver.db` |
 | `WEAVER_API` | loom URL (both sides — server binds, CLI talks) | `http://127.0.0.1:7878` |
-| `WEAVER_BRANCH` | override the branch resolver (set by `loom launch` in the worktree) | — |
+| `WEAVER_BRANCH` | override the branch resolver (set by `loom session launch` in the worktree) | — |
 | `WEAVER_TMUX_SOCKET` | pin tmux to a dedicated server (`tmux -L <name>`) so ops can't touch real sessions; set by the test harnesses | unset → default socket |
 | `RUST_LOG` / `EnvFilter` | tracing filter | `loom=info,weaver_core=info,tower_http=warn` |

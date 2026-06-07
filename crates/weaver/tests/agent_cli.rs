@@ -231,7 +231,7 @@ fn issue_ls_shows_delegated_sub_trees() {
 
 /// Insert a delegated tracking issue (sourced by `parent`, claimed by `child`)
 /// and give `child` a branch row with the supplied attention/description —
-/// reproducing the state a `loom launch` from inside `parent` would create.
+/// reproducing the state a `loom session launch` from inside `parent` would create.
 fn seed_delegated_issue(env: &Env, parent: &str, child: &str, attention: &str, description: &str) {
     let db_path = env.home_path.join("weaver.db");
     // Make sure the parent branch row exists first (a write resolves it).

@@ -66,8 +66,8 @@ issue
   which is the least-surprising behavior; aggregate by `github_repo` in the UI
   if cross-clone grouping is ever wanted.
 - **`source_branch`** answers "where did this come from" (use case B).
-- **`claimed_branch`** answers "who is working it" (use case A). `loom launch`
-  stamps it when a session picks up an open repo issue; this is what turns a
+- **`claimed_branch`** answers "who is working it" (use case A). `loom session
+  launch` stamps it when a session picks up an open repo issue; this is what turns a
   repo-level backlog item into a session's working item.
 
 "Branch-scoped" then means `source_branch = me OR claimed_branch = me` — the

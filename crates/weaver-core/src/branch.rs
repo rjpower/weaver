@@ -303,7 +303,7 @@ fn primary_worktree(dir: &Path) -> PathBuf {
 }
 
 /// Resolve the branch the current process is operating on. Order:
-///   1. `$WEAVER_BRANCH` (an internal branch id, set by `loom launch`)
+///   1. `$WEAVER_BRANCH` (an internal branch id, set by `loom session launch`)
 ///   2. Walk up from `cwd` to find a git checkout, read `HEAD`, and look up
 ///      `(repo_root, branch)` in the `branches` table. Auto-creates the row
 ///      on first call.

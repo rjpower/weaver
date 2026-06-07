@@ -75,6 +75,9 @@ const model = ref('');
 const effort = ref('');
 const name = ref('');
 const nameEdited = ref(false);
+// Optional base/parent branch to fork a new session from. Blank means the
+// server default: a freshly-fetched `origin/<default branch>` (the mainline).
+const base = ref('');
 const creating = ref(false);
 // Reference files staged in the form; base64-encoded into the create request
 // so they land in the new worktree's scratch/ before the agent launches.
@@ -196,6 +199,8 @@ async function create() {
       body.existing_branch = existingBranch.value.trim();
     } else {
       body.name = name.value || undefined;
+      // Only a new branch has a base to fork from; blank = server default.
+      if (base.value.trim()) body.base = base.value.trim();
     }
     if (scratchFiles.value.length) {
       body.scratch = await Promise.all(
@@ -211,6 +216,7 @@ async function create() {
     model.value = '';
     effort.value = '';
     name.value = '';
+    base.value = '';
     existingBranch.value = '';
     scratchFiles.value = [];
     nameEdited.value = false;
@@ -366,17 +372,35 @@ onUnmounted(() => clearInterval(timer));
             Existing branch
           </button>
         </div>
-        <div v-if="branchMode === 'new'">
-          <label class="block text-xs text-muted mb-1">
-            Name — the worktree (<code>.worktrees/&lt;name&gt;</code>) and branch
-            (<code>weaver/&lt;name&gt;</code>)
-          </label>
-          <input
-            v-model="name"
-            @input="nameEdited = true"
-            placeholder="health-endpoint"
-            class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
-          />
+        <div v-if="branchMode === 'new'" class="space-y-2">
+          <div>
+            <label class="block text-xs text-muted mb-1">
+              Name — the worktree (<code>.worktrees/&lt;name&gt;</code>) and branch
+              (<code>weaver/&lt;name&gt;</code>)
+            </label>
+            <input
+              v-model="name"
+              @input="nameEdited = true"
+              placeholder="health-endpoint"
+              class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
+            />
+          </div>
+          <div>
+            <label class="block text-xs text-muted mb-1">
+              Base branch — fork point (optional)
+            </label>
+            <input
+              v-model="base"
+              placeholder="origin/main (freshly fetched)"
+              autocomplete="off"
+              spellcheck="false"
+              class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
+            />
+            <p class="mt-1 text-xs text-faint">
+              Leave blank to fork from a freshly-fetched
+              <code>origin/&lt;default branch&gt;</code>.
+            </p>
+          </div>
         </div>
         <div v-else class="relative">
           <label class="block text-xs text-muted mb-1">

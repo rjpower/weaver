@@ -11,6 +11,7 @@ mod fixtures;
 mod archive;
 mod branches;
 mod files;
+mod pane;
 mod scratch;
 mod sessions;
 mod terminal;
