@@ -30,6 +30,38 @@ pub fn read_state() -> Option<ServerState> {
     serde_json::from_str(&text).ok()
 }
 
+/// Remove the state file on shutdown, but only if it still describes *this*
+/// process.
+///
+/// A restart overlaps two servers on the same port: `loom stop` drops the old
+/// listener (freeing the port) the instant it signals shutdown, but the old
+/// process keeps running until its in-flight connections drain — and the
+/// dashboard's SSE/terminal streams can hold those open for a long time. In
+/// that window the new server binds the freed port and writes its own
+/// `loom.json`. If the departing server then deleted the file unconditionally
+/// it would wipe the *successor's* state, leaving a live server with no state
+/// file — exactly the "loom is running but loom.json is missing" failure on the
+/// next `loom restart`. So we only remove the file when the pid on disk is
+/// still ours; otherwise a newer server owns it and we leave it be.
+fn remove_state_if_ours(path: &std::path::Path, my_pid: u32) {
+    let owner = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<ServerState>(&t).ok())
+        .map(|s| s.pid);
+    match owner {
+        Some(pid) if pid == my_pid => {
+            let _ = std::fs::remove_file(path);
+        }
+        Some(pid) => {
+            tracing::info!(
+                owner = pid,
+                "leaving loom.json in place — a newer server owns it"
+            );
+        }
+        None => {}
+    }
+}
+
 pub async fn run(addr: &str) -> Result<()> {
     let socket: SocketAddr = addr
         .parse()
@@ -74,7 +106,7 @@ pub async fn run(addr: &str) -> Result<()> {
     println!("loom listening on http://{actual}");
     let result = serve(state, listener).await;
 
-    std::fs::remove_file(&path).ok();
+    remove_state_if_ours(&path, std::process::id());
     match &result {
         Ok(()) => tracing::info!("loom stopped"),
         Err(e) => tracing::error!(error = %e, "loom stopped with error"),
@@ -164,5 +196,55 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let parsed: ServerState = serde_json::from_str(&json).unwrap();
         assert_eq!(state, parsed);
+    }
+
+    fn write_state(path: &std::path::Path, pid: u32) {
+        let state = ServerState {
+            pid,
+            addr: "127.0.0.1:7878".to_string(),
+            started_at: "2026-05-20T12:00:00.000Z".to_string(),
+        };
+        std::fs::write(path, serde_json::to_string(&state).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn shutdown_removes_only_our_own_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loom.json");
+
+        // Our own file is removed on shutdown.
+        write_state(&path, 1000);
+        remove_state_if_ours(&path, 1000);
+        assert!(!path.exists(), "a server should remove its own state file");
+
+        // A successor's file (different pid) is left untouched — this is the
+        // restart race: the departing server must not wipe the new server's
+        // loom.json.
+        write_state(&path, 2000);
+        remove_state_if_ours(&path, 1000);
+        assert!(
+            path.exists(),
+            "a departing server must not delete a newer server's state file"
+        );
+        assert_eq!(read_state_at(&path).unwrap().pid, 2000);
+    }
+
+    #[test]
+    fn shutdown_tolerates_a_missing_or_corrupt_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loom.json");
+
+        // Missing file: nothing to do, no panic.
+        remove_state_if_ours(&path, 1000);
+
+        // Corrupt file: left in place rather than blindly deleted.
+        std::fs::write(&path, "not json").unwrap();
+        remove_state_if_ours(&path, 1000);
+        assert!(path.exists(), "an unparseable state file is left untouched");
+    }
+
+    fn read_state_at(path: &std::path::Path) -> Option<ServerState> {
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&text).ok()
     }
 }
