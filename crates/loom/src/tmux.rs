@@ -116,6 +116,30 @@ pub async fn capture(name: &str, history: usize) -> Result<String> {
     run(&args).await
 }
 
+/// Send `text` to the session's pane as **literal** input (`send-keys -l`), so
+/// every character — including any that look like tmux key names — is typed
+/// verbatim. No trailing newline; pair with [`send_enter`] to submit.
+pub async fn send_literal(name: &str, text: &str) -> Result<()> {
+    let target = exact(name);
+    // `-l` is literal mode; `--` ends option parsing so a `text` that begins
+    // with `-` is still treated as input rather than a flag.
+    run(&["send-keys", "-t", &target, "-l", "--", text]).await?;
+    Ok(())
+}
+
+/// Send a single named key (e.g. `Enter`, `Escape`) to the session's pane.
+pub async fn send_key(name: &str, key: &str) -> Result<()> {
+    let target = exact(name);
+    run(&["send-keys", "-t", &target, key]).await?;
+    Ok(())
+}
+
+/// Submit the current pane input — a bare `Enter`. The agent-round trigger that
+/// follows a [`send_literal`].
+pub async fn send_enter(name: &str) -> Result<()> {
+    send_key(name, "Enter").await
+}
+
 /// Cleanly detach a single client identified by its controlling tty (e.g.
 /// `/dev/pts/5`). This is the principled way to end a `tmux attach`: the server
 /// tells that client to detach and the `tmux attach` process exits 0 on its own,

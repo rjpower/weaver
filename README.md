@@ -41,9 +41,14 @@ key decoupling — the agent CLI never speaks HTTP.
 ```sh
 # Orchestrator (optional)
 loom serve                            # run the daemon (REST + UI + tmux + monitor)
-loom launch "Add a /health endpoint"  # new worktree + tmux + agent, seeded with the task
-loom launch "Refactor the parser" --name parser-refactor   # override the branch slug
-loom launch "Big refactor" --model opus --effort high      # pick model tier + reasoning effort
+loom session launch "Add a /health endpoint"               # new worktree + tmux + agent, seeded with the task
+loom session launch "Refactor the parser" --name parser-refactor   # override the branch slug
+loom session launch "Big refactor" --model opus --effort high      # pick model tier + reasoning effort
+loom session poll <session>           # one-shot status (lifecycle + attention)
+loom session wait <session>           # block until it finishes or needs you
+loom session send <session> "try the curl again"   # type a message + Enter (trigger an agent round)
+loom session break <session>          # send Escape — interrupt the current turn
+loom session preview <session>        # print the recent tmux screen
 loom ps                               # list active sessions
 loom show <branch>                    # session detail
 loom attach <branch>                  # exec tmux attach (or use the browser terminal)
@@ -70,32 +75,41 @@ weaver where                          # debug: print resolved repo / branch / br
 weaver log --limit 50                 # recent events for the current branch
 ```
 
-`loom launch`'s positional argument is the **task**: it becomes the branch goal
-and the agent's opening prompt, and the `weaver/<slug>` branch name is derived
-from it (override with `--name`). The agent is `claude` unless you pass
-`--agent` or change `agent.default`, so the common case is just `loom launch
-"<what to do>"`. A `loom launch` with no task and nothing to pick up prints a
-usage hint and exits without launching.
+`loom session` is the uniform surface for driving a child session. `loom
+session launch`'s positional argument is the **task**: it becomes the branch
+goal and the agent's opening prompt, and the `weaver/<slug>` branch name is
+derived from it (override with `--name`). The agent is `claude` unless you pass
+`--agent` or change `agent.default`, so the common case is just `loom session
+launch "<what to do>"`. A launch with no task and nothing to pick up prints a
+usage hint and exits without launching. New branches fork from a
+freshly-fetched `origin/<default branch>` — the latest mainline — unless you
+pin a parent with `--base` (also a field in the web create form).
+
+Once a session is up, the other verbs interact with it: `loom session poll`
+reads its status, `loom session wait` blocks until it finishes or raises
+attention, `loom session send` types a message into the agent's pane (and
+submits it to trigger a round), `loom session break` sends Escape to interrupt
+the current turn, and `loom session preview` prints the recent tmux screen.
+Each takes a session key — an id, branch id, branch name, or `repo:branch`.
 
 Three flags seed the task from existing work instead of a fresh description:
-`loom launch --issue 123` takes the branch's title / goal / description from a
-GitHub issue (via the `gh` CLI), `loom launch --claim 7` takes them from an
-existing weaver issue and moves it out of the repo backlog, and `loom launch
---branch <name>` resumes an existing branch. `loom issues` prints the repo's
-board across branches.
+`loom session launch --issue 123` takes the branch's title / goal / description
+from a GitHub issue (via the `gh` CLI), `--claim 7` takes them from an existing
+weaver issue and moves it out of the repo backlog, and `--branch <name>` resumes
+an existing branch. `loom issues` prints the repo's board across branches.
 
 Every launch opens a **tracking issue** claimed by the new branch — the task as
-a weaver issue — and `loom launch` prints its number. That number is the handle
+a weaver issue — and the launch prints its number. That number is the handle
 for following the session: `weaver issue show <n>` reports the issue plus the
 live `set-status` of the branch working it, and `weaver issue wait <n>` blocks
 until the issue closes or that branch raises its attention. The launched agent
 is told to keep its status current and close the issue when the work is done.
-When an agent already inside a weaver session runs `loom launch`, the tracking
-issue is attributed to it (`source_branch`), so its sub-trees show up under
-"Delegated by this branch" in `weaver issue ls` — agents can fan work out into
-parallel sub-sessions and poll or block on them the same way a human does.
+When an agent already inside a weaver session runs `loom session launch`, the
+tracking issue is attributed to it (`source_branch`), so its sub-trees show up
+under "Delegated by this branch" in `weaver issue ls` — agents can fan work out
+into parallel sub-sessions and poll or block on them the same way a human does.
 
-`loom launch --model <haiku|sonnet|opus> --effort <low|medium|high|xhigh|max>`
+`loom session launch --model <haiku|sonnet|opus> --effort <low|medium|high|xhigh|max>`
 (both also selectors in the web create form) pin the session's Claude model
 tier and reasoning effort. They are orthogonal — any model runs at any effort —
 and spliced into the launch as `--model` / `--effort`. Both are stored per
@@ -110,7 +124,7 @@ The **lifecycle** (`session.status`) is mechanical and orchestrator-owned:
 `created`, `launching`, `running`, `orphaned`, `done`, or `error`. `done` and
 `error` are terminal; the rest, including `orphaned`, are recoverable. Claude-
 backed sessions drive it via Claude Code hooks installed into
-`.claude/settings.local.json` by `loom launch`. Each hook shells out to
+`.claude/settings.local.json` by `loom session launch`. Each hook shells out to
 `weaver hook --event {working|waiting|idle|session-start}`, writing an `events`
 row the monitor consumes on its next tick; any hook means the agent process is
 alive → `running`. When Claude blocks asking the user (the `waiting`/Notification
@@ -215,8 +229,8 @@ weaver config unset agent.claude_args
 
 Notable settings:
 
-- `agent.default` — agent kind launched for a new session when `loom launch`
-  is given no `--agent` (`claude`, `shell`, or a custom command).
+- `agent.default` — agent kind launched for a new session when `loom session
+  launch` is given no `--agent` (`claude`, `shell`, or a custom command).
 - `agent.claude_args` — extra arguments spliced into the Claude TUI launch,
   e.g. `--model claude-opus-4-7`.
 - `server.auto_adopt` — adopt every recoverable session on daemon startup.
@@ -246,4 +260,4 @@ tests are the Rust suites; the frontend's tests are the Playwright `e2e/` suite.
 - `WEAVER_HOME` — state directory (default `~/.weaver`)
 - `WEAVER_DB` — database path (default `$WEAVER_HOME/weaver.db`)
 - `WEAVER_API` — loom URL the `loom` CLI talks to (default `http://127.0.0.1:7878`)
-- `WEAVER_BRANCH` — override the branch resolver (set by `loom launch` in the worktree)
+- `WEAVER_BRANCH` — override the branch resolver (set by `loom session launch` in the worktree)

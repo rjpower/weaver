@@ -372,6 +372,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/log", get(log_session))
         .route("/sessions/{id}/events", get(events_sse))
         .route("/sessions/{id}/terminal", get(crate::terminal::terminal_ws))
+        // Drive a session's tmux pane: type a message, interrupt, peek at it.
+        .route("/sessions/{id}/send", post(send_session))
+        .route("/sessions/{id}/interrupt", post(interrupt_session))
+        .route("/sessions/{id}/preview", get(preview_session))
         // Branches & issues
         .route("/branches", get(list_branches))
         .route("/branches/{id}", get(get_branch).patch(patch_branch))
@@ -597,9 +601,13 @@ async fn create_session(
         ));
     }
 
+    // Unless the caller pins a base, fork from a freshly-fetched `origin/<default
+    // branch>` so new work starts from the latest mainline, not the launching
+    // checkout's (possibly stale) current branch. `default_base` degrades to the
+    // current branch on a remote-less repo.
     let base = match req.base.clone() {
         Some(b) => b,
-        None => git::current_branch(&repo_root).await?,
+        None => git::default_base(&repo_root).await?,
     };
 
     let (branch_name, work_dir) = if let Some(existing_branch) = existing {
@@ -1787,6 +1795,98 @@ async fn events_sse(
             .unwrap_or_default()))
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+// ---------------------------------------------------------------------------
+// Driving a session's tmux pane (send / interrupt / preview)
+//
+// One-shot HTTP primitives for an agent (or script) to drive a child session
+// uniformly, distinct from the interactive terminal WebSocket: type a message,
+// interrupt the current turn, or read back the pane.
+// ---------------------------------------------------------------------------
+
+/// Guard the pane-driving endpoints: the session must have a live tmux to type
+/// into or capture. An orphaned/torn-down session returns 409.
+async fn require_live_tmux(session: &Session) -> ApiResult<()> {
+    if tmux::has_session(&session.tmux_session).await {
+        Ok(())
+    } else {
+        Err(AppError::conflict(format!(
+            "session '{}' has no live tmux to drive",
+            session.id
+        )))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SendReq {
+    /// The text to type into the agent's pane.
+    text: String,
+    /// Whether to follow the text with Enter to submit it (and so trigger an
+    /// agent round). Defaults to true; pass false to stage input unsubmitted.
+    #[serde(default = "default_submit")]
+    submit: bool,
+}
+
+fn default_submit() -> bool {
+    true
+}
+
+/// Type a message into a session's agent pane and, by default, submit it with
+/// Enter to trigger an agent round.
+async fn send_session(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<SendReq>,
+) -> ApiResult<Json<Value>> {
+    let (session, _) = require_session(&st.db, &key).await?;
+    require_live_tmux(&session).await?;
+    tmux::send_literal(&session.tmux_session, &req.text)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if req.submit {
+        tmux::send_enter(&session.tmux_session)
+            .await
+            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    Ok(Json(json!({ "sent": true, "submitted": req.submit })))
+}
+
+/// Send a break/interrupt — `Escape`, the keystroke Claude Code reads as "stop
+/// the current turn" — to a session's agent pane.
+async fn interrupt_session(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let (session, _) = require_session(&st.db, &key).await?;
+    require_live_tmux(&session).await?;
+    tmux::send_key(&session.tmux_session, "Escape")
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({ "interrupted": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviewQuery {
+    /// Extra scrollback lines to include above the visible screen (0 = just the
+    /// visible pane).
+    #[serde(default)]
+    lines: usize,
+}
+
+/// Capture the session's tmux pane as plain text — "what does the child look
+/// like right now". Returns `{ "screen": "<text>" }`.
+async fn preview_session(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+    Query(q): Query<PreviewQuery>,
+) -> ApiResult<Json<Value>> {
+    let (session, _) = require_session(&st.db, &key).await?;
+    require_live_tmux(&session).await?;
+    let screen = tmux::capture(&session.tmux_session, q.lines)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({ "screen": screen })))
 }
 
 // ---------------------------------------------------------------------------

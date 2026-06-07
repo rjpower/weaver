@@ -6,7 +6,7 @@ use serial_test::serial;
 
 use loom::tmux;
 
-use crate::fixtures::TestServer;
+use crate::fixtures::{sh, TestServer};
 
 /// Creating a session provisions a worktree + tmux session and records the repo;
 /// deleting it tears the tmux session down and releases the repo's active count.
@@ -80,6 +80,46 @@ async fn create_lists_and_tears_down() {
     assert_eq!(recent.len(), 1, "recent repo should outlive its sessions");
     assert_eq!(recent[0]["repo_root"], repo_root);
     assert_eq!(recent[0]["active_branches"], 0);
+}
+
+/// With an `origin` remote present, a launch that doesn't pin `--base` forks the
+/// new branch from the freshly-fetched `origin/<default branch>`, recorded as
+/// the branch's base.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launch_forks_from_fresh_origin_default() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+    let repo = ts.repo_path();
+
+    // Give the throwaway repo a bare `origin` and publish `main` to it, so the
+    // remote-tracking ref + origin/HEAD exist (what `default_base` resolves).
+    let remote = tempfile::tempdir().unwrap();
+    sh(
+        remote.path(),
+        "git",
+        &["init", "-q", "--bare", "-b", "main"],
+    );
+    let remote_url = remote.path().to_string_lossy().to_string();
+    sh(repo, "git", &["remote", "add", "origin", &remote_url]);
+    sh(repo, "git", &["push", "-q", "origin", "main"]);
+    sh(repo, "git", &["fetch", "-q", "origin"]);
+    sh(repo, "git", &["remote", "set-head", "origin", "main"]);
+
+    let ws = client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "fork from fresh main", "cwd": ts.cwd(), "agent": "shell" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ws["branch"]["base_branch"], "origin/main",
+        "launch should fork from the fetched origin default, got {ws}"
+    );
+
+    let id = ws["id"].as_str().unwrap().to_string();
+    client.delete(&format!("/api/sessions/{id}")).await.unwrap();
 }
 
 /// A session can be created with no goal at all — just a title.

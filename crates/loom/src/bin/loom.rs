@@ -7,7 +7,7 @@
 //! other interaction surface).
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde_json::{json, Value};
 
 use loom::client::Client;
@@ -39,59 +39,24 @@ enum Cmd {
     /// Stop and re-start the loom daemon.
     Restart,
 
-    /// Launch a new session: worktree + tmux + agent, seeded with a task.
+    /// Manage sessions: launch, poll, wait, send, break, preview.
     ///
-    /// The positional argument is the task the agent should work on — it
-    /// becomes the branch goal and the agent's opening prompt:
+    /// A uniform surface for driving a child session — start one, watch it, and
+    /// interact with its agent pane:
     ///
-    ///     loom launch "Add a /health endpoint and a test for it"
-    ///
-    /// The branch name (`weaver/<slug>`) is derived from the task; override it
-    /// with `--name`. To pick up existing work instead of describing a new
-    /// task, use `--claim <id>`, `--issue <n>`, or `--branch <name>`.
-    Launch {
-        /// What the agent should do. Sets the branch goal and is fed to the
-        /// agent as its first prompt. Multiple words are joined, so quoting is
-        /// optional. Omit only when seeding from `--claim`/`--issue`/`--branch`.
-        task: Vec<String>,
-        /// Branch slug to create (`weaver/<name>`). Defaults to a slug derived
-        /// from the task. Mutually exclusive with `--branch`.
-        #[arg(long)]
-        name: Option<String>,
-        /// Agent to run: `claude` (the default), `shell` for a plain shell, or
-        /// any other command. Optional — omit to use the configured
-        /// `agent.default` (see `weaver config get agent.default`).
-        #[arg(long)]
-        agent: Option<String>,
-        /// Branch to fork the new worktree from. Defaults to the repo's current
-        /// branch.
-        #[arg(long)]
-        base: Option<String>,
-        /// One-line title shown on the dashboard. Defaults to a title derived
-        /// from the task.
-        #[arg(long)]
-        title: Option<String>,
-        /// Seed the task from a GitHub issue (by number, via the `gh` CLI):
-        /// fills in title, goal, and description.
-        #[arg(long)]
-        issue: Option<i64>,
-        /// Claim an existing weaver issue (by id) for this session: seeds the
-        /// goal from it and moves it out of the repo backlog.
-        #[arg(long)]
-        claim: Option<i64>,
-        /// Resume an existing branch rather than creating a new one. Mutually
-        /// exclusive with `--name`.
-        #[arg(long)]
-        branch: Option<String>,
-        /// Model tier: haiku, sonnet, or opus. Omit to inherit the configured
-        /// `agent.claude_args`.
-        #[arg(long)]
-        model: Option<String>,
-        /// Reasoning effort: low, medium, high, xhigh, or max. Omit to inherit
-        /// the configured `agent.claude_args`.
-        #[arg(long)]
-        effort: Option<String>,
+    ///     loom session launch "Add a /health endpoint and a test for it"
+    ///     loom session poll weaver/health      # one-shot status
+    ///     loom session wait weaver/health      # block until done / needs you
+    ///     loom session send weaver/health "try the curl again"
+    ///     loom session break weaver/health     # interrupt the current turn
+    ///     loom session preview weaver/health   # peek at the tmux screen
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
     },
+    /// Deprecated alias for `loom session launch`.
+    #[command(hide = true)]
+    Launch(LaunchOpts),
     /// List active sessions.
     Ps,
     /// Show the repo's issue board (every issue across branches + backlog).
@@ -123,6 +88,121 @@ enum Cmd {
     Completions { shell: clap_complete::Shell },
 }
 
+/// Subcommands under `loom session` — the uniform way to drive a child session.
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// Launch a new session: worktree + tmux + agent, seeded with a task.
+    ///
+    /// The positional argument is the task the agent should work on — it
+    /// becomes the branch goal and the agent's opening prompt:
+    ///
+    ///     loom session launch "Add a /health endpoint and a test for it"
+    ///
+    /// The branch name (`weaver/<slug>`) is derived from the task; override it
+    /// with `--name`. To pick up existing work instead of describing a new
+    /// task, use `--claim <id>`, `--issue <n>`, or `--branch <name>`.
+    Launch(LaunchOpts),
+    /// Poll a session's status: lifecycle + the agent's attention and message.
+    Poll {
+        /// Session key: id, branch id, branch name, or `repo:branch`.
+        session: String,
+    },
+    /// Block until a session finishes or its agent needs you.
+    ///
+    /// Polls until the session reaches a terminal lifecycle state (`done` /
+    /// `error` / `archived`) or is lost (`orphaned`), or — unless
+    /// `--lifecycle-only` — until its agent raises attention to
+    /// `attention`/`blocked`. Prints why it woke. Exits non-zero if `--timeout`
+    /// elapses first.
+    Wait {
+        /// Session key: id, branch id, branch name, or `repo:branch`.
+        session: String,
+        /// Give up after this many seconds (0 = wait indefinitely).
+        #[arg(long, default_value = "1800")]
+        timeout: u64,
+        /// Seconds between polls.
+        #[arg(long, default_value = "3")]
+        interval: u64,
+        /// Wake only on a lifecycle change; ignore the agent's attention.
+        #[arg(long)]
+        lifecycle_only: bool,
+    },
+    /// Type a message into a session's agent pane (and submit it to trigger an
+    /// agent round).
+    Send {
+        /// Session key: id, branch id, branch name, or `repo:branch`.
+        session: String,
+        /// The message to type. Multiple words are joined, so quoting is
+        /// optional.
+        message: Vec<String>,
+        /// Type the message but don't press Enter — stage it without submitting.
+        #[arg(long)]
+        no_enter: bool,
+    },
+    /// Send a break (Escape) to a session — interrupt the agent's current turn.
+    Break {
+        /// Session key: id, branch id, branch name, or `repo:branch`.
+        session: String,
+    },
+    /// Print a session's recent tmux screen.
+    #[command(alias = "sp")]
+    Preview {
+        /// Session key: id, branch id, branch name, or `repo:branch`.
+        session: String,
+        /// Extra scrollback lines above the visible screen (0 = visible only).
+        #[arg(long, default_value = "0")]
+        lines: usize,
+    },
+}
+
+/// Shared `launch` options, used by both `loom session launch` and the
+/// deprecated top-level `loom launch` alias.
+#[derive(Args)]
+struct LaunchOpts {
+    /// What the agent should do. Sets the branch goal and is fed to the agent as
+    /// its first prompt. Multiple words are joined, so quoting is optional. Omit
+    /// only when seeding from `--claim`/`--issue`/`--branch`.
+    task: Vec<String>,
+    /// Branch slug to create (`weaver/<name>`). Defaults to a slug derived from
+    /// the task. Mutually exclusive with `--branch`.
+    #[arg(long)]
+    name: Option<String>,
+    /// Agent to run: `claude` (the default), `shell` for a plain shell, or any
+    /// other command. Optional — omit to use the configured `agent.default`
+    /// (see `weaver config get agent.default`).
+    #[arg(long)]
+    agent: Option<String>,
+    /// Branch to fork the new worktree from. Defaults to a freshly-fetched
+    /// `origin/<default branch>` (the repo's mainline), so new work starts from
+    /// the latest upstream rather than the launching checkout.
+    #[arg(long)]
+    base: Option<String>,
+    /// One-line title shown on the dashboard. Defaults to a title derived from
+    /// the task.
+    #[arg(long)]
+    title: Option<String>,
+    /// Seed the task from a GitHub issue (by number, via the `gh` CLI): fills in
+    /// title, goal, and description.
+    #[arg(long)]
+    issue: Option<i64>,
+    /// Claim an existing weaver issue (by id) for this session: seeds the goal
+    /// from it and moves it out of the repo backlog.
+    #[arg(long)]
+    claim: Option<i64>,
+    /// Resume an existing branch rather than creating a new one. Mutually
+    /// exclusive with `--name`.
+    #[arg(long)]
+    branch: Option<String>,
+    /// Model tier: haiku, sonnet, or opus. Omit to inherit the configured
+    /// `agent.claude_args`.
+    #[arg(long)]
+    model: Option<String>,
+    /// Reasoning effort: low, medium, high, xhigh, or max. Omit to inherit the
+    /// configured `agent.claude_args`.
+    #[arg(long)]
+    effort: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
@@ -143,31 +223,10 @@ async fn run() -> Result<()> {
         Cmd::Start => cmd_start().await,
         Cmd::Stop => cmd_stop().await,
         Cmd::Restart => cmd_restart().await,
-        Cmd::Launch {
-            task,
-            name,
-            agent,
-            base,
-            title,
-            issue,
-            claim,
-            branch,
-            model,
-            effort,
-        } => {
-            cmd_launch(LaunchArgs {
-                goal: task.join(" "),
-                name,
-                agent,
-                base,
-                title,
-                issue,
-                claim,
-                branch,
-                model,
-                effort,
-            })
-            .await
+        Cmd::Session { cmd } => run_session(cmd).await,
+        Cmd::Launch(opts) => {
+            eprintln!("note: `loom launch` is deprecated — use `loom session launch`");
+            cmd_launch(opts.into()).await
         }
         Cmd::Ps => cmd_ps().await,
         Cmd::Issues { all, backlog } => cmd_issues(all, backlog).await,
@@ -185,6 +244,27 @@ async fn run() -> Result<()> {
             clap_complete::generate(shell, &mut cmd, "loom", &mut std::io::stdout());
             Ok(())
         }
+    }
+}
+
+/// Dispatch the `loom session <verb>` subcommands.
+async fn run_session(cmd: SessionCmd) -> Result<()> {
+    match cmd {
+        SessionCmd::Launch(opts) => cmd_launch(opts.into()).await,
+        SessionCmd::Poll { session } => cmd_session_poll(session).await,
+        SessionCmd::Wait {
+            session,
+            timeout,
+            interval,
+            lifecycle_only,
+        } => cmd_session_wait(session, timeout, interval.max(1), lifecycle_only).await,
+        SessionCmd::Send {
+            session,
+            message,
+            no_enter,
+        } => cmd_session_send(session, message.join(" "), !no_enter).await,
+        SessionCmd::Break { session } => cmd_session_break(session).await,
+        SessionCmd::Preview { session, lines } => cmd_session_preview(session, lines).await,
     }
 }
 
@@ -394,8 +474,8 @@ async fn cmd_restart() -> Result<()> {
 // Session commands (HTTP)
 // ---------------------------------------------------------------------------
 
-/// Parsed `loom launch` inputs, after folding the positional task words into a
-/// single `goal` string.
+/// Parsed launch inputs, after folding the positional task words into a single
+/// `goal` string.
 struct LaunchArgs {
     goal: String,
     name: Option<String>,
@@ -409,7 +489,24 @@ struct LaunchArgs {
     effort: Option<String>,
 }
 
-/// A bare `loom launch` with nothing to work on — no task, no name, no title,
+impl From<LaunchOpts> for LaunchArgs {
+    fn from(o: LaunchOpts) -> Self {
+        LaunchArgs {
+            goal: o.task.join(" "),
+            name: o.name,
+            agent: o.agent,
+            base: o.base,
+            title: o.title,
+            issue: o.issue,
+            claim: o.claim,
+            branch: o.branch,
+            model: o.model,
+            effort: o.effort,
+        }
+    }
+}
+
+/// A bare `loom session launch` with nothing to work on — no task, no name, no title,
 /// and nothing to pick up (`--claim`/`--issue`/`--branch`). Launching anyway
 /// would spawn an agent with an empty goal that "starts unprompted", so we
 /// stop and point the user at the useful forms instead.
@@ -423,12 +520,12 @@ fn launch_underspecified(a: &LaunchArgs) -> bool {
 }
 
 const LAUNCH_HINT: &str = "nothing to do — give the agent a task or something to pick up:
-  loom launch \"<what the agent should do>\"   # the common case
-  loom launch --claim <id>                     # pick up a weaver issue
-  loom launch --issue <n>                      # seed from a GitHub issue
-  loom launch --branch <name>                  # resume an existing branch
-  loom launch --name <slug> --agent shell      # an empty named worktree (no task)
-See `loom launch --help` for all options.";
+  loom session launch \"<what the agent should do>\"   # the common case
+  loom session launch --claim <id>                     # pick up a weaver issue
+  loom session launch --issue <n>                      # seed from a GitHub issue
+  loom session launch --branch <name>                  # resume an existing branch
+  loom session launch --name <slug> --agent shell      # an empty named worktree (no task)
+See `loom session launch --help` for all options.";
 
 async fn cmd_launch(a: LaunchArgs) -> Result<()> {
     if launch_underspecified(&a) {
@@ -448,9 +545,10 @@ async fn cmd_launch(a: LaunchArgs) -> Result<()> {
     } = a;
     let client = Client::new();
     let cwd = std::env::current_dir()?;
-    // When an agent in a weaver session runs `loom launch`, `$WEAVER_BRANCH` is
-    // its own branch id — pass it so the tracking issue is attributed to the
-    // launching (parent) agent. A human shell launch leaves it unset.
+    // When an agent in a weaver session runs `loom session launch`,
+    // `$WEAVER_BRANCH` is its own branch id — pass it so the tracking issue is
+    // attributed to the launching (parent) agent. A human shell launch leaves it
+    // unset.
     let parent_branch = std::env::var("WEAVER_BRANCH")
         .ok()
         .filter(|s| !s.is_empty());
@@ -504,12 +602,167 @@ async fn cmd_launch(a: LaunchArgs) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a session view by key, surfacing a clearer error than a bare 404 when
+/// the key matches no live session.
+async fn fetch_session(client: &Client, key: &str) -> Result<Value> {
+    client
+        .get(&format!("/api/sessions/{key}"))
+        .await
+        .with_context(|| format!("no live session for '{key}'"))
+}
+
+/// One-line attention summary: the level, plus its current-state message when set.
+fn attention_summary(ws: &Value) -> String {
+    let attention = branch_str(ws, "attention");
+    let message = branch_str(ws, "description");
+    if message.is_empty() {
+        attention.to_string()
+    } else {
+        format!("{attention} — {message}")
+    }
+}
+
+/// `loom session poll` — a one-shot status read: lifecycle + attention.
+async fn cmd_session_poll(key: String) -> Result<()> {
+    let client = Client::new();
+    let ws = fetch_session(&client, &key).await?;
+    println!(
+        "session {}  ({})",
+        str_field(&ws, "id"),
+        branch_str(&ws, "name")
+    );
+    println!("  status:    {}", str_field(&ws, "status"));
+    println!("  attention: {}", attention_summary(&ws));
+    if let Some(n) = ws.get("tracking_issue").and_then(Value::as_i64) {
+        println!("  track:     weaver issue #{n}");
+    }
+    println!("  activity:  {}", str_field(&ws, "last_activity_at"));
+    Ok(())
+}
+
+/// `loom session wait` — block until the session finishes, is lost, or (unless
+/// `lifecycle_only`) its agent raises attention. Mirrors `weaver issue wait`.
+async fn cmd_session_wait(
+    key: String,
+    timeout: u64,
+    interval: u64,
+    lifecycle_only: bool,
+) -> Result<()> {
+    let client = Client::new();
+    // Short-circuit if the session is already in a wake state at call time.
+    let ws = fetch_session(&client, &key).await?;
+    if let Some(reason) = wake_reason(&ws, &key, lifecycle_only) {
+        println!("{reason}");
+        return Ok(());
+    }
+    println!(
+        "waiting on {} ({}) — {}",
+        key,
+        branch_str(&ws, "name"),
+        str_field(&ws, "status")
+    );
+
+    let interval = std::time::Duration::from_secs(interval);
+    let deadline =
+        (timeout > 0).then(|| std::time::Instant::now() + std::time::Duration::from_secs(timeout));
+    loop {
+        // Never nap past the deadline: a long `--interval` must not stretch a
+        // short `--timeout`.
+        let nap = match deadline {
+            Some(d) => interval.min(d.saturating_duration_since(std::time::Instant::now())),
+            None => interval,
+        };
+        tokio::time::sleep(nap).await;
+        let ws = fetch_session(&client, &key).await?;
+        if let Some(reason) = wake_reason(&ws, &key, lifecycle_only) {
+            println!("{reason}");
+            return Ok(());
+        }
+        // Timing out is a real "not done" outcome: report it as an error so the
+        // process exits non-zero (callers branch on it).
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            bail!(
+                "timed out after {timeout}s — session {key} still {}",
+                str_field(&ws, "status")
+            );
+        }
+    }
+}
+
+/// Why a `wait` should stop watching `ws`, or `None` to keep waiting: a terminal
+/// or orphaned lifecycle, or — unless `lifecycle_only` — a raised attention.
+fn wake_reason(ws: &Value, key: &str, lifecycle_only: bool) -> Option<String> {
+    let status = str_field(ws, "status");
+    if is_terminal_status(status) {
+        return Some(format!("session {key} is {status} — finished"));
+    }
+    if status == "orphaned" {
+        return Some(format!(
+            "session {key} is orphaned — its tmux was lost (try `loom adopt {key}`)"
+        ));
+    }
+    if !lifecycle_only && branch_str(ws, "attention") != "ok" {
+        return Some(format!(
+            "session {key} needs you — {}",
+            attention_summary(ws)
+        ));
+    }
+    None
+}
+
+/// The terminal session lifecycle states (mirrors `session::is_terminal`).
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "done" | "error" | "archived")
+}
+
+/// `loom session send` — type a message into the agent's pane, submitting it
+/// (Enter) unless `submit` is false.
+async fn cmd_session_send(key: String, message: String, submit: bool) -> Result<()> {
+    if message.trim().is_empty() {
+        bail!("nothing to send — provide a message");
+    }
+    let client = Client::new();
+    client
+        .post(
+            &format!("/api/sessions/{key}/send"),
+            json!({ "text": message, "submit": submit }),
+        )
+        .await?;
+    println!(
+        "sent to {key}{}",
+        if submit { "" } else { " (not submitted)" }
+    );
+    Ok(())
+}
+
+/// `loom session break` — send Escape to interrupt the agent's current turn.
+async fn cmd_session_break(key: String) -> Result<()> {
+    let client = Client::new();
+    client
+        .post(&format!("/api/sessions/{key}/interrupt"), json!({}))
+        .await?;
+    println!("sent break (Escape) to {key}");
+    Ok(())
+}
+
+/// `loom session preview` — print the session's recent tmux screen.
+async fn cmd_session_preview(key: String, lines: usize) -> Result<()> {
+    let client = Client::new();
+    let res = client
+        .get(&format!("/api/sessions/{key}/preview?lines={lines}"))
+        .await?;
+    print!("{}", str_field(&res, "screen"));
+    // The capture is right-trimmed server-side; ensure a clean final newline.
+    println!();
+    Ok(())
+}
+
 async fn cmd_ps() -> Result<()> {
     let client = Client::new();
     let list = client.get("/api/sessions").await?;
     let rows = list.as_array().cloned().unwrap_or_default();
     if rows.is_empty() {
-        println!("no sessions — start one with `loom launch \"<task>\"`");
+        println!("no sessions — start one with `loom session launch \"<task>\"`");
         return Ok(());
     }
     println!(
@@ -745,6 +998,50 @@ mod tests {
         assert_eq!(truncate("a very long string", 6), "a ver…");
     }
 
+    /// clap's own consistency check over the full command tree — catches a
+    /// malformed arg/subcommand (e.g. the nested `session` group) at test time
+    /// rather than on first run.
+    #[test]
+    fn cli_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn terminal_statuses_match_the_session_model() {
+        for s in ["done", "error", "archived"] {
+            assert!(is_terminal_status(s), "{s} should be terminal");
+        }
+        for s in ["created", "launching", "running", "orphaned"] {
+            assert!(!is_terminal_status(s), "{s} should not be terminal");
+        }
+    }
+
+    fn view(status: &str, attention: &str, description: &str) -> Value {
+        json!({
+            "status": status,
+            "branch": { "attention": attention, "description": description },
+        })
+    }
+
+    #[test]
+    fn wake_reason_fires_on_terminal_orphan_and_attention() {
+        // A running, ok session keeps the wait blocked.
+        assert!(wake_reason(&view("running", "ok", ""), "s", false).is_none());
+
+        // Terminal and orphaned lifecycles always wake.
+        assert!(wake_reason(&view("done", "ok", ""), "s", false)
+            .unwrap()
+            .contains("finished"));
+        assert!(wake_reason(&view("orphaned", "ok", ""), "s", false)
+            .unwrap()
+            .contains("orphaned"));
+
+        // A raised attention wakes — and carries the message — unless lifecycle_only.
+        let needs = wake_reason(&view("running", "blocked", "build broken"), "s", false).unwrap();
+        assert!(needs.contains("needs you") && needs.contains("build broken"));
+        assert!(wake_reason(&view("running", "blocked", "build broken"), "s", true).is_none());
+    }
+
     fn empty_launch() -> LaunchArgs {
         LaunchArgs {
             goal: String::new(),
@@ -762,7 +1059,7 @@ mod tests {
 
     #[test]
     fn bare_launch_is_underspecified() {
-        // `loom launch` with nothing, or only an agent/model/effort/base
+        // `loom session launch` with nothing, or only an agent/model/effort/base
         // selector, has no actual task to run.
         assert!(launch_underspecified(&empty_launch()));
         let only_agent = LaunchArgs {
