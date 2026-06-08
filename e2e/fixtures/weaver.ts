@@ -28,6 +28,8 @@ export interface Branch {
   created_at: string;
   updated_at: string;
   open_issue_count: number;
+  /** Branch id of the session that launched this one, or null at the top level. */
+  parent_id: string | null;
 }
 
 /** A session as returned by `/api/sessions[/...]`. */
@@ -51,6 +53,8 @@ export interface SeedOpts {
   title?: string;
   name?: string;
   base?: string;
+  /** Branch id of the launching session — sets this session's tree parent. */
+  parent?: string;
 }
 
 export interface WeaverFixture {
@@ -315,6 +319,7 @@ export const test = base.extend<{ weaver: WeaverFixture }, WorkerFixtures>({
             agent: 'shell',
             name: opts.name,
             base: opts.base,
+            parent_branch: opts.parent,
           }),
         })) as Session;
       },

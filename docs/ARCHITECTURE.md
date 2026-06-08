@@ -193,7 +193,15 @@ top-level (`id`, `status`, `work_dir`, `tmux_session`, `agent_kind`, `model`,
 `tracking_issue`) plus a nested `branch: BranchView`
 (`id`, `name`, `title`, `goal`, `description`, `attention`,
 `repo_root`, `branch`, `base_branch`, `created_at`, `updated_at`,
-`open_issue_count`, `github`).
+`open_issue_count`, `parent_id`, `github`).
+
+`BranchView::parent_id` is the branch id of the session that **launched** this
+one — the parent in loom's session tree — or `null` for a top-level session. It
+is derived from the tracking issue's `source_branch` (the delegating parent)
+resolved to a tracked branch id in the same repo, and is `null` too when that
+parent is no longer tracked. The dashboard's session list
+groups sessions into threads by it (children under their launcher, siblings by
+launch time); a flat fleet with no sub-sessions is unchanged.
 
 `BranchView::github` is the branch's latest GitHub pull-request snapshot
 (`pr_number`, `pr_url`, `pr_state`, `pr_title`, `is_draft`, `review_decision`,

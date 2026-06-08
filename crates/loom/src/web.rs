@@ -177,6 +177,12 @@ pub struct BranchView {
     pub created_at: String,
     pub updated_at: String,
     pub open_issue_count: i64,
+    /// The branch id of the session that **launched** this one (the parent in
+    /// loom's session tree), or `null` for a top-level session run directly by a
+    /// human. Derived from the tracking issue's `source_branch` and resolved to
+    /// the parent's branch id *within the same repo*; `null` too when that parent
+    /// branch is no longer tracked. The dashboard groups the list by it.
+    pub parent_id: Option<String>,
     /// The branch's latest GitHub pull-request snapshot (link, review decision,
     /// check rollup), or `null` when GitHub polling is off, the repo has no
     /// remote PR, or `gh` is unavailable. Maintained by the poll loop in
@@ -192,12 +198,26 @@ impl BranchView {
             .unwrap_or(0);
         // Best-effort: a missing/erroring snapshot just renders as no GitHub info.
         let github = github::get_status(db, &branch.id).await.ok().flatten();
-        Ok(Self::from_parts(branch, open, github))
+        // The parent in loom's session tree: the tracking issue's `source_branch`
+        // resolved to a tracked branch id in the same repo. Best-effort — a
+        // missing link or an untracked parent just leaves this top-level.
+        let parent_id =
+            match weaver_core::issue::parent_branch_of(db, &branch.repo_root, &branch.branch).await
+            {
+                Ok(Some(name)) => branch_mod::find_by_repo_branch(db, &branch.repo_root, &name)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|p| p.id),
+                _ => None,
+            };
+        Ok(Self::from_parts(branch, open, parent_id, github))
     }
 
     fn from_parts(
         branch: &Branch,
         open_issue_count: i64,
+        parent_id: Option<String>,
         github: Option<github::GithubStatus>,
     ) -> Self {
         let name = branch
@@ -218,6 +238,7 @@ impl BranchView {
             created_at: branch.created_at.clone(),
             updated_at: branch.updated_at.clone(),
             open_issue_count,
+            parent_id,
             github,
         }
     }

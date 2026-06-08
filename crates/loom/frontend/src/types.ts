@@ -20,6 +20,11 @@ export interface Branch {
   created_at: string;
   updated_at: string;
   open_issue_count: number;
+  /** Branch id of the session that launched this one (its parent in loom's
+   *  session tree), or null for a top-level session. The dashboard groups the
+   *  list into threads by it; null parents (and parents not in the list) sit at
+   *  the root. Derived server-side from the tracking issue's `source_branch`. */
+  parent_id: string | null;
   /** Latest GitHub pull-request snapshot for the branch, or null when GitHub
    *  polling is off, there's no PR, or `gh` is unavailable. Maintained
    *  server-side by loom's poll loop. */

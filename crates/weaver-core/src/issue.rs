@@ -153,6 +153,27 @@ pub async fn list_delegated_by(
     Ok(rows)
 }
 
+/// The branch this one was **delegated from**, if any: the `source_branch` of
+/// its tracking issue — the issue claimed by `branch` whose source is a
+/// *different* branch (the parent that launched it). A top-level session, run by
+/// a human rather than delegated, has no such issue and returns `None`. Closed
+/// tracking issues still count, so the parent link survives the sub-task
+/// finishing. When several qualify (rare), the earliest tracking issue wins.
+pub async fn parent_branch_of(db: &Db, repo_root: &str, branch: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT source_branch FROM issues
+         WHERE repo_root = ? AND claimed_branch = ?
+           AND source_branch IS NOT NULL AND source_branch != ?
+         ORDER BY id ASC LIMIT 1",
+    )
+    .bind(repo_root)
+    .bind(branch)
+    .bind(branch)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|(s,)| s))
+}
+
 /// The unclaimed repo backlog (`claimed_branch IS NULL`).
 pub async fn list_backlog(db: &Db, repo_root: &str, include_closed: bool) -> Result<Vec<Issue>> {
     let sql = format!(
@@ -423,6 +444,48 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn parent_branch_of_reads_the_tracking_issue() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        // `parent` delegated to `child` (source=parent, claimed=child).
+        let tracking = add(
+            &db,
+            &NewIssue {
+                repo_root: "/r".to_string(),
+                source_branch: Some("parent".to_string()),
+                claimed_branch: Some("child".to_string()),
+                title: "do the sub-task".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // The child's own self-claimed work must not be mistaken for its parent.
+        add(&db, &claimed("/r", "child", "my own work"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            parent_branch_of(&db, "/r", "child")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("parent")
+        );
+        // A top-level branch (only self-sourced work) has no parent.
+        assert_eq!(parent_branch_of(&db, "/r", "parent").await.unwrap(), None);
+
+        // The link survives the sub-task being closed.
+        close(&db, tracking.id).await.unwrap();
+        assert_eq!(
+            parent_branch_of(&db, "/r", "child")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("parent")
+        );
     }
 
     #[tokio::test]
