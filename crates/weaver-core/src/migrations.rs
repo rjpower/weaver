@@ -293,6 +293,12 @@ mod tests {
             .unwrap()
     }
 
+    /// Every migration version in order — the expected fully-migrated set, so
+    /// these assertions track [`MIGRATIONS`] instead of a hand-kept literal.
+    fn all_versions() -> Vec<i64> {
+        MIGRATIONS.iter().map(|(v, _, _)| *v).collect()
+    }
+
     /// A fresh database ends up with the current schema, every migration
     /// recorded, and no `notes` table (created by the baseline, dropped by 0002).
     #[tokio::test]
@@ -305,7 +311,7 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(versions, all_versions());
 
         assert!(!table_columns(&pool, "branches").await.unwrap().is_empty());
         assert!(
@@ -356,7 +362,7 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(versions, all_versions());
         assert!(
             table_columns(&pool, "notes").await.unwrap().is_empty(),
             "0002 should still drop the notes table"
