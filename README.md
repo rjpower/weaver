@@ -17,6 +17,52 @@ weaver ships two binaries:
 
 Both binaries share one sqlite database at `~/.weaver/weaver.db`.
 
+## Getting Started
+
+The fastest way in is to **have your coding agent set weaver up for you**: open
+this repo in Claude Code (or your agent of choice) and tell it to *"set up weaver
+— run `scripts/setup.sh` and put `weaver` and `loom` on my PATH."* It builds the
+binaries, links them onto your PATH, and can then drive `loom` for you.
+
+### One command
+
+```sh
+./scripts/setup.sh
+```
+
+It builds the binaries and symlinks `weaver` and `loom` into `~/.local/bin`
+(override with `BIN_DIR=…`, or `PROFILE=release` for an optimized build). If
+`cargo` is missing it installs the Rust toolchain via [rustup](https://rustup.rs)
+first. Re-run it any time to rebuild and refresh the links.
+
+### Or by hand
+
+```sh
+# 1. Rust toolchain — skip if you already have cargo
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# 2. Build weaver + loom (debug build → target/debug)
+cargo build
+
+# 3. Put them on your PATH (~/.local/bin must be on $PATH)
+mkdir -p ~/.local/bin
+ln -sf "$PWD/target/debug/weaver" ~/.local/bin/weaver
+ln -sf "$PWD/target/debug/loom"   ~/.local/bin/loom
+```
+
+Then start the orchestrator and open the dashboard:
+
+```sh
+loom serve     # REST + SSE server, tmux launcher, background monitor
+loom open      # open the web UI (http://127.0.0.1:7878)
+```
+
+`weaver` needs no running daemon — it talks straight to the sqlite db — so the
+agent inside a worktree works the moment it's on your PATH. `loom serve` is only
+for the dashboard, tmux sessions, and summaries. See [Usage](#usage) for the
+full command surface, and [AGENTS.md](AGENTS.md) for the build/test loop and how
+to work on weaver itself.
+
 ## Architecture
 
 ```
@@ -241,19 +287,14 @@ Notable settings:
 - `terminal.theme` — colour palette for the in-browser terminal: `dark` (the
   classic black background, default) or `light`.
 
-## Building
+## Developing weaver
 
-```sh
-cargo build                              # builds the backend + the Vue SPA (needs Node + npm)
-cargo test --workspace                   # backend unit + integration tests (need git, tmux)
-cd e2e && npm test                       # frontend end-to-end tests (Playwright)
-```
-
-`cargo build` builds the SPA into `crates/loom/static/dist` (via `build.rs`),
-which `loom serve` serves at runtime; `rerun-if-changed` keeps it a no-op when no
-frontend source changed, so backend-only edits don't re-run rspack. On a checkout
-without Node the build still succeeds and serves a placeholder page. Backend
-tests are the Rust suites; the frontend's tests are the Playwright `e2e/` suite.
+To build, test, or hack on weaver itself, see [AGENTS.md](AGENTS.md) — it has
+the full loop, the pre-commit gate, and the project conventions. The short of
+it: `cargo build` compiles the backend and bundles the Vue dashboard into the
+`loom` binary (needs Node + npm; a Node-less checkout still builds and serves a
+placeholder page), `cargo test --workspace` runs the backend suites, and `cd e2e
+&& npm test` runs the Playwright UI suite.
 
 ## Environment
 
