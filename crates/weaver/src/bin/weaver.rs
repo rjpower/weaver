@@ -44,6 +44,24 @@ enum Cmd {
         /// Current-state message, e.g. "Wired up routes; tests pass".
         message: Vec<String>,
     },
+    /// Mark a session's triage status — the overlooker's third status axis.
+    ///
+    /// Distinct from `set-status`: that is the agent's own signal about itself;
+    /// this is an *outside* assessment of another session, stamped by an
+    /// overlooker (or by hand). Daemon-less, like `set-status`. Names the target
+    /// session by id, `repo:branch`, or unambiguous prefix. With only a session
+    /// it prints that session's current mark.
+    Triage {
+        /// The session to mark: an id, `repo:branch`, or unambiguous prefix.
+        session: String,
+        /// Triage level: `ok`, `attention`, or `blocked`. Omit to read.
+        level: Option<String>,
+        /// One-line reason for the mark.
+        note: Vec<String>,
+        /// Which overlooker is making the call (attribution); defaults to `manual`.
+        #[arg(long, default_value = "manual")]
+        by: String,
+    },
     /// Print a quick orientation for the current branch.
     ///
     /// A one-shot catch-up for an agent picking up (or resuming) a branch: the
@@ -198,6 +216,12 @@ async fn run() -> Result<()> {
     match cli.cmd {
         Cmd::Goal { text } => cmd_goal(text.join(" ")).await,
         Cmd::SetStatus { level, message } => cmd_set_status(level, message.join(" ")).await,
+        Cmd::Triage {
+            session,
+            level,
+            note,
+            by,
+        } => cmd_triage(session, level, note.join(" "), by).await,
         Cmd::Summary => cmd_summary().await,
         Cmd::Readme => cmd_readme().await,
         Cmd::Issue { cmd } => cmd_issue(cmd).await,
@@ -482,6 +506,63 @@ async fn cmd_set_status_write(
         println!("status: {level}");
     } else {
         println!("status: {level} — {message}");
+    }
+    Ok(())
+}
+
+/// Set (or read) a session's triage mark — the overlooker's assessment axis.
+/// Resolves the *named* session (not the current branch), writes the branch's
+/// triage fields directly (daemon-less) and a `triage` event so a running loom
+/// can push the change to the dashboard. The agent's own `attention` is never
+/// touched. With no `level`, prints the session's current mark.
+async fn cmd_triage(
+    session: String,
+    level: Option<String>,
+    note: String,
+    by: String,
+) -> Result<()> {
+    let db = open_db().await?;
+    let b = branch::resolve_key(&db, &session)
+        .await?
+        .ok_or_else(|| anyhow!("no session matching '{session}'"))?;
+    let Some(level) = level else {
+        // Read-only.
+        if b.triage_level.is_empty() {
+            println!("triage: {} — (unmarked)", b.branch);
+        } else if b.triage_note.is_empty() {
+            println!(
+                "triage: {} — {} (by {})",
+                b.branch, b.triage_level, b.triage_by
+            );
+        } else {
+            println!(
+                "triage: {} — {} — {} (by {})",
+                b.branch, b.triage_level, b.triage_note, b.triage_by
+            );
+        }
+        return Ok(());
+    };
+    let level = level.trim().to_ascii_lowercase();
+    if !branch::is_valid_triage(&level) {
+        bail!(
+            "unknown triage level '{level}' — expected one of {}",
+            branch::TRIAGE_LEVELS.join(", ")
+        );
+    }
+    let note = note.trim();
+    let by = by.trim();
+    branch::set_triage(&db, &b.id, &level, note, by).await?;
+    events::record_local(
+        &db,
+        &b.id,
+        "triage",
+        json!({ "level": level, "note": note, "by": by }),
+    )
+    .await?;
+    if note.is_empty() {
+        println!("triage: {} → {level}", b.branch);
+    } else {
+        println!("triage: {} → {level} — {note}", b.branch);
     }
     Ok(())
 }

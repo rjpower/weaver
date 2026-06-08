@@ -43,6 +43,13 @@ pub async fn run(state: AppState) {
                             state.bus.publish(ev.clone());
                             continue;
                         }
+                        // `weaver triage` (and the overlooker) wrote the branch's
+                        // triage fields daemon-less; re-broadcast so dashboards
+                        // refresh the mark badge. Same shape as `attention`.
+                        "triage" => {
+                            state.bus.publish(ev.clone());
+                            continue;
+                        }
                         "hook" => {}
                         _ => continue,
                     }

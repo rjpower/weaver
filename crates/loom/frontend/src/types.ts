@@ -14,6 +14,17 @@ export interface Branch {
   /** Agent-declared attention level: 'ok' | 'attention' | 'blocked'. The
    *  "does this need me?" signal, set by the agent via `weaver set-status`. */
   attention: string;
+  /** The overlooker's assessment — a third status axis distinct from
+   *  `attention`. '' when unmarked; otherwise 'ok' | 'attention' | 'blocked'.
+   *  The agent owns `attention`; an overlooker owns this. */
+  triage_level: string;
+  /** One-line reason accompanying the triage mark. */
+  triage_note: string;
+  /** Which overlooker (or 'manual') last set the mark. */
+  triage_by: string;
+  /** When the mark was last set; null if never marked. The dashboard shows the
+   *  mark stale once the session's activity advances past it. */
+  triage_at: string | null;
   repo_root: string;
   branch: string;
   base_branch: string;

@@ -124,6 +124,71 @@ async fn branch_issues_and_repo_board() {
     );
 }
 
+/// The triage axis: `POST /api/sessions/{id}/triage` stamps the overlooker's
+/// mark on the session's branch, surfaces it on the SessionView, and never
+/// disturbs the agent's own attention. An invalid level is rejected.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn triage_axis_marks_a_session() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+    let repo_root = ts.cwd();
+
+    let ws = client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "triage me", "cwd": repo_root, "agent": "shell" }),
+        )
+        .await
+        .unwrap();
+    let id = ws["id"].as_str().unwrap().to_string();
+
+    // The agent declares `blocked` about itself.
+    client
+        .patch(
+            &format!("/api/sessions/{id}"),
+            json!({ "attention": "blocked" }),
+        )
+        .await
+        .unwrap();
+
+    // Fresh: no overlooker mark yet.
+    let view = client.get(&format!("/api/sessions/{id}")).await.unwrap();
+    assert_eq!(view["branch"]["triage_level"], "");
+
+    // An overlooker stamps a mark via the dedicated endpoint.
+    let marked = client
+        .post(
+            &format!("/api/sessions/{id}/triage"),
+            json!({ "level": "attention", "note": "idle 30m with red CI", "by": "status-check" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(marked["branch"]["triage_level"], "attention");
+    assert_eq!(marked["branch"]["triage_note"], "idle 30m with red CI");
+    assert_eq!(marked["branch"]["triage_by"], "status-check");
+    assert!(
+        marked["branch"]["triage_at"].is_string(),
+        "a mark stamps triage_at"
+    );
+    // The agent's own attention is untouched — two actors, two axes.
+    assert_eq!(
+        marked["branch"]["attention"], "blocked",
+        "triage must not stomp the agent's self-report"
+    );
+
+    // An invalid level is rejected.
+    let bad = client
+        .post(
+            &format!("/api/sessions/{id}/triage"),
+            json!({ "level": "bogus" }),
+        )
+        .await;
+    assert!(bad.is_err(), "invalid triage level should be rejected");
+
+    client.delete(&format!("/api/sessions/{id}")).await.unwrap();
+}
+
 /// Attaching to an existing branch reuses its worktree if one exists, creates
 /// `.worktrees/<slug>` otherwise, and rejects a branch that doesn't exist.
 #[serial]

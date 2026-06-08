@@ -171,6 +171,17 @@ pub struct BranchView {
     /// "does this need me?" signal the dashboard filters on. The accompanying
     /// message is `description`.
     pub attention: String,
+    /// The overlooker's assessment — a third status axis distinct from
+    /// `attention`. Empty when unmarked; otherwise `ok` | `attention` |
+    /// `blocked`. The agent owns `attention`; an overlooker owns this.
+    pub triage_level: String,
+    /// One-line reason accompanying the triage mark.
+    pub triage_note: String,
+    /// Which overlooker (or `manual`) last set the mark.
+    pub triage_by: String,
+    /// When the mark was last set; `null` if never marked. The dashboard shows
+    /// the mark stale once `last_activity_at` advances past it.
+    pub triage_at: Option<String>,
     pub repo_root: String,
     pub branch: String,
     pub base_branch: String,
@@ -212,6 +223,10 @@ impl BranchView {
             goal: branch.goal.clone(),
             description: branch.description.clone(),
             attention: branch.attention.clone(),
+            triage_level: branch.triage_level.clone(),
+            triage_note: branch.triage_note.clone(),
+            triage_by: branch.triage_by.clone(),
+            triage_at: branch.triage_at.clone(),
             repo_root: branch.repo_root.clone(),
             branch: branch.branch.clone(),
             base_branch: branch.base_branch.clone(),
@@ -384,6 +399,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/send", post(send_session))
         .route("/sessions/{id}/interrupt", post(interrupt_session))
         .route("/sessions/{id}/preview", get(preview_session))
+        .route("/sessions/{id}/triage", post(triage_session))
         // Branches & issues
         .route("/branches", get(list_branches))
         .route("/branches/{id}", get(get_branch).patch(patch_branch))
@@ -988,6 +1004,49 @@ async fn apply_attention_patch(
     .await
     .ok();
     Ok(())
+}
+
+/// Body for `POST /api/sessions/{id}/triage`: stamp the overlooker's mark.
+#[derive(Debug, Deserialize)]
+struct TriageReq {
+    /// `ok` | `attention` | `blocked`, or empty to clear the mark.
+    level: String,
+    #[serde(default)]
+    note: String,
+    /// Which overlooker is making the call; defaults to `manual`.
+    #[serde(default)]
+    by: Option<String>,
+}
+
+/// Write the triage axis on a session's branch: validate the level, update the
+/// branch, and broadcast a `triage` event. This is the overlooker's (and a hand
+/// operator's) channel; it never touches the agent's own `attention`.
+async fn triage_session(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<TriageReq>,
+) -> ApiResult<Json<SessionView>> {
+    let (session, branch) = require_session(&st.db, &key).await?;
+    let level = req.level.trim().to_ascii_lowercase();
+    if !level.is_empty() && !branch_mod::is_valid_triage(&level) {
+        return Err(AppError::bad_request(format!(
+            "invalid triage '{level}' — expected one of {}",
+            branch_mod::TRIAGE_LEVELS.join(", ")
+        )));
+    }
+    let by = req.by.as_deref().unwrap_or("manual").trim().to_string();
+    branch_mod::set_triage(&st.db, &branch.id, &level, req.note.trim(), &by).await?;
+    events::record(
+        &st.db,
+        &st.bus,
+        &branch.id,
+        "triage",
+        json!({ "level": level, "note": req.note.trim(), "by": by }),
+    )
+    .await
+    .ok();
+    let (session, branch) = require_session(&st.db, &session.id).await?;
+    Ok(Json(SessionView::build(&st.db, &session, &branch).await?))
 }
 
 async fn patch_session(

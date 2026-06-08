@@ -4,10 +4,11 @@ import { get, post } from '../api';
 import type { Session, RecentRepo, RepoBranch } from '../types';
 import StatusBadge from '../components/StatusBadge.vue';
 import AttentionBadge from '../components/AttentionBadge.vue';
+import TriageBadge from '../components/TriageBadge.vue';
 import GithubStatus from '../components/GithubStatus.vue';
 import ScratchPicker from '../components/ScratchPicker.vue';
 import { timeAgo } from '../lib/time';
-import { levelOf, messageOf } from '../lib/sessionState';
+import { levelOf, messageOf, triageOf, triageStale } from '../lib/sessionState';
 
 const sessions = ref<Session[]>([]);
 
@@ -582,9 +583,17 @@ onUnmounted(() => clearInterval(timer));
           <span class="tree-col" :class="isLast ? 'tree-col--elbow' : 'tree-col--tee'"></span>
         </div>
 
-        <!-- Signal: the one reserved loud axis. -->
-        <div class="shrink-0 pt-0.5">
+        <!-- Signal: the agent's own loud axis, plus the overlooker's quieter
+             mark beside it when one exists. -->
+        <div class="flex shrink-0 flex-col items-start gap-1 pt-0.5">
           <AttentionBadge :level="levelOf(s)" :note="messageOf(s)" />
+          <TriageBadge
+            v-if="triageOf(s)"
+            :level="triageOf(s)"
+            :note="s.branch.triage_note"
+            :by="s.branch.triage_by"
+            :stale="triageStale(s)"
+          />
         </div>
 
         <!-- Title + current-state (the work, in prose). -->

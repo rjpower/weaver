@@ -539,6 +539,83 @@ fn set_status_sets_level_and_message() {
     );
 }
 
+/// `weaver triage` stamps the overlooker's mark on a *named* session — a third
+/// status axis that never touches the agent's own attention — and records a
+/// `triage` event for the audit trail. An unmarked session reads back cleanly.
+#[test]
+fn triage_marks_a_session_without_touching_attention() {
+    let env = setup();
+    // The agent declares its own attention about itself.
+    run(&env, &["set-status", "blocked", "build", "broke"]);
+
+    // Unmarked until an overlooker looks.
+    let out = run(&env, &["triage", "feature-test"]);
+    assert!(
+        out.contains("(unmarked)"),
+        "fresh session is unmarked: {out}"
+    );
+
+    // An overlooker stamps a *different* opinion on the same session.
+    let out = run(
+        &env,
+        &[
+            "triage",
+            "feature-test",
+            "attention",
+            "looks",
+            "stuck",
+            "on",
+            "tests",
+            "--by",
+            "status-check",
+        ],
+    );
+    assert!(
+        out.contains("feature-test → attention — looks stuck on tests"),
+        "triage set: {out}"
+    );
+
+    // Read it back with its note and attribution.
+    let out = run(&env, &["triage", "feature-test"]);
+    assert!(out.contains("attention"), "read level: {out}");
+    assert!(out.contains("looks stuck on tests"), "read note: {out}");
+    assert!(out.contains("status-check"), "read attribution: {out}");
+
+    // The agent's own attention is untouched — two actors, two axes.
+    let out = run(&env, &["set-status"]);
+    assert!(
+        out.contains("status:      blocked — build broke"),
+        "attention must survive a triage write: {out}"
+    );
+
+    // The mark is logged as a `triage` event.
+    let log = run(&env, &["log"]);
+    assert!(
+        log.contains("triage"),
+        "log should record triage events: {log}"
+    );
+}
+
+/// An unknown triage level is rejected with a non-zero exit, like `set-status`.
+#[test]
+fn triage_rejects_unknown_level() {
+    let env = setup();
+    run(&env, &["goal", "exist"]); // materialize the branch row first
+    let out = Command::new(weaver_bin())
+        .args(["triage", "feature-test", "bogus"])
+        .current_dir(&env.repo_path)
+        .env("WEAVER_HOME", &env.home_path)
+        .env("WEAVER_API", "http://127.0.0.1:1")
+        .output()
+        .expect("failed to spawn weaver");
+    assert!(!out.status.success(), "unknown triage level should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown triage level 'bogus'"),
+        "stderr: {stderr}"
+    );
+}
+
 #[test]
 fn set_status_rejects_unknown_level() {
     let env = setup();

@@ -18,6 +18,25 @@ export function messageOf(s: Session): string {
   return s.branch.description ?? '';
 }
 
+// The overlooker's triage mark, normalized. '' means unmarked (no badge).
+// Distinct from levelOf(): that is the agent's own attention; this is an
+// outside assessment stamped by an overlooker. Archived sessions show nothing.
+export function triageOf(s: Session): '' | Attention {
+  if (s.status === 'archived') return '';
+  const t = s.branch.triage_level;
+  return t === 'ok' || t === 'attention' || t === 'blocked' ? t : '';
+}
+
+// Whether the mark predates the session's latest activity — the session has
+// "moved on" since the overlooker last looked, so the mark may no longer hold.
+// The badge renders this faded with a stale hint. No mark, or no activity
+// timestamp, is never stale.
+export function triageStale(s: Session): boolean {
+  const at = s.branch.triage_at;
+  if (!at || !triageOf(s)) return false;
+  return s.last_activity_at > at;
+}
+
 // Compact conversation-state line for the detail header (#5): a derived
 // STATE, not verbatim agent chatter. Drives the line that replaces the old
 // "Waiting for input" slab. Returns a glyph + short label; glyphs are plain
