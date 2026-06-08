@@ -86,7 +86,9 @@ noun in the code and the UI.
    changes already flow through; the engine is a pure **event consumer** that
    matches new events to overlooker triggers. A clock tick and an
    `attention=blocked` event are handled by one code path — **level-triggered**,
-   so either is just a nudge to re-survey the whole scope.
+   so either is just a nudge to re-survey the whole scope. An overlooker may be
+   **repo-scoped** — an optional `repo` on its trigger filters the stream to one
+   repository, so a watcher can tend just one project's sessions.
 3. **One runtime owner, one API seam.** The live tmux/worktree/session runtime
    stays **single-owner in the loom daemon** (two processes driving tmux = races
    and broken orphan-detection). Everything else reuses it through one new shared
@@ -133,7 +135,10 @@ Concretely the engine has two halves:
   overlookers whose trigger matches: a scheduled overlooker matches its own `cron`
   tick; a reactive one matches `attention=blocked`, a staleness signal, a PR
   going red. `loom overlooker run` injects a `manual` trigger event. One dispatch
-  path, whatever woke it.
+  path, whatever woke it. A trigger may also carry a **`repo`** filter; when set,
+  the dispatcher only fires for events whose branch lives in that repo (and a
+  `cron` round scopes its survey to that repo), so an overlooker can be pinned to
+  a single project.
 
 This is why **level-triggered** (the K8s lesson) matters and is now structural:
 the matched event is only a *nudge to look*. The round always observes the
@@ -263,10 +268,12 @@ Overlookers are meant to be **drafted and refined by an agent on your behalf** �
 authoring surface to be plain files plus a CLI an agent can drive, not a
 click-only UI. Three things make it work:
 
-- **Programs are files.** A Python overlooker lives in the repo (e.g.
-  `.weaver/overlookers/<name>.py`) or a global dir — diffable, reviewable,
-  version-controlled, editable by any agent like any other code. `loom overlooker
-  new <name>` scaffolds a starter (as `weaver plan new` scaffolds a plan).
+- **Programs are files.** A Python overlooker lives in the global
+  `~/.weaver/overlookers/<name>.py` — diffable, reviewable, editable by any agent
+  like any other code, and fleet-wide rather than tied to one checkout (repo
+  pinning is the trigger's `repo` filter, not the file's location). `loom
+  overlooker new <name>` scaffolds a starter there (as `weaver plan new`
+  scaffolds a plan).
 - **The API is the CLI is the binding.** Because `loom session
   {preview,send,break,poll}` and the `weaver-py` module are *both* thin wrappers
   over `weaver-api`, an agent explores the live fleet with the exact vocabulary
@@ -351,8 +358,9 @@ through the same `weaver-api` the out-of-process programs use.
 **Storage — two new tables, the `triage` axis, one events accommodation.**
 
 - `overlookers` — `id`, `name`, `enabled`, `trigger` (JSON: the event-match —
-  `{cron:"0 * * * *"}` / `{every:"30m"}` / `{event:"attention", level:"blocked"}`),
-  `scope` (JSON fleet query), `program` (`builtin:status` or a file path),
+  `{cron:"0 * * * *"}` / `{every:"30m"}` / `{event:"attention", level:"blocked"}`,
+  with an optional `repo` filter), `scope` (JSON fleet query, repo-aware),
+  `program` (`builtin:status` or a file path under `~/.weaver/overlookers/`),
   `params` (JSON for a stock program / the prompt), `capabilities` (JSON set),
   `model`, `effort`, `cooldown_secs`, `last_run_at`, `next_run_at`,
   `warm_session_id` (nullable), `created_at`, `updated_at`.
@@ -469,9 +477,11 @@ a running loom.
 
 Generalise `events` with a **system scope** (branchless rows); add the `cron`
 event kind. The overlooker engine as an event **consumer** on its own watermark
-(the monitor's pattern), matching new events to overlooker triggers; `loom
-overlooker run` injects a `manual` tick. No timer yet. Acceptance: inserting a
-matching event fires the right overlooker exactly once; re-firing is idempotent.
+(the monitor's pattern), matching new events to overlooker triggers, including
+the optional **`repo`** filter (fire only for events whose branch is in that
+repo); `loom overlooker run` injects a `manual` tick. No timer yet. Acceptance:
+inserting a matching event fires the right overlooker exactly once; a repo filter
+excludes other repos' events; re-firing is idempotent.
 
 ### T5 — Round execution: the program substrate + guardrails  `exec: session`  `value: high`  `deps: T3, T4`
 
@@ -499,12 +509,12 @@ stale wakes a matching overlooker before its next cron tick.
 
 ### T8 — Authoring & iteration loop  `exec: session`  `value: high`  `deps: T5`
 
-`loom overlooker new` scaffold; the `--dry-run` simulator (mutating actions
-stubbed and logged); `runs`/`logs`; and the convention that programs are
-version-controlled files. Confirms the CLI/binding/`weaver-api` share one
-vocabulary so an agent can draft → dry-run → refine. Acceptance: an agent, given
-only the CLI, scaffolds an overlooker, dry-runs it against the live fleet, and
-registers it.
+`loom overlooker new` scaffold (into `~/.weaver/overlookers/`); the `--dry-run`
+simulator (mutating actions stubbed and logged); `runs`/`logs`; and the
+convention that programs are plain files an agent can edit. Confirms the
+CLI/binding/`weaver-api` share one vocabulary so an agent can draft → dry-run →
+refine. Acceptance: an agent, given only the CLI, scaffolds an overlooker,
+dry-runs it against the live fleet, and registers it.
 
 ### T9 — Round history + audit  `exec: session`  `value: med`  `deps: T5`
 
@@ -575,9 +585,9 @@ The `deps` graph collapses into five phases, each independently shippable:
   the open call is how much of `web.rs`'s inline types move now vs incrementally,
   and whether the `weaver` CLI gains any thin client use or stays purely
   DB-direct.
-- **Where program files live.** Repo-local `.weaver/overlookers/` (travels with
-  the repo, reviewable, but repo-scoped) vs a global dir (fleet-wide, but
-  off to the side of git). Likely both, resolved like `WEAVER.md`.
+- **Repo scoping granularity.** A trigger's `repo` filter pins an overlooker to
+  one repository; the open call is whether finer scoping (a branch glob, a label)
+  earns its keep, or whether repo + the existing `scope` fleet query is enough.
 - **Stock-program coverage.** How many declarative `builtin:` programs earn their
   keep (status, idle-nudge, PR-watch) before the rest is "write a Python one"?
 - **Escalation channel.** `escalate` raising the overlooker's own `attention` is
