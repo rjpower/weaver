@@ -1,6 +1,6 @@
 ---
 plan: overlooker
-status: draft
+status: active
 ---
 
 # The Overlooker — periodic, triggered watch agents
