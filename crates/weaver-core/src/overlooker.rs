@@ -295,6 +295,72 @@ pub async fn set_enabled(db: &Db, id: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// A partial update of an overlooker's mutable definition: every field is
+/// optional, and only the `Some(_)` ones are written (`enabled` is handled by
+/// [`set_enabled`], schedule bookkeeping by [`set_schedule`]). JSON-bearing
+/// fields take the already-serialized text, mirroring [`NewOverlooker`].
+#[derive(Debug, Clone, Default)]
+pub struct OverlookerUpdate {
+    pub trigger_spec: Option<String>,
+    pub scope: Option<String>,
+    pub program: Option<String>,
+    pub params: Option<String>,
+    pub capabilities: Option<Vec<String>>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub cooldown_secs: Option<i64>,
+}
+
+impl OverlookerUpdate {
+    /// Whether any field is set — lets a caller skip a no-op write.
+    pub fn is_empty(&self) -> bool {
+        self.trigger_spec.is_none()
+            && self.scope.is_none()
+            && self.program.is_none()
+            && self.params.is_none()
+            && self.capabilities.is_none()
+            && self.model.is_none()
+            && self.effort.is_none()
+            && self.cooldown_secs.is_none()
+    }
+}
+
+/// Apply a partial update to an overlooker's mutable fields. Each `Some(_)`
+/// overwrites; `COALESCE(?, col)` leaves an absent field untouched. `updated_at`
+/// always advances.
+pub async fn update(db: &Db, id: &str, patch: &OverlookerUpdate) -> Result<()> {
+    let caps = match &patch.capabilities {
+        Some(c) => Some(serde_json::to_string(c)?),
+        None => None,
+    };
+    sqlx::query(
+        "UPDATE overlookers SET
+           trigger_spec  = COALESCE(?, trigger_spec),
+           scope         = COALESCE(?, scope),
+           program       = COALESCE(?, program),
+           params        = COALESCE(?, params),
+           capabilities  = COALESCE(?, capabilities),
+           model         = COALESCE(?, model),
+           effort        = COALESCE(?, effort),
+           cooldown_secs = COALESCE(?, cooldown_secs),
+           updated_at    = ?
+         WHERE id = ?",
+    )
+    .bind(&patch.trigger_spec)
+    .bind(&patch.scope)
+    .bind(&patch.program)
+    .bind(&patch.params)
+    .bind(&caps)
+    .bind(&patch.model)
+    .bind(&patch.effort)
+    .bind(patch.cooldown_secs)
+    .bind(now_iso())
+    .bind(id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// Record a round's schedule bookkeeping: when it last ran and when it is next
 /// due (the timer advances `next_run_at`; the executor stamps `last_run_at`).
 pub async fn set_schedule(
@@ -487,6 +553,37 @@ mod tests {
         assert_eq!(runs[0].outcome, "ok");
         assert_eq!(runs[0].trigger_reason, "manual");
         assert!(runs[0].finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn update_overwrites_only_the_set_fields() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let o = create(
+            &db,
+            &NewOverlooker {
+                name: "patchme".to_string(),
+                program: "builtin:status".to_string(),
+                cooldown_secs: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        update(
+            &db,
+            &o.id,
+            &OverlookerUpdate {
+                program: Some("/abs/path.py".to_string()),
+                capabilities: Some(vec!["observe".to_string(), "nudge".to_string()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let after = get(&db, &o.id).await.unwrap().unwrap();
+        assert_eq!(after.program, "/abs/path.py", "program overwritten");
+        assert_eq!(after.cooldown_secs, 10, "untouched field is preserved");
+        assert!(after.has_capability("nudge"), "capabilities overwritten");
     }
 
     #[test]

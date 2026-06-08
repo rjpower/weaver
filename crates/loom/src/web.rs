@@ -77,10 +77,11 @@ use tower_http::services::{ServeDir, ServeFile};
 use crate::db::Db;
 use crate::events::{Event, EventBus};
 use crate::session::{self as session_mod, NewSession, Session};
-use crate::{agent, config, db, events, git, github, repo, tmux};
+use crate::{agent, config, db, events, git, github, overlooker as ov_engine, repo, tmux};
 use weaver_core::branch as branch_mod;
 use weaver_core::branch::Branch;
 use weaver_core::issue::Issue;
+use weaver_core::overlooker::{self as ov, Overlooker, OverlookerRun};
 use weaver_core::{plan, repo_config};
 
 #[derive(Clone)]
@@ -419,6 +420,19 @@ pub fn router(state: AppState) -> Router {
             get(list_repo_issues).post(create_repo_issue),
         )
         .route("/settings", get(get_settings).patch(patch_settings))
+        // Overlookers — periodic / triggered watch programs over the fleet.
+        .route(
+            "/overlookers",
+            get(list_overlookers).post(create_overlooker),
+        )
+        .route(
+            "/overlookers/{id}",
+            get(get_overlooker)
+                .patch(patch_overlooker)
+                .delete(delete_overlooker),
+        )
+        .route("/overlookers/{id}/run", post(run_overlooker))
+        .route("/overlookers/{id}/runs", get(overlooker_runs))
         // Scratch uploads can carry images / logs; lift the default 2 MB cap.
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
@@ -2372,6 +2386,332 @@ async fn patch_settings(
     }
     config::apply(&st.db, &changes).await?;
     settings_envelope(&st.db).await
+}
+
+// ---------------------------------------------------------------------------
+// Overlookers — the operator + authoring surface (server-owned state)
+// ---------------------------------------------------------------------------
+
+/// One overlooker, as the API exposes it. The JSON-bearing columns
+/// (`trigger`, `scope`, `params`) are returned as **parsed** structured JSON so
+/// a UI never re-parses strings; `capabilities` is a real array; the rest is the
+/// stored definition plus its schedule bookkeeping.
+#[derive(Debug, Clone, Serialize)]
+pub struct OverlookerView {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    /// The event-match predicate, parsed: `{cron|every|event|level|repo}`.
+    pub trigger: Value,
+    /// The fleet query a round surveys, parsed: `{attention?, repo?}`.
+    pub scope: Value,
+    /// `builtin:<name>` for a stock program, or an absolute path under
+    /// `~/.weaver/overlookers/` for a custom one.
+    pub program: String,
+    /// Stock-program parameters (e.g. the judgement `prompt`), parsed.
+    pub params: Value,
+    /// The granted capability set (the intervention ladder). `observe` is
+    /// implicit; the rest are explicit grants.
+    pub capabilities: Vec<String>,
+    pub model: String,
+    pub effort: String,
+    pub cooldown_secs: i64,
+    pub last_run_at: Option<String>,
+    pub next_run_at: Option<String>,
+    /// The most recent round's outcome (`ok|noop|skipped|error`), or `null` if
+    /// it has never run — the at-a-glance health a list view shows.
+    pub last_outcome: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl OverlookerView {
+    async fn build(db: &Db, o: &Overlooker) -> ApiResult<Self> {
+        let last_outcome = ov::recent_runs(db, &o.id, 1)
+            .await?
+            .into_iter()
+            .next()
+            .map(|r| r.outcome);
+        Ok(Self {
+            id: o.id.clone(),
+            name: o.name.clone(),
+            enabled: o.enabled,
+            trigger: serde_json::to_value(o.trigger()).unwrap_or(Value::Null),
+            scope: serde_json::to_value(o.scope()).unwrap_or(Value::Null),
+            program: o.program.clone(),
+            params: o.params(),
+            capabilities: o.capabilities(),
+            model: o.model.clone(),
+            effort: o.effort.clone(),
+            cooldown_secs: o.cooldown_secs,
+            last_run_at: o.last_run_at.clone(),
+            next_run_at: o.next_run_at.clone(),
+            last_outcome,
+            created_at: o.created_at.clone(),
+            updated_at: o.updated_at.clone(),
+        })
+    }
+}
+
+/// One round in an overlooker's history (the audit trail), with `actions`
+/// parsed back into JSON for a UI to render.
+#[derive(Debug, Clone, Serialize)]
+pub struct OverlookerRunView {
+    pub id: i64,
+    pub trigger_reason: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub outcome: String,
+    pub summary: String,
+    /// The JSON array of marks / nudges / would-dos the round recorded.
+    pub actions: Value,
+}
+
+impl From<OverlookerRun> for OverlookerRunView {
+    fn from(r: OverlookerRun) -> Self {
+        Self {
+            id: r.id,
+            trigger_reason: r.trigger_reason,
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            outcome: r.outcome,
+            summary: r.summary,
+            actions: serde_json::from_str(&r.actions).unwrap_or(Value::Null),
+        }
+    }
+}
+
+/// Body for `POST /api/overlookers`. JSON-bearing fields take structured JSON
+/// (`trigger`/`scope`/`params`), which the handler serializes into the stored
+/// text columns. Optional fields fall back to the model's defaults.
+#[derive(Debug, Deserialize)]
+struct CreateOverlookerReq {
+    name: String,
+    #[serde(default)]
+    trigger: Option<Value>,
+    #[serde(default)]
+    scope: Option<Value>,
+    #[serde(default)]
+    program: Option<String>,
+    #[serde(default)]
+    params: Option<Value>,
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    cooldown_secs: Option<i64>,
+}
+
+/// Body for `PATCH /api/overlookers/{id}`: every mutable field optional.
+#[derive(Debug, Deserialize)]
+struct PatchOverlookerReq {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    trigger: Option<Value>,
+    #[serde(default)]
+    scope: Option<Value>,
+    #[serde(default)]
+    program: Option<String>,
+    #[serde(default)]
+    params: Option<Value>,
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    cooldown_secs: Option<i64>,
+}
+
+/// Body for `POST /api/overlookers/{id}/run`.
+#[derive(Debug, Deserialize, Default)]
+struct RunOverlookerReq {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunsQuery {
+    /// How many recent rounds to return; defaults to 50.
+    limit: Option<i64>,
+}
+
+/// Reject a capability set that isn't a subset of the known ladder, naming the
+/// offender. Returns the cleaned set on success.
+fn validate_capabilities(caps: &[String]) -> ApiResult<()> {
+    for c in caps {
+        if !ov::CAPABILITIES.contains(&c.as_str()) {
+            return Err(AppError::bad_request(format!(
+                "unknown capability '{c}' — expected a subset of {}",
+                ov::CAPABILITIES.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A program reference must be a stock `builtin:*` program or an absolute path
+/// (a file under `~/.weaver/overlookers/`); a bare relative path is rejected so
+/// the engine never resolves it against an ambiguous cwd.
+fn validate_program(program: &str) -> ApiResult<()> {
+    let ok = program.starts_with("builtin:") || PathBuf::from(program).is_absolute();
+    if !ok {
+        return Err(AppError::bad_request(format!(
+            "invalid program '{program}' — expected 'builtin:<name>' or an absolute path"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve an overlooker (by id or name) or 404.
+async fn require_overlooker(db: &Db, key: &str) -> ApiResult<Overlooker> {
+    ov::resolve(db, key)
+        .await?
+        .ok_or_else(|| AppError::not_found("overlooker"))
+}
+
+async fn list_overlookers(State(st): State<AppState>) -> ApiResult<Json<Vec<OverlookerView>>> {
+    let mut out = Vec::new();
+    for o in ov::list(&st.db).await? {
+        out.push(OverlookerView::build(&st.db, &o).await?);
+    }
+    Ok(Json(out))
+}
+
+async fn create_overlooker(
+    State(st): State<AppState>,
+    Json(req): Json<CreateOverlookerReq>,
+) -> ApiResult<Json<OverlookerView>> {
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::bad_request("name must not be empty"));
+    }
+    if ov::get_by_name(&st.db, &name).await?.is_some() {
+        return Err(AppError::conflict(format!(
+            "an overlooker named '{name}' already exists"
+        )));
+    }
+
+    let defaults = ov::NewOverlooker::default();
+    let program = req.program.unwrap_or(defaults.program);
+    validate_program(&program)?;
+    let capabilities = req.capabilities.unwrap_or(defaults.capabilities);
+    validate_capabilities(&capabilities)?;
+
+    let new = ov::NewOverlooker {
+        name,
+        trigger_spec: json_text(req.trigger, &defaults.trigger_spec),
+        scope: json_text(req.scope, &defaults.scope),
+        program,
+        params: json_text(req.params, &defaults.params),
+        capabilities,
+        model: req.model.unwrap_or(defaults.model),
+        effort: req.effort.unwrap_or(defaults.effort),
+        cooldown_secs: req.cooldown_secs.unwrap_or(defaults.cooldown_secs),
+    };
+    let o = ov::create(&st.db, &new).await?;
+    Ok(Json(OverlookerView::build(&st.db, &o).await?))
+}
+
+async fn get_overlooker(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<OverlookerView>> {
+    let o = require_overlooker(&st.db, &key).await?;
+    Ok(Json(OverlookerView::build(&st.db, &o).await?))
+}
+
+async fn patch_overlooker(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<PatchOverlookerReq>,
+) -> ApiResult<Json<OverlookerView>> {
+    let o = require_overlooker(&st.db, &key).await?;
+
+    if let Some(program) = &req.program {
+        validate_program(program)?;
+    }
+    if let Some(caps) = &req.capabilities {
+        validate_capabilities(caps)?;
+    }
+    if let Some(enabled) = req.enabled {
+        ov::set_enabled(&st.db, &o.id, enabled).await?;
+    }
+    let patch = ov::OverlookerUpdate {
+        trigger_spec: req.trigger.map(|v| v.to_string()),
+        scope: req.scope.map(|v| v.to_string()),
+        program: req.program,
+        params: req.params.map(|v| v.to_string()),
+        capabilities: req.capabilities,
+        model: req.model,
+        effort: req.effort,
+        cooldown_secs: req.cooldown_secs,
+    };
+    if !patch.is_empty() {
+        ov::update(&st.db, &o.id, &patch).await?;
+    }
+    let o = require_overlooker(&st.db, &o.id).await?;
+    Ok(Json(OverlookerView::build(&st.db, &o).await?))
+}
+
+async fn delete_overlooker(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let o = require_overlooker(&st.db, &key).await?;
+    ov::delete(&st.db, &o.id).await?;
+    Ok(Json(json!({ "deleted": true })))
+}
+
+/// Fire a round now, in the daemon (the single tmux owner), and report its
+/// outcome. `dry_run` stubs every mutating action — the iteration primitive,
+/// safe to repeat. Re-reads the closed run row to surface outcome + summary.
+async fn run_overlooker(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<RunOverlookerReq>,
+) -> ApiResult<Json<Value>> {
+    let o = require_overlooker(&st.db, &key).await?;
+    let reason = if req.dry_run { "run (dry)" } else { "run" };
+    let run_id = ov_engine::fire_now(&st, &o.id, req.dry_run, reason).await?;
+    let run = ov::recent_runs(&st.db, &o.id, 50)
+        .await?
+        .into_iter()
+        .find(|r| r.id == run_id);
+    let (outcome, summary) = run
+        .map(|r| (r.outcome, r.summary))
+        .unwrap_or_else(|| (String::new(), String::new()));
+    Ok(Json(json!({
+        "run_id": run_id,
+        "outcome": outcome,
+        "summary": summary,
+    })))
+}
+
+async fn overlooker_runs(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+    Query(q): Query<RunsQuery>,
+) -> ApiResult<Json<Vec<OverlookerRunView>>> {
+    let o = require_overlooker(&st.db, &key).await?;
+    let limit = q.limit.unwrap_or(50).clamp(1, 1000);
+    let runs = ov::recent_runs(&st.db, &o.id, limit).await?;
+    Ok(Json(
+        runs.into_iter().map(OverlookerRunView::from).collect(),
+    ))
+}
+
+/// Serialize an optional structured-JSON field into the text column the model
+/// stores, falling back to the model default when absent.
+fn json_text(value: Option<Value>, default: &str) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| default.to_string())
 }
 
 #[cfg(test)]
