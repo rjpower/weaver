@@ -15,9 +15,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use sqlx::FromRow;
+use serde::Deserialize;
+use serde_json::json;
 use tokio::process::Command;
 use tokio::sync::OnceCell;
 
@@ -26,6 +25,7 @@ use crate::session::{self as session_mod, Session};
 use crate::web::AppState;
 use crate::{branch as branch_mod, config, events};
 use weaver_core::branch::Branch;
+use weaver_core::github::GithubStatus;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Issue {
@@ -121,54 +121,6 @@ const POLL_TICK: Duration = Duration::from_secs(30);
 /// struct and the query can't drift.
 const PR_FIELDS: &str =
     "number,url,state,title,isDraft,reviewDecision,mergeable,mergedAt,statusCheckRollup";
-
-/// A branch's pull-request snapshot, as stored and as served under
-/// `BranchView::github`. `pr_state` is `OPEN` / `CLOSED` / `MERGED`; `checks` is
-/// the rolled-up `passing` / `failing` / `pending` (or `null` when the PR has no
-/// checks); `review_decision` is GitHub's `APPROVED` / `CHANGES_REQUESTED` /
-/// `REVIEW_REQUIRED` (or `null` when review isn't required).
-#[derive(Debug, Clone, Serialize, FromRow)]
-pub struct GithubStatus {
-    pub pr_number: i64,
-    pub pr_url: String,
-    pub pr_state: String,
-    pub pr_title: String,
-    pub is_draft: bool,
-    pub review_decision: Option<String>,
-    pub checks: Option<String>,
-    pub mergeable: Option<String>,
-    pub merged_at: Option<String>,
-    pub fetched_at: String,
-}
-
-impl GithubStatus {
-    /// The fields whose change is worth announcing on the activity feed — PR
-    /// identity and the human-meaningful state. `mergeable` and timestamps are
-    /// deliberately excluded: they flap (e.g. `UNKNOWN` ⇄ `MERGEABLE`) without
-    /// telling the user anything.
-    fn signature(&self) -> (i64, String, Option<String>, Option<String>, bool) {
-        (
-            self.pr_number,
-            self.pr_state.clone(),
-            self.review_decision.clone(),
-            self.checks.clone(),
-            self.is_draft,
-        )
-    }
-
-    /// Payload for the `github` event the poller records when the snapshot
-    /// changes — enough for a dashboard to summarize without re-fetching.
-    pub fn event_data(&self) -> Value {
-        json!({
-            "pr": self.pr_number,
-            "url": self.pr_url,
-            "state": self.pr_state,
-            "review": self.review_decision,
-            "checks": self.checks,
-            "draft": self.is_draft,
-        })
-    }
-}
 
 /// The shape of one `gh pr view --json` record. Internal — callers see
 /// [`GithubStatus`].

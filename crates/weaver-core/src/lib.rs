@@ -8,6 +8,7 @@ pub mod config;
 pub mod db;
 pub mod events;
 pub mod git;
+pub mod github;
 pub mod issue;
 pub mod migrations;
 pub mod overlooker;
