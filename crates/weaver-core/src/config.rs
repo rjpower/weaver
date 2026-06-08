@@ -176,10 +176,26 @@ pub const REGISTRY: &[SettingSpec] = &[
         group: "Overlooker",
         options: &[],
     },
+    SettingSpec {
+        key: "overlooker.stale_after_secs",
+        label: "Stale-after (seconds)",
+        description: "How long a non-terminal session may go without any activity \
+            before the monitor emits a one-shot `stale` event into the stream — a \
+            reactive trigger an overlooker can match. Edge-detected, so a session \
+            that stays quiet is announced once, not every tick.",
+        kind: SettingKind::Int,
+        default: "1800",
+        group: "Overlooker",
+        options: &[],
+    },
 ];
 
 /// Whether the Overlooker engine master switch is on. Off by default.
 pub const DEFAULT_OVERLOOKER_ENABLED: bool = false;
+
+/// How many seconds a non-terminal session may be idle before the monitor emits
+/// a one-shot `stale` event. 30 minutes by default.
+pub const DEFAULT_OVERLOOKER_STALE_AFTER_SECS: i64 = 1800;
 
 /// Look up the [`SettingSpec`] for a key, if it is a registered setting.
 pub fn spec(key: &str) -> Option<&'static SettingSpec> {

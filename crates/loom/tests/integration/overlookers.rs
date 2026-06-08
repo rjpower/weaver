@@ -10,12 +10,15 @@
 //! calls the public engine seams — `dispatch`, `fire_now`, `new_in_flight` /
 //! `fire` — so a round runs without waiting on the timer.
 
+use std::collections::HashSet;
+
+use chrono::Utc;
 use serde_json::json;
 use serial_test::serial;
 
 use loom::events::EventBus;
 use loom::web::AppState;
-use loom::{db, events, overlooker};
+use loom::{db, events, monitor, overlooker, session as session_mod};
 use weaver_core::overlooker as ov;
 
 use crate::fixtures::TestServer;
@@ -147,6 +150,119 @@ async fn dispatcher_matches_trigger_with_repo_filter_and_is_idempotent() {
     assert_eq!(
         runs_before, runs_after,
         "a repo-filtered trigger ignores an event from outside its repo"
+    );
+
+    ts.client
+        .delete(&format!("/api/sessions/{session_id}"))
+        .await
+        .unwrap();
+}
+
+/// T7: a session that crosses the staleness threshold causes the monitor to emit
+/// a one-shot `stale` event, an overlooker with an `{"event":"stale"}` trigger
+/// fires a round off it, and the emission is edge-detected — driving the
+/// staleness check twice produces exactly one `stale` row, not one per pass.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_session_emits_one_event_and_wakes_a_reactive_overlooker() {
+    let ts = TestServer::start().await;
+    let state = engine_state(&ts).await;
+    let (session_id, _branch_id, _repo_root) = make_session(&ts, "go stale").await;
+
+    // The session reports `attention` about itself so the stock round's rule
+    // produces a non-ok mark when the overlooker fires (proving it ran).
+    ts.client
+        .patch(
+            &format!("/api/sessions/{session_id}"),
+            json!({ "attention": "attention" }),
+        )
+        .await
+        .unwrap();
+
+    // A reactive overlooker matching `stale` events fleet-wide.
+    let o = enabled_overlooker(
+        &state,
+        ov::NewOverlooker {
+            name: "stale-watch".to_string(),
+            trigger_spec: json!({ "event": "stale" }).to_string(),
+            scope: json!({ "attention": "!ok" }).to_string(),
+            program: "builtin:status".to_string(),
+            capabilities: vec!["observe".to_string(), "mark".to_string()],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Drive the monitor's staleness check directly with a zero threshold (stale
+    // immediately) — the deterministic, fast stand-in for waiting 30 minutes.
+    let session = session_mod::get(&state.db, &session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let watermark = events::max_id(&state.db).await.unwrap();
+    let mut seen: HashSet<String> = HashSet::new();
+    let now = Utc::now();
+
+    // Two passes: the edge fires on the first, the second is a no-op.
+    monitor::detect_stale(&state, &session, 0, now, &mut seen, watermark).await;
+    monitor::detect_stale(&state, &session, 0, now, &mut seen, watermark).await;
+
+    // Exactly one `stale` event was emitted across both passes (edge-detected).
+    let new_events = events::since(&state.db, watermark).await.unwrap();
+    let stale: Vec<_> = new_events.iter().filter(|e| e.kind == "stale").collect();
+    assert_eq!(
+        stale.len(),
+        1,
+        "the monitor emits `stale` once per transition, not every tick: {new_events:?}"
+    );
+    let stale_ev = stale[0];
+    assert_eq!(
+        stale_ev.data["session"],
+        session_id.as_str(),
+        "the stale event names the idle session"
+    );
+    assert!(
+        stale_ev.data["idle_secs"].is_number(),
+        "the stale event carries an idle_secs"
+    );
+    assert!(
+        !events::is_system(&stale_ev.branch_id),
+        "a stale event is branch-scoped so its repo resolves for repo-filtering"
+    );
+
+    // The dispatcher consumes the stale tick and fires the reactive round.
+    let in_flight = overlooker::new_in_flight();
+    overlooker::dispatch(&state, &in_flight, stale_ev).await;
+    let runs = ov::recent_runs(&state.db, &o.id, 10).await.unwrap();
+    assert_eq!(runs.len(), 1, "the stale event fires exactly one round");
+    let view = ts
+        .client
+        .get(&format!("/api/sessions/{session_id}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        view["branch"]["triage_level"], "attention",
+        "the woken round marked the in-scope stale session"
+    );
+    assert_eq!(view["branch"]["triage_by"], "stale-watch");
+
+    // Once activity resumes (a non-stale pass clears the session from `seen`),
+    // the edge re-arms: a later stale crossing emits a fresh event.
+    let watermark2 = events::max_id(&state.db).await.unwrap();
+    // A high threshold makes this just-touched session read as not-stale, which
+    // re-arms the edge…
+    monitor::detect_stale(&state, &session, 100_000, now, &mut seen, watermark2).await;
+    assert!(
+        !seen.contains(&session_id),
+        "a not-stale pass clears the session, re-arming the edge"
+    );
+    // …so crossing the threshold again emits a second `stale` event.
+    monitor::detect_stale(&state, &session, 0, now, &mut seen, watermark2).await;
+    let after = events::since(&state.db, watermark2).await.unwrap();
+    assert_eq!(
+        after.iter().filter(|e| e.kind == "stale").count(),
+        1,
+        "after the edge re-arms, a new crossing emits again"
     );
 
     ts.client

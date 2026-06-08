@@ -10,17 +10,24 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde_json::json;
 
-use crate::session as session_mod;
+use crate::session::{self as session_mod, Session};
 use crate::web::AppState;
 use crate::{events, tmux};
 use weaver_core::branch as branch_mod;
+use weaver_core::config as core_config;
 
 const TICK: Duration = Duration::from_millis(1500);
 
 pub async fn run(state: AppState) {
     let mut screen_hash: HashMap<String, u64> = HashMap::new();
+    // The session ids the monitor has already announced `stale` for, so a
+    // session that stays quiet is announced once (edge-detected), not every
+    // tick. A session leaves the set the moment its activity advances; it is
+    // pruned with `screen_hash` when the session disappears.
+    let mut stale_seen: HashSet<String> = HashSet::new();
     // Watermark: process every event written after this id, then advance.
     let mut last_event = events::max_id(&state.db).await.unwrap_or(0);
     tracing::info!(tick_ms = TICK.as_millis() as u64, "monitor loop started");
@@ -80,10 +87,38 @@ pub async fn run(state: AppState) {
         };
         let mut alive: HashSet<String> = HashSet::new();
 
+        // Edge-detect no-activity staleness once per walk, gated on the
+        // overlooker master switch (no consumer ⇒ no point emitting). The
+        // threshold and `now` are read once and shared across the walk.
+        let stale_enabled = core_config::get_bool(
+            &state.db,
+            "overlooker.enabled",
+            core_config::DEFAULT_OVERLOOKER_ENABLED,
+        )
+        .await;
+        let stale_after = core_config::get(&state.db, "overlooker.stale_after_secs")
+            .await
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(core_config::DEFAULT_OVERLOOKER_STALE_AFTER_SECS);
+        let now = Utc::now();
+
         for session in &sessions {
             alive.insert(session.id.clone());
             if session_mod::is_terminal(&session.status) {
                 continue;
+            }
+
+            // Staleness: emit `stale` exactly on the not-stale → stale edge.
+            if stale_enabled {
+                last_event = detect_stale(
+                    &state,
+                    session,
+                    stale_after,
+                    now,
+                    &mut stale_seen,
+                    last_event,
+                )
+                .await;
             }
             if !tmux::has_session(&session.tmux_session).await {
                 if session.status != "orphaned" {
@@ -120,7 +155,87 @@ pub async fn run(state: AppState) {
         }
 
         screen_hash.retain(|k, _| alive.contains(k));
+        stale_seen.retain(|k| alive.contains(k));
     }
+}
+
+/// The time a session was last active: its `last_activity_at`, or its
+/// `created_at` for a session that has never been touched. `None` when neither
+/// timestamp parses (a corrupt row treated as "no anchor" rather than panicking).
+fn activity_anchor(session: &Session) -> Option<DateTime<Utc>> {
+    session
+        .last_activity_at
+        .as_deref()
+        .or(Some(session.created_at.as_str()))
+        .and_then(parse_iso)
+}
+
+/// Whether `session` has been idle for at least `after` seconds as of `now`.
+///
+/// A non-positive threshold means "stale immediately" — useful for tests and a
+/// deliberate operator setting. A session with no recorded `last_activity_at`
+/// (never touched) falls back to its `created_at`, so a session that was created
+/// and never moved still goes stale.
+pub fn is_stale(session: &Session, after: i64, now: DateTime<Utc>) -> bool {
+    let Some(anchor) = activity_anchor(session) else {
+        return false;
+    };
+    (now - anchor).num_seconds() >= after
+}
+
+/// Emit a one-shot `stale` event on the not-stale → stale transition for one
+/// session, edge-detected against `seen`. Returns the (possibly advanced) event
+/// watermark so the monitor's own emission isn't reprocessed.
+///
+/// * Crosses into stale and not yet announced → record a branch-scoped `stale`
+///   event (so a reactive trigger can resolve its repo) and remember the id.
+/// * No longer stale (activity resumed) → forget the id, re-arming the edge.
+///
+/// Branch-scoped rather than system-scoped: the event carries the session's
+/// branch so the dispatcher's `reactive_context` can repo-filter it.
+pub async fn detect_stale(
+    state: &AppState,
+    session: &Session,
+    after: i64,
+    now: DateTime<Utc>,
+    seen: &mut HashSet<String>,
+    last_event: i64,
+) -> i64 {
+    if is_stale(session, after, now) {
+        if seen.insert(session.id.clone()) {
+            let idle_secs = idle_secs(session, now);
+            if events::record(
+                &state.db,
+                &state.bus,
+                &session.branch_id,
+                "stale",
+                json!({ "session": session.id, "idle_secs": idle_secs }),
+            )
+            .await
+            .is_ok()
+            {
+                return events::max_id(&state.db).await.unwrap_or(last_event);
+            }
+        }
+    } else {
+        // Activity resumed (or never crossed): re-arm the edge.
+        seen.remove(&session.id);
+    }
+    last_event
+}
+
+/// Seconds since the session's last activity (or creation), clamped at 0.
+fn idle_secs(session: &Session, now: DateTime<Utc>) -> i64 {
+    activity_anchor(session)
+        .map(|t| (now - t).num_seconds().max(0))
+        .unwrap_or(0)
+}
+
+/// Parse an ISO-8601 timestamp (the `weaver_core::db::now_iso` format) to UTC.
+fn parse_iso(ts: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Reflect a Claude lifecycle hook (`working` / `waiting` / `idle`) onto the
@@ -221,7 +336,52 @@ fn normalize_screen(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_screen;
+    use super::{is_stale, normalize_screen, Session};
+    use chrono::{Duration, Utc};
+
+    /// A bare `Session` with the given `last_activity_at`; only the timestamps
+    /// matter for staleness.
+    fn session_with_activity(last_activity_at: Option<&str>, created_at: &str) -> Session {
+        Session {
+            id: "s1".to_string(),
+            branch_id: "b1".to_string(),
+            work_dir: String::new(),
+            tmux_session: String::new(),
+            agent_kind: "shell".to_string(),
+            model: String::new(),
+            effort: String::new(),
+            status: "running".to_string(),
+            github_repo: None,
+            last_activity_at: last_activity_at.map(str::to_string),
+            created_at: created_at.to_string(),
+            parent_branch_id: None,
+        }
+    }
+
+    #[test]
+    fn is_stale_crosses_the_threshold() {
+        let now = Utc::now();
+        let iso = |t: chrono::DateTime<Utc>| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+
+        // Active 10 minutes ago, threshold 30 minutes → not stale.
+        let recent = session_with_activity(Some(&iso(now - Duration::minutes(10))), &iso(now));
+        assert!(!is_stale(&recent, 1800, now));
+
+        // Active 40 minutes ago, threshold 30 minutes → stale.
+        let old = session_with_activity(Some(&iso(now - Duration::minutes(40))), &iso(now));
+        assert!(is_stale(&old, 1800, now));
+
+        // No recorded activity falls back to created_at.
+        let never = session_with_activity(None, &iso(now - Duration::minutes(40)));
+        assert!(is_stale(&never, 1800, now));
+
+        // A zero threshold means "stale immediately" (the test/operator knob).
+        assert!(is_stale(&recent, 0, now));
+
+        // An unparseable timestamp is treated as not stale rather than panicking.
+        let bad = session_with_activity(Some("not-a-time"), "also-bad");
+        assert!(!is_stale(&bad, 0, now));
+    }
 
     #[test]
     fn normalize_ignores_resize_padding() {
