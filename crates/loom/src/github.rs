@@ -263,6 +263,14 @@ fn rollup_checks(items: &[CheckJson]) -> Option<String> {
     )
 }
 
+/// Whether a branch's check rollup just transitioned **into** failing: the new
+/// snapshot is `failing` and the previously-stored value was not. The first time
+/// a branch is seen (`prev_checks == None`) counts as a transition if it is
+/// already failing, so a PR that is red on first sighting still announces once.
+fn checks_went_red(prev_checks: Option<&str>, next: &GithubStatus) -> bool {
+    next.checks.as_deref() == Some("failing") && prev_checks != Some("failing")
+}
+
 /// Whether the `gh` CLI is usable on this machine. Probed once and cached — a
 /// missing `gh` is the common "GitHub integration off" case and shouldn't cost a
 /// process spawn on every poll.
@@ -399,6 +407,21 @@ async fn apply_snapshot(
         .ok();
     }
 
+    // Edge-detect the checks → failing transition and emit a one-shot `pr_red`
+    // event a reactive overlooker can match. Compared against the *prior* stored
+    // value so it fires once per transition, not every poll while it stays red.
+    if checks_went_red(prev.as_ref().and_then(|p| p.checks.as_deref()), snap) {
+        events::record(
+            &state.db,
+            &state.bus,
+            &branch.id,
+            "pr_red",
+            json!({ "pr": snap.pr_number, "checks": "failing" }),
+        )
+        .await
+        .ok();
+    }
+
     if archive_on_merge && snap.pr_state == "MERGED" && !session_mod::is_terminal(&session.status) {
         // The merge is already on the record as a `github` event (above) and the
         // archive records a `status` event, so no extra log line is needed.
@@ -500,6 +523,32 @@ mod tests {
             check(Some("COMPLETED"), Some("FAILURE"), None),
         ];
         assert_eq!(rollup_checks(&failing).as_deref(), Some("failing"));
+    }
+
+    #[test]
+    fn checks_went_red_fires_once_per_transition() {
+        let red = snapshot_with_checks(Some("failing"));
+        let green = snapshot_with_checks(Some("passing"));
+        let pending = snapshot_with_checks(Some("pending"));
+        let none = snapshot_with_checks(None);
+
+        // not-failing → failing is the edge (including first-ever sighting).
+        assert!(checks_went_red(None, &red));
+        assert!(checks_went_red(Some("passing"), &red));
+        assert!(checks_went_red(Some("pending"), &red));
+        // Staying red does not re-fire.
+        assert!(!checks_went_red(Some("failing"), &red));
+        // A non-failing new state never fires, whatever the prior value.
+        assert!(!checks_went_red(Some("failing"), &green));
+        assert!(!checks_went_red(Some("failing"), &pending));
+        assert!(!checks_went_red(None, &none));
+    }
+
+    fn snapshot_with_checks(checks: Option<&str>) -> GithubStatus {
+        GithubStatus {
+            checks: checks.map(str::to_string),
+            ..snapshot("OPEN")
+        }
     }
 
     #[test]
