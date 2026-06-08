@@ -36,6 +36,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         include_str!("../migrations/0002_drop_notes.sql"),
     ),
     (3, "triage", include_str!("../migrations/0003_triage.sql")),
+    (
+        4,
+        "overlookers",
+        include_str!("../migrations/0004_overlookers.sql"),
+    ),
 ];
 
 /// Apply every pending migration, bringing the database up to the latest schema.

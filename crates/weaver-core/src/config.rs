@@ -142,7 +142,44 @@ pub const REGISTRY: &[SettingSpec] = &[
         group: "Appearance",
         options: &["dark", "light"],
     },
+    SettingSpec {
+        key: "overlooker.enabled",
+        label: "Enable overlookers",
+        description: "Master switch for the Overlooker engine — the periodic / \
+            triggered watch programs that survey the fleet and stamp triage \
+            marks. Off by default: nothing fires until you opt in, even if \
+            individual overlookers are enabled.",
+        kind: SettingKind::Bool,
+        default: "false",
+        group: "Overlooker",
+        options: &[],
+    },
+    SettingSpec {
+        key: "overlooker.default_timeout_secs",
+        label: "Round timeout (seconds)",
+        description: "Wall-clock budget for one overlooker round. A round that \
+            overruns is killed and recorded as an error; the next trigger still \
+            fires. Mirrors the lint-review 600s precedent.",
+        kind: SettingKind::Int,
+        default: "600",
+        group: "Overlooker",
+        options: &[],
+    },
+    SettingSpec {
+        key: "overlooker.default_cooldown_secs",
+        label: "Default cooldown (seconds)",
+        description: "Minimum gap between two rounds of the same overlooker when \
+            it does not set its own cooldown. A re-fire inside the gap is \
+            skipped, so a chatty event stream can't hammer a watcher.",
+        kind: SettingKind::Int,
+        default: "0",
+        group: "Overlooker",
+        options: &[],
+    },
 ];
+
+/// Whether the Overlooker engine master switch is on. Off by default.
+pub const DEFAULT_OVERLOOKER_ENABLED: bool = false;
 
 /// Look up the [`SettingSpec`] for a key, if it is a registered setting.
 pub fn spec(key: &str) -> Option<&'static SettingSpec> {

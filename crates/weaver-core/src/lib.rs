@@ -10,6 +10,7 @@ pub mod events;
 pub mod git;
 pub mod issue;
 pub mod migrations;
+pub mod overlooker;
 pub mod plan;
 pub mod repo_config;
 
