@@ -31,7 +31,7 @@ const archivedCount = computed(
 // reads empty while archived rows exist. Attention is no longer pinned to the
 // top — threading groups related work instead — but attention rows still get
 // their loud row wash + pulse, so they stay easy to spot.
-const visibleSet = computed<Session[]>(() => {
+const visibleSessions = computed<Session[]>(() => {
   const all = sessions.value;
   const live = all.filter((s) => s.status !== 'archived');
   const base = showArchived.value || live.length === 0 ? all : live;
@@ -64,17 +64,17 @@ interface TreeRow {
 }
 
 // Group the visible sessions into threads: each hangs under the session that
-// launched it (branch.parent_id), with top-level sessions under an implicit
-// root. Siblings sort by launch time (newest first) and a parent always sits
-// directly above its children. A parent that's filtered/archived out of the
+// launched it (`parent_id`, a branch id), with top-level sessions under an
+// implicit root. Siblings sort by launch time (newest first) and a parent always
+// sits directly above its children. A parent that's filtered/archived out of the
 // visible set (or was never tracked) drops its orphaned children to the top.
 const treeRows = computed<TreeRow[]>(() => {
-  const list = visibleSet.value;
+  const list = visibleSessions.value;
   const present = new Set(list.map((s) => s.branch.id));
   const children = new Map<string, Session[]>();
   const roots: Session[] = [];
   for (const s of list) {
-    const pid = s.branch.parent_id;
+    const pid = s.parent_id;
     if (pid && pid !== s.branch.id && present.has(pid)) {
       const arr = children.get(pid);
       if (arr) arr.push(s);

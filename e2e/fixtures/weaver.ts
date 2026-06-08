@@ -28,8 +28,6 @@ export interface Branch {
   created_at: string;
   updated_at: string;
   open_issue_count: number;
-  /** Branch id of the session that launched this one, or null at the top level. */
-  parent_id: string | null;
 }
 
 /** A session as returned by `/api/sessions[/...]`. */
@@ -44,6 +42,8 @@ export interface Session {
   last_activity_at: string;
   created_at: string;
   updated_at: string;
+  /** Branch id of the session that launched this one, or null at the top level. */
+  parent_id: string | null;
   branch: Branch;
 }
 
