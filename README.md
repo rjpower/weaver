@@ -20,35 +20,36 @@ Both binaries share one sqlite database at `~/.weaver/weaver.db`.
 ## Getting Started
 
 The fastest way in is to **have your coding agent set weaver up for you**: open
-this repo in Claude Code (or your agent of choice) and tell it to *"set up weaver
-— run `scripts/setup.sh` and put `weaver` and `loom` on my PATH."* It builds the
-binaries, links them onto your PATH, and can then drive `loom` for you.
+this repo in Claude Code (or your agent of choice) and tell it to *"set weaver up
+for me — follow the Getting Started steps in the README."* The steps below are
+written for it to run; do them yourself if you'd rather.
 
-### One command
+1. **Get a Rust toolchain.** If `cargo` isn't already on the PATH, install it
+   via [rustup](https://rustup.rs):
 
-```sh
-./scripts/setup.sh
-```
+   ```sh
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
 
-It builds the binaries and symlinks `weaver` and `loom` into `~/.local/bin`
-(override with `BIN_DIR=…`, or `PROFILE=release` for an optimized build). If
-`cargo` is missing it installs the Rust toolchain via [rustup](https://rustup.rs)
-first. Re-run it any time to rebuild and refresh the links.
+2. **Build the tooling.** From the repo root:
 
-### Or by hand
+   ```sh
+   cargo build
+   ```
 
-```sh
-# 1. Rust toolchain — skip if you already have cargo
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   This produces `target/debug/weaver` and `target/debug/loom`.
 
-# 2. Build weaver + loom (debug build → target/debug)
-cargo build
+3. **Put both binaries on the PATH.** Symlink them into a directory already on
+   `$PATH` (e.g. `~/.local/bin`), so they stay current as you rebuild:
 
-# 3. Put them on your PATH (~/.local/bin must be on $PATH)
-mkdir -p ~/.local/bin
-ln -sf "$PWD/target/debug/weaver" ~/.local/bin/weaver
-ln -sf "$PWD/target/debug/loom"   ~/.local/bin/loom
-```
+   ```sh
+   mkdir -p ~/.local/bin
+   ln -sf "$PWD/target/debug/weaver" ~/.local/bin/weaver
+   ln -sf "$PWD/target/debug/loom"   ~/.local/bin/loom
+   ```
+
+   If `~/.local/bin` isn't on your `$PATH`, add it (e.g.
+   `export PATH="$HOME/.local/bin:$PATH"` in your shell profile).
 
 Then start the orchestrator and open the dashboard:
 
