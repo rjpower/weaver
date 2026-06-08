@@ -7,8 +7,10 @@
 //! definition of the wire contract the server serializes and these consumers
 //! deserialize (and that `frontend/types.ts` mirrors).
 
+pub mod capability;
 pub mod client;
 pub mod dto;
 
+pub use capability::{require, CapabilityError};
 pub use client::Client;
 pub use dto::*;
