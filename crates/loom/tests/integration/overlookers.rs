@@ -418,3 +418,150 @@ async fn cooldown_and_overlap_refire_are_refused() {
         .await
         .unwrap();
 }
+
+/// T8/T9: the operator REST surface end to end — create via POST, read back via
+/// GET, enable via PATCH, fire a `dry_run` round via POST /run (the audit row
+/// comes back with an outcome), list the round history via GET /runs, then
+/// DELETE. Plus the validation gates: a bad capability and a duplicate name are
+/// both rejected.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_overlooker_lifecycle_and_validation() {
+    let ts = TestServer::start().await;
+    // A non-ok session so the dry-run round has something in scope to "would-mark".
+    let (session_id, _branch_id, _repo_root) = make_session(&ts, "rest me").await;
+    ts.client
+        .patch(
+            &format!("/api/sessions/{session_id}"),
+            json!({ "attention": "attention" }),
+        )
+        .await
+        .unwrap();
+
+    // Create: structured trigger/scope/params JSON in, an OverlookerView out.
+    let created = ts
+        .client
+        .post(
+            "/api/overlookers",
+            json!({
+                "name": "rest-watch",
+                "trigger": { "cron": "0 * * * *" },
+                "scope": { "attention": "!ok" },
+                "program": "builtin:status",
+                "params": { "prompt": "is it stuck?" },
+                "capabilities": ["observe", "mark"],
+            }),
+        )
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["name"], "rest-watch");
+    assert_eq!(created["enabled"], false, "new overlookers start disabled");
+    // JSON-bearing fields come back parsed, not as strings.
+    assert_eq!(created["trigger"]["cron"], "0 * * * *");
+    assert_eq!(created["scope"]["attention"], "!ok");
+    assert_eq!(created["params"]["prompt"], "is it stuck?");
+    assert_eq!(created["capabilities"][1], "mark");
+    assert!(created["last_outcome"].is_null(), "never run yet");
+
+    // A duplicate name is rejected (the client surfaces the error status).
+    let dup = ts
+        .client
+        .post("/api/overlookers", json!({ "name": "rest-watch" }))
+        .await;
+    assert!(dup.is_err(), "a duplicate name is rejected");
+
+    // A bad capability is rejected at create time.
+    let bad_cap = ts
+        .client
+        .post(
+            "/api/overlookers",
+            json!({ "name": "bad", "capabilities": ["observe", "teleport"] }),
+        )
+        .await;
+    assert!(bad_cap.is_err(), "an unknown capability is rejected");
+
+    // GET by id (resolve also accepts the name).
+    let got = ts
+        .client
+        .get(&format!("/api/overlookers/{id}"))
+        .await
+        .unwrap();
+    assert_eq!(got["name"], "rest-watch");
+    let by_name = ts.client.get("/api/overlookers/rest-watch").await.unwrap();
+    assert_eq!(by_name["id"], id.as_str());
+
+    // It shows up in the list.
+    let list = ts.client.get("/api/overlookers").await.unwrap();
+    assert!(list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|o| o["id"] == id.as_str()));
+
+    // Enable via PATCH, and update a mutable field in the same call.
+    let patched = ts
+        .client
+        .patch(
+            &format!("/api/overlookers/{id}"),
+            json!({ "enabled": true, "cooldown_secs": 120 }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(patched["enabled"], true);
+    assert_eq!(patched["cooldown_secs"], 120, "a mutable field updates");
+
+    // Dry-run a round: it returns a run id + outcome, applies no mark.
+    let run = ts
+        .client
+        .post(
+            &format!("/api/overlookers/{id}/run"),
+            json!({ "dry_run": true }),
+        )
+        .await
+        .unwrap();
+    let run_id = run["run_id"].as_i64().unwrap();
+    assert!(run_id > 0, "a run row was opened");
+    assert_eq!(
+        run["outcome"], "ok",
+        "the round surveyed the scoped session"
+    );
+    let view = ts
+        .client
+        .get(&format!("/api/sessions/{session_id}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        view["branch"]["triage_level"], "",
+        "a dry run applies no mark"
+    );
+
+    // GET /runs returns the audit history with actions parsed back to JSON.
+    let runs = ts
+        .client
+        .get(&format!("/api/overlookers/{id}/runs?limit=10"))
+        .await
+        .unwrap();
+    let runs = runs.as_array().unwrap();
+    assert!(!runs.is_empty(), "the round is in the history");
+    assert_eq!(runs[0]["id"], run_id);
+    assert!(
+        runs[0]["actions"].is_array(),
+        "actions come back as parsed JSON"
+    );
+
+    // DELETE.
+    let deleted = ts
+        .client
+        .delete(&format!("/api/overlookers/{id}"))
+        .await
+        .unwrap();
+    assert_eq!(deleted["deleted"], true);
+    let gone = ts.client.get(&format!("/api/overlookers/{id}")).await;
+    assert!(gone.is_err(), "a deleted overlooker 404s");
+
+    ts.client
+        .delete(&format!("/api/sessions/{session_id}"))
+        .await
+        .unwrap();
+}
