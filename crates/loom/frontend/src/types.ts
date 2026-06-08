@@ -210,6 +210,94 @@ export interface FileContent {
   bytes: number;
 }
 
+/** An overlooker's trigger — the event-match predicate, parsed. A scheduled
+ *  trigger carries a `cron` (or `every`) cadence; a reactive one carries an
+ *  `event` kind (and optional `level`). An optional `repo` pins it to one
+ *  repository. Mirrors weaver-core's `Trigger`. */
+export interface OverlookerTrigger {
+  cron?: string;
+  every?: string;
+  event?: string;
+  level?: string;
+  repo?: string;
+}
+
+/** The fleet query a round surveys, parsed. `attention` is `!ok` (anything not
+ *  ok) or an exact level; `repo` scopes the survey to one repository. */
+export interface OverlookerScope {
+  attention?: string;
+  repo?: string;
+}
+
+/** One overlooker: a periodic / triggered watch program over the fleet. The
+ *  JSON-bearing fields (`trigger`, `scope`, `params`) arrive as parsed objects;
+ *  `capabilities` is a real array. Mirrors `OverlookerView` in web.rs. */
+export interface Overlooker {
+  id: string;
+  name: string;
+  enabled: boolean;
+  /** The event-match predicate: `{cron|every|event|level|repo}`. */
+  trigger: OverlookerTrigger;
+  /** The fleet query a round surveys: `{attention?, repo?}`. */
+  scope: OverlookerScope;
+  /** `builtin:<name>` for a stock program, or an absolute path under
+   *  `~/.weaver/overlookers/` for a custom one. */
+  program: string;
+  /** Stock-program parameters, e.g. `{prompt}`. */
+  params: Record<string, unknown>;
+  /** The granted capability set (the intervention ladder). `observe` is
+   *  implicit; the rest are explicit grants. */
+  capabilities: string[];
+  model: string;
+  effort: string;
+  cooldown_secs: number;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  /** The most recent round's outcome, or null if it has never run. */
+  last_outcome: 'ok' | 'noop' | 'skipped' | 'error' | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One action a round recorded — a mark, nudge, interrupt, or a stubbed
+ *  "would do X" from a dry-run. The shape is loose (the engine writes free-form
+ *  JSON); these are the fields the panel renders when present. */
+export interface OverlookerAction {
+  /** The session the action targeted, when it targets one. */
+  session?: string;
+  /** A performed action's verb (e.g. `mark`, `nudge`). */
+  action?: string;
+  /** A dry-run's stubbed verb — what it *would* have done. */
+  would?: string;
+  /** The triage level a `mark` stamped. */
+  level?: string;
+  /** A one-line reason / note. */
+  note?: string;
+  /** The message body of a nudge. */
+  text?: string;
+  [key: string]: unknown;
+}
+
+/** One round in an overlooker's history — the audit trail. `actions` is the
+ *  array of marks / nudges / would-dos the round recorded. Mirrors
+ *  `OverlookerRunView` in web.rs. */
+export interface OverlookerRun {
+  id: number;
+  trigger_reason: string;
+  started_at: string;
+  finished_at: string | null;
+  outcome: 'ok' | 'noop' | 'skipped' | 'error' | string;
+  summary: string;
+  actions: OverlookerAction[];
+}
+
+/** The reply from `POST /api/overlookers/{id}/run`. */
+export interface OverlookerRunResult {
+  run_id: number;
+  outcome: string;
+  summary: string;
+}
+
 export type SettingKind = 'string' | 'int' | 'bool' | 'enum';
 
 /** One configurable setting: its registry metadata plus its current value. */
