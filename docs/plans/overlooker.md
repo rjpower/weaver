@@ -54,10 +54,10 @@ Five reference points, each contributing one idea.
 | **Stuck-agent watchers** (Wink, ClawKeeper, HITL guardrails) | a watcher monitors an agent's tool-use / loops and intervenes — nudge, interrupt, or escalate to a human past a threshold | the **intervention ladder** (observe → nudge → interrupt → escalate) and that autonomy must be *bounded* and *auditable* | a watcher that acts too eagerly is worse than none — it interrupts healthy work and erodes trust |
 
 The synthesis writes itself: a **level-triggered reconciler** (K8s) whose
-"reconcile" step is a **bounded supervisor agent** (LangGraph) woken by a
-**cron-or-event trigger** with a **fresh context package** (heartbeat), most of
-whose decisions are cheap **rules** (rules engine) and whose actions climb a
-**bounded, audited intervention ladder** (stuck-agent watchers).
+"reconcile" step is a **bounded supervisor agent** (LangGraph) woken by an
+**event** with a **fresh context package** (heartbeat), most of whose decisions
+are cheap **rules** (rules engine) and whose actions climb a **bounded, audited
+intervention ladder** (stuck-agent watchers).
 
 ## The name
 
@@ -68,7 +68,7 @@ Not a weaver — a *watcher of* weavers and their looms. It is the exact word fo
 "the thing that looks over the looms," and loom is already our session
 orchestrator. So:
 
-- An **overlooker** is one configured watch agent.
+- An **overlooker** is one configured watch program.
 - A **round** is one execution of it (it "walks the shed" / "does its rounds").
 - A **mark** is the assessment it stamps on a session — the new status indicator
   the problem statement asks for.
@@ -78,506 +78,511 @@ noun in the code and the UI.
 
 ## TL;DR
 
-1. **One new subsystem, three nouns.** An **overlooker** (a watch definition), a
-   **trigger** (when it wakes), and a **round** (one execution). Managed in a
-   dedicated **Overlooker panel**, separate from the session fleet — they are
-   infrastructure, not workstreams.
-2. **Reuse the session machinery verbatim.** An overlooker's round runs through
-   the same `agent::launch` + tmux + hooks + `loom session
-   {preview,send,break}` primitives that already exist. We are adding a
-   *scheduler and a panel*, not a second agent runtime.
-3. **Level-triggered, not edge-triggered.** A trigger (cron tick or session
-   event) is a *nudge to re-survey the whole scoped fleet*, never a one-shot
-   reaction. The round observes current state and reconciles. This makes it
-   idempotent, crash-safe, and immune to missed events — the K8s insight applied
-   to agents.
+1. **One subsystem, three nouns.** An **overlooker** (a watch definition), a
+   **trigger** (an event match), and a **round** (one execution), in a dedicated
+   **Overlooker panel** — infrastructure, separate from the session fleet.
+2. **One event vocabulary; cron is an event.** There is no `cron` vs `event`
+   fork. The timer emits a `cron` tick into the *same* `events` stream session
+   changes already flow through; the engine is a pure **event consumer** that
+   matches new events to overlooker triggers. A clock tick and an
+   `attention=blocked` event are handled by one code path — **level-triggered**,
+   so either is just a nudge to re-survey the whole scope.
+3. **One runtime owner, one API seam.** The live tmux/worktree/session runtime
+   stays **single-owner in the loom daemon** (two processes driving tmux = races
+   and broken orphan-detection). Everything else reuses it through one new shared
+   crate, **`weaver-api`** — the typed client + DTOs lifted out of loom — used by
+   the engine, the `loom` CLI, and the Python binding alike. Not a second
+   runtime: one seam over the existing one.
 4. **A third status axis: the mark.** Lifecycle (`session.status`) and attention
    (`branch.attention`, agent self-reported) stay untouched. The overlooker
-   writes a *separate* `triage` axis — *its* assessment of a session — so it
-   never stomps what the agent said about itself. The dashboard shows both
-   badges.
-5. **Two authoring surfaces, one engine.** A **declarative** overlooker (trigger
-   + scope + prompt, no code) covers the headline case. A **scripted**
-   overlooker — a Python file against a PyO3-bound `weaver` module — is the
-   power-user escape hatch for arbitrary trigger logic and mechanical rules. Both
-   run on the same trigger engine.
-6. **Bounded and audited by construction.** Least-privilege capabilities
-   (observe/mark/escalate by default; nudge/interrupt/launch opt-in), a
-   per-round time + token budget, a cooldown, a no-recursion rule, and every
-   action recorded as an event. Autonomy you can trust because you can see it and
-   cap it.
+   writes a *separate* `triage` axis — *its* assessment — so it never stomps what
+   the agent said about itself.
+5. **One execution substrate: a program with the bound API.** Python (via PyO3)
+   is the first-class authoring language; the no-code **declarative** overlooker
+   is sugar over a built-in stock program. "Warm vs fresh" is not an engine
+   mode — it is a library call the program makes (`warm_session()` to keep a
+   session across rounds, `run_agent()` for a one-shot, or neither for pure
+   rules).
+6. **Agent-authorable and bounded.** The same `weaver-api` vocabulary is exposed
+   over the CLI with a `--dry-run` simulator, so you can ask an agent to draft,
+   dry-run against the live fleet, and iterate a new overlooker. Least-privilege
+   capabilities, per-round budget, cooldown, no-recursion, every action an event.
 
 The rest argues each point.
 
-## The core model: overlooker, trigger, round
+## One event vocabulary: cron is an event
 
-An **overlooker** is a stored definition — a row, eventually editable in the
-panel — with five fields:
+The cleanest version of the trigger model is the one with no special cases.
+weaver already has a single event spine — the append-only `events` table that
+`weaver hook` writes and the monitor consumes on a watermark. The overlooker
+engine joins it as **another consumer**, and the trigger model collapses to:
 
-- **Trigger** — *when* it wakes. One of:
-  - `cron` — a crontab expression (`0 * * * *`, every hour) or a fixed interval.
-  - `event` — a filter over the `events` stream (e.g. *any branch raises
-    attention to `blocked`*; *a session has had no activity for 30 min*; *a PR's
-    checks went red*).
-  - `manual` — only the "Run now" button / CLI.
-- **Scope** — *which* sessions a round considers. A query over the fleet:
-  `all`, or filtered by attention (`attention != ok`), lifecycle (`status =
-  running`), repo, staleness, label. The example overlooker's scope is "every
-  session that isn't idle."
-- **Mode** — *how* the round executes (see [Execution](#execution-reuse-the-session-machinery)):
-  `warm` (a long-lived nudged session), `headless` (a one-shot `claude -p`), or
-  `script` (a Python file — which itself decides whether to call an LLM).
-- **Instructions** — *what* it does: the prompt (declarative/warm/headless) or
-  the script path (scripted).
-- **Capabilities** — *what it is allowed to do* (see [Capabilities &
-  safety](#capabilities--safety)).
+> A **trigger** is an event-match predicate. The engine consumes new events and,
+> for each, fires every overlooker whose trigger matches. **Cron is not a
+> separate mechanism — it is an event source.**
 
-A **round** is the unit of work: trigger fires → engine composes a context
-package over the scope → the agent reasons and acts → the engine records the
-outcome. Rounds are the audit trail; the panel lists them.
+Concretely the engine has two halves:
+
+- **The timer (a producer).** It keeps each scheduled overlooker's next-fire time
+  (parsed with the [`croner`](https://github.com/Hexagon/croner-rust) crate) and,
+  at fire time, writes a `cron` event into the stream — nothing more. A cron tick
+  is now a first-class, logged, SSE-broadcast event (`{kind: "cron", overlooker}`)
+  you can see in the history, exactly like a hook.
+- **The dispatcher (a consumer).** It reads `events::since(watermark)` like the
+  monitor (its own independent watermark), and for each new event fires the
+  overlookers whose trigger matches: a scheduled overlooker matches its own `cron`
+  tick; a reactive one matches `attention=blocked`, a staleness signal, a PR
+  going red. `loom overlooker run` injects a `manual` trigger event. One dispatch
+  path, whatever woke it.
+
+This is why **level-triggered** (the K8s lesson) matters and is now structural:
+the matched event is only a *nudge to look*. The round always observes the
+*current* scoped fleet and reconciles — it never "handles" the specific event.
+So firing twice is idempotent, a restart that misses events self-heals on the
+next tick, and a session legitimately waiting isn't hammered by an edge-triggered
+nag. The one accommodation the events table needs: a **system scope** for
+fleet-global rows (a reserved branch id, or a nullable `branch_id`) so a `cron`
+tick — which belongs to no branch — lives in the same stream.
 
 ### The mark: a third status axis
 
-The problem statement asks for the overlooker to "mark them ok, or tag a new
-status indicator for the session." That indicator must be a **distinct axis**,
-not a write to the existing two:
+The problem statement asks the overlooker to "mark them ok, or tag a new status
+indicator." That indicator must be a **distinct axis**, not a write to the
+existing two:
 
 - `session.status` is the **lifecycle** — mechanical, orchestrator-owned.
 - `branch.attention` is what the **agent says about itself** — "I'm blocked",
   "ready for review". The overlooker must never overwrite this; conflating "the
   agent declared blocked" with "the overlooker thinks it's stuck" destroys the
   signal that made watching worthwhile.
-- `branch.triage` (new) is **the overlooker's assessment**: `ok` /
-  `attention` / `blocked`, plus a one-line `triage_note`, plus `triage_by` (which
-  overlooker) and `triage_at` (when). It mirrors the `attention` mechanism
-  exactly — a denormalised latest on the branch, backed by a `triage` event the
-  monitor re-broadcasts — so it costs almost no new machinery.
+- `branch.triage` (new) is **the overlooker's assessment**: `ok` / `attention` /
+  `blocked`, plus a one-line `triage_note`, `triage_by` (which overlooker) and
+  `triage_at` (when). It mirrors the `attention` mechanism exactly — a
+  denormalised latest on the branch, backed by a `triage` event the monitor
+  re-broadcasts — so it costs almost no new machinery.
 
 The dashboard renders the mark as a second badge beside attention. When the
 session moves on (its `last_activity_at` advances past `triage_at`) the mark is
-shown as **stale** until the next round refreshes it — so a "looks stuck" mark
-from an hour ago doesn't lie about a session that has since recovered.
+shown **stale** until the next round refreshes it — so a "looks stuck" mark from
+an hour ago doesn't lie about a session that has since recovered. Same discipline
+as [structured projects](../structured-projects.md): **two actors must never
+author the same fact.** The agent owns `attention`; the overlooker owns `triage`.
 
-This is the same discipline as [structured projects](../structured-projects.md):
-**two actors must never author the same fact.** The agent owns `attention`; the
-overlooker owns `triage`; the renderer shows both.
+## Library breakdown: one API seam, a single runtime owner
 
-## Level-triggered, not edge-triggered
+"Do we move some of the loom tmux/session management into a shared library?" The
+answer turns on a hard invariant: **the live runtime has exactly one owner.** The
+tmux sessions, the worktrees, the monitor's liveness/orphan detection — all
+assume a single process driving them. Two processes both running
+`tmux new-session` / `kill-session` and both reaping orphans would race and
+corrupt state. So the tmux/session *runtime* must **not** be extracted to be
+co-driven; it stays in the daemon.
 
-The single most important design decision, lifted straight from the Kubernetes
-controller pattern. A trigger does **not** carry a payload the round reacts to.
-It carries only "wake up and look." The round then:
+What gets reused is therefore not the runtime but the **API over it**. There are
+two kinds of consumer, and the seam serves both:
 
-1. **Observes** the *current* scoped fleet (list sessions, read their status,
-   attention, last-activity, recent diff, PR snapshot — all existing reads).
-2. **Reconciles** — decides, per session, whether the mark is still right and
-   whether to act.
+- **In-process** — the overlooker **engine** runs inside the loom server and
+  already has direct access to `agent::launch`, `tmux`, `session`. No extraction
+  needed; it is a loom module.
+- **Out-of-process** — the **Python binding**, scripted overlookers, the CLI, and
+  any agent helping author one. These run as separate processes and drive
+  sessions **through the loom REST API**, never tmux directly.
 
-Why this matters:
+So the one structural change is to lift loom's private client and its DTOs into a
+shared crate:
 
-- **Idempotent.** Running a round twice produces the same marks; re-firing is
-  always safe.
-- **Crash-safe.** If loom restarts and the engine misses ten events, the next
-  round still sees the true current state. There is no event-replay to get
-  wrong (exactly why the monitor already works on a watermark, not a queue).
-- **No nag loops.** Because the round compares against current state, it only
-  re-acts when something *changed*. An edge-triggered design ("on every
-  `waiting` event, nudge") would hammer a session that's legitimately waiting.
+| Crate | Role | Today | Change |
+|---|---|---|---|
+| `weaver-core` | pure shared logic (branch, issue, **events**, db, config, plan) | shared by both binaries | add the `triage` axis + the system-scoped `cron` event kind here |
+| **`weaver-api`** *(new)* | the typed loom REST **client + request/response DTOs** | `client.rs` is private to loom; DTOs live inline in `web.rs` and are hand-mirrored in `frontend/types.ts` | extract both here, so the server, the CLI, and the binding share **one** typed surface (and the TS mirror tracks one source) |
+| `loom` | the daemon: tmux/session **runtime**, web, monitor, **the overlooker engine** | the orchestrator | depend on `weaver-api` for DTOs; the engine is a new module |
+| **`weaver-py`** *(new, maturin)* | the PyO3 `weaver` Python module | — | a thin Pythonic wrapper over `weaver-api` |
 
-Events are thus demoted to *nudges to look sooner* — a `blocked` event might
-wake a round immediately instead of waiting for the next cron tick — but the
-round's logic is always "survey and reconcile the whole scope," never "handle
-this one event."
+`weaver-api` is the load-bearing extraction: it is what makes "reuse the session
+logic" true for everything outside the daemon **without** a second tmux owner,
+and it removes the `web.rs` ↔ `types.ts` drift on the Rust side as a bonus. The
+`weaver` agent CLI stays DB-direct for the daemon-less writes it already does
+(`set-status`, and now `weaver triage`), exactly as `attention` works today.
 
-## Execution: reuse the session machinery
+## Execution: one program, one API
 
-"These agents reuse our session tmux etc logic" is the explicit constraint, and
-the right one. There is nothing special about *running* an overlooker — it is an
-agent in a tmux pane, launched by `agent::launch`, reporting via the same hooks.
-What differs is *who drives it* (the trigger engine, not a one-time launch) and
-*where it shows up* (the panel, not the fleet). Three modes, picked per
-overlooker:
+Rather than bake "warm session" vs "headless one-shot" vs "script" in as engine
+modes, there is **one substrate: a round runs a program against the bound API.**
+The program decides everything — whether to call an LLM, whether to keep a warm
+session or spawn a fresh one, whether to act or just observe. The
+warm/fresh/rules distinctions become *library calls inside the program*:
 
-### Warm (default for judgement)
+- `ov.sessions(scope)` / `s.preview()` / `s.diff()` — observe (always allowed).
+- `s.mark(level, note)` — write the triage axis.
+- `s.nudge(text)` / `s.interrupt()` — the intervention ladder (capability-gated).
+- `ov.run_agent(prompt)` — spawn a **fresh** one-shot agent for a judgement call
+  (the env-stripped `claude -p` pattern from
+  [`scripts/lint-review.py`](../lint.md), behind the API).
+- `ov.warm_session()` — get the overlooker's **persistent** session (created on
+  first use, reused after), for accumulating judgement across rounds — "still
+  stuck since last hour?" The binding handles create-or-reuse; the program just
+  calls it.
 
-The overlooker **is** a long-lived session — its own tmux pane, launched once,
-kept alive between rounds. Each trigger **nudges** it via the existing
-`send` primitive (`tmux send-keys`) with a freshly-composed context package:
-"It's the 14:00 round. Here are the 3 non-idle sessions and what changed since
-12:00. Investigate and mark them." The agent uses its on-PATH tools (`weaver`,
-`loom session preview/send`, `gh`) to drill in, then records its marks.
+Two authoring languages sit on that one substrate:
 
-Warm mode is the heartbeat pattern with memory: because the TUI persists, the
-agent *remembers* it flagged session X as stuck last round and can ask "still
-stuck?" — precisely the accumulating judgement the problem wants. It reuses the
-session machinery to the letter: it is a normal session, just hidden from the
-fleet and driven by the engine instead of a human.
+- **Python (first-class).** A program file against the `weaver-py` module, run by
+  the engine as an env-stripped subprocess (the lint-review pattern), or by you
+  standalone while iterating. This is where custom triggers, mechanical rules, and
+  bespoke judgement live. Most fleet checks are pure rules — `idle > 30m and PR
+  red → mark attention` — that need no model and cost nothing.
+- **Declarative (sugar).** The no-code case — cron + scope + prompt +
+  capabilities — is a small config that a **built-in stock program** consumes.
+  It is not a separate engine; it is the default program, parameterised. So the
+  headline example needs zero Python, yet runs on the exact same substrate,
+  audit trail, and capability gate as a custom one.
 
-### Headless (for cheap, stateless judgement)
+```python
+import weaver
 
-A one-shot `claude -p` per round, exactly as
-[`scripts/lint-review.py`](../lint.md) already spawns a headless reviewer:
-environment stripped of `CLAUDE_CODE_*` so it neither nests in a transcript nor
-bills the metered API, prompt on stdin, a timeout (lint-review uses 600 s),
-output parsed. No idle tmux between rounds; no memory across rounds (the context
-package carries everything). Right for "summarise the fleet each morning"-style
-checks that don't need continuity.
+@weaver.on_cron("0 * * * *")               # the trigger — a cron event source
+def hourly_status(ov):
+    for s in ov.sessions(attention="!ok"): # the scope, queried over the fleet
+        if s.idle_minutes() > 30 and s.pr_checks() == "failing":
+            s.mark("attention", "idle 30m with red CI")        # a pure rule
+        else:
+            verdict = ov.run_agent(           # …or a fresh agent for judgement
+                f"Is this session stuck? Screen:\n{s.preview(200)}")
+            s.mark(verdict.level, verdict.note)
+            if verdict.level != "ok" and ov.can("nudge"):
+                s.nudge(verdict.suggestion)
+```
 
-### Script (for mechanical rules and custom triggers)
+`@weaver.on_cron(...)` / `@weaver.on_event(...)` declare the trigger the engine
+registers; the body is the round. The binding enforces capabilities — a program
+without `nudge` can't call `s.nudge` — and the per-round budget kills a runaway.
 
-The round runs a **Python file** (see [The Python
-surface](#the-python-surface-pyo3)). The script decides everything — whether to
-call an LLM at all. Most fleet checks are pure rules ("idle > 30 min and PR
-checks failing → mark attention") that need no model and cost nothing. The
-script is also where genuinely custom trigger logic lives.
+## Authoring & iteration (agent-friendly)
 
-> **Recommendation:** ship **headless** first (it reuses the proven
-> lint-review subprocess pattern and needs no idle-session lifecycle), make
-> **warm** the default for judgement overlookers once the panel can show their
-> terminal, and add **script** with the Python surface last.
+Overlookers are meant to be **drafted and refined by an agent on your behalf** —
+"write me one that nudges sessions stuck on the same test." That requires the
+authoring surface to be plain files plus a CLI an agent can drive, not a
+click-only UI. Three things make it work:
+
+- **Programs are files.** A Python overlooker lives in the repo (e.g.
+  `.weaver/overlookers/<name>.py`) or a global dir — diffable, reviewable,
+  version-controlled, editable by any agent like any other code. `loom overlooker
+  new <name>` scaffolds a starter (as `weaver plan new` scaffolds a plan).
+- **The API is the CLI is the binding.** Because `loom session
+  {preview,send,break,poll}` and the `weaver-py` module are *both* thin wrappers
+  over `weaver-api`, an agent explores the live fleet with the exact vocabulary
+  its program will call — `loom session preview <id>`, `weaver triage …` — and
+  there is one API to learn, not three. The CLI *is* the API mirror.
+- **`--dry-run` is the iteration primitive.** `loom overlooker run <name>
+  --dry-run` executes the program against the live fleet but **stubs every
+  mutating action** (mark/nudge/interrupt/launch are logged as "would do X", not
+  performed) and prints the plan. Safe to run on repeat. The loop is: agent
+  scaffolds → explores via the CLI → writes logic → `--dry-run`s → reads the
+  would-do output → refines → registers + enables with chosen capabilities. The
+  `pip`-installable `weaver-py` lets the agent also run the program standalone
+  for a tighter loop before it ever touches the engine.
 
 ## Capabilities & safety
 
-An agent that can act on *other people's* sessions is a loaded gun; the
+An agent that acts on *other people's* sessions is a loaded gun; the
 stuck-agent-watcher literature is unanimous that bounded, auditable autonomy is
 the whole game. Each overlooker declares a capability set, least-privilege by
-default — the **intervention ladder**, rung by rung:
+default — the **intervention ladder**, rung by rung — enforced **at the binding**
+so neither a Python program nor the stock program can exceed it:
 
 | Capability | What it allows | Default |
 |---|---|---|
 | `observe` | all read APIs (preview, diff, log, PR status) | always on |
 | `mark` | write the `triage` axis on a session | on |
-| `escalate` | raise the *overlooker's own* attention / push a notification to the human | on |
+| `escalate` | raise the *overlooker's own* attention / notify the human | on |
 | `nudge` | `loom session send` a message into a watched session | **opt-in** |
 | `interrupt` | `loom session break` a watched session | **opt-in** |
 | `launch` | spawn new sessions | **opt-in**, highest privilege |
 
-Plus global guardrails, none of them optional:
+Plus global guardrails, none optional:
 
 - **Budget per round** — a wall-clock timeout (the lint-review 600 s precedent)
-  and, for LLM modes, a token ceiling. A runaway round is killed, the run
-  recorded `error`, the next trigger still fires.
-- **Cooldown + no overlap** — a minimum gap between rounds and a hard rule that
-  an overlooker never runs two rounds concurrently (a round still in flight when
-  its trigger re-fires is skipped, recorded `skipped`).
-- **No recursion** — an overlooker's scope can never include overlooker
-  sessions, and an overlooker cannot act on another overlooker. Watchers don't
-  watch watchers.
-- **Everything is an event** — every mark, nudge, interrupt, and launch is
-  recorded as an `events` row and shown in the round's history. Nothing the
-  overlooker does is invisible or unattributable.
+  and a token ceiling for LLM calls. A runaway round is killed, recorded `error`;
+  the next trigger still fires.
+- **Cooldown + no overlap** — a minimum gap between rounds, and an overlooker
+  never runs two rounds at once (a re-fire while one is in flight is `skipped`).
+- **No recursion** — an overlooker's scope can never include overlooker sessions,
+  and it cannot act on another overlooker. Watchers don't watch watchers.
+- **Everything is an event** — every mark, nudge, interrupt, launch, and every
+  `cron` tick is an `events` row, shown in the round history. Nothing is invisible
+  or unattributable.
 - **Kill switches** — a per-overlooker `enabled` toggle and a global
-  `overlooker.enabled` setting; flipping either stops it cold, no redeploy.
+  `overlooker.enabled` setting stop it cold, no redeploy.
 
-The conservative default — observe, mark, escalate, but do not touch — means the
-worst a misfiring overlooker can do out of the box is paint a wrong badge and
-ping you. Touching a session is a deliberate opt-in per watcher.
-
-## The trigger engine
-
-A background task, `overlooker::run(state)`, spawned in `server::serve`
-alongside `monitor::run` and `github::poll` — the established shape for loom's
-background loops. It is a single loop that:
-
-1. **Cron** — keeps each cron overlooker's next-fire time (parsed with the
-   `croner` crate, the de-facto Rust cron parser; `tokio-cron-scheduler` builds
-   on it). When `now ≥ next_fire`, it fires and recomputes.
-2. **Event** — consumes `events::since(watermark)` exactly as the monitor does,
-   matching new rows against each event-overlooker's filter. A match, past
-   cooldown and debounce, fires a round.
-3. **Dispatch** — firing creates an `overlooker_runs` row, composes the context
-   package over the scope, runs the round in the configured mode, captures the
-   summary and actions, and records the events.
-
-It is a **separate** task from the monitor, not folded in: the monitor's job is
-mechanical liveness, and keeping the overlooker's heavier, LLM-spawning,
-fail-prone work out of that tight 1.5 s loop keeps both legible. Like the GitHub
-poller it self-gates — if `overlooker.enabled` is off or no overlookers are
-defined, it idles cheaply.
-
-## The Python surface (PyO3)
-
-"Cron triggers & workflows might be indicated via a Python script which we PyO3
-bind the Loom & Weaver API into." This is the **scripted** authoring surface,
-and the binding direction matters.
-
-Ship a **`weaver` Python package built with maturin/PyO3** — a native module
-that wraps loom's existing REST `client.rs` (and weaver-core's DB-direct reads).
-Python *imports Rust*; it does **not** embed Python inside loom. That choice is
-deliberate:
-
-- It mirrors the pattern already in the tree: `lint-review.py` runs as a
-  **subprocess**, env-stripped, with a timeout. The overlooker engine runs a
-  scripted round the same way. No GIL in the server, no interpreter-embedding
-  packaging pain (the PyO3 guide's "embed Python in Rust" path is the hard one).
-- A maturin module is `pip install`-able, so the same script a user iterates on
-  standalone is what the engine runs — it just talks to loom over the REST API
-  either way.
-
-A scripted overlooker looks like:
-
-```python
-import weaver
-
-@weaver.on_cron("0 * * * *")           # the trigger, declared in code
-def hourly_status(round):
-    for s in weaver.sessions(attention="!ok"):   # the scope, queried
-        screen = s.preview(lines=200)
-        if looks_stuck(screen):                  # a pure rule — no LLM
-            s.mark("attention", "stuck: same test failing 5×")
-            s.nudge("You've retried this test unchanged 5×. Step back and re-read the error.")
-        else:
-            s.mark("ok", "progressing")
-```
-
-`@weaver.on_cron(...)` / `@weaver.on_event(...)` declare the trigger; the engine
-reads them at registration and schedules accordingly. The `weaver.sessions(...)`
-query is the scope; `s.preview/diff/log` are observe; `s.mark/nudge/break` are
-the capability-gated actions (the binding enforces the overlooker's capability
-set — a script with only `mark` can't call `nudge`). The script may call an LLM
-itself (`claude -p`, the Anthropic SDK) for judgement, or stay pure-rules and
-cost nothing.
-
-This unifies the rules-engine and supervisor-agent views: the Python file *is*
-the glue, free to be a one-line rule or a full agent harness, on the same
-trigger/scheduling/capability backbone as the declarative overlooker.
-
-> The Python surface is the **last** phase. The declarative overlooker delivers
-> the headline example with zero Python; the PyO3 module is the power-user
-> escape hatch, not the price of entry.
+`--dry-run` runs with every mutating capability stubbed, so iterating is always
+safe; granting real capabilities is a deliberate step at register time.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    cron["cron tick (croner)"] --> engine
-    ev["session events<br/>(events table)"] --> engine
-    manual["Run now / loom overlooker run"] --> engine
+    timer["Timer (croner)"] -->|writes cron tick| events
+    hooks["Session hooks /<br/>attention / PR / staleness"] --> events
+    manual["loom overlooker run"] -->|manual tick| events
 
-    engine["Overlooker engine<br/>background loop, sibling of monitor + github::poll<br/>budget · cooldown · no-overlap · no-recursion"]
-    engine -->|fires a round| round["Round"]
+    events["events stream<br/>(one vocabulary, +system scope)"]
+    events -->|events::since watermark| dispatch["Dispatcher<br/>match event → overlooker trigger"]
+    dispatch -->|fires| round["Round (level-triggered:<br/>observe scope → reconcile)"]
 
-    round -->|warm: nudge| warm["Warm session<br/>tmux + agent::launch + hooks"]
-    round -->|headless| headless["claude -p one-shot<br/>env-stripped subprocess"]
-    round -->|script| py["Python script<br/>PyO3-bound weaver module"]
+    round --> prog["Program + bound API<br/>(weaver-api)"]
+    prog -->|builtin| stock["Stock program<br/>(declarative sugar)"]
+    prog -->|custom| pyprog["Python program<br/>(weaver-py / PyO3)"]
 
-    warm --> act
-    headless --> act
-    py --> act
-    act["observe · mark · nudge · break · escalate<br/>(capability-gated)"]
+    stock --> api
+    pyprog --> api
+    api["capability-gated API:<br/>sessions · preview · mark · nudge · run_agent · warm_session"]
 
-    act -->|observe| fleet["Fleet sessions<br/>(preview / diff / log / PR)"]
-    act -->|mark| triage["triage axis on branch<br/>(level · note · by · at)"]
-    act -->|nudge / break| fleet
-    round --> runs["overlooker_runs<br/>(audit trail)"]
-
-    triage --> panel["Overlooker panel<br/>+ mark badges on the fleet"]
+    api -->|observe / nudge / break| fleet["Fleet sessions<br/>(daemon = sole tmux owner)"]
+    api -->|mark| triage["triage axis on branch"]
+    round --> runs["overlooker_runs (audit)"]
+    triage --> panel["Overlooker panel + fleet badges"]
     runs --> panel
 ```
 
+The daemon is the only box that touches tmux; the engine reaches the fleet
+through the same `weaver-api` the out-of-process programs use.
+
 ## Data, CLI, and API sketch
 
-**Storage — two new tables plus the `triage` axis.**
+**Storage — two new tables, the `triage` axis, one events accommodation.**
 
-- `overlookers` — `id`, `name`, `enabled`, `trigger_kind` (`cron|event|manual`),
-  `trigger_spec` (the cron expression or the event filter, JSON), `scope`
-  (the fleet query, JSON), `mode` (`warm|headless|script`), `instructions`
-  (prompt or script path), `model`, `effort`, `capabilities` (JSON set),
-  `cooldown_secs`, `last_run_at`, `next_run_at`, `session_id` (the warm
-  session, when `mode = warm`), `created_at`, `updated_at`.
+- `overlookers` — `id`, `name`, `enabled`, `trigger` (JSON: the event-match —
+  `{cron:"0 * * * *"}` / `{every:"30m"}` / `{event:"attention", level:"blocked"}`),
+  `scope` (JSON fleet query), `program` (`builtin:status` or a file path),
+  `params` (JSON for a stock program / the prompt), `capabilities` (JSON set),
+  `model`, `effort`, `cooldown_secs`, `last_run_at`, `next_run_at`,
+  `warm_session_id` (nullable), `created_at`, `updated_at`.
 - `overlooker_runs` — `id`, `overlooker_id`, `trigger_reason`, `started_at`,
   `finished_at`, `outcome` (`ok|noop|skipped|error`), `summary`, `actions`
-  (JSON: the marks/nudges it made), `created_at`. The audit trail and the
-  panel's history list.
-- **`triage` axis** — denormalised `triage_level`, `triage_note`, `triage_by`,
-  `triage_at` on `branches`, plus a `triage` event kind. Mirrors `attention`;
-  reuse the monitor's re-broadcast path.
+  (JSON), `created_at`. The audit trail + the panel's history.
+- **`triage` axis** on `branches` (`triage_level/note/by/at`) + a `triage` event
+  kind. Mirrors `attention`.
+- **events accommodation** — a system scope so `cron` ticks (branchless) live in
+  the one stream.
 
-**CLI (`weaver`, DB-direct — the agent/script side):**
+**CLI — `weaver` (DB-direct, the agent/program side):**
 
-- `weaver triage <session> <level> "<note>"` — write the mark. The one new
-  agent-facing verb; the binding and the warm/headless agent both call it.
+- `weaver triage <session> <level> "<note>"` — write the mark, daemon-less, like
+  `set-status`. The binding and any agent both call it.
 
-**CLI (`loom`, the operator side) — a new `loom overlooker` group:**
+**CLI — `loom overlooker` (the operator + authoring side):**
 
-- `loom overlooker ls` — list overlookers with last/next run and enabled state.
-- `loom overlooker add … ` / `rm <id>` / `enable|disable <id>`.
-- `loom overlooker run <id>` — fire a round now (manual trigger).
-- `loom overlooker runs <id>` — round history.
-- `loom overlooker logs <id>` / reuse `loom attach` for a warm overlooker's
-  pane.
+- `loom overlooker new <name>` — scaffold a program file.
+- `loom overlooker add|rm|enable|disable <name>` — register / manage.
+- `loom overlooker run <name> [--dry-run]` — fire now / simulate.
+- `loom overlooker ls | runs <name> | logs <name>`; `loom attach` a warm one.
 
-**API (`loom`, `web.rs` — API-first, the SPA and CLI both consume it):**
+**API — `loom` (`web.rs`, DTOs now in `weaver-api`):**
 
 - `GET POST /api/overlookers`, `GET PATCH DELETE /api/overlookers/{id}`.
-- `POST /api/overlookers/{id}/run` — manual round.
-- `GET /api/overlookers/{id}/runs` — history.
-- `POST /api/sessions/{id}/triage` — write the mark (backs `weaver triage` and
-  the binding); `SessionView` / `BranchView` grow the `triage` fields.
+- `POST /api/overlookers/{id}/run` (`{dry_run}`); `GET /api/overlookers/{id}/runs`.
+- `POST /api/sessions/{id}/triage`; `SessionView`/`BranchView` grow `triage`.
 
 **Settings (`config::registry()`):** `overlooker.enabled` (Bool, default
-`false` — opt-in subsystem), `overlooker.default_timeout_secs`,
-`overlooker.default_cooldown_secs`, all under an **Overlooker** group, exactly
-like the GitHub group.
+`false`), `overlooker.default_timeout_secs`, `overlooker.default_cooldown_secs`,
+under an **Overlooker** group.
 
 ## The panel (loom UI)
 
 A new top-level **Overlooker** view, sibling to the session list and Settings —
-the "separate panel & system" the problem asks for. Built API-first, a thin REST
-client like the rest of the SPA ([[ui-built-on-rest-api]]):
+the "separate panel & system" the problem asks for, API-first
+([[ui-built-on-rest-api]]):
 
-- **List** — each overlooker: name, trigger (next fire / last run), mode,
-  enabled toggle, last outcome. A **Run now** button per row.
-- **Detail** — the config editor (trigger, scope, capabilities, instructions);
-  the **round history** (`overlooker_runs`, each with its summary and the marks
-  it made); and, for a warm overlooker, its **live terminal** via the existing
-  `AgentTerminal` component — you can watch it work or take it over.
-- **On the fleet** — every session in the main list grows the **mark badge**
-  beside its attention badge, with the `triage_note` on hover and a stale
-  indicator when the session has moved since it was marked. This is where the
-  overlooker's judgement actually lands in front of you.
+- **List** — each overlooker: trigger (next fire / last run), enabled toggle,
+  last outcome, a **Run now** (and **Dry-run**) button.
+- **Detail** — the program (the file, or the declarative config editor), the
+  **round history** (`overlooker_runs` with summaries and the marks made), and,
+  for an overlooker that keeps a warm session, its **live terminal** via the
+  existing `AgentTerminal` component.
+- **On the fleet** — every session grows the **mark badge** beside its attention
+  badge, `triage_note` on hover, a stale indicator when the session has moved on.
 
 ## Worked example: the hourly status overlooker
 
-The motivating case, end to end, in the **declarative** form (no Python):
+The motivating case, end to end. The **zero-code** form is a stock program:
 
 ```
 loom overlooker add status-check \
-  --cron "0 * * * *" \
-  --scope "attention != ok" \
-  --mode warm --model sonnet \
+  --cron "0 * * * *" --scope "attention != ok" \
   --capabilities observe,mark,escalate,nudge \
-  --instructions "For each session, read its recent screen and diff. If it's \
-    making progress, mark it ok. If it looks stuck (same action repeating, an \
-    unhandled error, no movement), mark it attention with a one-line reason and \
-    nudge it with a concrete next step. If it needs a human decision, mark it \
+  --program builtin:status \
+  --prompt "If a session is progressing, mark it ok. If it looks stuck (same \
+    action repeating, an unhandled error, no movement), mark it attention with a \
+    one-line reason and nudge a concrete next step. If it needs a human, mark it \
     blocked and escalate."
 ```
 
-At the top of each hour the engine wakes the warm `status-check` session,
-sends it the round's context package (the non-idle sessions and what changed
-since last hour), and the agent walks them: `loom session preview` to see each
-screen, `weaver triage` to mark, `loom session send` to nudge the stuck one,
-and — if three need you — raises its own attention so the dashboard flags
-*the overlooker* with "3 sessions need you." A `blocked` event from any session
-in scope wakes the round early instead of waiting for the hour. You open the
-Overlooker panel, read the round summary, and see the marks on your fleet.
+Each hour the timer writes a `cron` tick; the dispatcher matches it to
+`status-check` and fires a round. The stock program surveys the non-idle
+sessions (`weaver-api` reads), uses a fresh `run_agent` per session for the
+judgement, marks each, nudges the stuck one, and — if three need you — escalates
+(raising the overlooker's own attention to "3 sessions need you"). A `blocked`
+event from any in-scope session writes to the same stream and wakes the round
+early. The equivalent **custom** form is the Python program shown
+[above](#execution-one-program-one-api) — same triggers, same API, same audit.
+
+The agent-authored path: you ask a session "make me an overlooker that watches
+for sessions stuck retrying a test"; it runs `loom overlooker new test-watch`,
+explores with `loom session preview`, writes the rule, `loom overlooker run
+test-watch --dry-run` until the would-do output looks right, then registers it
+with `nudge` enabled.
 
 ## Tasks
 
-Each task has a stable id (`T1`, `T2`, …). `exec: session` tasks materialise
-into weaver issues on `weaver plan sync overlooker`; status is projected from the
-issue ledger, never hand-edited here. The dependency edges (`deps:`) form the
-delivery order — each task is independently shippable once its deps land.
+Each task has a stable id (`T1`, `T2`, …). `exec: session` tasks materialise into
+weaver issues on `weaver plan sync overlooker`; status is projected from the
+ledger, never hand-edited here. The `deps:` edges — not the id order — define the
+delivery sequence; the [Rollout](#rollout) section groups them into phases.
 
 ### T1 — The mark axis (triage)  `exec: session`  `value: high`  `deps: —`
 
-The third status axis, in isolation. Add `triage_level` / `triage_note` /
-`triage_by` / `triage_at` to `branches`, a `triage` event kind the monitor
-re-broadcasts (mirror the `attention` path), the agent-facing `weaver triage
-<session> <level> "<note>"` CLI, the `POST /api/sessions/{id}/triage` route, the
-`triage` fields on `SessionView` / `BranchView`, and the **mark badge** beside
-the attention badge on the fleet — with the stale indicator when the session has
-moved past `triage_at`. Acceptance: a human (or a script) can mark a session and
-see the badge, with the agent's own `attention` untouched.
+The third status axis, in isolation. `triage_level/note/by/at` on `branches`, a
+`triage` event the monitor re-broadcasts (mirror the `attention` path), the
+daemon-less `weaver triage <session> <level> "<note>"` CLI, `POST
+/api/sessions/{id}/triage`, the `triage` fields on `SessionView`/`BranchView`,
+and the **mark badge** (with the stale indicator) on the fleet. Acceptance: a
+human or script can mark a session and see the badge, the agent's own `attention`
+untouched.
 
-### T2 — Headless round + manual trigger  `exec: session`  `value: high`  `deps: T1`
+### T2 — weaver-api crate: shared client and DTOs  `exec: session`  `value: high`  `deps: —`
 
-The `overlookers` table and a single overlooker fired only by `loom overlooker
-run <id>` — no scheduler yet. The round composes a context package over a scope
-query and runs a `headless` round (the env-stripped `claude -p` subprocess
-pattern from [`scripts/lint-review.py`](../lint.md), with a timeout), whose marks
-land via T1. Acceptance: `loom overlooker run` produces marks on the scoped
-fleet end to end.
+Lift `client.rs` and the `web.rs` request/response DTOs into a new `weaver-api`
+crate; the loom server depends on it for the types, the `loom` CLI uses its
+client, and `frontend/types.ts` mirrors one source. The structural extraction
+that makes the runtime reusable out-of-process without a second tmux owner.
+Acceptance: loom + the CLI build on `weaver-api` with no behaviour change; DTOs
+have one definition.
 
-### T3 — Trigger engine: cron + guardrails  `exec: session`  `value: high`  `deps: T2`
+### T3 — PyO3 weaver-py module (maturin) over weaver-api  `exec: session`  `value: high`  `deps: T2`
 
-The `overlooker::run` background task (sibling of `monitor::run` /
-`github::poll`, self-gating on `overlooker.enabled`), cron firing via `croner`
-with next-fire bookkeeping, and the non-optional guardrails: per-round wall-clock
-timeout + token budget, cooldown, no-overlap (a still-running round skips its
-re-fire), and the no-recursion rule (an overlooker never scopes or acts on
-overlooker sessions). The `overlooker.*` settings in `config::registry()`.
-Acceptance: the hourly status overlooker runs unattended within its budget.
+The `weaver-py` crate: a Pythonic wrapper exposing `sessions/preview/diff/mark/
+nudge/interrupt/run_agent/warm_session` over `weaver-api`, `pip`-installable via
+maturin. Capability enforcement lives here. Acceptance: a standalone Python
+script can query the fleet and (capabilities permitting) mark/nudge a session via
+a running loom.
 
-### T4 — Event triggers  `exec: session`  `value: med`  `deps: T3`
+### T4 — Unified trigger events: cron kind + system scope + dispatcher  `exec: session`  `value: high`  `deps: T1`
 
-Level-triggered event firing: consume `events::since(watermark)` like the
-monitor, match new rows against an overlooker's event filter (e.g.
-attention→`blocked`, staleness), debounce, and wake a round *early* — the event
-is a nudge to re-survey the whole scope, never a payload the round reacts to once.
-Acceptance: a `blocked` event wakes a round before the next cron tick, and
-re-firing is idempotent.
+Generalise `events` with a **system scope** (branchless rows); add the `cron`
+event kind. The overlooker engine as an event **consumer** on its own watermark
+(the monitor's pattern), matching new events to overlooker triggers; `loom
+overlooker run` injects a `manual` tick. No timer yet. Acceptance: inserting a
+matching event fires the right overlooker exactly once; re-firing is idempotent.
 
-### T5 — Round history + audit  `exec: session`  `value: med`  `deps: T2`
+### T5 — Round execution: the program substrate + guardrails  `exec: session`  `value: high`  `deps: T3, T4`
 
-The `overlooker_runs` table: every round's trigger reason, outcome
-(`ok|noop|skipped|error`), summary, and the actions it took — each action also
-an `events` row. The audit trail the safety story and the panel depend on.
-Acceptance: every round and every action it took is reconstructable after the
-fact.
+A round runs a **program** with the bound API + a composed context package:
+the in-process stock executor (declarative) and the Python-subprocess executor
+(custom) on one path, plus `warm_session()`/`run_agent()` helpers and the
+non-optional guardrails — per-round timeout + token budget, cooldown, no-overlap,
+no-recursion. `overlooker.*` settings. Acceptance: a manual round runs a program
+end to end and lands marks, within budget.
 
-### T6 — The Overlooker panel (UI)  `exec: session`  `value: high`  `deps: T3, T5`
+### T6 — Cron as an event source  `exec: session`  `value: high`  `deps: T4`
 
-A new top-level **Overlooker** view, API-first and a thin REST client
-([[ui-built-on-rest-api]]): the list (trigger, next/last run, enabled toggle,
-Run now), the detail (config editor for trigger/scope/capabilities/instructions,
-plus the round history from T5), the `loom overlooker` CLI group, and the
-`/api/overlookers*` routes. Surfaces the T1 mark badge on the main fleet list.
-Acceptance: an overlooker can be created, edited, enabled, and run from the UI,
-with its history visible.
+The timer half of the engine: keep each scheduled overlooker's next-fire
+(`croner`), emit `cron` ticks into the stream; `--every <dur>` sugar over raw
+crontab; self-gate on `overlooker.enabled`, sibling of `monitor::run` /
+`github::poll`. Acceptance: a scheduled overlooker fires unattended on its
+cadence, the tick visible in the event log.
 
-### T7 — Warm mode  `exec: session`  `value: med`  `deps: T3, T6`
+### T7 — Reactive event sources  `exec: session`  `value: med`  `deps: T4`
 
-Long-lived nudged overlooker sessions: launch once via `agent::launch`, keep the
-tmux warm, and nudge each round through the existing `send` primitive with the
-round's context package — accumulating judgement across rounds. The live
-terminal in the panel via the `AgentTerminal` component, and the warm session's
-orphan/adopt lifecycle. Acceptance: a warm overlooker remembers a prior round's
-mark and refines it, and is attachable from the panel.
+Wire the session-change signals the dispatcher matches on — `attention=blocked`
+and friends are already in the stream; add the synthetic ones (no-activity
+staleness, PR-checks-red) as events. Acceptance: a session going `blocked` or
+stale wakes a matching overlooker before its next cron tick.
 
-### T8 — The Python surface (PyO3)  `exec: session`  `value: low`  `deps: T3, T5`
+### T8 — Authoring & iteration loop  `exec: session`  `value: high`  `deps: T5`
 
-The maturin/PyO3 `weaver` module wrapping the REST `client.rs`, and `script`-mode
-overlookers run as env-stripped subprocesses on the engine. `@weaver.on_cron` /
-`@weaver.on_event` decorators declare the trigger; `weaver.sessions(...)` is the
-scope; `s.mark` / `s.nudge` / `s.break_` are capability-gated by the binding (a
-script without `nudge` cannot call it). Acceptance: a pure-rules Python
-overlooker and an LLM-calling one both run on the engine with capabilities
-enforced.
+`loom overlooker new` scaffold; the `--dry-run` simulator (mutating actions
+stubbed and logged); `runs`/`logs`; and the convention that programs are
+version-controlled files. Confirms the CLI/binding/`weaver-api` share one
+vocabulary so an agent can draft → dry-run → refine. Acceptance: an agent, given
+only the CLI, scaffolds an overlooker, dry-runs it against the live fleet, and
+registers it.
+
+### T9 — Round history + audit  `exec: session`  `value: med`  `deps: T5`
+
+The `overlooker_runs` table and the rule that every action (and every `cron`
+tick) is also an `events` row. The audit trail the safety story and the panel
+depend on. Acceptance: every round and the actions it took are reconstructable
+after the fact.
+
+### T10 — The Overlooker panel (UI)  `exec: session`  `value: med`  `deps: T8, T9`
+
+The top-level Overlooker view (API-first): list, detail (program + round
+history + warm terminal via `AgentTerminal`), the `loom overlooker` surfaces, and
+the mark badges on the main fleet. Acceptance: an overlooker can be created,
+dry-run, enabled, and inspected from the UI.
+
+### T11 — Declarative stock programs  `exec: session`  `value: med`  `deps: T5`
+
+The no-code path: `builtin:status` and any sibling stock programs, parameterised
+by `scope` + `prompt` + `capabilities`, running on T5's in-process executor — so
+the headline example needs no Python. Acceptance: `--program builtin:status`
+reproduces the worked example without a script file.
+
+### T12 — Warm-session lifecycle  `exec: session`  `value: low`  `deps: T5`
+
+Harden engine-managed warm sessions: hidden from the fleet, orphan/adopt across a
+loom restart, and an auto-adopt policy independent of `server.auto_adopt`.
+Acceptance: a warm overlooker survives a daemon restart and resumes its
+across-round memory.
+
+## Rollout
+
+The `deps` graph collapses into five phases, each independently shippable:
+
+- **Phase 0 — Foundations (parallel).** T1 (mark axis) and T2 (`weaver-api`).
+  Independent; both unblock everything downstream. T1 is demonstrable alone — a
+  badge you can set by hand.
+- **Phase 1 — Binding & spine.** T3 (PyO3 over `weaver-api`) and T4 (unified
+  events + dispatcher). After this a Python script can drive the fleet and an
+  injected event can fire an overlooker.
+- **Phase 2 — Rounds run.** T5 (program substrate + guardrails) and T6 (cron
+  source). **First end-to-end milestone:** the hourly example runs unattended on
+  a schedule.
+- **Phase 3 — Usable & safe.** T8 (authoring + `--dry-run` — so agents can help
+  write them), T9 (audit), T7 (reactive triggers).
+- **Phase 4 — Surfaces & polish.** T10 (panel), T11 (declarative stock programs),
+  T12 (warm-session lifecycle).
 
 ## Non-goals
 
-- **Not a second agent runtime.** Overlookers run on the existing
-  `agent::launch` + tmux + hooks + `loom session` primitives. We add a scheduler
-  and a panel, not a parallel way to run agents.
-- **Not edge-triggered automation.** No "on event X, do Y once." Triggers are
-  nudges to re-survey; rounds reconcile current state. (The K8s lesson; the
-  anti-pattern is the nag loop.)
+- **Not a second runtime.** The daemon stays the sole owner of tmux/worktrees;
+  the engine and every out-of-process consumer reach the fleet through
+  `weaver-api`. We add a seam and a scheduler, not a parallel session runtime.
+- **Not a cron/event fork.** There is one event vocabulary. Cron is an event
+  source feeding the same dispatcher session changes feed; no second mechanism.
+- **Not edge-triggered automation.** No "on event X, do Y once." Events are
+  nudges to re-survey; rounds reconcile current state (the anti-pattern is the
+  nag loop).
 - **Not autonomous remediation by default.** Out of the box an overlooker
-  observes, marks, and escalates. Touching sessions (nudge/interrupt/launch) is
-  a deliberate per-watcher opt-in, never the default.
-- **Not the agent's self-report.** The mark is the overlooker's opinion; it
-  never overwrites `attention`. Two actors, two axes.
-- **Not embedded Python.** The PyO3 binding is a `pip`-installable module Python
-  imports and the engine runs as a subprocess — not an interpreter embedded in
-  the loom server.
+  observes, marks, and escalates. Touching sessions is a per-watcher opt-in.
+- **Not the agent's self-report.** The mark is the overlooker's opinion; it never
+  overwrites `attention`. Two actors, two axes.
+- **Not embedded Python.** `weaver-py` is a `pip`-installable module Python
+  imports and the engine runs as a subprocess — not an interpreter inside loom.
 
 ## Open questions
 
-- **Warm-session lifecycle.** A warm overlooker is an idle tmux session between
-  rounds. Does it survive a loom restart via the existing orphan/adopt path
-  (likely yes — it's a normal session), and should the engine auto-adopt its
-  warm sessions on startup regardless of the global `server.auto_adopt`?
-- **Scope query language.** How rich does the `--scope` filter need to be before
-  it wants the Python surface? Start with a small fixed set (attention, status,
-  repo, staleness) and let `script` mode cover the rest.
-- **Cron vs interval ergonomics.** Expose raw crontab (`croner`), a friendly
-  `--every 1h`, or both? Both is cheap; pick the default for the UI.
+- **`weaver-api` vs the existing split.** Extracting `client.rs` + DTOs is clean;
+  the open call is how much of `web.rs`'s inline types move now vs incrementally,
+  and whether the `weaver` CLI gains any thin client use or stays purely
+  DB-direct.
+- **Where program files live.** Repo-local `.weaver/overlookers/` (travels with
+  the repo, reviewable, but repo-scoped) vs a global dir (fleet-wide, but
+  off to the side of git). Likely both, resolved like `WEAVER.md`.
+- **Stock-program coverage.** How many declarative `builtin:` programs earn their
+  keep (status, idle-nudge, PR-watch) before the rest is "write a Python one"?
 - **Escalation channel.** `escalate` raising the overlooker's own `attention` is
-  free and needs no new surface. A real push notification (the deferred
-  `PushNotification` capability) is a richer follow-up — worth it once the panel
-  exists.
+  free; a real push (the deferred `PushNotification` capability) is a richer
+  follow-up once the panel exists.
 
 ## Sources
 
@@ -601,6 +606,7 @@ Stuck-agent intervention / HITL:
 [stopping AI agent loops](https://markaicode.com/fix-ai-agent-looping-autonomous-coding/),
 [human-in-the-loop agentic systems](https://medium.com/@tahirbalarabe2/human-in-the-loop-agentic-systems-explained-db9805dbaa86).
 Implementation building blocks:
-[PyO3](https://github.com/PyO3/pyo3) and the [calling-Python / embedding guide](https://pyo3.rs/),
+[PyO3](https://github.com/PyO3/pyo3) and the [user guide](https://pyo3.rs/),
+[maturin](https://github.com/PyO3/maturin),
 [croner (Rust cron parser)](https://github.com/Hexagon/croner-rust),
 [tokio-cron-scheduler](https://github.com/mvniekerk/tokio-cron-scheduler).
