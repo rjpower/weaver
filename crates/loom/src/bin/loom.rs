@@ -425,6 +425,21 @@ fn branch_str<'a>(v: &'a Value, key: &str) -> &'a str {
         .unwrap_or("")
 }
 
+/// The agent's resolved attention level from a `SessionView`'s `branch.tags` —
+/// the value of the `attention` tag, or `ok` when it is absent (the calm state).
+fn branch_attention(v: &Value) -> &str {
+    v.get("branch")
+        .and_then(|b| b.get("tags"))
+        .and_then(Value::as_array)
+        .and_then(|tags| {
+            tags.iter()
+                .find(|t| t.get("key").and_then(Value::as_str) == Some("attention"))
+        })
+        .and_then(|t| t.get("value").and_then(Value::as_str))
+        .filter(|v| !v.is_empty())
+        .unwrap_or("ok")
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -749,9 +764,10 @@ async fn fetch_session(client: &Client, key: &str) -> Result<Value> {
         .with_context(|| format!("no live session for '{key}'"))
 }
 
-/// One-line attention summary: the level, plus its current-state message when set.
+/// One-line attention summary: the resolved level (the agent's `attention` tag,
+/// `ok` when absent), plus its current-state message when set.
 fn attention_summary(ws: &Value) -> String {
-    let attention = branch_str(ws, "attention");
+    let attention = branch_attention(ws);
     let message = branch_str(ws, "description");
     if message.is_empty() {
         attention.to_string()
@@ -839,7 +855,7 @@ fn wake_reason(ws: &Value, key: &str, lifecycle_only: bool) -> Option<String> {
             "session {key} is orphaned — its tmux was lost (try `loom adopt {key}`)"
         ));
     }
-    if !lifecycle_only && branch_str(ws, "attention") != "ok" {
+    if !lifecycle_only && branch_attention(ws) != "ok" {
         return Some(format!(
             "session {key} needs you — {}",
             attention_summary(ws)
@@ -912,7 +928,7 @@ async fn cmd_ps() -> Result<()> {
             "{:<10}  {:<9}  {:<10}  {:<22}  {}",
             str_field(&ws, "id"),
             str_field(&ws, "status"),
-            branch_str(&ws, "attention"),
+            branch_attention(&ws),
             truncate(branch_str(&ws, "name"), 22),
             truncate(branch_str(&ws, "title"), 46),
         );
@@ -977,9 +993,10 @@ fn print_session(ws: &Value) {
     );
     println!("  title:    {}", branch_str(ws, "title"));
     println!("  status:   {}", str_field(ws, "status"));
-    // Agent-declared attention level plus its current-state message (the
-    // branch `description`), shown together — one signal.
-    let attention = branch_str(ws, "attention");
+    // Agent-declared attention level (the resolved `attention` tag) plus its
+    // current-state message (the branch `description`), shown together — one
+    // signal.
+    let attention = branch_attention(ws);
     let message = branch_str(ws, "description");
     let attention = if message.is_empty() {
         attention.to_string()
@@ -1530,9 +1547,16 @@ mod tests {
     }
 
     fn view(status: &str, attention: &str, description: &str) -> Value {
+        // `ok` is the calm, tag-less state; any other level is the `attention`
+        // tag's value, mirroring the wire `branch.tags` shape.
+        let tags = if attention == "ok" {
+            json!([])
+        } else {
+            json!([{ "key": "attention", "value": attention }])
+        };
         json!({
             "status": status,
-            "branch": { "attention": attention, "description": description },
+            "branch": { "tags": tags, "description": description },
         })
     }
 

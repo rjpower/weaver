@@ -8,13 +8,22 @@
 
 use serial_test::serial;
 
-use weaver_api::{CreateReq, TriageReq};
+use weaver_api::CreateReq;
 
 use crate::fixtures::TestServer;
 
+/// The value of a typed `BranchView`'s tag by key, or `None` when absent.
+fn tag_value<'a>(branch: &'a weaver_api::BranchView, key: &str) -> Option<&'a str> {
+    branch
+        .tags
+        .iter()
+        .find(|t| t.key == key)
+        .map(|t| t.value.as_str())
+}
+
 /// A typed create → list → get → mark cycle. The view fields deserialize from
 /// the server's JSON, and the triage mark round-trips onto the session's branch
-/// without disturbing the agent's own (default `ok`) attention.
+/// `tags` without disturbing the agent's own (absent ⇒ `ok`) attention.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typed_create_list_get_and_mark() {
@@ -48,27 +57,33 @@ async fn typed_create_list_get_and_mark() {
     // Typed get by id.
     let got = client.get_session(&id).await.unwrap();
     assert_eq!(got.id, id);
-    assert_eq!(got.branch.attention, "ok", "agent attention starts ok");
-    assert_eq!(got.branch.triage_level, "", "unmarked at first");
+    assert!(
+        tag_value(&got.branch, "attention").is_none(),
+        "agent attention starts calm (no tag)"
+    );
+    assert!(
+        tag_value(&got.branch, "triage").is_none(),
+        "unmarked at first"
+    );
 
-    // Typed mark (triage): stamps the overlooker axis, agent attention untouched.
+    // Typed mark (triage): stamps the overlooker axis as the `triage` tag, the
+    // agent's own `attention` tag untouched.
     let marked = client
-        .mark(
-            &id,
-            &TriageReq {
-                level: "attention".to_string(),
-                note: "looks stuck".to_string(),
-                by: Some("typed-test".to_string()),
-            },
-        )
+        .mark(&id, "attention", "looks stuck", Some("typed-test"))
         .await
         .unwrap();
-    assert_eq!(marked.branch.triage_level, "attention");
-    assert_eq!(marked.branch.triage_note, "looks stuck");
-    assert_eq!(marked.branch.triage_by, "typed-test");
-    assert!(marked.branch.triage_at.is_some(), "mark stamps a timestamp");
-    assert_eq!(
-        marked.branch.attention, "ok",
+    let triage = marked
+        .branch
+        .tags
+        .iter()
+        .find(|t| t.key == "triage")
+        .expect("the mark wrote a triage tag");
+    assert_eq!(triage.value, "attention");
+    assert_eq!(triage.note, "looks stuck");
+    assert_eq!(triage.set_by, "typed-test");
+    assert!(!triage.set_at.is_empty(), "mark stamps a timestamp");
+    assert!(
+        tag_value(&marked.branch, "attention").is_none(),
         "the mark never touches the agent's own attention"
     );
 

@@ -5,10 +5,11 @@
 //! * `/api/sessions` — list + create active sessions (each session is one
 //!   tmux + one agent attached to a branch).
 //! * `/api/sessions/{id}` — GET / PATCH / DELETE a single session, plus the
-//!   action subroutes `/archive`, `/adopt`,
-//!   `/log`, `/events`, and `/terminal` (a WebSocket bridged to the session's
-//!   tmux via a PTY — see `crate::terminal`). Interacting with the agent
-//!   (keystrokes, keys, TUIs) happens entirely over `/terminal`.
+//!   action subroutes `/archive`, `/adopt`, `/tags/{key}` (PUT to set a tag,
+//!   DELETE to clear it), `/log`, `/events`, and `/terminal` (a WebSocket
+//!   bridged to the session's tmux via a PTY — see `crate::terminal`).
+//!   Interacting with the agent (keystrokes, keys, TUIs) happens entirely over
+//!   `/terminal`.
 //! * `/api/branches` — list every tracked branch (with or without an active
 //!   session). `/api/branches/{id}` — GET / PATCH (goal / title / description).
 //! * `/api/branches/{id}/issues` — list / POST issues for a branch.
@@ -41,7 +42,10 @@
 //!     "title": "...",
 //!     "goal": "...",
 //!     "description": "...",         // current-state message (weaver set-status)
-//!     "attention": "ok",            // agent-declared: ok|attention|blocked
+//!     "tags": [                     // every (key, value) annotation on the branch
+//!       { "key": "attention", "value": "blocked", "note": "...",
+//!         "set_by": "agent", "set_at": "..." }
+//!     ],
 //!     "repo_root": "/path/to/repo",
 //!     "branch": "weaver/feature-x",
 //!     "base_branch": "main",
@@ -51,6 +55,11 @@
 //!   }
 //! }
 //! ```
+//!
+//! A branch's status axes — the agent's self-reported `attention` and an
+//! overlooker's `triage` — are **tags**: well-known keys under `tags`, set
+//! through `PUT /api/sessions/{id}/tags/{key}` and cleared through `DELETE`.
+//! Absence is the calm state; there is no stored `ok` tag.
 
 use std::convert::Infallible;
 use std::path::{Component, PathBuf};
@@ -81,13 +90,13 @@ use crate::{agent, config, db, events, git, github, overlooker as ov_engine, rep
 use weaver_api::{
     BranchView, CreateIssueReq, CreateOverlookerReq, CreateRepoIssueReq, CreateReq, IssueView,
     OverlookerRunView, OverlookerView, PatchIssueReq, PatchOverlookerReq, PatchSessionReq,
-    PlanTaskView, PlanView, RunOverlookerReq, ScratchUpload, SendReq, SessionView, TriageReq,
+    PlanTaskView, PlanView, RunOverlookerReq, ScratchUpload, SendReq, SessionView, TagReq,
 };
 use weaver_core::branch as branch_mod;
 use weaver_core::branch::Branch;
 use weaver_core::issue::Issue;
 use weaver_core::overlooker::{self as ov, Overlooker};
-use weaver_core::{plan, repo_config};
+use weaver_core::{plan, repo_config, tags};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -167,16 +176,19 @@ type ApiResult<T> = Result<T, AppError>;
 // constructors. The DB access stays here; the wire shape stays there.
 // ---------------------------------------------------------------------------
 
-/// Build a [`BranchView`] for a branch, joining the denormalized open-issue
-/// count and the latest GitHub snapshot from the database.
+/// Build a [`BranchView`] for a branch, joining its tags, the denormalized
+/// open-issue count, and the latest GitHub snapshot from the database.
 async fn branch_view(db: &Db, branch: &Branch) -> ApiResult<BranchView> {
+    // Every tag (the agent's `attention`, an overlooker's `triage`, any free-form
+    // key) the dashboard resolves into a badge or a pill.
+    let tags = tags::list(db, &branch.id).await?;
     // The badge counts the work this branch has claimed, not the whole repo.
     let open = weaver_core::issue::open_count_for_branch(db, &branch.repo_root, &branch.branch)
         .await
         .unwrap_or(0);
     // Best-effort: a missing/erroring snapshot just renders as no GitHub info.
     let github = github::get_status(db, &branch.id).await.ok().flatten();
-    Ok(BranchView::from_parts(branch, open, github))
+    Ok(BranchView::from_parts(branch, &tags, open, github))
 }
 
 /// Build a [`SessionView`] for a session + its branch. `tracking_issue` is left
@@ -272,7 +284,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/send", post(send_session))
         .route("/sessions/{id}/interrupt", post(interrupt_session))
         .route("/sessions/{id}/preview", get(preview_session))
-        .route("/sessions/{id}/triage", post(triage_session))
+        .route(
+            "/sessions/{id}/tags/{key}",
+            axum::routing::put(set_session_tag).delete(clear_session_tag),
+        )
         // Branches & issues
         .route("/branches", get(list_branches))
         .route("/branches/{id}", get(get_branch).patch(patch_branch))
@@ -799,64 +814,51 @@ async fn create_tracking_issue(
     Ok(Some(issue.id))
 }
 
-/// Apply an attention-level patch to a branch: validate it, update the branch,
-/// and broadcast an `attention` event. No-op when no level is supplied. The
-/// accompanying message lives in `description` and is patched separately.
-async fn apply_attention_patch(
-    st: &AppState,
-    branch: &Branch,
-    level: Option<&str>,
-) -> ApiResult<()> {
-    let Some(level) = level else {
-        return Ok(());
-    };
-    let level = level.trim().to_ascii_lowercase();
-    if !branch_mod::is_valid_attention(&level) {
-        return Err(AppError::bad_request(format!(
-            "invalid attention '{level}' — expected one of {}",
-            branch_mod::ATTENTION_LEVELS.join(", ")
-        )));
-    }
-    branch_mod::set_attention(&st.db, &branch.id, &level).await?;
-    events::record(
-        &st.db,
-        &st.bus,
-        &branch.id,
-        "attention",
-        json!({ "level": level, "source": "manual" }),
-    )
-    .await
-    .ok();
-    Ok(())
-}
-
-/// Write the triage axis on a session's branch: validate the level, update the
-/// branch, and broadcast a `triage` event. This is the overlooker's (and a hand
-/// operator's) channel; it never touches the agent's own `attention`.
-async fn triage_session(
+/// Set (upsert) a tag on a session's branch: validate `value` against the key's
+/// ladder, write the tag, and broadcast a `tag` event. The well-known keys are
+/// `attention` (the agent's self-report) and `triage` (an overlooker's, or a
+/// hand operator's, assessment); any other key is a free-form quiet pill. To
+/// return a loud key to calm, `DELETE` the tag rather than setting an `ok` value.
+async fn set_session_tag(
     State(st): State<AppState>,
-    Path(key): Path<String>,
-    Json(req): Json<TriageReq>,
+    Path((key, tag_key)): Path<(String, String)>,
+    Json(req): Json<TagReq>,
 ) -> ApiResult<Json<SessionView>> {
     let (session, branch) = require_session(&st.db, &key).await?;
-    let level = req.level.trim().to_ascii_lowercase();
-    if !level.is_empty() && !branch_mod::is_valid_triage(&level) {
-        return Err(AppError::bad_request(format!(
-            "invalid triage '{level}' — expected one of {}",
-            branch_mod::TRIAGE_LEVELS.join(", ")
-        )));
+    let value = req.value.trim();
+    if !tags::is_valid_value(&tag_key, value) {
+        return Err(AppError::bad_request(if tags::is_loud(&tag_key) {
+            format!(
+                "invalid value '{value}' for '{tag_key}' — expected one of {} (clear the tag to return to calm)",
+                tags::ATTENTION_VALUES.join(", ")
+            )
+        } else {
+            format!("invalid value '{value}' for '{tag_key}' — must be non-empty")
+        }));
     }
     let by = req.by.as_deref().unwrap_or("manual").trim().to_string();
-    branch_mod::set_triage(&st.db, &branch.id, &level, req.note.trim(), &by).await?;
-    events::record(
-        &st.db,
-        &st.bus,
-        &branch.id,
-        "triage",
-        json!({ "level": level, "note": req.note.trim(), "by": by }),
-    )
-    .await
-    .ok();
+    let note = req.note.trim();
+    tags::set(&st.db, &branch.id, &tag_key, value, note, &by).await?;
+    events::record_tag(&st.db, &st.bus, &branch.id, &tag_key, value, note, &by)
+        .await
+        .ok();
+    let (session, branch) = require_session(&st.db, &session.id).await?;
+    Ok(Json(session_view(&st.db, &session, &branch).await?))
+}
+
+/// Clear a tag on a session's branch — delete the row and broadcast a `tag`
+/// event with an empty value (the cleared signal). How a loud axis returns to
+/// calm (`ok`). A no-op when the tag is already absent. DELETE carries no body,
+/// so the author is recorded as `manual`.
+async fn clear_session_tag(
+    State(st): State<AppState>,
+    Path((key, tag_key)): Path<(String, String)>,
+) -> ApiResult<Json<SessionView>> {
+    let (session, branch) = require_session(&st.db, &key).await?;
+    tags::clear(&st.db, &branch.id, &tag_key).await?;
+    events::record_tag(&st.db, &st.bus, &branch.id, &tag_key, "", "", "manual")
+        .await
+        .ok();
     let (session, branch) = require_session(&st.db, &session.id).await?;
     Ok(Json(session_view(&st.db, &session, &branch).await?))
 }
@@ -867,7 +869,6 @@ async fn patch_session(
     Json(req): Json<PatchSessionReq>,
 ) -> ApiResult<Json<SessionView>> {
     let (session, branch) = require_session(&st.db, &key).await?;
-    apply_attention_patch(&st, &branch, req.attention.as_deref()).await?;
     if let Some(title) = &req.title {
         branch_mod::set_title(&st.db, &branch.id, title).await?;
     }
@@ -973,12 +974,17 @@ pub async fn archive(
     }
     session_mod::set_status(&st.db, &session.id, "archived").await?;
     // An archived session is finished with: its agent is gone, so it can no
-    // longer "need me". Clear any lingering attention so the dashboard stops
-    // flagging a torn-down workstream. Attention is the agent's live "does this
-    // need a human?" signal; nothing is live here any more. The history (goal,
-    // status, events) is kept.
-    if branch.attention != branch_mod::DEFAULT_ATTENTION {
-        branch_mod::set_attention(&st.db, &branch.id, branch_mod::DEFAULT_ATTENTION).await?;
+    // longer "need me". Clear the loud tags (the agent's `attention` and any
+    // overlooker `triage` mark) so the dashboard stops flagging a torn-down
+    // workstream — absence is the calm state. The history (goal, status, events)
+    // is kept; the `description` message stays too.
+    for key in tags::LOUD_KEYS {
+        if tags::get(&st.db, &branch.id, key).await?.is_some() {
+            tags::clear(&st.db, &branch.id, key).await?;
+            events::record_tag(&st.db, &st.bus, &branch.id, key, "", "", "manual")
+                .await
+                .ok();
+        }
     }
     events::record(
         &st.db,
@@ -1880,7 +1886,6 @@ struct PatchBranchReq {
     title: Option<String>,
     goal: Option<String>,
     description: Option<String>,
-    attention: Option<String>,
 }
 
 async fn patch_branch(
@@ -1889,7 +1894,6 @@ async fn patch_branch(
     Json(req): Json<PatchBranchReq>,
 ) -> ApiResult<Json<BranchView>> {
     let branch = require_branch(&st.db, &key).await?;
-    apply_attention_patch(&st, &branch, req.attention.as_deref()).await?;
     if let Some(title) = &req.title {
         branch_mod::set_title(&st.db, &branch.id, title).await?;
     }

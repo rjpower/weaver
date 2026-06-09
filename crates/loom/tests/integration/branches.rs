@@ -5,7 +5,7 @@
 use serde_json::json;
 use serial_test::serial;
 
-use crate::fixtures::{sh, TestServer};
+use crate::fixtures::{branch_tag, branch_tag_value, sh, TestServer};
 
 /// A launch opens a self-sourced tracking issue; hand-created issues are claimed
 /// by the branch and show on the repo board; teardown releases the claims but
@@ -124,9 +124,10 @@ async fn branch_issues_and_repo_board() {
     );
 }
 
-/// The triage axis: `POST /api/sessions/{id}/triage` stamps the overlooker's
-/// mark on the session's branch, surfaces it on the SessionView, and never
-/// disturbs the agent's own attention. An invalid level is rejected.
+/// The triage axis: `PUT /api/sessions/{id}/tags/triage` stamps the overlooker's
+/// mark on the session's branch, surfaces it on the SessionView's `branch.tags`,
+/// and never disturbs the agent's own `attention` tag. An invalid value is
+/// rejected.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn triage_axis_marks_a_session() {
@@ -143,48 +144,53 @@ async fn triage_axis_marks_a_session() {
         .unwrap();
     let id = ws["id"].as_str().unwrap().to_string();
 
-    // The agent declares `blocked` about itself.
+    // The agent declares `blocked` about itself — its own `attention` tag.
     client
-        .patch(
-            &format!("/api/sessions/{id}"),
-            json!({ "attention": "blocked" }),
+        .put(
+            &format!("/api/sessions/{id}/tags/attention"),
+            json!({ "value": "blocked", "by": "agent" }),
         )
         .await
         .unwrap();
 
     // Fresh: no overlooker mark yet.
     let view = client.get(&format!("/api/sessions/{id}")).await.unwrap();
-    assert_eq!(view["branch"]["triage_level"], "");
+    assert!(
+        branch_tag(&view, "triage").is_none(),
+        "unmarked: no triage tag yet"
+    );
 
-    // An overlooker stamps a mark via the dedicated endpoint.
+    // An overlooker stamps a mark via the triage tag.
     let marked = client
-        .post(
-            &format!("/api/sessions/{id}/triage"),
-            json!({ "level": "attention", "note": "idle 30m with red CI", "by": "status-check" }),
+        .put(
+            &format!("/api/sessions/{id}/tags/triage"),
+            json!({ "value": "attention", "note": "idle 30m with red CI", "by": "status-check" }),
         )
         .await
         .unwrap();
-    assert_eq!(marked["branch"]["triage_level"], "attention");
-    assert_eq!(marked["branch"]["triage_note"], "idle 30m with red CI");
-    assert_eq!(marked["branch"]["triage_by"], "status-check");
+    let triage = branch_tag(&marked, "triage").expect("the mark wrote a triage tag");
+    assert_eq!(triage["value"], "attention");
+    assert_eq!(triage["note"], "idle 30m with red CI");
+    assert_eq!(triage["set_by"], "status-check");
     assert!(
-        marked["branch"]["triage_at"].is_string(),
-        "a mark stamps triage_at"
+        triage["set_at"].as_str().is_some_and(|s| !s.is_empty()),
+        "a mark stamps set_at"
     );
     // The agent's own attention is untouched — two actors, two axes.
     assert_eq!(
-        marked["branch"]["attention"], "blocked",
+        branch_tag_value(&marked, "attention"),
+        "blocked",
         "triage must not stomp the agent's self-report"
     );
 
-    // An invalid level is rejected.
+    // An invalid value is rejected.
     let bad = client
-        .post(
-            &format!("/api/sessions/{id}/triage"),
-            json!({ "level": "bogus" }),
+        .put(
+            &format!("/api/sessions/{id}/tags/triage"),
+            json!({ "value": "bogus" }),
         )
         .await;
-    assert!(bad.is_err(), "invalid triage level should be rejected");
+    assert!(bad.is_err(), "invalid triage value should be rejected");
 
     client.delete(&format!("/api/sessions/{id}")).await.unwrap();
 }

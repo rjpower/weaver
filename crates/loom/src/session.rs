@@ -39,7 +39,8 @@ pub struct Session {
 /// Session **lifecycle** states — the mechanical, orchestrator-owned axis: is
 /// the agent process being set up, alive, lost, or finished. How the agent is
 /// *doing* (whether it needs the user) is the separate, agent-declared
-/// `attention` axis on the branch — see [`weaver_core::branch::ATTENTION_LEVELS`].
+/// `attention` axis — the branch's `attention` tag, see
+/// [`weaver_core::tags::ATTENTION_KEY`].
 ///
 /// `running` replaces the old inferred `working`/`waiting`/`idle` trio: those
 /// guessed at the agent's state from hooks and screen stillness and were

@@ -1,7 +1,7 @@
 //! Background task: detects when a session's tmux has ended and consumes the
 //! event rows the `weaver` CLI writes — `hook` events (Claude lifecycle) and
-//! `attention` events (`weaver set-status`) — reflecting them onto the session
-//! and the dashboard.
+//! `tag` events (`weaver set-status` writing the `attention` tag) — reflecting
+//! them onto the session and the dashboard.
 //!
 //! The browser terminal (xterm.js over a PTY) is the live-screen surface; this
 //! loop no longer pushes a `screen` mirror to clients. It still `capture`s the
@@ -16,8 +16,8 @@ use serde_json::json;
 use crate::session::{self as session_mod, Session};
 use crate::web::AppState;
 use crate::{events, tmux};
-use weaver_core::branch as branch_mod;
 use weaver_core::config as core_config;
+use weaver_core::tags;
 
 const TICK: Duration = Duration::from_millis(1500);
 
@@ -42,18 +42,12 @@ pub async fn run(state: AppState) {
                 for ev in new_events {
                     last_event = last_event.max(ev.id);
                     match ev.kind.as_str() {
-                        // `weaver set-status` wrote the branch's attention
-                        // fields directly (daemon-less) but, via the CLI,
-                        // never touched the bus. Re-broadcast so live dashboards
-                        // refresh; nothing else to do.
-                        "attention" => {
-                            state.bus.publish(ev.clone());
-                            continue;
-                        }
-                        // `weaver triage` (and the overlooker) wrote the branch's
-                        // triage fields daemon-less; re-broadcast so dashboards
-                        // refresh the mark badge. Same shape as `attention`.
-                        "triage" => {
+                        // A tag write — `weaver set-status` (the agent's
+                        // `attention`), an overlooker's `triage`, or any free-form
+                        // key — written daemon-less by the CLI never touched the
+                        // bus. Re-broadcast so live dashboards refresh the badge or
+                        // pill; nothing else to do.
+                        "tag" => {
                             state.bus.publish(ev.clone());
                             continue;
                         }
@@ -245,18 +239,21 @@ fn parse_iso(ts: &str) -> Option<DateTime<Utc>> {
 ///
 /// Mapping rationale: hooks now drive only liveness and the genuine
 /// attention signals. Any hook means the agent process is alive → `running`
-/// (this also promotes a freshly-`launching` session). Beyond that:
+/// (this also promotes a freshly-`launching` session). Beyond that the hook
+/// writes the agent's `attention` tag:
 ///
-/// * `working` (a prompt was submitted — the user is engaged) clears attention
-///   back to `ok`.
-/// * `waiting` (Claude is blocked asking the user) raises attention to
+/// * `working` (a prompt was submitted — the user is engaged) clears the
+///   attention tag back to calm (`ok`).
+/// * `waiting` (Claude is blocked asking the user) sets the attention tag to
 ///   `attention`.
 /// * `idle` (a turn ended) leaves attention untouched — a finished-but-fine
 ///   agent must not be mistaken for one that needs the user. If it actually
 ///   needs something it will have said so via `weaver set-status`.
 async fn apply_hook(state: &AppState, branch_id: &str, kind: &str) -> Option<i64> {
+    // The attention level the hook implies, or `None` to leave it untouched. An
+    // empty string is the calm state — it clears the tag rather than storing.
     let attention: Option<&str> = match kind {
-        "working" => Some("ok"),
+        "working" => Some(""),
         "waiting" => Some("attention"),
         "idle" => None,
         // `session-start` and anything unknown carry no status signal.
@@ -275,14 +272,32 @@ async fn apply_hook(state: &AppState, branch_id: &str, kind: &str) -> Option<i64
     }
     let _ = session_mod::touch(&state.db, &session.id).await;
 
-    // Attention, only when the hook carries a signal and the level differs.
+    // Attention, only when the hook carries a signal and the tag value differs.
+    // Calm (empty) clears the tag (absence is the default state); any other level
+    // upserts it. Emit a `tag` event on a real change so dashboards refresh.
     let mut attention_changed: Option<&str> = None;
     if let Some(level) = attention {
-        if let Ok(Some(branch)) = branch_mod::get(&state.db, branch_id).await {
-            if branch.attention != level {
-                let _ = branch_mod::set_attention(&state.db, branch_id, level).await;
-                attention_changed = Some(level);
+        let current = tags::get(&state.db, branch_id, tags::ATTENTION_KEY)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.value)
+            .unwrap_or_default();
+        if current != level {
+            if level.is_empty() {
+                let _ = tags::clear(&state.db, branch_id, tags::ATTENTION_KEY).await;
+            } else {
+                let _ = tags::set(
+                    &state.db,
+                    branch_id,
+                    tags::ATTENTION_KEY,
+                    level,
+                    "",
+                    "agent",
+                )
+                .await;
             }
+            attention_changed = Some(level);
         }
     }
 
@@ -297,12 +312,14 @@ async fn apply_hook(state: &AppState, branch_id: &str, kind: &str) -> Option<i64
         .await;
     }
     if let Some(level) = attention_changed {
-        let _ = events::record(
+        let _ = events::record_tag(
             &state.db,
             &state.bus,
             branch_id,
-            "attention",
-            json!({ "level": level, "source": "hook" }),
+            tags::ATTENTION_KEY,
+            level,
+            "",
+            "agent",
         )
         .await;
     }

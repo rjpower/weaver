@@ -22,7 +22,7 @@ use loom::{db, events, monitor, overlooker, server, session as session_mod, tmux
 use weaver_core::config as core_config;
 use weaver_core::overlooker as ov;
 
-use crate::fixtures::TestServer;
+use crate::fixtures::{branch_tag, branch_tag_value, TestServer};
 
 /// An `AppState` over the test server's isolated db — a second connection to the
 /// same sqlite file (WAL, so concurrent readers/writers are fine). Lets a test
@@ -69,11 +69,12 @@ async fn dispatcher_matches_trigger_with_repo_filter_and_is_idempotent() {
     let state = engine_state(&ts).await;
     let (session_id, branch_id, repo_root) = make_session(&ts, "watch me").await;
 
-    // The agent declares `blocked` about itself (the reactive signal).
+    // The agent declares `blocked` about itself (the reactive signal): its own
+    // `attention` tag.
     ts.client
-        .patch(
-            &format!("/api/sessions/{session_id}"),
-            json!({ "attention": "blocked" }),
+        .put(
+            &format!("/api/sessions/{session_id}/tags/attention"),
+            json!({ "value": "blocked", "by": "agent" }),
         )
         .await
         .unwrap();
@@ -95,12 +96,14 @@ async fn dispatcher_matches_trigger_with_repo_filter_and_is_idempotent() {
 
     let in_flight = overlooker::new_in_flight();
 
-    // A matching reactive event (attention=blocked on a branch in this repo).
+    // A matching reactive event: a `tag` write of the `attention` tag (value
+    // `blocked`) on a branch in this repo. The dispatcher maps the tag's
+    // key/value onto the trigger's match kind/level.
     let ev = events::Event {
         id: 0,
         branch_id: branch_id.clone(),
-        kind: "attention".to_string(),
-        data: json!({ "level": "blocked" }),
+        kind: "tag".to_string(),
+        data: json!({ "key": "attention", "value": "blocked" }),
         created_at: db::now_iso(),
     };
     overlooker::dispatch(&state, &in_flight, &ev).await;
@@ -115,10 +118,14 @@ async fn dispatcher_matches_trigger_with_repo_filter_and_is_idempotent() {
         .await
         .unwrap();
     assert_eq!(
-        view["branch"]["triage_level"], "blocked",
+        branch_tag_value(&view, "triage"),
+        "blocked",
         "the rule mirrors the agent's attention onto the mark"
     );
-    assert_eq!(view["branch"]["triage_by"], "blocked-watch");
+    assert_eq!(
+        branch_tag(&view, "triage").unwrap()["set_by"],
+        "blocked-watch"
+    );
 
     // Re-firing the identical event is idempotent: it converges on the same mark
     // (a fresh run, but no contradictory state). Level-triggered: the round
@@ -130,7 +137,8 @@ async fn dispatcher_matches_trigger_with_repo_filter_and_is_idempotent() {
         .await
         .unwrap();
     assert_eq!(
-        view2["branch"]["triage_level"], "blocked",
+        branch_tag_value(&view2, "triage"),
+        "blocked",
         "re-firing converges on the same mark, not a contradiction"
     );
 
@@ -142,8 +150,8 @@ async fn dispatcher_matches_trigger_with_repo_filter_and_is_idempotent() {
         // A system (branchless) event carries no repo, so the repo-filtered
         // trigger must not match it.
         branch_id: events::SYSTEM_BRANCH.to_string(),
-        kind: "attention".to_string(),
-        data: json!({ "level": "blocked" }),
+        kind: "tag".to_string(),
+        data: json!({ "key": "attention", "value": "blocked" }),
         created_at: db::now_iso(),
     };
     overlooker::dispatch(&state, &in_flight, &other_repo_event).await;
@@ -173,9 +181,9 @@ async fn stale_session_emits_one_event_and_wakes_a_reactive_overlooker() {
     // The session reports `attention` about itself so the stock round's rule
     // produces a non-ok mark when the overlooker fires (proving it ran).
     ts.client
-        .patch(
-            &format!("/api/sessions/{session_id}"),
-            json!({ "attention": "attention" }),
+        .put(
+            &format!("/api/sessions/{session_id}/tags/attention"),
+            json!({ "value": "attention", "by": "agent" }),
         )
         .await
         .unwrap();
@@ -242,10 +250,14 @@ async fn stale_session_emits_one_event_and_wakes_a_reactive_overlooker() {
         .await
         .unwrap();
     assert_eq!(
-        view["branch"]["triage_level"], "attention",
+        branch_tag_value(&view, "triage"),
+        "attention",
         "the woken round marked the in-scope stale session"
     );
-    assert_eq!(view["branch"]["triage_by"], "stale-watch");
+    assert_eq!(
+        branch_tag(&view, "triage").unwrap()["set_by"],
+        "stale-watch"
+    );
 
     // Once activity resumes (a non-stale pass clears the session from `seen`),
     // the edge re-arms: a later stale crossing emits a fresh event.
@@ -284,9 +296,9 @@ async fn builtin_status_marks_a_session_and_dry_run_is_safe() {
 
     // The session reports `attention` about itself → it's in a `!ok` scope.
     ts.client
-        .patch(
-            &format!("/api/sessions/{session_id}"),
-            json!({ "attention": "attention" }),
+        .put(
+            &format!("/api/sessions/{session_id}/tags/attention"),
+            json!({ "value": "attention", "by": "agent" }),
         )
         .await
         .unwrap();
@@ -316,10 +328,14 @@ async fn builtin_status_marks_a_session_and_dry_run_is_safe() {
         .await
         .unwrap();
     assert_eq!(
-        view["branch"]["triage_level"], "attention",
+        branch_tag_value(&view, "triage"),
+        "attention",
         "the round marks the in-scope session"
     );
-    assert_eq!(view["branch"]["triage_by"], "status-check");
+    assert_eq!(
+        branch_tag(&view, "triage").unwrap()["set_by"],
+        "status-check"
+    );
 
     // The run row records the mark action.
     let runs = ov::recent_runs(&state.db, &o.id, 10).await.unwrap();
@@ -335,10 +351,7 @@ async fn builtin_status_marks_a_session_and_dry_run_is_safe() {
 
     // Clear the mark, then a dry run must NOT re-apply it — it records a `would`.
     ts.client
-        .post(
-            &format!("/api/sessions/{session_id}/triage"),
-            json!({ "level": "", "by": "manual" }),
-        )
+        .delete(&format!("/api/sessions/{session_id}/tags/triage"))
         .await
         .unwrap();
     let dry_run_id = overlooker::fire_now(&state, &o.name, true, "manual")
@@ -349,8 +362,8 @@ async fn builtin_status_marks_a_session_and_dry_run_is_safe() {
         .get(&format!("/api/sessions/{session_id}"))
         .await
         .unwrap();
-    assert_eq!(
-        view["branch"]["triage_level"], "",
+    assert!(
+        branch_tag(&view, "triage").is_none(),
         "a dry run applies no mark"
     );
     let runs = ov::recent_runs(&state.db, &o.id, 10).await.unwrap();
@@ -386,9 +399,9 @@ async fn timer_emits_cron_tick_for_a_due_overlooker_and_dispatches_it() {
     let state = engine_state(&ts).await;
     let (session_id, _branch_id, _repo_root) = make_session(&ts, "tick me").await;
     ts.client
-        .patch(
-            &format!("/api/sessions/{session_id}"),
-            json!({ "attention": "attention" }),
+        .put(
+            &format!("/api/sessions/{session_id}/tags/attention"),
+            json!({ "value": "attention", "by": "agent" }),
         )
         .await
         .unwrap();
@@ -449,7 +462,8 @@ async fn timer_emits_cron_tick_for_a_due_overlooker_and_dispatches_it() {
         .await
         .unwrap();
     assert_eq!(
-        view["branch"]["triage_level"], "attention",
+        branch_tag_value(&view, "triage"),
+        "attention",
         "the scheduled round marked the in-scope session"
     );
 
@@ -469,9 +483,9 @@ async fn cooldown_and_overlap_refire_are_refused() {
     let state = engine_state(&ts).await;
     let (session_id, branch_id, repo_root) = make_session(&ts, "cool down").await;
     ts.client
-        .patch(
-            &format!("/api/sessions/{session_id}"),
-            json!({ "attention": "blocked" }),
+        .put(
+            &format!("/api/sessions/{session_id}/tags/attention"),
+            json!({ "value": "blocked", "by": "agent" }),
         )
         .await
         .unwrap();
@@ -497,8 +511,8 @@ async fn cooldown_and_overlap_refire_are_refused() {
     let ev = events::Event {
         id: 0,
         branch_id: branch_id.clone(),
-        kind: "attention".to_string(),
-        data: json!({ "level": "blocked" }),
+        kind: "tag".to_string(),
+        data: json!({ "key": "attention", "value": "blocked" }),
         created_at: db::now_iso(),
     };
 
@@ -548,9 +562,9 @@ async fn rest_overlooker_lifecycle_and_validation() {
     // A non-ok session so the dry-run round has something in scope to "would-mark".
     let (session_id, _branch_id, _repo_root) = make_session(&ts, "rest me").await;
     ts.client
-        .patch(
-            &format!("/api/sessions/{session_id}"),
-            json!({ "attention": "attention" }),
+        .put(
+            &format!("/api/sessions/{session_id}/tags/attention"),
+            json!({ "value": "attention", "by": "agent" }),
         )
         .await
         .unwrap();
@@ -648,8 +662,8 @@ async fn rest_overlooker_lifecycle_and_validation() {
         .get(&format!("/api/sessions/{session_id}"))
         .await
         .unwrap();
-    assert_eq!(
-        view["branch"]["triage_level"], "",
+    assert!(
+        branch_tag(&view, "triage").is_none(),
         "a dry run applies no mark"
     );
 
@@ -743,9 +757,9 @@ async fn warm_session_is_hidden_from_fleet_and_survey() {
     // An ordinary fleet session, reporting non-ok so the survey would mark it.
     let (visible_id, _branch_id, repo_root) = make_session(&ts, "visible work").await;
     ts.client
-        .patch(
-            &format!("/api/sessions/{visible_id}"),
-            json!({ "attention": "attention" }),
+        .put(
+            &format!("/api/sessions/{visible_id}/tags/attention"),
+            json!({ "value": "attention", "by": "agent" }),
         )
         .await
         .unwrap();
@@ -777,9 +791,16 @@ async fn warm_session_is_hidden_from_fleet_and_survey() {
         .await
         .unwrap()
         .unwrap();
-    weaver_core::branch::set_attention(&state.db, &warm.branch_id, "blocked")
-        .await
-        .unwrap();
+    weaver_core::tags::set(
+        &state.db,
+        &warm.branch_id,
+        weaver_core::tags::ATTENTION_KEY,
+        "blocked",
+        "",
+        "agent",
+    )
+    .await
+    .unwrap();
 
     // The dashboard listing shows the ordinary session, not the warm one.
     let list = ts.client.get("/api/sessions").await.unwrap();
@@ -808,15 +829,19 @@ async fn warm_session_is_hidden_from_fleet_and_survey() {
         .await
         .unwrap();
     assert_eq!(
-        visible_view["branch"]["triage_level"], "attention",
+        branch_tag_value(&visible_view, "triage"),
+        "attention",
         "the round marked the in-scope ordinary session"
     );
     let warm_after = session_mod::with_branch(&state.db, &warm_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        warm_after.1.triage_level, "",
+    assert!(
+        weaver_core::tags::get(&state.db, &warm_after.1.id, weaver_core::tags::TRIAGE_KEY)
+            .await
+            .unwrap()
+            .is_none(),
         "the round never surveyed (or marked) the warm session"
     );
 

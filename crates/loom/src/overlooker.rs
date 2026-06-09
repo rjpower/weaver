@@ -13,8 +13,11 @@
 //! * **The dispatcher (consumer).** A sibling of [`crate::monitor::run`] on its
 //!   own independent watermark: it reads `events::since`, and for each new event
 //!   fires every enabled overlooker whose trigger matches — a scheduled one
-//!   matches its own `cron` tick, a reactive one matches `attention`/`triage`,
-//!   and `manual` ticks (operator "run now") fire the named overlooker.
+//!   matches its own `cron` tick, a reactive one matches a `tag` write (the
+//!   tag's key/value become the trigger's match kind/level, so `attention` and
+//!   `triage` tags still drive `{event:"attention"|"triage"}` triggers) or a
+//!   `stale` tick, and `manual` ticks (operator "run now") fire the named
+//!   overlooker.
 //!
 //! Both halves are folded into one [`run`] loop, self-gated on the
 //! `overlooker.enabled` master switch so the daemon can always spawn it and it
@@ -42,6 +45,7 @@ use crate::{events, tmux};
 use weaver_core::branch::{self as branch_mod, Branch};
 use weaver_core::config as core_config;
 use weaver_core::overlooker::{self as ov, Overlooker};
+use weaver_core::tags::{self, TRIAGE_KEY};
 
 /// How often the engine wakes to drain new events and check the timer. Matches
 /// the monitor's cadence closely enough that a reactive event is acted on
@@ -230,10 +234,16 @@ pub async fn dispatch(state: &AppState, in_flight: &InFlight, ev: &events::Event
         // The engine's own audit rows (and a `cron`/`manual` already handled)
         // must never re-trigger a reactive round, or it would chase its tail.
         "overlooker" => {}
-        kind => {
-            // Reactive: the event's repo is the repo_root of its branch. System
-            // rows (no branch) carry no repo and match only repo-less triggers.
-            let (level, repo) = reactive_context(state, ev).await;
+        ev_kind => {
+            // Reactive: resolve the trigger's match `(kind, level, repo)`. A tag
+            // write is one `"tag"` event carrying `{key, value}` — its key is the
+            // match-kind and value the level, so a `{event:"attention",
+            // level:"blocked"}` trigger fires off the `attention` tag event. Every
+            // other reactive kind (`stale`, `pr_red`, hook-derived) matches on the
+            // event kind with the level from `data.level`. The repo is the
+            // repo_root of the event's branch; system rows (no branch) carry no
+            // repo and match only repo-less triggers.
+            let (match_kind, level, repo) = reactive_context(state, ev, ev_kind).await;
             let overlookers = match ov::list_enabled(&state.db).await {
                 Ok(o) => o,
                 Err(e) => {
@@ -243,9 +253,9 @@ pub async fn dispatch(state: &AppState, in_flight: &InFlight, ev: &events::Event
             };
             for o in overlookers {
                 if o.trigger()
-                    .matches_event(kind, level.as_deref(), repo.as_deref())
+                    .matches_event(&match_kind, level.as_deref(), repo.as_deref())
                 {
-                    let _ = fire(state, in_flight, &o, &format!("event:{kind}"), false).await;
+                    let _ = fire(state, in_flight, &o, &format!("event:{match_kind}"), false).await;
                 }
             }
         }
@@ -260,27 +270,53 @@ async fn resolve_target(state: &AppState, ev: &events::Event) -> Option<Overlook
     o.enabled.then_some(o)
 }
 
-/// The `(level, repo)` an event carries for reactive matching: `level` from the
-/// payload, `repo` from the originating branch's `repo_root`. System events have
-/// no branch and so no repo.
+/// The `(match_kind, level, repo)` an event presents for reactive matching.
+///
+/// * For a `"tag"` event the match-kind is the tag's `key` and the level its
+///   `value` (an `attention` tag with value `blocked` matches a `{event:
+///   "attention", level:"blocked"}` trigger). A cleared tag (empty value) yields
+///   no level, matching only a level-agnostic `{event:"<key>"}` trigger.
+/// * For every other reactive kind the match-kind is the event kind itself and
+///   the level comes from `data.level`.
+///
+/// `repo` is the originating branch's `repo_root`; system events have no branch
+/// and so no repo.
 async fn reactive_context(
     state: &AppState,
     ev: &events::Event,
-) -> (Option<String>, Option<String>) {
-    let level = ev
-        .data
-        .get("level")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    ev_kind: &str,
+) -> (String, Option<String>, Option<String>) {
+    let (match_kind, level) = if ev_kind == "tag" {
+        let key = ev
+            .data
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let level = ev
+            .data
+            .get("value")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        (key, level)
+    } else {
+        let level = ev
+            .data
+            .get("level")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        (ev_kind.to_string(), level)
+    };
     if events::is_system(&ev.branch_id) {
-        return (level, None);
+        return (match_kind, level, None);
     }
     let repo = branch_mod::get(&state.db, &ev.branch_id)
         .await
         .ok()
         .flatten()
         .map(|b| b.repo_root);
-    (level, repo)
+    (match_kind, level, repo)
 }
 
 // ---------------------------------------------------------------------------
@@ -485,13 +521,28 @@ async fn builtin_status(
         let Some(branch) = branch_mod::get(&state.db, &session.branch_id).await? else {
             continue;
         };
-        if !scope.admits(&branch.attention, &branch.repo_root) {
+        // The scope's attention filter matches the resolved `attention` tag
+        // value; an absent tag is the calm `ok` state.
+        let attention = attention_value(state, &branch).await;
+        if !scope.admits(&attention, &branch.repo_root) {
             continue;
         }
         surveyed += 1;
 
         let (level, note) = judge(state, o, &session, &branch).await;
-        if !branch_mod::is_valid_triage(&level) {
+        // A non-storable level (an `ok`/clear decision) returns the triage axis to
+        // calm rather than marking: clear the tag and log a `tag` event with an
+        // empty value (the audit rule — every mutating action is also an events
+        // row). The dry-run path mutates nothing.
+        if !tags::is_valid_value(TRIAGE_KEY, &level) {
+            if can_mark && !dry_run {
+                tags::clear(&state.db, &branch.id, TRIAGE_KEY).await?;
+                events::record_tag(
+                    &state.db, &state.bus, &branch.id, TRIAGE_KEY, "", "", &o.name,
+                )
+                .await
+                .ok();
+            }
             continue;
         }
 
@@ -517,16 +568,12 @@ async fn builtin_status(
             continue;
         }
 
-        // Apply the mark: write the triage axis and record the `triage` event so
+        // Apply the mark: write the `triage` tag and record the `tag` event so
         // the fleet badge updates and the monitor re-broadcasts it (the audit
         // rule — every mutating action is also an events row).
-        branch_mod::set_triage(&state.db, &branch.id, &level, &note, &o.name).await?;
-        events::record(
-            &state.db,
-            &state.bus,
-            &branch.id,
-            "triage",
-            json!({ "level": level, "note": note, "by": o.name }),
+        tags::set(&state.db, &branch.id, TRIAGE_KEY, &level, &note, &o.name).await?;
+        events::record_tag(
+            &state.db, &state.bus, &branch.id, TRIAGE_KEY, &level, &note, &o.name,
         )
         .await
         .ok();
@@ -623,15 +670,34 @@ async fn judge(
         }
     }
 
-    // Rule fallback: mirror the agent's self-reported attention as the mark.
-    let level = if branch_mod::is_valid_triage(&branch.attention) {
-        branch.attention.clone()
+    // Rule fallback: mirror the agent's self-reported attention as the mark. The
+    // agent's `attention` tag value (absent ⇒ calm `ok`) is the candidate level;
+    // a non-storable value (`ok`) makes the caller clear the triage tag instead.
+    let attention = attention_value(state, branch).await;
+    let level = if tags::is_valid_value(TRIAGE_KEY, &attention) {
+        attention.clone()
     } else {
         "ok".to_string()
     };
-    let note = format!("attention is {}", branch.attention);
+    let note = format!("attention is {attention}");
     (level, note)
 }
+
+/// The resolved value of a branch's `attention` tag — the agent's self-report —
+/// or `ok` when the tag is absent (absence is the calm state).
+async fn attention_value(state: &AppState, branch: &Branch) -> String {
+    tags::get(&state.db, &branch.id, tags::ATTENTION_KEY)
+        .await
+        .ok()
+        .flatten()
+        .map(|t| t.value)
+        .unwrap_or_else(|| "ok".to_string())
+}
+
+/// The levels an agent judgement may name. The two storable triage values plus
+/// the calm `ok` — recognising `ok` lets a judgement explicitly return the axis
+/// to calm (the caller then clears the tag rather than marking).
+const JUDGED_LEVELS: &[&str] = &["ok", "attention", "blocked"];
 
 /// Parse an agent judgement into `(level, note)`. Lenient by design: the first
 /// recognised triage word is the level; the rest of that line (or the next
@@ -640,7 +706,7 @@ async fn judge(
 fn parse_judgement(out: &str) -> Option<(String, String)> {
     for line in out.lines() {
         let lower = line.to_ascii_lowercase();
-        for level in branch_mod::TRIAGE_LEVELS {
+        for level in JUDGED_LEVELS {
             if lower
                 .split(|c: char| !c.is_ascii_alphabetic())
                 .any(|w| w == *level)
