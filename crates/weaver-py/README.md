@@ -35,14 +35,21 @@ c = weaver_py.Client(base="http://127.0.0.1:7420",
                      capabilities=["observe", "mark", "nudge"])
 
 for s in c.sessions():
-    print(s["id"], s["branch"]["title"], s["branch"]["attention"],
-          s["branch"]["triage_level"])
+    branch = s["branch"]
+    # Status lives in `branch["tags"]`, a list of {key, value, note, set_by,
+    # set_at}. The well-known keys are `attention` (the agent's self-report) and
+    # `triage` (an overlooker's assessment); a missing key means calm.
+    tags = {t["key"]: t["value"] for t in branch["tags"]}
+    print(s["id"], branch["title"], branch["description"],
+          tags.get("attention", "calm"), tags.get("triage", "calm"))
 
 s = c.session("abc123")            # by id, branch id, branch name, or repo:branch
 screen = c.preview("abc123", 200)  # tmux pane as text, 200 lines of scrollback
 tree = c.diff("abc123")            # worktree file tree + change map
 
-c.mark("abc123", level="attention", note="stuck on tests")  # needs "mark"
+c.set_tag("abc123", "triage", "attention", note="stuck on tests")  # needs "mark"
+c.clear_tag("abc123", "triage")                          # back to calm; needs "mark"
+c.mark("abc123", level="attention", note="stuck on tests")  # triage-tag shortcut; "mark"
 c.nudge("abc123", "try running the tests again")            # needs "nudge"
 c.interrupt("abc123")                                       # needs "interrupt"
 ```
@@ -52,9 +59,9 @@ the loom default `http://127.0.0.1:7878` — the same env convention
 `loom::endpoint` uses. So a bare `weaver_py.Client()` targets the local loom.
 
 Responses cross into Python as plain dicts/lists (via `serde_json` →
-`pythonize`), so you read `s["branch"]["triage_level"]` directly; there is no
-wrapper class to learn per response type. A type stub (`python/weaver_py.pyi`)
-ships the surface for editors and type checkers.
+`pythonize`), so you read `s["branch"]["tags"]` directly; there is no wrapper
+class to learn per response type. A type stub (`python/weaver_py.pyi`) ships the
+surface for editors and type checkers.
 
 ## The capability model
 
@@ -67,7 +74,7 @@ grant is absent.
 | Capability  | Gates                                    | Default  |
 |-------------|------------------------------------------|----------|
 | `observe`   | all reads (`sessions`/`session`/`preview`/`diff`) | always on |
-| `mark`      | `mark` — the triage axis                 | opt-in   |
+| `mark`      | write a tag (`set_tag`/`clear_tag`/`mark`) | opt-in   |
 | `escalate`  | raise the overlooker's own attention     | opt-in   |
 | `nudge`     | `nudge` — type a message into a session  | opt-in   |
 | `interrupt` | `interrupt` — break the agent's turn     | opt-in   |

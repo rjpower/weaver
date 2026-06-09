@@ -95,10 +95,10 @@ noun in the code and the UI.
    crate, **`weaver-api`** — the typed client + DTOs lifted out of loom — used by
    the engine, the `loom` CLI, and the Python binding alike. Not a second
    runtime: one seam over the existing one.
-4. **A third status axis: the mark.** Lifecycle (`session.status`) and attention
-   (`branch.attention`, agent self-reported) stay untouched. The overlooker
-   writes a *separate* `triage` axis — *its* assessment — so it never stomps what
-   the agent said about itself.
+4. **A separate tag for the mark.** Lifecycle (`session.status`) and the agent's
+   own `attention` tag stay untouched. The overlooker writes a *separate*
+   `triage` tag — *its* assessment — so it never stomps what the agent said about
+   itself. Both are well-known keys in the branch's `tags` table.
 5. **One execution substrate: a program with the bound API.** Python (via PyO3)
    is the first-class authoring language; the no-code **declarative** overlooker
    is sugar over a built-in stock program. "Warm vs fresh" is not an engine
@@ -149,29 +149,31 @@ nag. The one accommodation the events table needs: a **system scope** for
 fleet-global rows (a reserved branch id, or a nullable `branch_id`) so a `cron`
 tick — which belongs to no branch — lives in the same stream.
 
-### The mark: a third status axis
+### The mark: a separate tag
 
 The problem statement asks the overlooker to "mark them ok, or tag a new status
-indicator." That indicator must be a **distinct axis**, not a write to the
+indicator." That indicator must be a **distinct signal**, not a write to the
 existing two:
 
 - `session.status` is the **lifecycle** — mechanical, orchestrator-owned.
-- `branch.attention` is what the **agent says about itself** — "I'm blocked",
-  "ready for review". The overlooker must never overwrite this; conflating "the
-  agent declared blocked" with "the overlooker thinks it's stuck" destroys the
-  signal that made watching worthwhile.
-- `branch.triage` (new) is **the overlooker's assessment**: `ok` / `attention` /
-  `blocked`, plus a one-line `triage_note`, `triage_by` (which overlooker) and
-  `triage_at` (when). It mirrors the `attention` mechanism exactly — a
-  denormalised latest on the branch, backed by a `triage` event the monitor
-  re-broadcasts — so it costs almost no new machinery.
+- The branch's **`attention` tag** is what the **agent says about itself** —
+  "I'm blocked", "ready for review". The overlooker must never overwrite this;
+  conflating "the agent declared blocked" with "the overlooker thinks it's
+  stuck" destroys the signal that made watching worthwhile.
+- The branch's **`triage` tag** is **the overlooker's assessment**: value
+  `attention` | `blocked` (absent ⇒ calm — there is no stored `ok`), plus a
+  one-line `note`, `set_by` (which overlooker), and `set_at` (when). It is just
+  another well-known key in the `tags` table, raised by a `tag` event the monitor
+  re-broadcasts — so it costs no new machinery.
 
-The dashboard renders the mark as a second badge beside attention. When the
-session moves on (its `last_activity_at` advances past `triage_at`) the mark is
-shown **stale** until the next round refreshes it — so a "looks stuck" mark from
-an hour ago doesn't lie about a session that has since recovered. Same discipline
-as [structured projects](../structured-projects.md): **two actors must never
-author the same fact.** The agent owns `attention`; the overlooker owns `triage`.
+The dashboard resolves the louder of the two loud tags into one attention signal
+with attribution, and renders any other tag as a quiet deletable pill. A tag is
+shown **stale** when the session moves on (its `last_activity_at` advances past
+the tag's `set_at`) until the next round refreshes it — so a "looks stuck" mark
+from an hour ago doesn't lie about a session that has since recovered. Same
+discipline as [structured projects](../structured-projects.md): **two actors must
+never author the same fact.** The agent owns the `attention` tag; the overlooker
+owns the `triage` tag.
 
 ## Library breakdown: one API seam, a single runtime owner
 
@@ -198,7 +200,7 @@ shared crate:
 
 | Crate | Role | Today | Change |
 |---|---|---|---|
-| `weaver-core` | pure shared logic (branch, issue, **events**, db, config, plan) | shared by both binaries | add the `triage` axis + the system-scoped `cron` event kind here |
+| `weaver-core` | pure shared logic (branch, issue, **events**, db, config, plan) | shared by both binaries | add the `tags` table + registry (the `triage` key) + the system-scoped `cron` event kind here |
 | **`weaver-api`** *(new)* | the typed loom REST **client + request/response DTOs** | `client.rs` is private to loom; DTOs live inline in `web.rs` and are hand-mirrored in `frontend/types.ts` | extract both here, so the server, the CLI, and the binding share **one** typed surface (and the TS mirror tracks one source) |
 | `loom` | the daemon: tmux/session **runtime**, web, monitor, **the overlooker engine** | the orchestrator | depend on `weaver-api` for DTOs; the engine is a new module |
 | **`weaver-py`** *(new, maturin)* | the PyO3 `weaver` Python module | — | a thin Pythonic wrapper over `weaver-api` |
@@ -207,7 +209,8 @@ shared crate:
 logic" true for everything outside the daemon **without** a second tmux owner,
 and it removes the `web.rs` ↔ `types.ts` drift on the Rust side as a bonus. The
 `weaver` agent CLI stays DB-direct for the daemon-less writes it already does
-(`set-status`, and now `weaver triage`), exactly as `attention` works today.
+(`set-status`, which writes the `attention` tag, and the general `weaver tag`
+group), exactly as the `attention` tag works.
 
 ## Execution: one program, one API
 
@@ -218,7 +221,7 @@ session or spawn a fresh one, whether to act or just observe. The
 warm/fresh/rules distinctions become *library calls inside the program*:
 
 - `ov.sessions(scope)` / `s.preview()` / `s.diff()` — observe (always allowed).
-- `s.mark(level, note)` — write the triage axis.
+- `s.mark(level, note)` — write the `triage` tag.
 - `s.nudge(text)` / `s.interrupt()` — the intervention ladder (capability-gated).
 - `ov.run_agent(prompt)` — spawn a **fresh** one-shot agent for a judgement call
   (the env-stripped `claude -p` pattern from
@@ -277,8 +280,8 @@ click-only UI. Three things make it work:
 - **The API is the CLI is the binding.** Because `loom session
   {preview,send,break,poll}` and the `weaver-py` module are *both* thin wrappers
   over `weaver-api`, an agent explores the live fleet with the exact vocabulary
-  its program will call — `loom session preview <id>`, `weaver triage …` — and
-  there is one API to learn, not three. The CLI *is* the API mirror.
+  its program will call — `loom session preview <id>`, `weaver tag set triage …`
+  — and there is one API to learn, not three. The CLI *is* the API mirror.
 - **`--dry-run` is the iteration primitive.** `loom overlooker run <name>
   --dry-run` executes the program against the live fleet but **stubs every
   mutating action** (mark/nudge/interrupt/launch are logged as "would do X", not
@@ -299,7 +302,7 @@ so neither a Python program nor the stock program can exceed it:
 | Capability | What it allows | Default |
 |---|---|---|
 | `observe` | all read APIs (preview, diff, log, PR status) | always on |
-| `mark` | write the `triage` axis on a session | on |
+| `mark` | write the `triage` tag on a session | on |
 | `escalate` | raise the *overlooker's own* attention / notify the human | on |
 | `nudge` | `loom session send` a message into a watched session | **opt-in** |
 | `interrupt` | `loom session break` a watched session | **opt-in** |
@@ -344,7 +347,7 @@ flowchart TD
     api["capability-gated API:<br/>sessions · preview · mark · nudge · run_agent · warm_session"]
 
     api -->|observe / nudge / break| fleet["Fleet sessions<br/>(daemon = sole tmux owner)"]
-    api -->|mark| triage["triage axis on branch"]
+    api -->|mark| triage["triage tag on branch"]
     round --> runs["overlooker_runs (audit)"]
     triage --> panel["Overlooker panel + fleet badges"]
     runs --> panel
@@ -355,7 +358,7 @@ through the same `weaver-api` the out-of-process programs use.
 
 ## Data, CLI, and API sketch
 
-**Storage — two new tables, the `triage` axis, one events accommodation.**
+**Storage — two new tables, the `tags` table, one events accommodation.**
 
 - `overlookers` — `id`, `name`, `enabled`, `trigger` (JSON: the event-match —
   `{cron:"0 * * * *"}` / `{every:"30m"}` / `{event:"attention", level:"blocked"}`,
@@ -367,15 +370,17 @@ through the same `weaver-api` the out-of-process programs use.
 - `overlooker_runs` — `id`, `overlooker_id`, `trigger_reason`, `started_at`,
   `finished_at`, `outcome` (`ok|noop|skipped|error`), `summary`, `actions`
   (JSON), `created_at`. The audit trail + the panel's history.
-- **`triage` axis** on `branches` (`triage_level/note/by/at`) + a `triage` event
-  kind. Mirrors `attention`.
+- **`tags` table** — one row per `(branch_id, key)` (`value/note/set_by/set_at`)
+  with a registry of well-known keys (`attention`, `triage`); a `tag` event kind
+  carries `{key, value, note, by}`. The overlooker's mark is the `triage` key.
 - **events accommodation** — a system scope so `cron` ticks (branchless) live in
   the one stream.
 
 **CLI — `weaver` (DB-direct, the agent/program side):**
 
-- `weaver triage <session> <level> "<note>"` — write the mark, daemon-less, like
-  `set-status`. The binding and any agent both call it.
+- `weaver tag set triage <level> --note "<note>" --session <s>` — write the
+  mark, daemon-less, like `set-status`. The binding and any agent both call it;
+  `weaver tag rm triage --session <s>` returns it to calm.
 
 **CLI — `loom overlooker` (the operator + authoring side):**
 
@@ -388,7 +393,8 @@ through the same `weaver-api` the out-of-process programs use.
 
 - `GET POST /api/overlookers`, `GET PATCH DELETE /api/overlookers/{id}`.
 - `POST /api/overlookers/{id}/run` (`{dry_run}`); `GET /api/overlookers/{id}/runs`.
-- `POST /api/sessions/{id}/triage`; `SessionView`/`BranchView` grow `triage`.
+- `PUT DELETE /api/sessions/{id}/tags/{key}`; `SessionView`/`BranchView` grow a
+  `tags` list.
 
 **Settings (`config::registry()`):** `overlooker.enabled` (Bool, default
 `false`), `overlooker.default_timeout_secs`, `overlooker.default_cooldown_secs`,
@@ -406,8 +412,9 @@ the "separate panel & system" the problem asks for, API-first
   **round history** (`overlooker_runs` with summaries and the marks made), and,
   for an overlooker that keeps a warm session, its **live terminal** via the
   existing `AgentTerminal` component.
-- **On the fleet** — every session grows the **mark badge** beside its attention
-  badge, `triage_note` on hover, a stale indicator when the session has moved on.
+- **On the fleet** — every session's resolved attention signal carries the
+  `triage` mark's attribution, the tag `note` on hover, and a stale indicator
+  when the session has moved on; other tags render as quiet deletable pills.
 
 ## Worked example: the hourly status overlooker
 
@@ -446,15 +453,15 @@ weaver issues on `weaver plan sync overlooker`; status is projected from the
 ledger, never hand-edited here. The `deps:` edges — not the id order — define the
 delivery sequence; the [Rollout](#rollout) section groups them into phases.
 
-### T1 — The mark axis (triage)  `exec: session`  `value: high`  `deps: —`
+### T1 — The mark tag (triage)  `exec: session`  `value: high`  `deps: —`
 
-The third status axis, in isolation. `triage_level/note/by/at` on `branches`, a
-`triage` event the monitor re-broadcasts (mirror the `attention` path), the
-daemon-less `weaver triage <session> <level> "<note>"` CLI, `POST
-/api/sessions/{id}/triage`, the `triage` fields on `SessionView`/`BranchView`,
-and the **mark badge** (with the stale indicator) on the fleet. Acceptance: a
-human or script can mark a session and see the badge, the agent's own `attention`
-untouched.
+The overlooker's mark, in isolation. The `tags` table + registry in
+`weaver-core` with the `triage` well-known key, a `tag` event the monitor
+re-broadcasts, the daemon-less `weaver tag set triage <level>` CLI, the
+`PUT`/`DELETE /api/sessions/{id}/tags/{key}` routes, the `tags` list on
+`SessionView`/`BranchView`, and the resolved attention signal (with the stale
+indicator) on the fleet. Acceptance: a human or script can mark a session and see
+the badge, the agent's own `attention` tag untouched.
 
 ### T2 — weaver-api crate: shared client and DTOs  `exec: session`  `value: high`  `deps: —`
 

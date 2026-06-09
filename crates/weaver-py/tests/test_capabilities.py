@@ -46,6 +46,8 @@ def test_can_reflects_the_granted_set():
 
 
 @pytest.mark.parametrize("method,args", [
+    ("set_tag", ("sess", "triage", "attention")),
+    ("clear_tag", ("sess", "triage")),
     ("mark", ("sess", "attention")),
     ("nudge", ("sess", "hello")),
     ("interrupt", ("sess",)),
@@ -55,6 +57,18 @@ def test_mutating_calls_raise_when_capability_absent(method, args):
     c = weaver_py.Client(capabilities=[])
     with pytest.raises(weaver_py.CapabilityDenied):
         getattr(c, method)(*args)
+
+
+def test_set_tag_requires_mark_capability():
+    c = weaver_py.Client(capabilities=["nudge", "interrupt"])  # everything but mark
+    with pytest.raises(weaver_py.CapabilityDenied):
+        c.set_tag("sess", "triage", "blocked", "stuck on tests")
+
+
+def test_clear_tag_requires_mark_capability():
+    c = weaver_py.Client(capabilities=["nudge", "interrupt"])  # everything but mark
+    with pytest.raises(weaver_py.CapabilityDenied):
+        c.clear_tag("sess", "triage")
 
 
 def test_mark_requires_mark_capability():

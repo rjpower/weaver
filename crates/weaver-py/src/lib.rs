@@ -19,8 +19,11 @@
 //!   `observe`.
 //!
 //! DTOs cross into Python as plain dicts via `serde_json` → `pythonize`, so a
-//! script reads `s["id"]`, `s["attention"]`, `s["branch"]["triage_level"]`
-//! without a bespoke wrapper class per View.
+//! script reads `s["id"]`, `s["branch"]["description"]`, and the branch's
+//! `tags` (a list of `{key, value, note, set_by, set_at}`) without a bespoke
+//! wrapper class per View. The well-known keys are `attention` (the agent's
+//! self-report) and `triage` (an overlooker's assessment); absence is the calm
+//! state — there is no `ok` tag.
 
 use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -28,7 +31,7 @@ use pythonize::pythonize;
 use serde::Serialize;
 
 use weaver_api::capability::{require, CapabilityError};
-use weaver_api::{Client as ApiClient, SendReq, TriageReq};
+use weaver_api::{Client as ApiClient, SendReq};
 
 pyo3::create_exception!(
     weaver_py,
@@ -185,9 +188,45 @@ impl Client {
 
     // -- Writes (capability-gated) ----------------------------------------
 
-    /// Stamp the overlooker's triage mark on a session (needs `mark`).
-    /// `level` is `ok` | `attention` | `blocked` (or empty to clear);
-    /// `by` defaults to `manual` server-side. Returns the updated session.
+    /// Set (upsert) a tag on a session (needs `mark`). `tag_key` is the axis
+    /// (`attention`, `triage`, or any free-form key); for a loud key `value` is
+    /// `attention` | `blocked` — clear the tag (rather than setting `ok`) to
+    /// return to calm. `by` defaults to `manual` server-side. Returns the
+    /// updated session.
+    #[pyo3(signature = (key, tag_key, value, note="", by=None))]
+    fn set_tag(
+        &self,
+        py: Python<'_>,
+        key: &str,
+        tag_key: &str,
+        value: &str,
+        note: &str,
+        by: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        self.gate("mark")?;
+        let view = py
+            .detach(|| {
+                self.rt
+                    .block_on(self.inner.set_tag(key, tag_key, value, note, by.as_deref()))
+            })
+            .map_err(api_err)?;
+        to_py(py, &view)
+    }
+
+    /// Clear a tag on a session (needs `mark`) — how a loud axis returns to
+    /// calm. Returns the updated session.
+    fn clear_tag(&self, py: Python<'_>, key: &str, tag_key: &str) -> PyResult<Py<PyAny>> {
+        self.gate("mark")?;
+        let view = py
+            .detach(|| self.rt.block_on(self.inner.clear_tag(key, tag_key)))
+            .map_err(api_err)?;
+        to_py(py, &view)
+    }
+
+    /// Stamp the overlooker's triage mark on a session (needs `mark`) — a
+    /// convenience over the `triage` tag. `level` is `attention` | `blocked` to
+    /// raise it, or empty/`ok` to clear it; `by` defaults to `manual`
+    /// server-side. Returns the updated session.
     #[pyo3(signature = (key, level, note="", by=None))]
     fn mark(
         &self,
@@ -198,13 +237,11 @@ impl Client {
         by: Option<String>,
     ) -> PyResult<Py<PyAny>> {
         self.gate("mark")?;
-        let req = TriageReq {
-            level: level.to_string(),
-            note: note.to_string(),
-            by,
-        };
         let view = py
-            .detach(|| self.rt.block_on(self.inner.mark(key, &req)))
+            .detach(|| {
+                self.rt
+                    .block_on(self.inner.mark(key, level, note, by.as_deref()))
+            })
             .map_err(api_err)?;
         to_py(py, &view)
     }

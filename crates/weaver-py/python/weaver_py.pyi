@@ -42,7 +42,10 @@ class Client:
 
     # -- Reads (observe) --
     def sessions(self) -> list[dict[str, Any]]:
-        """Every active session, as a list of dicts."""
+        """Every active session, as a list of dicts. Each carries a nested
+        `branch` whose `tags` is a list of `{key, value, note, set_by, set_at}`
+        (the well-known `attention`/`triage` keys plus any free-form key);
+        absence of a key is the calm state."""
 
     def session(self, key: str) -> dict[str, Any]:
         """One session by key (id, branch id, branch name, or `repo:branch`)."""
@@ -54,6 +57,20 @@ class Client:
         """The worktree file tree + change map vs the diff base."""
 
     # -- Writes (capability-gated) --
+    def set_tag(
+        self,
+        key: str,
+        tag_key: str,
+        value: str,
+        note: str = ...,
+        by: str | None = ...,
+    ) -> dict[str, Any]:
+        """Set (upsert) a tag on a session — `tag_key` is the axis
+        (`attention`, `triage`, or any free-form key). Needs `mark`."""
+
+    def clear_tag(self, key: str, tag_key: str) -> dict[str, Any]:
+        """Clear a tag — how a loud axis returns to calm. Needs `mark`."""
+
     def mark(
         self,
         key: str,
@@ -61,7 +78,8 @@ class Client:
         note: str = ...,
         by: str | None = ...,
     ) -> dict[str, Any]:
-        """Stamp the triage mark on a session. Needs `mark`."""
+        """Stamp the triage mark on a session — a convenience over the `triage`
+        tag (empty/`ok` clears it). Needs `mark`."""
 
     def nudge(self, key: str, text: str, submit: bool = ...) -> dict[str, Any]:
         """Type a message into a session's agent pane. Needs `nudge`."""

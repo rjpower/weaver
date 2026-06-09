@@ -23,6 +23,15 @@ import sys
 import weaver_py
 
 
+def tag_value(branch: dict, key: str) -> str:
+    """The value of a branch tag by key, or 'calm' when it is absent (absence is
+    the default state — there is no stored 'ok')."""
+    for tag in branch.get("tags", []):
+        if tag.get("key") == key:
+            return tag.get("value") or "calm"
+    return "calm"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--base", default=None, help="loom base URL (default: $WEAVER_API or 127.0.0.1:7878)")
@@ -50,10 +59,10 @@ def main() -> int:
         print("  (no active sessions)")
     for s in sessions:
         branch = s.get("branch", {})
-        triage = branch.get("triage_level") or "-"
         print(
             f"  {s['id'][:8]}  {branch.get('title', ''):<30.30}  "
-            f"attention={s['branch'].get('attention', '-'):<10}  triage={triage}"
+            f"attention={tag_value(branch, 'attention'):<10}  "
+            f"triage={tag_value(branch, 'triage')}"
         )
 
     if args.mark:
@@ -66,7 +75,7 @@ def main() -> int:
         except weaver_py.WeaverError as e:
             print(f"mark failed: {e}", file=sys.stderr)
             return 1
-        print(f"# marked {session} -> {updated['branch']['triage_level']} ({note!r})")
+        print(f"# marked {session} -> {tag_value(updated['branch'], 'triage')} ({note!r})")
 
     return 0
 

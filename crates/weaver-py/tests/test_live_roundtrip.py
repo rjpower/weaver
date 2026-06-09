@@ -16,12 +16,12 @@ and it kills the server + tears the tmux socket down on teardown.
 
 What it asserts is the parts that are reproducible without an agent runtime:
 the binding reaches the real server and decodes its typed responses
-(`sessions()` -> []), and a gated mutating call that the capability permits
-reaches the server and surfaces the server's error as `WeaverError` (marking a
-session that does not exist). Creating a real session launches an agent
-(`claude`) under tmux, which is not reproducible in CI, so the full
-create-then-mark round-trip is left to a human running this locally against a
-seeded session.
+(`sessions()` -> []), and gated mutating calls that the capability permits
+(`set_tag`/`clear_tag`/`mark`) reach the server and surface the server's error
+as `WeaverError` (tagging a session that does not exist). Creating a real
+session launches an agent (`claude`) under tmux, which is not reproducible in
+CI, so the full create-then-tag round-trip is left to a human running this
+locally against a seeded session.
 
 Run it locally with:
 
@@ -131,15 +131,28 @@ def test_sessions_decodes_an_empty_fleet(isolated_loom):
     assert sessions == [], "a fresh isolated server has no sessions"
 
 
-def test_mark_reaches_the_server_and_surfaces_its_error(isolated_loom):
+def test_set_tag_reaches_the_server_and_surfaces_its_error(isolated_loom):
     # Capability present, so the gate passes; the session does not exist, so the
     # server errors and the binding maps it to WeaverError (not CapabilityDenied).
+    c = weaver_py.Client(base=isolated_loom, capabilities=["observe", "mark"])
+    with pytest.raises(weaver_py.WeaverError):
+        c.set_tag("does-not-exist", "triage", "attention", "smoke test")
+
+
+def test_clear_tag_reaches_the_server_and_surfaces_its_error(isolated_loom):
+    c = weaver_py.Client(base=isolated_loom, capabilities=["observe", "mark"])
+    with pytest.raises(weaver_py.WeaverError):
+        c.clear_tag("does-not-exist", "triage")
+
+
+def test_mark_reaches_the_server_and_surfaces_its_error(isolated_loom):
+    # The `triage`-tag convenience over set_tag, same gate and same round-trip.
     c = weaver_py.Client(base=isolated_loom, capabilities=["observe", "mark"])
     with pytest.raises(weaver_py.WeaverError):
         c.mark("does-not-exist", "attention", "smoke test")
 
 
-def test_mark_without_capability_never_reaches_the_server(isolated_loom):
+def test_set_tag_without_capability_never_reaches_the_server(isolated_loom):
     c = weaver_py.Client(base=isolated_loom, capabilities=["observe"])
     with pytest.raises(weaver_py.CapabilityDenied):
-        c.mark("does-not-exist", "attention", "smoke test")
+        c.set_tag("does-not-exist", "triage", "attention", "smoke test")
