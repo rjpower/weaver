@@ -158,16 +158,19 @@ const changedList = computed(() => {
 // Status → single-letter badge + colour class.
 function badge(status: string): { letter: string; cls: string } {
   switch (status) {
+    // Conventional diff colours, but routed through loom's semantic tokens so
+    // they theme light/dark with the rest of the UI. (Added keeps a literal
+    // green — the palette has no positive/added token.)
     case 'added':
       return { letter: 'A', cls: 'text-green-600 dark:text-green-400' };
     case 'deleted':
-      return { letter: 'D', cls: 'text-red-500' };
+      return { letter: 'D', cls: 'text-block' };
     case 'renamed':
-      return { letter: 'R', cls: 'text-blue-500' };
+      return { letter: 'R', cls: 'text-accent' };
     case 'copied':
-      return { letter: 'C', cls: 'text-blue-500' };
+      return { letter: 'C', cls: 'text-accent' };
     default:
-      return { letter: 'M', cls: 'text-amber-500' };
+      return { letter: 'M', cls: 'text-attn' };
   }
 }
 
@@ -656,7 +659,7 @@ onUnmounted(teardownEditors);
 
           <div
             v-else-if="kind === 'error'"
-            class="flex h-full w-full items-center justify-center p-4 text-sm text-red-400"
+            class="flex h-full w-full items-center justify-center p-4 text-sm text-block"
           >
             {{ viewError }}
           </div>

@@ -80,6 +80,15 @@ function statusOf(t: PlanTask): Status {
   return { label: t.exec, cls: 'text-faint', glyph: '·' };
 }
 
+// The rendered plan document, minus its leading YAML frontmatter (`---\n…\n---`).
+// The frontmatter (`plan:`, `status:`) is already surfaced as the header title +
+// status pill; left in, markdown-it renders it as a stray `<hr>` + "plan: …"
+// paragraph at the top of the prose. Only a frontmatter block at the very start
+// is stripped, so a `---` rule elsewhere in the doc is untouched.
+const renderedContent = computed(() =>
+  (plan.value?.content ?? '').replace(/^﻿?---\r?\n[\s\S]*?\r?\n---[ \t]*\r?\n?/, ''),
+);
+
 const valueRank: Record<string, number> = { high: 0, med: 1, medium: 1, low: 2 };
 const tasksByValue = computed(() =>
   [...(plan.value?.tasks ?? [])].sort((a, b) => {
@@ -310,7 +319,7 @@ onUnmounted(teardownEditor);
            host stays mounted (v-show) so its ref survives the mode flip. -->
       <div v-show="editing" ref="host" class="h-[60vh] w-full border-t border-line"></div>
       <div v-show="!editing" class="border-t border-line">
-        <MarkdownView :id="props.id" :path="plan.path" :source="plan.content" />
+        <MarkdownView :id="props.id" :path="plan.path" :source="renderedContent" />
       </div>
     </div>
   </section>

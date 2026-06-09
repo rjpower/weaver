@@ -175,6 +175,32 @@ export async function renderMarkdown(src: string, ctx: RenderContext): Promise<s
 
 let mermaidSeq = 0;
 
+// Mermaid's stock `default`/`dark` themes paint nodes lavender-purple, which
+// clashes with loom's neutral-slate + single-blue palette. Drive mermaid's
+// `base` theme with loom's own tokens instead so diagrams read as part of the
+// same UI in both palettes. Hexes mirror the slate/blue values in styles.css.
+function mermaidThemeVariables(dark: boolean): Record<string, string> {
+  return dark
+    ? {
+        background: '#1e293b', // surface (slate-800)
+        primaryColor: '#0f172a', // canvas (slate-900) — node fill
+        primaryBorderColor: '#475569', // slate-600
+        primaryTextColor: '#f1f5f9', // slate-100
+        lineColor: '#64748b', // slate-500 — edges
+        secondaryColor: '#334155', // slate-700
+        tertiaryColor: '#0f172a',
+      }
+    : {
+        background: '#ffffff',
+        primaryColor: '#f1f5f9', // slate-100 — node fill
+        primaryBorderColor: '#cbd5e1', // slate-300
+        primaryTextColor: '#0f172a', // slate-900
+        lineColor: '#94a3b8', // slate-400 — edges
+        secondaryColor: '#e2e8f0', // slate-200
+        tertiaryColor: '#f8fafc',
+      };
+}
+
 /** Turn every `<pre class="mermaid">` placeholder under `root` into a rendered
  *  SVG diagram. Mermaid runs with `securityLevel: 'strict'` (it sanitises its
  *  own SVG); a diagram that fails to parse is left as its source text with an
@@ -188,7 +214,8 @@ export async function renderMermaid(root: HTMLElement, dark: boolean): Promise<v
   mermaid.initialize({
     startOnLoad: false,
     securityLevel: 'strict',
-    theme: dark ? 'dark' : 'default',
+    theme: 'base',
+    themeVariables: mermaidThemeVariables(dark),
     fontFamily: 'inherit',
   });
 

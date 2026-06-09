@@ -285,8 +285,16 @@ onUnmounted(() => clearInterval(timer));
   <div>
     <div class="flex items-center justify-between mb-4">
       <h1 class="text-xl font-semibold">Sessions</h1>
+      <!-- Toggles the create form. Closed → primary (accent) call-to-action;
+           open → a neutral "Cancel" so it never reads as a second primary
+           action competing with the form's own Create button. -->
       <button
-        class="rounded bg-accent hover:bg-accent-hover px-3 py-1.5 text-sm font-medium"
+        :class="[
+          'rounded px-3 py-1.5 text-sm font-medium transition-colors',
+          showForm
+            ? 'bg-subtle text-fg hover:bg-subtle-hover'
+            : 'bg-accent text-accent-fg hover:bg-accent-hover',
+        ]"
         @click="showForm = !showForm"
       >
         {{ showForm ? 'Cancel' : 'New session' }}
@@ -497,7 +505,7 @@ onUnmounted(() => clearInterval(timer));
       <button
         type="submit"
         :disabled="creating"
-        class="rounded bg-accent hover:bg-accent-hover px-3 py-1.5 text-sm font-medium disabled:opacity-50"
+        class="rounded bg-accent text-accent-fg hover:bg-accent-hover px-3 py-1.5 text-sm font-medium disabled:opacity-50"
       >
         {{ creating ? 'Creating…' : 'Create' }}
       </button>
@@ -510,21 +518,30 @@ onUnmounted(() => clearInterval(timer));
     </p>
 
     <div v-if="sessions.length" class="mb-3 flex items-center gap-3">
-      <!-- Attention filter: jump straight to the sessions that need a human. -->
-      <div class="inline-flex rounded border border-line text-xs overflow-hidden">
+      <!-- Attention filter: jump straight to the sessions that need a human.
+           Each segment pairs a label with its count in a small pill so the
+           number reads as a count, not a suffix glued to the word. -->
+      <div class="inline-flex rounded-md border border-line text-xs overflow-hidden">
         <button
           v-for="opt in (['all', 'attention', 'ok'] as const)"
           :key="opt"
           type="button"
           :data-testid="`filter-${opt}`"
           :class="[
-            'px-3 py-1 border-l border-line first:border-l-0',
-            filter === opt ? 'bg-accent text-accent-fg' : 'bg-input text-muted hover:bg-subtle',
+            'flex items-center gap-1.5 px-3 py-1.5 font-medium border-l border-line first:border-l-0 transition-colors',
+            filter === opt
+              ? 'bg-accent text-accent-fg'
+              : 'bg-input text-muted hover:bg-subtle hover:text-fg',
           ]"
           @click="filter = opt"
         >
           {{ opt === 'all' ? 'All' : opt === 'attention' ? 'Needs attention' : 'OK' }}
-          <span class="opacity-70">{{ counts[opt] }}</span>
+          <span
+            :class="[
+              'rounded-full px-1.5 text-[0.7rem] leading-5 tabular-nums',
+              filter === opt ? 'bg-accent-fg/20 text-accent-fg' : 'bg-subtle text-faint',
+            ]"
+          >{{ counts[opt] }}</span>
         </button>
       </div>
 
