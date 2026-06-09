@@ -80,14 +80,31 @@ function statusOf(t: PlanTask): Status {
   return { label: t.exec, cls: 'text-faint', glyph: '·' };
 }
 
-// The rendered plan document, minus its leading YAML frontmatter (`---\n…\n---`).
-// The frontmatter (`plan:`, `status:`) is already surfaced as the header title +
-// status pill; left in, markdown-it renders it as a stray `<hr>` + "plan: …"
-// paragraph at the top of the prose. Only a frontmatter block at the very start
-// is stripped, so a `---` rule elsewhere in the doc is untouched.
-const renderedContent = computed(() =>
-  (plan.value?.content ?? '').replace(/^﻿?---\r?\n[\s\S]*?\r?\n---[ \t]*\r?\n?/, ''),
-);
+// The rendered plan document, minus its leading YAML frontmatter (`---\n…\n---`)
+// AND its `## Tasks` section. The frontmatter (`plan:`, `status:`) is already
+// surfaced as the header title + status pill; left in, markdown-it renders it as
+// a stray `<hr>` + "plan: …" paragraph at the top of the prose. Only a
+// frontmatter block at the very start is stripped, so a `---` rule elsewhere in
+// the doc is untouched. The `## Tasks` section (its heading, preamble, and every
+// `### T<n>` block) restates the projected task list above, so it's dropped from
+// the prose: a line-based scan removes everything from `## Task[s]` up to — but
+// not including — the next `^## ` heading (or end of doc). Display-only: the raw
+// `plan.content` still drives parsing, the graph, reconcile, and saving.
+const renderedContent = computed(() => {
+  const body = (plan.value?.content ?? '').replace(/^﻿?---\r?\n[\s\S]*?\r?\n---[ \t]*\r?\n?/, '');
+  let inTasks = false;
+  return body
+    .split('\n')
+    .filter((line) => {
+      if (/^## +tasks?\s*$/i.test(line)) {
+        inTasks = true; // enter the Tasks section — drop this and following lines
+        return false;
+      }
+      if (inTasks && /^## /.test(line)) inTasks = false; // next level-2 heading ends it
+      return !inTasks;
+    })
+    .join('\n');
+});
 
 const valueRank: Record<string, number> = { high: 0, med: 1, medium: 1, low: 2 };
 const tasksByValue = computed(() =>
@@ -145,6 +162,10 @@ async function edit() {
   delta.value = null;
   await nextTick();
   await mountEditor();
+  // Land the user on the editor: it's the only thing shown in edit mode, but the
+  // page may be scrolled to the read-first projections above it.
+  editor?.focus();
+  host.value?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
 
 function cancel() {
@@ -226,7 +247,7 @@ onUnmounted(teardownEditor);
         <div class="ml-auto flex gap-1.5">
           <template v-if="!editing">
             <button
-              class="rounded bg-subtle px-2.5 py-1 text-xs text-fg hover:bg-subtle-hover"
+              class="btn-secondary px-2.5 py-1 text-xs"
               @click="edit"
             >
               Edit
@@ -241,14 +262,14 @@ onUnmounted(teardownEditor);
           </template>
           <template v-else>
             <button
-              class="rounded bg-accent px-2.5 py-1 text-xs text-accent-fg hover:bg-accent-hover"
+              class="btn-primary px-2.5 py-1 text-xs"
               :disabled="busy === 'save'"
               @click="save"
             >
               {{ busy === 'save' ? 'Saving…' : 'Save' }}
             </button>
             <button
-              class="rounded bg-subtle px-2.5 py-1 text-xs text-fg hover:bg-subtle-hover"
+              class="btn-secondary px-2.5 py-1 text-xs"
               @click="cancel"
             >
               Cancel
@@ -284,13 +305,13 @@ onUnmounted(teardownEditor);
       </ul>
       <div class="mt-2.5 flex gap-1.5">
         <button
-          class="rounded bg-accent px-2.5 py-1 text-xs text-accent-fg hover:bg-accent-hover"
+          class="btn-primary px-2.5 py-1 text-xs"
           :disabled="busy === 'apply'"
           @click="applyDelta"
         >
           {{ busy === 'apply' ? 'Applying…' : `Apply ${delta.actions.length} change(s)` }}
         </button>
-        <button class="rounded bg-subtle px-2.5 py-1 text-xs text-fg hover:bg-subtle-hover" @click="delta = null">
+        <button class="btn-secondary px-2.5 py-1 text-xs" @click="delta = null">
           Dismiss
         </button>
       </div>
@@ -298,8 +319,9 @@ onUnmounted(teardownEditor);
 
     <div v-if="plan">
       <!-- Task list — the live projection: status comes from the issue ledger,
-           sorted so the highest-value work surfaces first. -->
-      <ul v-if="plan.tasks.length" class="divide-y divide-line">
+           sorted so the highest-value work surfaces first. Hidden while editing,
+           so Monaco is the only thing on screen. -->
+      <ul v-if="plan.tasks.length" v-show="!editing" data-testid="plan-tasks" class="divide-y divide-line">
         <li v-for="t in tasksByValue" :key="t.id" class="flex items-baseline gap-2 px-4 py-1.5 text-sm">
           <span class="font-mono text-xs text-faint">{{ t.id }}</span>
           <span :class="statusOf(t).cls" :title="statusOf(t).label">{{ statusOf(t).glyph }}</span>
@@ -310,8 +332,8 @@ onUnmounted(teardownEditor);
         </li>
       </ul>
 
-      <!-- Dependency graph (only when there are edges). -->
-      <div v-if="graphSource" class="border-t border-line">
+      <!-- Dependency graph (only when there are edges). Hidden while editing. -->
+      <div v-if="graphSource" v-show="!editing" class="border-t border-line">
         <MarkdownView :id="props.id" :path="plan.path" :source="graphSource" />
       </div>
 

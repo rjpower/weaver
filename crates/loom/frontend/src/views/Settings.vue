@@ -154,14 +154,14 @@ onMounted(load);
               :class="{ 'font-mono': s.kind === 'string' }"
             />
             <button
-              class="rounded bg-accent text-accent-fg hover:bg-accent-hover px-3 py-1.5 text-sm disabled:opacity-40"
+              class="btn-primary px-3 py-1.5 text-sm"
               :disabled="busy === s.key || !dirty(s)"
               @click="save(s)"
             >
               Save
             </button>
             <button
-              class="rounded bg-subtle hover:bg-subtle-hover px-3 py-1.5 text-sm disabled:opacity-40"
+              class="btn-secondary px-3 py-1.5 text-sm"
               :disabled="busy === s.key || s.is_default"
               :title="`Reset to default: ${s.default || '(empty)'}`"
               @click="reset(s)"
