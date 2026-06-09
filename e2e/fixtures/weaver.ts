@@ -12,16 +12,28 @@ const WEAVER_BINARY = join(WEAVER_ROOT, 'target', 'debug', 'weaver');
 const FRONTEND_DIR = join(WEAVER_ROOT, 'crates', 'loom', 'frontend');
 const DIST_INDEX = join(WEAVER_ROOT, 'crates', 'loom', 'static', 'dist', 'index.html');
 
+/** One (key, value) annotation on a branch. The well-known loud keys are
+ *  `attention` (the agent) and `triage` (an overlooker / `manual`); any other
+ *  key is a quiet pill. Absence is the calm state — there is no `ok` tag. */
+export interface TagView {
+  key: string;
+  value: string;
+  note: string;
+  set_by: string;
+  set_at: string;
+}
+
 /** The branch-level fields embedded in a SessionView. */
 export interface Branch {
   id: string;
   name: string;
   title: string;
   goal: string;
-  /** Current-state message, set with `attention` via `weaver set-status`. */
+  /** Current-state message, set with the `attention` tag via `weaver set-status`. */
   description: string;
-  /** Agent-declared attention level: 'ok' | 'attention' | 'blocked'. */
-  attention: string;
+  /** Every tag on the branch (the agent's `attention`, an overlooker's
+   *  `triage`, any free-form key). Empty when calm — absence is the default. */
+  tags: TagView[];
   repo_root: string;
   branch: string;
   base_branch: string;
@@ -94,11 +106,28 @@ export interface WeaverFixture {
   listSessions(): Promise<Session[]>;
   /** Flip a session's status by writing a hook event row via `weaver hook`. */
   hook(session: Session, event: 'working' | 'waiting' | 'idle'): Promise<void>;
-  /** Declare the agent's status (level + message) via `weaver set-status`. */
+  /** Declare the agent's status (level + message) via `weaver set-status`. It
+   *  writes the branch's `attention` tag (clearing it on `ok`) and the
+   *  current-state message, recording a `tag` event the monitor re-broadcasts. */
   setStatus(
     session: Session,
     level: 'ok' | 'attention' | 'blocked',
     message?: string,
+  ): Promise<void>;
+  /** Set (upsert) one tag on a session's branch via `PUT …/tags/{key}`. */
+  setTag(
+    session: Session,
+    key: string,
+    value: string,
+    opts?: { note?: string; by?: string },
+  ): Promise<void>;
+  /** Clear one tag via `DELETE …/tags/{key}`. */
+  clearTag(session: Session, key: string): Promise<void>;
+  /** Stamp an overlooker's `triage` mark — sugar over `setTag(triage, …)`. */
+  mark(
+    session: Session,
+    level: 'attention' | 'blocked',
+    opts?: { note?: string; by?: string },
   ): Promise<void>;
 }
 
@@ -397,13 +426,33 @@ export const test = base.extend<{ weaver: WeaverFixture }, WorkerFixtures>({
       },
 
       async setStatus(session, level, message) {
-        // `weaver set-status <level> [message]` writes the branch's attention
-        // level (and message) directly and records an `attention` event the
-        // monitor re-broadcasts.
+        // `weaver set-status <level> [message]` writes the branch's `attention`
+        // tag (clearing it on `ok`) and the current-state message, recording a
+        // `tag` event the monitor re-broadcasts.
         const args = ['set-status', level, ...(message ? [message] : [])];
         execFileSync(WEAVER_BINARY, args, {
           env: { ...childEnv, WEAVER_BRANCH: session.branch.id },
           stdio: 'pipe',
+        });
+      },
+
+      async setTag(session, key, value, opts) {
+        await fetchJson(`${baseUrl}/api/sessions/${session.id}/tags/${key}`, {
+          method: 'PUT',
+          body: JSON.stringify({ value, note: opts?.note, by: opts?.by }),
+        });
+      },
+
+      async clearTag(session, key) {
+        await fetchJson(`${baseUrl}/api/sessions/${session.id}/tags/${key}`, {
+          method: 'DELETE',
+        });
+      },
+
+      async mark(session, level, opts) {
+        await fixture.setTag(session, 'triage', level, {
+          note: opts?.note,
+          by: opts?.by ?? 'manual',
         });
       },
     };

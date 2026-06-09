@@ -1,3 +1,21 @@
+/** One (key, value) annotation on a branch. A status axis collapsed into data:
+ *  the well-known *loud* keys are `attention` (authored by the agent) and
+ *  `triage` (authored by an overlooker or `manual`), both on the
+ *  `attention | blocked` ladder; every other key is a quiet, free-form pill.
+ *  Absence is the calm state — there is no stored `ok`. Mirrors weaver-api's
+ *  `TagView`. */
+export interface Tag {
+  key: string;
+  value: string;
+  /** One-line reason accompanying the tag. */
+  note: string;
+  /** Who set it — `agent`, an overlooker name, or `manual`. */
+  set_by: string;
+  /** When it was last set (ISO). The dashboard fades a triage mark stale once
+   *  the session's activity advances past this. */
+  set_at: string;
+}
+
 /** A branch is the engine's view of "what the agent is working on": one
  *  `(repo_root, branch)` pair with a goal, a title, and a free-form
  *  description. Branches are owned by `weaver-core` and exist whether or not
@@ -8,23 +26,14 @@ export interface Branch {
   name: string;
   title: string;
   goal: string;
-  /** The agent's current-state message, set together with `attention` via
-   *  `weaver set-status` (e.g. "Wired up routes; tests pass"). */
+  /** The agent's current-state message, set together with the `attention` tag
+   *  via `weaver set-status` (e.g. "Wired up routes; tests pass"). Shown even
+   *  when the branch is calm. */
   description: string;
-  /** Agent-declared attention level: 'ok' | 'attention' | 'blocked'. The
-   *  "does this need me?" signal, set by the agent via `weaver set-status`. */
-  attention: string;
-  /** The overlooker's assessment — a third status axis distinct from
-   *  `attention`. '' when unmarked; otherwise 'ok' | 'attention' | 'blocked'.
-   *  The agent owns `attention`; an overlooker owns this. */
-  triage_level: string;
-  /** One-line reason accompanying the triage mark. */
-  triage_note: string;
-  /** Which overlooker (or 'manual') last set the mark. */
-  triage_by: string;
-  /** When the mark was last set; null if never marked. The dashboard shows the
-   *  mark stale once the session's activity advances past it. */
-  triage_at: string | null;
+  /** Every tag on the branch: the agent's `attention`, an overlooker's
+   *  `triage`, and any free-form key. Empty when the branch is calm and
+   *  unmarked — absence is the default state, there is no `ok` tag. */
+  tags: Tag[];
   repo_root: string;
   branch: string;
   base_branch: string;

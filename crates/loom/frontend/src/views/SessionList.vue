@@ -4,11 +4,12 @@ import { get, post } from '../api';
 import type { Session, RecentRepo, RepoBranch } from '../types';
 import StatusBadge from '../components/StatusBadge.vue';
 import AttentionBadge from '../components/AttentionBadge.vue';
-import TriageBadge from '../components/TriageBadge.vue';
+import TagPill from '../components/TagPill.vue';
 import GithubStatus from '../components/GithubStatus.vue';
 import ScratchPicker from '../components/ScratchPicker.vue';
 import { timeAgo } from '../lib/time';
-import { levelOf, messageOf, triageOf, triageStale } from '../lib/sessionState';
+import { effectiveAttention, messageOf, quietTags } from '../lib/sessionState';
+import { del } from '../api';
 
 const sessions = ref<Session[]>([]);
 
@@ -36,18 +37,18 @@ const visibleSessions = computed<Session[]>(() => {
   const all = sessions.value;
   const live = all.filter((s) => s.status !== 'archived');
   const base = showArchived.value || live.length === 0 ? all : live;
-  if (filter.value === 'attention') return base.filter((s) => levelOf(s) !== 'ok');
-  if (filter.value === 'ok') return base.filter((s) => levelOf(s) === 'ok');
+  if (filter.value === 'attention') return base.filter((s) => effectiveAttention(s).level !== 'ok');
+  if (filter.value === 'ok') return base.filter((s) => effectiveAttention(s).level === 'ok');
   return base;
 });
 
 // Counts reflect the full fleet (NOT the archived-hidden view) so the filter
-// chips read the true picture; levelOf() already forces archived → ok, keeping
-// "needs attention" honest.
+// chips read the true picture; effectiveAttention() already forces archived → ok
+// and ignores stale overlooker marks, keeping "needs attention" honest.
 const counts = computed(() => {
   const c = { all: sessions.value.length, attention: 0, ok: 0 };
   for (const s of sessions.value) {
-    if (levelOf(s) === 'ok') c.ok += 1;
+    if (effectiveAttention(s).level === 'ok') c.ok += 1;
     else c.attention += 1; // 'attention' and 'blocked' both need a human
   }
   return c;
@@ -213,6 +214,21 @@ async function load() {
     error.value = '';
   } catch (e) {
     error.value = (e as Error).message;
+  }
+}
+
+// A quiet pill's × clears that tag, then refreshes the row. The tag write
+// surface is the same DELETE the detail page uses.
+const clearingTag = ref('');
+async function clearTag(sessionId: string, key: string) {
+  clearingTag.value = `${sessionId}:${key}`;
+  try {
+    await del(`/sessions/${sessionId}/tags/${encodeURIComponent(key)}`);
+    await load();
+  } catch (e) {
+    error.value = (e as Error).message;
+  } finally {
+    clearingTag.value = '';
   }
 }
 
@@ -563,9 +579,9 @@ onUnmounted(() => clearInterval(timer));
         :class="[
           'stagger-in group flex cursor-pointer items-start gap-3 border-b border-line px-3 py-3 last:border-0',
           'min-h-[3.25rem] transition-colors hover:bg-subtle',
-          levelOf(s) === 'blocked'
+          effectiveAttention(s).level === 'blocked'
             ? 'border-l-2 border-l-block-line bg-block-soft pulse-attention'
-            : levelOf(s) === 'attention'
+            : effectiveAttention(s).level === 'attention'
               ? 'border-l-2 border-l-attn-line bg-attn-soft pulse-attention'
               : '',
         ]"
@@ -583,22 +599,21 @@ onUnmounted(() => clearInterval(timer));
           <span class="tree-col" :class="isLast ? 'tree-col--elbow' : 'tree-col--tee'"></span>
         </div>
 
-        <!-- Signal: the agent's own loud axis, plus the overlooker's quieter
-             mark beside it when one exists. -->
+        <!-- Signal: the single resolved attention badge (the louder of the
+             agent's own report and a non-stale overlooker mark, attributed). -->
         <div class="flex shrink-0 flex-col items-start gap-1 pt-0.5">
-          <AttentionBadge :level="levelOf(s)" :note="messageOf(s)" />
-          <TriageBadge
-            v-if="triageOf(s)"
-            :level="triageOf(s)"
-            :note="s.branch.triage_note"
-            :by="s.branch.triage_by"
-            :stale="triageStale(s)"
+          <AttentionBadge
+            :level="effectiveAttention(s).level"
+            :raised-by="effectiveAttention(s).raisedBy"
+            :by="effectiveAttention(s).by"
+            :note="effectiveAttention(s).note"
+            :stale="effectiveAttention(s).stale"
           />
         </div>
 
         <!-- Title + current-state (the work, in prose). -->
         <div class="min-w-0 flex-1">
-          <div class="flex items-center gap-2">
+          <div class="flex flex-wrap items-center gap-2">
             <router-link
               :to="`/s/${s.id}`"
               class="truncate text-base font-semibold text-fg hover:text-accent"
@@ -608,6 +623,14 @@ onUnmounted(() => clearInterval(timer));
             </router-link>
             <!-- Lifecycle: demoted, neutral, mono pill (StatusBadge). -->
             <StatusBadge :status="s.status" class="shrink-0" />
+            <!-- Quiet free-form tags: deletable pills, never the loud fill. -->
+            <TagPill
+              v-for="t in quietTags(s)"
+              :key="t.key"
+              :tag="t"
+              :busy="clearingTag === `${s.id}:${t.key}`"
+              @clear="(key) => clearTag(s.id, key)"
+            />
           </div>
 
           <!-- Current-state headline (agent's set-status message), else the goal. -->
