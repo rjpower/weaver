@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::Row;
 use tokio::sync::broadcast;
 
@@ -95,6 +95,26 @@ pub async fn record_local(db: &Db, branch_id: &str, kind: &str, data: Value) -> 
             .fetch_one(db)
             .await?;
     Ok(row.get("id"))
+}
+
+/// Persist and broadcast a `tag` event — the single event kind for a tag being
+/// set or cleared on a branch (the agent's `attention`, an overlooker's
+/// `triage`, or any free-form key). The payload carries the tag's `key`,
+/// `value` (empty when the tag was cleared), `note`, and author `by`. The
+/// monitor re-broadcasts these, and an overlooker dispatcher maps `key`/`value`
+/// onto a trigger's match `kind`/`level`. Sugar over [`record`] so every tag
+/// mutation logs through one well-shaped path.
+pub async fn record_tag(
+    db: &Db,
+    bus: &EventBus,
+    branch_id: &str,
+    key: &str,
+    value: &str,
+    note: &str,
+    by: &str,
+) -> Result<Event> {
+    let data = json!({ "key": key, "value": value, "note": note, "by": by });
+    record(db, bus, branch_id, "tag", data).await
 }
 
 /// Persist and broadcast a fleet-global event under the [`SYSTEM_BRANCH`] scope

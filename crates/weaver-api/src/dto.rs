@@ -17,10 +17,36 @@ use weaver_core::branch::Branch;
 use weaver_core::github::GithubStatus;
 use weaver_core::issue::Issue;
 use weaver_core::overlooker::{Overlooker, OverlookerRun};
+use weaver_core::tags::Tag;
 
 // ---------------------------------------------------------------------------
 // View payloads (responses)
 // ---------------------------------------------------------------------------
+
+/// One tag on a branch, as the API exposes it. A `(key, value)` annotation with
+/// a reason, author, and timestamp. The well-known keys are `attention` (the
+/// agent's self-report) and `triage` (an overlooker's assessment); any other key
+/// is a free-form, quiet pill. Absence is the calm state — there is no `ok` tag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagView {
+    pub key: String,
+    pub value: String,
+    pub note: String,
+    pub set_by: String,
+    pub set_at: String,
+}
+
+impl From<&Tag> for TagView {
+    fn from(t: &Tag) -> Self {
+        TagView {
+            key: t.key.clone(),
+            value: t.value.clone(),
+            note: t.note.clone(),
+            set_by: t.set_by.clone(),
+            set_at: t.set_at.clone(),
+        }
+    }
+}
 
 /// Branch with denormalized open-issue count, returned by `/api/branches` and
 /// embedded under `SessionView::branch`.
@@ -31,24 +57,13 @@ pub struct BranchView {
     pub name: String,
     pub title: String,
     pub goal: String,
-    /// The agent's current-state message, set with `attention` via
-    /// `weaver set-status`.
+    /// The agent's current-state message, set via `weaver set-status`, shown even
+    /// when the branch is calm. The attention *level* is the `attention` tag.
     pub description: String,
-    /// Agent-declared attention level (`ok` | `attention` | `blocked`) — the
-    /// "does this need me?" signal the dashboard filters on. The accompanying
-    /// message is `description`.
-    pub attention: String,
-    /// The overlooker's assessment — a third status axis distinct from
-    /// `attention`. Empty when unmarked; otherwise `ok` | `attention` |
-    /// `blocked`. The agent owns `attention`; an overlooker owns this.
-    pub triage_level: String,
-    /// One-line reason accompanying the triage mark.
-    pub triage_note: String,
-    /// Which overlooker (or `manual`) last set the mark.
-    pub triage_by: String,
-    /// When the mark was last set; `null` if never marked. The dashboard shows
-    /// the mark stale once `last_activity_at` advances past it.
-    pub triage_at: Option<String>,
+    /// Every tag on the branch (the agent's `attention`, an overlooker's
+    /// `triage`, and any free-form key), ordered by key. Empty when the branch is
+    /// calm and unmarked — absence is the default state, there is no `ok` tag.
+    pub tags: Vec<TagView>,
     pub repo_root: String,
     pub branch: String,
     pub base_branch: String,
@@ -62,11 +77,12 @@ pub struct BranchView {
 }
 
 impl BranchView {
-    /// Build the wire view from a branch plus the parts the server gathered (the
-    /// open-issue count and the latest GitHub snapshot). The async DB lookups
-    /// that produce those parts live in the loom server.
+    /// Build the wire view from a branch plus the parts the server gathered (its
+    /// tags, the open-issue count, and the latest GitHub snapshot). The async DB
+    /// lookups that produce those parts live in the loom server.
     pub fn from_parts(
         branch: &Branch,
+        tags: &[Tag],
         open_issue_count: i64,
         github: Option<GithubStatus>,
     ) -> Self {
@@ -81,11 +97,7 @@ impl BranchView {
             title: branch.title.clone(),
             goal: branch.goal.clone(),
             description: branch.description.clone(),
-            attention: branch.attention.clone(),
-            triage_level: branch.triage_level.clone(),
-            triage_note: branch.triage_note.clone(),
-            triage_by: branch.triage_by.clone(),
-            triage_at: branch.triage_at.clone(),
+            tags: tags.iter().map(TagView::from).collect(),
             repo_root: branch.repo_root.clone(),
             branch: branch.branch.clone(),
             base_branch: branch.base_branch.clone(),
@@ -344,7 +356,9 @@ pub struct CreateReq {
 }
 
 /// Body for `PATCH /api/sessions/{id}`. Branch-level fields (goal/title/
-/// description/attention) are forwarded to the underlying branch row.
+/// description) are forwarded to the underlying branch row. The attention *level*
+/// is set through the tags endpoints (`PUT/DELETE /sessions/{id}/tags/{key}`),
+/// not here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PatchSessionReq {
     #[serde(default)]
@@ -353,22 +367,23 @@ pub struct PatchSessionReq {
     pub title: Option<String>,
     #[serde(default)]
     pub goal: Option<String>,
-    /// The agent's current-state message — the note shown beside the level.
+    /// The agent's current-state message — the prose shown beside the level.
     #[serde(default)]
     pub description: Option<String>,
-    /// Agent-declared attention level (`ok` | `attention` | `blocked`).
-    #[serde(default)]
-    pub attention: Option<String>,
 }
 
-/// Body for `POST /api/sessions/{id}/triage`: stamp the overlooker's mark.
+/// Body for `PUT /api/sessions/{id}/tags/{key}`: set (upsert) a tag. The `key`
+/// is the path segment; this carries the rest. For a loud key (`attention` |
+/// `triage`) `value` is `attention` | `blocked` — to return to calm, `DELETE`
+/// the tag rather than setting an `ok` value.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TriageReq {
-    /// `ok` | `attention` | `blocked`, or empty to clear the mark.
-    pub level: String,
+pub struct TagReq {
+    pub value: String,
+    /// One-line reason accompanying the tag.
     #[serde(default)]
     pub note: String,
-    /// Which overlooker is making the call; defaults to `manual`.
+    /// Who is setting it (an overlooker name or `manual`); the server defaults a
+    /// missing author.
     #[serde(default)]
     pub by: Option<String>,
 }

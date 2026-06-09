@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::dto::{
     CreateOverlookerReq, CreateReq, OverlookerView, PatchOverlookerReq, PatchSessionReq,
-    RunOverlookerReq, SendReq, SessionView, TriageReq,
+    RunOverlookerReq, SendReq, SessionView, TagReq,
 };
 
 /// A client for one loom server, identified by its base URL.
@@ -83,6 +83,10 @@ impl Client {
         self.send(Method::PATCH, path, Some(body)).await
     }
 
+    pub async fn put(&self, path: &str, body: Value) -> Result<Value> {
+        self.send(Method::PUT, path, Some(body)).await
+    }
+
     pub async fn delete(&self, path: &str) -> Result<Value> {
         self.send(Method::DELETE, path, None).await
     }
@@ -135,14 +139,58 @@ impl Client {
             .await
     }
 
-    /// Stamp the overlooker's mark on a session (`POST /api/sessions/{key}/triage`).
-    pub async fn mark(&self, key: &str, req: &TriageReq) -> Result<SessionView> {
+    /// Set (upsert) a tag on a session
+    /// (`PUT /api/sessions/{key}/tags/{tag_key}`). For a loud key (`attention` |
+    /// `triage`) `value` is `attention` | `blocked`; use [`Client::clear_tag`] to
+    /// return to calm rather than setting an `ok` value.
+    pub async fn set_tag(
+        &self,
+        key: &str,
+        tag_key: &str,
+        value: &str,
+        note: &str,
+        by: Option<&str>,
+    ) -> Result<SessionView> {
+        let req = TagReq {
+            value: value.to_string(),
+            note: note.to_string(),
+            by: by.map(str::to_string),
+        };
         self.send_typed(
-            Method::POST,
-            &format!("/api/sessions/{key}/triage"),
-            Some(req),
+            Method::PUT,
+            &format!("/api/sessions/{key}/tags/{tag_key}"),
+            Some(&req),
         )
         .await
+    }
+
+    /// Clear a tag on a session (`DELETE /api/sessions/{key}/tags/{tag_key}`) —
+    /// how a loud axis returns to calm (`ok`).
+    pub async fn clear_tag(&self, key: &str, tag_key: &str) -> Result<SessionView> {
+        let value = self
+            .delete(&format!("/api/sessions/{key}/tags/{tag_key}"))
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|e| anyhow!("decoding response from /api/sessions/{key}/tags/{tag_key}: {e}"))
+    }
+
+    /// Stamp an overlooker's mark on a session — the `triage` tag. A convenience
+    /// over [`Client::set_tag`] / [`Client::clear_tag`] that keeps the `mark`
+    /// capability name: a `level` of `attention`/`blocked` sets the tag, an empty
+    /// `level` (or `ok`) clears it.
+    pub async fn mark(
+        &self,
+        key: &str,
+        level: &str,
+        note: &str,
+        by: Option<&str>,
+    ) -> Result<SessionView> {
+        if level.is_empty() || level == "ok" {
+            self.clear_tag(key, weaver_core::tags::TRIAGE_KEY).await
+        } else {
+            self.set_tag(key, weaver_core::tags::TRIAGE_KEY, level, note, by)
+                .await
+        }
     }
 
     /// Type a message into a session's agent pane, submitting it by default

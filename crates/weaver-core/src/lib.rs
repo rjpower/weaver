@@ -14,5 +14,6 @@ pub mod migrations;
 pub mod overlooker;
 pub mod plan;
 pub mod repo_config;
+pub mod tags;
 
 pub use db::Db;

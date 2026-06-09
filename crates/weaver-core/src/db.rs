@@ -97,11 +97,13 @@ mod tests {
     use super::*;
 
     /// Regression: the on-disk pool must serve a fully-migrated schema on every
-    /// connection. A column-adding migration once left some pooled connections
+    /// connection. A schema-changing migration once left some pooled connections
     /// with a stale, narrower view of `branches`, so a later `SELECT *`
     /// (`branch::get`) decoded a short row against the wider struct and panicked.
     /// Migrating on a dedicated connection before the pool opens fixes it; this
-    /// exercises the file path (not the single-connection in-memory pool).
+    /// exercises the file path (not the single-connection in-memory pool). The
+    /// 0005 migration *drops* columns, so a stale-schema connection would decode
+    /// a wider row against the narrower struct — the same failure mode in reverse.
     #[tokio::test]
     async fn on_disk_pool_reads_the_full_migrated_branch() {
         let dir = tempfile::tempdir().unwrap();
@@ -109,10 +111,29 @@ mod tests {
         let b = crate::branch::upsert(&db, "/r", "main", "main")
             .await
             .unwrap();
-        // The triage columns (added by a later migration) decode cleanly.
+        // The branch decodes cleanly against the post-migration schema.
         let got = crate::branch::get(&db, &b.id).await.unwrap().unwrap();
-        assert_eq!(got.triage_level, "");
-        assert!(got.triage_at.is_none());
+        assert_eq!(got.branch, "main");
+        // And the tags table (created by 0005) is usable on the shared pool.
+        assert!(crate::tags::get(&db, &b.id, crate::tags::ATTENTION_KEY)
+            .await
+            .unwrap()
+            .is_none());
+        crate::tags::set(
+            &db,
+            &b.id,
+            crate::tags::ATTENTION_KEY,
+            "blocked",
+            "",
+            "agent",
+        )
+        .await
+        .unwrap();
+        let tag = crate::tags::get(&db, &b.id, crate::tags::ATTENTION_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tag.value, "blocked");
     }
 
     #[tokio::test]

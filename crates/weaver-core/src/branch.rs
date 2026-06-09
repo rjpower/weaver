@@ -16,58 +16,12 @@ pub struct Branch {
     pub base_branch: String,
     pub goal: String,
     pub title: String,
-    /// The agent's current-state message, set together with [`Branch::attention`]
-    /// via `weaver set-status`. Free-form ("Wired up routes; tests pass").
+    /// The agent's current-state message, set via `weaver set-status`. Free-form
+    /// ("Wired up routes; tests pass"), shown even when the branch is calm. The
+    /// attention *level* is a separate [`crate::tags`] tag.
     pub description: String,
-    /// Agent-declared attention level: one of [`ATTENTION_LEVELS`].
-    pub attention: String,
-    /// The overlooker's assessment of this branch — a third status axis, set by
-    /// an overlooker (or `weaver triage`), never by the agent. Empty when
-    /// unmarked; otherwise one of [`TRIAGE_LEVELS`]. Distinct from
-    /// [`Branch::attention`]: the agent owns attention, an overlooker owns this.
-    pub triage_level: String,
-    /// One-line reason accompanying the triage mark.
-    pub triage_note: String,
-    /// Which overlooker (or `manual`) last set the mark — attribution.
-    pub triage_by: String,
-    /// When the mark was last set; `None` if never marked. Compared against a
-    /// session's last activity to render the mark stale once it has moved on.
-    pub triage_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
-}
-
-/// Agent-declared attention levels, ordered calm → urgent:
-///
-/// * `ok` — progressing fine, or blocked on something external (a CI run, a PR
-///   review) that is *not* the user. No action needed.
-/// * `attention` — the agent wants the user to look: a question, a decision to
-///   confirm, or "done, ready for review".
-/// * `blocked` — the agent is stuck or hit an error and needs help to proceed.
-///
-/// This is the agent's own signal, distinct from the orchestrator's mechanical
-/// session lifecycle (`launching` / `running` / `orphaned` / …). It is what the
-/// dashboard surfaces and filters on for "which sessions need me?".
-pub const ATTENTION_LEVELS: &[&str] = &["ok", "attention", "blocked"];
-
-/// The default attention level for a freshly-created branch.
-pub const DEFAULT_ATTENTION: &str = "ok";
-
-/// Whether `level` is a recognized attention level.
-pub fn is_valid_attention(level: &str) -> bool {
-    ATTENTION_LEVELS.contains(&level)
-}
-
-/// Overlooker-assigned triage levels — the overlooker's assessment of a session,
-/// a third axis distinct from the agent's own [`ATTENTION_LEVELS`]. Same ladder
-/// (`ok` looks fine, `attention` looks like it needs a look, `blocked` looks
-/// stuck), different author: the agent declares `attention` about itself, an
-/// overlooker stamps `triage` about it. An empty level means "not yet marked".
-pub const TRIAGE_LEVELS: &[&str] = &["ok", "attention", "blocked"];
-
-/// Whether `level` is a recognized triage level.
-pub fn is_valid_triage(level: &str) -> bool {
-    TRIAGE_LEVELS.contains(&level)
 }
 
 /// An 8-character lowercase-alphanumeric id (re-used for branches and sessions).
@@ -234,43 +188,6 @@ pub async fn set_description(db: &Db, id: &str, description: &str) -> Result<()>
     Ok(())
 }
 
-/// Set the agent-declared attention level. The accompanying current-state
-/// message lives in [`Branch::description`] (see [`set_description`]); the two
-/// are written together by `weaver set-status`. `level` is assumed already
-/// validated by the caller (see [`is_valid_attention`]).
-pub async fn set_attention(db: &Db, id: &str, level: &str) -> Result<()> {
-    sqlx::query("UPDATE branches SET attention = ?, updated_at = ? WHERE id = ?")
-        .bind(level)
-        .bind(now_iso())
-        .bind(id)
-        .execute(db)
-        .await?;
-    Ok(())
-}
-
-/// Write the overlooker's triage mark on a branch: the assessment `level`, a
-/// one-line `note`, and which overlooker (`by`) made the call. Stamps
-/// `triage_at` so the dashboard can show the mark stale once the session moves
-/// past it. The agent's own [`Branch::attention`] is never touched. `level` is
-/// assumed already validated by the caller (see [`is_valid_triage`]); an empty
-/// `level` clears the mark.
-pub async fn set_triage(db: &Db, id: &str, level: &str, note: &str, by: &str) -> Result<()> {
-    let now = now_iso();
-    sqlx::query(
-        "UPDATE branches SET triage_level = ?, triage_note = ?, triage_by = ?, \
-         triage_at = ?, updated_at = ? WHERE id = ?",
-    )
-    .bind(level)
-    .bind(note)
-    .bind(by)
-    .bind(&now)
-    .bind(&now)
-    .bind(id)
-    .execute(db)
-    .await?;
-    Ok(())
-}
-
 pub async fn delete(db: &Db, id: &str) -> Result<()> {
     sqlx::query("DELETE FROM branches WHERE id = ?")
         .bind(id)
@@ -423,32 +340,6 @@ mod tests {
         let b1 = upsert(&db, "/r", "main", "main").await.unwrap();
         let b2 = upsert(&db, "/r", "main", "main").await.unwrap();
         assert_eq!(b1.id, b2.id);
-    }
-
-    #[tokio::test]
-    async fn triage_is_a_separate_axis_from_attention() {
-        let db = crate::db::connect_in_memory().await.unwrap();
-        let b = upsert(&db, "/r", "main", "main").await.unwrap();
-        // The agent declares its own attention.
-        set_attention(&db, &b.id, "blocked").await.unwrap();
-        // The overlooker stamps a different opinion via triage.
-        set_triage(
-            &db,
-            &b.id,
-            "attention",
-            "looks stuck on the same test",
-            "status-check",
-        )
-        .await
-        .unwrap();
-        let got = get(&db, &b.id).await.unwrap().unwrap();
-        // Triage persisted with attribution and timestamp…
-        assert_eq!(got.triage_level, "attention");
-        assert_eq!(got.triage_note, "looks stuck on the same test");
-        assert_eq!(got.triage_by, "status-check");
-        assert!(got.triage_at.is_some());
-        // …and the agent's own attention is untouched.
-        assert_eq!(got.attention, "blocked");
     }
 
     #[tokio::test]
