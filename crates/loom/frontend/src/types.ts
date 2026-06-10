@@ -313,6 +313,26 @@ export interface OverlookerRunResult {
   summary: string;
 }
 
+/** One program an overlooker can run, served by `GET /api/overlookers/programs`.
+ *  Builtin programs ship inside the loom binary: a `native` one is implemented
+ *  in Rust, a `script` one is an embedded Python file whose `source` the panel
+ *  renders read-only. `defaults` is the suggested starting config a create form
+ *  prefills. Mirrors `ProgramView` in weaver-api. */
+export interface ProgramView {
+  /** The reference an overlooker's `program` field uses, e.g. `builtin:status`. */
+  program: string;
+  title: string;
+  description: string;
+  kind: 'native' | 'script';
+  source: string | null;
+  defaults: {
+    trigger?: OverlookerTrigger;
+    scope?: OverlookerScope;
+    params?: Record<string, unknown>;
+    capabilities?: string[];
+  };
+}
+
 export type SettingKind = 'string' | 'int' | 'bool' | 'enum';
 
 /** One configurable setting: its registry metadata plus its current value. */

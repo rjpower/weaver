@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue';
 import { get, post, patch } from '../api';
-import type { Overlooker, OverlookerRunResult } from '../types';
+import type { Overlooker, OverlookerRunResult, ProgramView } from '../types';
 import OutcomeBadge from '../components/OutcomeBadge.vue';
 import { timeAgo } from '../lib/time';
 import {
@@ -31,6 +31,20 @@ async function load() {
     error.value = (e as Error).message;
   } finally {
     loaded.value = true;
+  }
+}
+
+// The builtin program registry — what the create form offers and the "Builtin
+// programs" section lists (script sources shown read-only).
+const programs = ref<ProgramView[]>([]);
+// The program whose script source is expanded in the registry section.
+const expandedSource = ref('');
+
+async function loadPrograms() {
+  try {
+    programs.value = (await get('/overlookers/programs')) as ProgramView[];
+  } catch (e) {
+    error.value = (e as Error).message;
   }
 }
 
@@ -80,7 +94,10 @@ const form = reactive({
   every: '30m',
   event: 'attention',
   level: 'blocked',
+  // A builtin reference from the registry, or the literal 'custom' to free-type
+  // a program file path into `customProgram`.
   program: 'builtin:status',
+  customProgram: '',
   prompt: '',
   scopeAttention: '!ok',
   repo: '',
@@ -95,10 +112,41 @@ function resetForm() {
   form.event = 'attention';
   form.level = 'blocked';
   form.program = 'builtin:status';
+  form.customProgram = '';
   form.prompt = '';
   form.scopeAttention = '!ok';
   form.repo = '';
   form.capabilities = { mark: true, escalate: true, nudge: false, interrupt: false, launch: false };
+}
+
+// Prefill the form from a builtin's suggested defaults (trigger cadence, scope,
+// capability grants) — the registry's starting point, freely editable after.
+function applyProgramDefaults(programRef: string) {
+  const p = programs.value.find((x) => x.program === programRef);
+  if (!p) return;
+  const t = p.defaults?.trigger ?? {};
+  if (t.cron) {
+    form.triggerKind = 'cron';
+    form.cron = t.cron;
+  } else if (t.every) {
+    form.triggerKind = 'every';
+    form.every = t.every;
+  } else if (t.event) {
+    form.triggerKind = 'event';
+    form.event = t.event;
+    form.level = t.level ?? '';
+  }
+  form.scopeAttention = p.defaults?.scope?.attention ?? '';
+  const granted = p.defaults?.capabilities ?? [];
+  for (const c of GRANTABLE_CAPABILITIES) form.capabilities[c] = granted.includes(c);
+}
+
+// "Use" on a registry row: open the create form prefilled with that program.
+function useProgram(p: ProgramView) {
+  form.program = p.program;
+  applyProgramDefaults(p.program);
+  if (!form.name.trim()) form.name = p.program.replace(/^builtin:/, '');
+  showForm.value = true;
 }
 
 async function create() {
@@ -122,12 +170,20 @@ async function create() {
     // `observe` is implicit; ship the explicitly-ticked grants on top of it.
     const capabilities = capabilitiesFrom(form.capabilities);
 
+    const programRef =
+      form.program === 'custom' ? form.customProgram.trim() : form.program;
+    // Start from the program's suggested params (e.g. pr-label's label), with
+    // the prompt — the form's one explicit param — layered on top.
+    const chosen = programs.value.find((p) => p.program === programRef);
+    const params: Record<string, unknown> = { ...(chosen?.defaults?.params ?? {}) };
+    if (form.prompt.trim()) params.prompt = form.prompt.trim();
+
     const body: Record<string, unknown> = {
       name: form.name.trim(),
       trigger,
       scope,
-      program: form.program.trim() || 'builtin:status',
-      params: form.prompt.trim() ? { prompt: form.prompt.trim() } : {},
+      program: programRef || 'builtin:status',
+      params,
       capabilities,
     };
     await post('/overlookers', body);
@@ -141,7 +197,10 @@ async function create() {
   }
 }
 
-onMounted(load);
+onMounted(() => {
+  load();
+  loadPrograms();
+});
 </script>
 
 <template>
@@ -246,12 +305,25 @@ onMounted(load);
       <div class="grid grid-cols-2 gap-3">
         <div>
           <label class="block text-xs text-muted mb-1">Program</label>
-          <input
+          <select
             v-model="form.program"
-            placeholder="builtin:status"
+            data-testid="overlooker-program"
+            class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
+            @change="applyProgramDefaults(form.program)"
+          >
+            <option v-for="p in programs" :key="p.program" :value="p.program">
+              {{ p.program }}
+            </option>
+            <option value="custom">custom path…</option>
+          </select>
+          <input
+            v-if="form.program === 'custom'"
+            v-model="form.customProgram"
+            data-testid="overlooker-custom-program"
+            placeholder="/home/you/.weaver/overlookers/my-watch.py"
             autocomplete="off"
             spellcheck="false"
-            class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
+            class="mt-2 w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
           />
         </div>
         <div>
@@ -441,5 +513,58 @@ onMounted(load);
         </div>
       </li>
     </ul>
+
+    <!-- Builtin programs — the stock programs that ship with loom. Script
+         sources are read-only (they live in the weaver repo); "Use" opens the
+         create form prefilled with the program's suggested defaults. -->
+    <section v-if="programs.length" class="mt-8" data-testid="builtin-programs">
+      <h2 class="text-sm font-semibold text-muted uppercase tracking-wide mb-1">
+        Builtin programs
+      </h2>
+      <p class="text-xs text-faint mb-2">
+        Stock programs shipped with loom — pick one as a new overlooker's
+        program. Sources are read-only; start a custom one from a copy with
+        <code>loom overlooker new &lt;name&gt;</code>.
+      </p>
+      <ul class="overflow-hidden rounded border border-line bg-surface">
+        <li
+          v-for="p in programs"
+          :key="p.program"
+          data-testid="program-row"
+          class="border-b border-line px-4 py-3 last:border-0"
+        >
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="font-mono text-sm font-semibold">{{ p.program }}</span>
+            <span class="meta-chip">{{ p.kind }}</span>
+            <span class="text-sm text-muted">{{ p.title }}</span>
+            <div class="ml-auto flex shrink-0 items-center gap-2">
+              <button
+                v-if="p.source"
+                type="button"
+                data-testid="program-source-toggle"
+                class="rounded bg-subtle hover:bg-subtle-hover px-2.5 py-1 text-xs font-medium"
+                @click="expandedSource = expandedSource === p.program ? '' : p.program"
+              >
+                {{ expandedSource === p.program ? 'Hide source' : 'View source' }}
+              </button>
+              <button
+                type="button"
+                data-testid="program-use"
+                class="rounded bg-accent hover:bg-accent-hover px-2.5 py-1 text-xs font-medium text-accent-fg"
+                @click="useProgram(p)"
+              >
+                Use
+              </button>
+            </div>
+          </div>
+          <p class="mt-1 text-xs text-faint">{{ p.description }}</p>
+          <pre
+            v-if="expandedSource === p.program && p.source"
+            data-testid="program-source"
+            class="mt-2 max-h-80 overflow-auto rounded bg-input p-3 text-xs font-mono"
+          >{{ p.source }}</pre>
+        </li>
+      </ul>
+    </section>
   </div>
 </template>

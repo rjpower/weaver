@@ -90,7 +90,8 @@ use crate::{agent, config, db, events, git, github, overlooker as ov_engine, rep
 use weaver_api::{
     BranchView, CreateIssueReq, CreateOverlookerReq, CreateRepoIssueReq, CreateReq, IssueView,
     OverlookerRunView, OverlookerView, PatchIssueReq, PatchOverlookerReq, PatchSessionReq,
-    PlanTaskView, PlanView, RunOverlookerReq, ScratchUpload, SendReq, SessionView, TagReq,
+    PlanTaskView, PlanView, ProgramView, RunOverlookerReq, ScratchUpload, SendReq, SessionView,
+    TagReq,
 };
 use weaver_core::branch as branch_mod;
 use weaver_core::branch::Branch;
@@ -312,6 +313,9 @@ pub fn router(state: AppState) -> Router {
             "/overlookers",
             get(list_overlookers).post(create_overlooker),
         )
+        // The static segment wins over the `{id}` capture below, so a program
+        // named "programs" can't shadow this listing.
+        .route("/overlookers/programs", get(list_programs))
         .route(
             "/overlookers/{id}",
             get(get_overlooker)
@@ -2281,17 +2285,36 @@ fn validate_capabilities(caps: &[String]) -> ApiResult<()> {
     Ok(())
 }
 
-/// A program reference must be a stock `builtin:*` program or an absolute path
-/// (a file under `~/.weaver/overlookers/`); a bare relative path is rejected so
-/// the engine never resolves it against an ambiguous cwd.
+/// A program reference must be a known `builtin:<name>` program or an absolute
+/// path (a file under `~/.weaver/overlookers/`). An unknown builtin is rejected
+/// here, naming the registry, rather than erroring every round; a bare relative
+/// path is rejected so the engine never resolves it against an ambiguous cwd.
 fn validate_program(program: &str) -> ApiResult<()> {
-    let ok = program.starts_with("builtin:") || PathBuf::from(program).is_absolute();
-    if !ok {
+    if program.starts_with("builtin:") {
+        if crate::builtins::find(program).is_none() {
+            let known = crate::builtins::BUILTINS
+                .iter()
+                .map(|b| b.program())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AppError::bad_request(format!(
+                "unknown builtin program '{program}' — expected one of {known}"
+            )));
+        }
+        return Ok(());
+    }
+    if !PathBuf::from(program).is_absolute() {
         return Err(AppError::bad_request(format!(
             "invalid program '{program}' — expected 'builtin:<name>' or an absolute path"
         )));
     }
     Ok(())
+}
+
+/// `GET /api/overlookers/programs` — the builtin program registry: what the
+/// create form offers and the panel's read-only script viewer renders.
+async fn list_programs() -> Json<Vec<ProgramView>> {
+    Json(crate::builtins::BUILTINS.iter().map(|b| b.view()).collect())
 }
 
 /// Resolve an overlooker (by id or name) or 404.

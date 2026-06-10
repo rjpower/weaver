@@ -48,6 +48,8 @@ needing the daemon to be reachable.
 | `crates/loom/src/web.rs` | axum routes, request/response types, SSE — **the API surface** |
 | `crates/loom/src/server.rs` | bind, write `server.json`, spawn bg tasks |
 | `crates/loom/src/monitor.rs` | status detection, orphan marking, hook-event consumer |
+| `crates/loom/src/overlooker.rs` | the overlooker engine: cron timer + event dispatcher + the round executor (the native `builtin:status` program and the script subprocess executor) |
+| `crates/loom/src/builtins.rs` | the builtin overlooker program registry; the script programs are real Python files in `crates/loom/overlookers/`, embedded into the binary |
 | `crates/loom/src/agent.rs` | launching agents into tmux + installing `.claude/settings.local.json` hooks |
 | `crates/loom/src/session.rs` | `Session` row + sqlx queries |
 | `crates/loom/src/tmux.rs` | `tmux new-session / capture-pane / kill-session / attach` (exact-match `=name:` targets) |
@@ -186,6 +188,9 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `GET POST /api/repos/issues?repo_root=…` | repo-wide board (`scope=repo\|backlog`) / create a backlog item |
 | `GET /api/repos/recent` / `GET /api/repos/branches?cwd=…` | recent repos / branches in a repo |
 | `GET PATCH /api/settings` | settings registry |
+| `GET POST /api/overlookers` / `GET PATCH DELETE /api/overlookers/{id}` | overlooker CRUD (see [Overlookers](#overlookers)) |
+| `GET /api/overlookers/programs` | the builtin program registry: titles, suggested defaults, read-only script sources |
+| `POST /api/overlookers/{id}/run` / `GET /api/overlookers/{id}/runs` | fire a round now (`{dry_run}` stubs mutations) / the round-history audit |
 
 `SessionView` (`/api/sessions[/...]`) returns session-specific fields
 top-level (`id`, `status`, `work_dir`, `tmux_session`, `agent_kind`, `model`,
@@ -366,6 +371,43 @@ JSON parse + check rollup), `refresh` (fetch → store → announce → maybe
 archive, behind both the poller and the refresh endpoint), and `poll` (the
 loop). The merge-archive decision is split into `apply_snapshot` so it is
 testable without invoking `gh`.
+
+## Overlookers
+
+An **overlooker** is a periodic / triggered watch program over the fleet: it
+wakes on a trigger (a cron tick or a session event), surveys the sessions in
+scope, and acts within an explicit capability set. The design of record is
+[docs/plans/overlooker.md](plans/overlooker.md). The engine
+(`loom::overlooker`, spawned in `server::serve`, self-gated on the
+`overlooker.enabled` setting) runs each **round** under non-optional guardrails
+— no-overlap, cooldown, a wall-clock timeout, no-recursion — and records it in
+`overlooker_runs`, the audit trail the panel's round history renders.
+
+A round runs the **program** the overlooker names:
+
+- **`builtin:status`** — the native (in-Rust) stock program: stamps a `triage`
+  mark on each in-scope session, judging via the configured `prompt` (a
+  one-shot env-stripped `claude -p` when available) or mirroring the agent's
+  own `attention` tag.
+- **Builtin scripts** — real Python files in `crates/loom/overlookers/`,
+  embedded into the binary and registered in `loom::builtins`:
+  `builtin:pr-label` (flag sessions whose open PR lacks the loom label) and
+  `builtin:archive-merged` (flag live sessions whose PR has merged). Both are
+  **read-only**: they record `would:` actions and mutate nothing — the actual
+  archive is still `github.archive_on_merge`, above. The Overlooker panel and
+  `loom overlooker programs` list the registry; script sources render
+  read-only (they ship with the binary).
+- **A custom program file** — an absolute path, conventionally
+  `~/.weaver/overlookers/<name>.py` (`loom overlooker new` scaffolds one).
+
+Builtin scripts and custom files run on one executor: an env-stripped `python3`
+subprocess that reaches the fleet only through the loom REST API. The contract:
+`$WEAVER_API` carries the daemon's base URL, `$WEAVER_OVERLOOKER` the round's
+config (`{id, name, program, params, scope, capabilities, dry_run}`), and the
+script prints one JSON object — `{outcome, summary, actions}` — to stdout. A
+non-zero exit, unparseable stdout, or a blown round budget records the round as
+an `error`. A mutating program must honor `dry_run` (record `{would: …}`
+actions instead of acting) and stay inside its granted capabilities.
 
 ## Environment
 
