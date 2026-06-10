@@ -1157,36 +1157,14 @@ fn scaffold_template(name: &str) -> String {
 # requires-python = ">=3.9"
 # dependencies = []
 # ///
-"""__NAME__ — a weaver overlooker program (a periodic / triggered watch over the fleet).
+"""__NAME__ — a weaver overlooker program.
 
-The loom engine runs this file as an env-stripped subprocess — via `uv run
---script` when uv is installed (the PEP 723 block above declares any
-third-party dependencies), else plain `python3`. The `weaver_loom` module —
-the Python layer over the loom REST API — is vendored onto PYTHONPATH by the
-engine; for standalone runs install it from the weaver repo with
-`uv pip install -e python/weaver-loom`.
+The engine runs this as a subprocess with WEAVER_API (the loom REST base URL)
+and WEAVER_OVERLOOKER (the round config JSON) set; `weaver_loom` is on
+PYTHONPATH. `Round.finish` prints the result the engine reads from stdout.
 
-The contract:
-
-* `WEAVER_API` — base URL of the loom REST API.
-* `WEAVER_OVERLOOKER` — JSON config for this round:
-  {"id", "name", "program", "params", "scope", "capabilities", "dry_run"}.
-* Print one JSON object as the final stdout line: {"outcome": "ok"|"noop",
-  "summary": str, "actions": [...]} — `Round.finish` does this for you. A
-  non-zero exit (or no result object) records the round as an error.
-
-A mutating program must honor dry_run (record `rnd.would(...)` instead of
-acting) and stay inside its granted capabilities. The builtin programs are
-working examples: `loom overlooker programs --source builtin:archive-merged`.
-
-Register this file once you're happy with it:
-
-    loom overlooker add __NAME__ --program __PATH__ \
-        --every 15m --capabilities observe
-
-Iterate safely — every mutating action is stubbed under --dry-run:
-
-    loom overlooker run __NAME__ --dry-run
+Register:   loom overlooker add __NAME__ --program __PATH__ --every 15m
+Try it:     loom overlooker run __NAME__ --dry-run
 """
 
 from weaver_loom import Round
@@ -1195,14 +1173,9 @@ from weaver_loom import Round
 def main():
     rnd = Round()
     for session in rnd.sessions():
-        # A round is level-triggered: survey the *current* fleet and reconcile,
-        # rather than reacting to the one event that woke you. Decide here —
-        # e.g. read session["branch"]["github"] or its tags — and record an
-        # action per finding:
-        #
+        # Decide per session and record findings, e.g.:
         #     rnd.would("mark", session=session["id"], note="one line on why")
         pass
-
     rnd.finish(f"surveyed {rnd.surveyed}, {len(rnd.actions)} finding(s)")
 
 

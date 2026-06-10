@@ -1,34 +1,31 @@
-#!/usr/bin/env python3
 """pr-label — flag sessions whose open PR lacks the loom label.
 
-A builtin loom overlooker program (`builtin:pr-label`). Each round it surveys
-the in-scope fleet over the loom REST API and, for every live session with an
-open pull request, checks (via a `gh` read) that the PR carries the configured
-label — so PRs born from loom sessions are identifiable on GitHub. Sessions
-whose PR already has the label are skipped.
-
-This builtin is **read-only**: it records a `would: label` action per
-unlabelled PR and mutates nothing. When `gh` is unavailable (or the labels
-can't be read) it still reports the ensure-label action, noting the labels
-were unreadable.
-
-Params: `{"label": "<name>"}` — the label to ensure; defaults to `weaver`.
-
-Written against `weaver_loom`, the Python layer over the loom REST API — the
-engine vendors that module onto PYTHONPATH for every script it runs. The
-program contract (env in, one result JSON object on stdout) is documented in
-docs/ARCHITECTURE.md (Overlookers).
+Read-only: records a would-label action per open PR missing the label
+(params.label, default 'weaver'). Labels are read via the gh CLI.
 """
 
-from weaver_loom import Round, gh
+import json
+import subprocess
+
+from weaver_loom import Round
 
 DEFAULT_LABEL = "weaver"
 
 
 def pr_labels(repo_root, pr_number):
-    """The PR's current label names, or None when unreadable."""
-    reply = gh(["pr", "view", str(pr_number), "--json", "labels"], cwd=repo_root)
-    if reply is None:
+    """The PR's current label names via gh, or None when unreadable."""
+    try:
+        out = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--json", "labels"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if out.returncode != 0:
+            return None
+        reply = json.loads(out.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
         return None
     return [label.get("name", "") for label in reply.get("labels") or []]
 

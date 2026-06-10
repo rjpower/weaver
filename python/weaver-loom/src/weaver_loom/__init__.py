@@ -34,7 +34,6 @@ from the weaver repo with ``uv pip install -e python/weaver-loom``.
 
 import json
 import os
-import subprocess
 import urllib.error
 import urllib.request
 
@@ -239,22 +238,3 @@ class Round:
                 }
             )
         )
-
-
-def gh(args, cwd=None, timeout=30):
-    """A `gh` CLI read, degrading to ``None`` when unavailable (gh missing,
-    unauthenticated, no GitHub remote, bad JSON). For loom-adjacent workflows
-    GitHub state isn't in the loom API yet; keep these calls read-only."""
-    try:
-        out = subprocess.run(
-            ["gh", *args],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if out.returncode != 0:
-            return None
-        return json.loads(out.stdout)
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
