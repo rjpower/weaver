@@ -83,7 +83,9 @@ test.describe('creating a session via the UI form', () => {
     await page.goto(weaver.baseUrl);
     await page.getByRole('button', { name: 'New session' }).click();
     await expect(page.getByPlaceholder('Add a /health endpoint')).toBeVisible();
-    await page.getByRole('button', { name: 'Cancel' }).click();
+    // There are now two "Cancel" buttons — the top toggle and the form's own
+    // bottom action. Scope to the form so this targets the bottom one uniquely.
+    await page.locator('form').getByRole('button', { name: 'Cancel' }).click();
     await expect(page.getByPlaceholder('Add a /health endpoint')).toBeHidden();
   });
 });

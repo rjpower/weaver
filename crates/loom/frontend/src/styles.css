@@ -62,8 +62,8 @@
   --faint: #94a3b8;         /* slate-400 — tertiary text */
   --subtle: #e2e8f0;        /* slate-200 — secondary buttons */
   --subtle-hover: #cbd5e1;  /* slate-300 */
-  --tree-line: #cbd5e1;     /* slate-300 — session-tree guides (a step up from
-                               --line so threading reads on white) */
+  --tree-line: #94a3b8;     /* slate-400 — session-tree guides; well above --line
+                               so the threading connectors read clearly on white */
   --accent: #2563eb;        /* blue-600  — primary action */
   --accent-hover: #1d4ed8;  /* blue-700 */
   --accent-fg: #ffffff;
@@ -92,7 +92,8 @@
   --faint: #64748b;         /* slate-500 */
   --subtle: #334155;        /* slate-700 */
   --subtle-hover: #475569;  /* slate-600 */
-  --tree-line: #475569;     /* slate-600 — session-tree guides on the dark canvas */
+  --tree-line: #64748b;     /* slate-500 — session-tree guides; lifted off the
+                               dark canvas so the connectors read clearly */
   --accent: #3b82f6;        /* blue-500 */
   --accent-hover: #2563eb;  /* blue-600 */
   --accent-fg: #ffffff;
@@ -185,8 +186,10 @@ body {
 
 /* Quiet, free-form tag pill — a deletable annotation chip (priority, needs-
    rebase, …). Token-only and intentionally unobtrusive: never the reserved loud
-   amber/red fill, which belongs to the single resolved attention signal. */
-@utility pill {
+   amber/red fill, which belongs to the single resolved attention signal. Distinct
+   from the generic count/label `pill` below: bordered and square-ish so a data
+   tag reads apart from a soft count chip. */
+@utility tag-pill {
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
@@ -225,7 +228,7 @@ body {
 
 .tree-col {
   position: relative;
-  width: 1.05rem;
+  width: 1.5rem; /* per-depth indent — wide enough that nesting reads at a glance */
 }
 
 /* Vertical line, centered in the column. `through`/`tee` run the full height
@@ -276,4 +279,67 @@ body {
   font-size: 0.75rem;
   line-height: 1rem;
   padding: 0.0625rem 0.5rem;
+}
+
+/* ── Buttons ─────────────────────────────────────────────────────────────────
+   Three shared button treatments, token-only so they stay light/dark correct
+   like `pill`/`meta-chip`. Each bakes shape + colour + hover + disabled; call
+   sites add only size (px/py/text), weight, and any layout. `primary` is the
+   accent call-to-action, `secondary` the neutral companion, `danger` the ghost
+   destructive. The segmented filter/branch toggles and the few bespoke
+   accent-ring buttons (Reconcile, Adopt, Mark OK) keep their own markup. */
+@utility btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  border-radius: 0.25rem;
+  background: var(--accent);
+  color: var(--accent-fg);
+  transition: background-color 0.15s ease;
+  cursor: pointer;
+  &:hover:not(:disabled) {
+    background: var(--accent-hover);
+  }
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+}
+@utility btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  border-radius: 0.25rem;
+  background: var(--subtle);
+  color: var(--fg);
+  transition: background-color 0.15s ease;
+  cursor: pointer;
+  &:hover:not(:disabled) {
+    background: var(--subtle-hover);
+  }
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+}
+@utility btn-danger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--block);
+  box-shadow: inset 0 0 0 1px var(--block-line);
+  transition: background-color 0.15s ease;
+  cursor: pointer;
+  &:hover:not(:disabled) {
+    background: var(--block-soft);
+  }
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
 }

@@ -21,7 +21,7 @@ const tooltip = computed(() => {
 
 <template>
   <span
-    class="pill"
+    class="tag-pill"
     data-testid="tag-pill"
     :data-tag-key="tag.key"
     :title="tooltip"

@@ -76,7 +76,7 @@ function remove(name: string) {
         </span>
         <button
           type="button"
-          class="shrink-0 rounded px-1.5 py-0.5 text-xs text-muted hover:text-red-400 hover:bg-subtle"
+          class="shrink-0 rounded px-1.5 py-0.5 text-xs text-muted hover:text-block hover:bg-subtle"
           title="Remove"
           @click.stop="remove(f.name)"
         >
