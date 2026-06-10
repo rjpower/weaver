@@ -462,18 +462,18 @@ async fn run_program(
         return builtin_status(state, o, dry_run).await;
     }
     if let Some(source) = crate::builtins::find(&o.program).and_then(|b| b.source) {
-        // Materialize the embedded source to a scratch file so a traceback
-        // carries a real file/line; the dir is removed when the round ends.
-        let dir = tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating scratch dir: {e}"))?;
-        let path = dir.path().join(program_file_name(&o.program));
-        tokio::fs::write(&path, source)
-            .await
-            .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
-        return run_script(state, o, dry_run, &path).await;
+        let file_name = program_file_name(&o.program);
+        return run_script(
+            state,
+            o,
+            dry_run,
+            ScriptSource::Embedded { file_name, source },
+        )
+        .await;
     }
     let path = std::path::PathBuf::from(&o.program);
     if path.is_absolute() {
-        return run_script(state, o, dry_run, &path).await;
+        return run_script(state, o, dry_run, ScriptSource::File(path)).await;
     }
     Err(anyhow::anyhow!(
         "unknown overlooker program '{}' — expected 'builtin:<name>' or an absolute path",
@@ -487,21 +487,93 @@ fn program_file_name(program: &str) -> String {
     format!("{}.py", program.strip_prefix("builtin:").unwrap_or(program))
 }
 
-/// Run a **script program**: an env-stripped `python3` subprocess (the
-/// lint-review precedent, like [`run_agent`]). The script reaches the fleet
-/// only through the loom REST API — `$WEAVER_API` carries the daemon's own
-/// address — and reads its round config from `$WEAVER_OVERLOOKER`
-/// (`{id, name, program, params, scope, capabilities, dry_run}`). Its contract
-/// is to print one JSON object, `{outcome, summary, actions}`, to stdout; a
-/// non-zero exit or unparseable stdout errors the round. The wall-clock budget
-/// in [`fire`] bounds it, and `kill_on_drop` reaps the subprocess when that
-/// budget cancels the future.
+/// Where a script program's code comes from: embedded in the binary (a
+/// builtin) or a file on disk (a custom program).
+enum ScriptSource {
+    Embedded {
+        file_name: String,
+        source: &'static str,
+    },
+    File(std::path::PathBuf),
+}
+
+/// Whether a script opts into PEP 723 inline metadata (`# /// script`). Such a
+/// script declares its own dependencies, so the engine prefers `uv run
+/// --script` — which resolves them — when `uv` is installed; a plain script
+/// runs under `python3` directly.
+fn has_pep723(source: &str) -> bool {
+    source.lines().any(|l| l.trim() == "# /// script")
+}
+
+/// Whether the `uv` CLI is usable. Probed once and cached, like
+/// [`crate::github::gh_available`] — absence is normal and shouldn't cost a
+/// process spawn every round.
+async fn uv_available() -> bool {
+    static AVAILABLE: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    *AVAILABLE
+        .get_or_init(|| async {
+            tokio::process::Command::new("uv")
+                .arg("--version")
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+        .await
+}
+
+/// Run a **script program**: an env-stripped subprocess (the lint-review
+/// precedent, like [`run_agent`]) that reaches the fleet only through the loom
+/// REST API. `$WEAVER_API` carries the daemon's own address and
+/// `$WEAVER_OVERLOOKER` the round config (`{id, name, program, params, scope,
+/// capabilities, dry_run}`); the vendored `weaver_loom` module rides
+/// `PYTHONPATH` so every program can import the API layer with no install
+/// step. The contract is to print one JSON object — `{outcome, summary,
+/// actions}` — as the final stdout line; a non-zero exit or unparseable
+/// stdout errors the round. The wall-clock budget in [`fire`] bounds it, and
+/// `kill_on_drop` reaps the subprocess when that budget cancels the future.
+///
+/// The interpreter is `python3`, or `uv run --script` when the script declares
+/// PEP 723 inline metadata and `uv` is installed (so a custom program can
+/// declare third-party dependencies; the builtins are stdlib-only).
 async fn run_script(
     state: &AppState,
     o: &Overlooker,
     dry_run: bool,
-    script: &std::path::Path,
+    src: ScriptSource,
 ) -> anyhow::Result<RoundResult> {
+    // One scratch dir per round: the vendored module always lands here (for
+    // PYTHONPATH), an embedded builtin's source too (so a traceback carries a
+    // real file/line). Removed when the round ends.
+    let scratch = tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating scratch dir: {e}"))?;
+    let module = scratch.path().join("weaver_loom.py");
+    tokio::fs::write(&module, crate::builtins::PYTHON_MODULE)
+        .await
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", module.display()))?;
+
+    let (script_path, source) = match &src {
+        ScriptSource::Embedded { file_name, source } => {
+            let path = scratch.path().join(file_name);
+            tokio::fs::write(&path, source)
+                .await
+                .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+            (path, source.to_string())
+        }
+        // The source is read only to detect PEP 723 metadata; a missing file
+        // surfaces as the spawn error below, with the path in it.
+        ScriptSource::File(path) => (
+            path.clone(),
+            tokio::fs::read_to_string(path).await.unwrap_or_default(),
+        ),
+    };
+
+    let pythonpath = match std::env::var("PYTHONPATH") {
+        Ok(existing) if !existing.is_empty() => {
+            format!("{}:{existing}", scratch.path().display())
+        }
+        _ => scratch.path().display().to_string(),
+    };
+
     let config = json!({
         "id": o.id,
         "name": o.name,
@@ -512,11 +584,20 @@ async fn run_script(
         "dry_run": dry_run,
     });
 
-    let mut command = tokio::process::Command::new("python3");
+    let interpreter = if has_pep723(&source) && uv_available().await {
+        "uv"
+    } else {
+        "python3"
+    };
+    let mut command = tokio::process::Command::new(interpreter);
+    if interpreter == "uv" {
+        command.args(["run", "--quiet", "--script"]);
+    }
     command
-        .arg(script)
+        .arg(&script_path)
         .env("WEAVER_API", api_base(&state.addr))
         .env("WEAVER_OVERLOOKER", config.to_string())
+        .env("PYTHONPATH", pythonpath)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -527,7 +608,7 @@ async fn run_script(
 
     let out = command.output().await.map_err(|e| {
         anyhow::anyhow!(
-            "spawning python3 for '{}' failed: {e} (is python3 installed?)",
+            "spawning {interpreter} for '{}' failed: {e} (is {interpreter} installed?)",
             o.program
         )
     })?;
@@ -561,12 +642,19 @@ fn api_base(addr: &str) -> String {
     format!("http://{dialable}")
 }
 
-/// Parse a script's stdout into a [`RoundResult`]. The stdout must be one JSON
-/// object; the fields are read leniently — a missing/unknown `outcome` reads as
-/// `ok`, a missing `summary` as empty, a missing/non-array `actions` as none —
-/// so a minimal script stays minimal.
+/// Parse a script's stdout into a [`RoundResult`]: the whole stdout as one
+/// JSON object, or — so a script may log progress lines first — the **last**
+/// stdout line that is one. The fields are read leniently: a missing/unknown
+/// `outcome` reads as `ok`, a missing `summary` as empty, a missing/non-array
+/// `actions` as none — so a minimal script stays minimal.
 fn parse_round_result(stdout: &str) -> Option<RoundResult> {
-    let v: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let trimmed = stdout.trim();
+    parse_result_object(trimmed).or_else(|| trimmed.lines().rev().find_map(parse_result_object))
+}
+
+/// One candidate result line → [`RoundResult`], if it is a JSON object.
+fn parse_result_object(text: &str) -> Option<RoundResult> {
+    let v: Value = serde_json::from_str(text.trim()).ok()?;
     let obj = v.as_object()?;
     let outcome = obj
         .get("outcome")
@@ -1114,10 +1202,28 @@ mod tests {
         assert_eq!(r.summary, "");
         assert_eq!(r.actions, Value::Array(vec![]));
 
-        // Anything that isn't one JSON object is a contract violation.
+        // A script may log progress lines first; the result is the last JSON
+        // object line on stdout.
+        let r = parse_round_result(
+            "surveying...\n3 sessions seen\n{\"outcome\":\"ok\",\"summary\":\"done\"}\n",
+        )
+        .unwrap();
+        assert_eq!(r.summary, "done");
+
+        // Anything without a JSON object is a contract violation.
         assert!(parse_round_result("").is_none());
         assert!(parse_round_result("not json").is_none());
         assert!(parse_round_result("[1, 2]").is_none());
+    }
+
+    #[test]
+    fn has_pep723_detects_the_inline_metadata_block() {
+        assert!(has_pep723(
+            "# /// script\n# dependencies = []\n# ///\nprint()"
+        ));
+        assert!(has_pep723("#!/usr/bin/env python3\n# /// script\n# ///\n"));
+        assert!(!has_pep723("import weaver_loom\n"));
+        assert!(!has_pep723("# script\n# ///\n"));
     }
 
     #[test]
@@ -1159,9 +1265,11 @@ mod tests {
         (state, o)
     }
 
-    /// A custom script file round-trips the whole contract: it reads its round
-    /// config from `$WEAVER_OVERLOOKER` (params and the dry-run flag included)
-    /// and its printed `{outcome, summary, actions}` lands on the run row.
+    /// A custom script file round-trips the whole contract **through the
+    /// vendored `weaver_loom` module**: the engine puts the API layer on
+    /// PYTHONPATH, the `Round` context exposes the `$WEAVER_OVERLOOKER` config
+    /// (params and the dry-run flag included), and `finish()`'s printed
+    /// `{outcome, summary, actions}` lands on the run row.
     #[tokio::test]
     async fn run_script_round_trips_the_contract() {
         if !python3_available() {
@@ -1173,15 +1281,12 @@ mod tests {
         std::fs::write(
             &script,
             r#"
-import json, os
-cfg = json.loads(os.environ["WEAVER_OVERLOOKER"])
-print(json.dumps({
-    "outcome": "ok",
-    "summary": "name=%s label=%s dry=%s api=%s" % (
-        cfg["name"], cfg["params"]["label"], json.dumps(cfg["dry_run"]),
-        os.environ["WEAVER_API"]),
-    "actions": [{"would": "label", "note": "from the script"}],
-}))
+import json
+from weaver_loom import Round
+rnd = Round()
+rnd.would("label", note="from the script")
+rnd.finish("name=%s label=%s dry=%s api=%s" % (
+    rnd.name, rnd.params["label"], json.dumps(rnd.dry_run), rnd.client.base))
 "#,
         )
         .unwrap();
@@ -1196,11 +1301,11 @@ print(json.dumps({
             .into_iter()
             .find(|r| r.id == run_id)
             .unwrap();
-        assert_eq!(run.outcome, "ok");
+        assert_eq!(run.outcome, "ok", "summary: {}", run.summary);
         assert!(
             run.summary
                 .contains("name=script-test label=weaver dry=true api=http://127.0.0.1:0"),
-            "the script saw its config: {}",
+            "the script saw its config through the module: {}",
             run.summary
         );
         let actions: Value = serde_json::from_str(&run.actions).unwrap();

@@ -1147,27 +1147,36 @@ async fn cmd_open() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// The starter program a `loom overlooker new` scaffolds: a small, runnable
-/// template against the program contract the engine speaks — the same contract
-/// the builtin scripts implement (`loom overlooker programs --source <name>`
-/// prints one as a fuller example). Plain `replace` rather than `format!`, so
-/// the template's literal braces (JSON, f-strings) stay readable.
+/// template against the `weaver_loom` API layer and the program contract the
+/// engine speaks — the same shape the builtin scripts implement
+/// (`loom overlooker programs --source <name>` prints one as a fuller
+/// example). Plain `replace` rather than `format!`, so the template's literal
+/// braces (JSON, f-strings) stay readable.
 fn scaffold_template(name: &str) -> String {
-    const TEMPLATE: &str = r##""""__NAME__ — a weaver overlooker program (a periodic / triggered watch over the fleet).
+    const TEMPLATE: &str = r##"# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
+"""__NAME__ — a weaver overlooker program (a periodic / triggered watch over the fleet).
 
-The loom engine runs this file as an env-stripped `python3` subprocess. The
-contract:
+The loom engine runs this file as an env-stripped subprocess — via `uv run
+--script` when uv is installed (the PEP 723 block above declares any
+third-party dependencies), else plain `python3`. The `weaver_loom` module —
+the Python layer over the loom REST API — is vendored onto PYTHONPATH by the
+engine; for standalone runs install it from the weaver repo with
+`uv pip install -e python/weaver-loom`.
 
-* `WEAVER_API` — base URL of the loom REST API; drive the fleet through it
-  (plain urllib works; the `weaver_py` binding wraps the same surface, typed
-  and capability-gated).
+The contract:
+
+* `WEAVER_API` — base URL of the loom REST API.
 * `WEAVER_OVERLOOKER` — JSON config for this round:
   {"id", "name", "program", "params", "scope", "capabilities", "dry_run"}.
-* Print one JSON object to stdout: {"outcome": "ok"|"noop", "summary": str,
-  "actions": [...]}. A non-zero exit (or unparseable stdout) records the
-  round as an error.
+* Print one JSON object as the final stdout line: {"outcome": "ok"|"noop",
+  "summary": str, "actions": [...]} — `Round.finish` does this for you. A
+  non-zero exit (or no result object) records the round as an error.
 
-A mutating program must honor dry_run (record {"would": ...} actions instead
-of acting) and stay inside its granted capabilities. The builtin programs are
+A mutating program must honor dry_run (record `rnd.would(...)` instead of
+acting) and stay inside its granted capabilities. The builtin programs are
 working examples: `loom overlooker programs --source builtin:archive-merged`.
 
 Register this file once you're happy with it:
@@ -1180,39 +1189,21 @@ Iterate safely — every mutating action is stubbed under --dry-run:
     loom overlooker run __NAME__ --dry-run
 """
 
-import json
-import os
-import urllib.request
-
-
-def api_get(path):
-    base = os.environ.get("WEAVER_API", "http://127.0.0.1:7878").rstrip("/")
-    with urllib.request.urlopen(base + "/api" + path) as resp:
-        return json.load(resp)
+from weaver_loom import Round
 
 
 def main():
-    cfg = json.loads(os.environ.get("WEAVER_OVERLOOKER", "{}"))
-
-    surveyed = 0
-    actions = []
-    for session in api_get("/sessions"):
-        if session.get("status") in ("done", "error", "archived"):
-            continue
-        surveyed += 1
+    rnd = Round()
+    for session in rnd.sessions():
         # A round is level-triggered: survey the *current* fleet and reconcile,
         # rather than reacting to the one event that woke you. Decide here —
-        # e.g. read session["branch"]["github"] or its tags — and append an
+        # e.g. read session["branch"]["github"] or its tags — and record an
         # action per finding:
         #
-        #     actions.append({"session": session["id"], "would": "mark",
-        #                     "note": "one line on why"})
+        #     rnd.would("mark", session=session["id"], note="one line on why")
+        pass
 
-    print(json.dumps({
-        "outcome": "ok" if actions else "noop",
-        "summary": f"surveyed {surveyed}, {len(actions)} finding(s)",
-        "actions": actions,
-    }))
+    rnd.finish(f"surveyed {rnd.surveyed}, {len(rnd.actions)} finding(s)")
 
 
 if __name__ == "__main__":
@@ -1761,17 +1752,19 @@ mod tests {
         }
     }
 
-    /// The scaffolded program carries the pieces an author starts from: a
-    /// module docstring and the env/stdout program contract.
+    /// The scaffolded program carries the pieces an author starts from: the
+    /// PEP 723 block (uv-runnable), a docstring documenting the contract, and
+    /// the `weaver_loom` round context.
     #[test]
     fn scaffold_template_is_well_formed() {
         let out = scaffold_template("test-watch");
+        assert!(out.starts_with("# /// script"), "PEP 723 block leads");
         // The docstring opens with exactly three quotes (a malformed `""` would
         // be the most likely raw-string bug).
-        assert!(out.starts_with("\"\"\"test-watch"), "got: {}", &out[..16]);
-        // It documents and implements the program contract.
+        assert!(out.contains("\"\"\"test-watch — "));
+        // It documents the program contract and uses the API layer.
         assert!(out.contains("WEAVER_OVERLOOKER"));
-        assert!(out.contains("import urllib.request"));
+        assert!(out.contains("from weaver_loom import Round"));
         assert!(out.contains("loom overlooker add test-watch"));
     }
 
@@ -1786,7 +1779,7 @@ mod tests {
         let path = home.path().join("overlookers").join("scaffolded.py");
         assert!(path.exists(), "the program file was written");
         let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.starts_with("\"\"\"scaffolded — "));
+        assert!(body.contains("\"\"\"scaffolded — "));
         // A second `new` of the same name refuses rather than clobbering.
         assert!(cmd_overlooker_new("scaffolded".to_string()).await.is_err());
         std::env::remove_var("WEAVER_HOME");

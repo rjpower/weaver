@@ -18,6 +18,13 @@
 use serde_json::{json, Value};
 use weaver_api::ProgramView;
 
+/// The `weaver_loom` Python module — the API layer over the loom REST API that
+/// overlooker programs import. Vendored into the binary so the engine can
+/// place it on every script's `PYTHONPATH` (no install step); the source of
+/// truth (and the installable package) is `python/weaver-loom/`.
+pub const PYTHON_MODULE: &str =
+    include_str!("../../../python/weaver-loom/src/weaver_loom/__init__.py");
+
 /// One stock program: its identity, its embedded source (for a script), and
 /// the suggested starting config a create form prefills. The JSON-bearing
 /// defaults are stored as text so the table stays a flat `const`.
@@ -178,10 +185,13 @@ mod tests {
             eprintln!("skipping: python3 not on PATH");
             return;
         }
-        for b in BUILTINS {
-            let Some(source) = b.source else { continue };
+        let scripts = BUILTINS
+            .iter()
+            .filter_map(|b| Some((b.name, b.source?)))
+            .chain([("weaver_loom", PYTHON_MODULE)]);
+        for (name, source) in scripts {
             let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join(format!("{}.py", b.name));
+            let path = dir.path().join(format!("{name}.py"));
             std::fs::write(&path, source).unwrap();
             let out = std::process::Command::new("python3")
                 .args(["-m", "py_compile"])
@@ -190,8 +200,7 @@ mod tests {
                 .unwrap();
             assert!(
                 out.status.success(),
-                "builtin:{} does not compile: {}",
-                b.name,
+                "{name} does not compile: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
         }

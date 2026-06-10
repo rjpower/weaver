@@ -50,6 +50,7 @@ needing the daemon to be reachable.
 | `crates/loom/src/monitor.rs` | status detection, orphan marking, hook-event consumer |
 | `crates/loom/src/overlooker.rs` | the overlooker engine: cron timer + event dispatcher + the round executor (the native `builtin:status` program and the script subprocess executor) |
 | `crates/loom/src/builtins.rs` | the builtin overlooker program registry; the script programs are real Python files in `crates/loom/overlookers/`, embedded into the binary |
+| `python/weaver-loom/` | the pure-Python layer over the loom REST API (`weaver_loom`: client + overlooker round context); stdlib-only, uv-buildable, vendored onto every script's `PYTHONPATH` by the engine |
 | `crates/loom/src/agent.rs` | launching agents into tmux + installing `.claude/settings.local.json` hooks |
 | `crates/loom/src/session.rs` | `Session` row + sqlx queries |
 | `crates/loom/src/tmux.rs` | `tmux new-session / capture-pane / kill-session / attach` (exact-match `=name:` targets) |
@@ -400,14 +401,26 @@ A round runs the **program** the overlooker names:
 - **A custom program file** — an absolute path, conventionally
   `~/.weaver/overlookers/<name>.py` (`loom overlooker new` scaffolds one).
 
-Builtin scripts and custom files run on one executor: an env-stripped `python3`
-subprocess that reaches the fleet only through the loom REST API. The contract:
-`$WEAVER_API` carries the daemon's base URL, `$WEAVER_OVERLOOKER` the round's
-config (`{id, name, program, params, scope, capabilities, dry_run}`), and the
-script prints one JSON object — `{outcome, summary, actions}` — to stdout. A
-non-zero exit, unparseable stdout, or a blown round budget records the round as
-an `error`. A mutating program must honor `dry_run` (record `{would: …}`
-actions instead of acting) and stay inside its granted capabilities.
+Builtin scripts and custom files run on one executor: an env-stripped
+subprocess that reaches the fleet only through the loom REST API — everything
+loom can do is an HTTP route, and Python is purely a convenience layer on top.
+The contract: `$WEAVER_API` carries the daemon's base URL, `$WEAVER_OVERLOOKER`
+the round's config (`{id, name, program, params, scope, capabilities,
+dry_run}`), and the script prints one JSON object — `{outcome, summary,
+actions}` — as its final stdout line. A non-zero exit, no result object, or a
+blown round budget records the round as an `error`. A mutating program must
+honor `dry_run` (record `{would: …}` actions instead of acting) and stay inside
+its granted capabilities.
+
+That convenience layer is **`weaver_loom`** (`python/weaver-loom/`, stdlib-only):
+a capability-gated `Client` over the REST routes plus the `Round` context
+(config, scope-filtered survey, action log, result emission). The engine vendors
+the module onto every script's `PYTHONPATH`, so programs import it with no
+install step; for standalone iteration it installs with
+`uv pip install -e python/weaver-loom`. The interpreter is `python3`, or
+`uv run --script` when the script declares PEP 723 inline metadata and `uv` is
+installed — so a custom program can declare third-party dependencies (the
+builtins are stdlib-only and need neither).
 
 ## Environment
 
