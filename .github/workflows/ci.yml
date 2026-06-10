@@ -19,6 +19,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Least-privilege GITHUB_TOKEN: every job below only checks out and builds/tests
+# — none writes to the repo, posts comments, or publishes — so the token is
+# read-only. (CodeQL's Analyze jobs live in a separate workflow with their own
+# `security-events: write`.)
+permissions:
+  contents: read
+
 jobs:
   build:
     name: build
