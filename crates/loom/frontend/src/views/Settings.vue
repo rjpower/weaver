@@ -100,7 +100,7 @@ onMounted(load);
       (<code>weaver config</code>).
     </p>
 
-    <p v-if="error" class="mb-3 text-sm text-red-400">{{ error }}</p>
+    <p v-if="error" class="mb-3 text-sm text-block">{{ error }}</p>
     <p v-if="notice" class="mb-3 text-sm text-accent">{{ notice }}</p>
 
     <div v-for="g in groups" :key="g.name" class="mb-6">
@@ -154,14 +154,14 @@ onMounted(load);
               :class="{ 'font-mono': s.kind === 'string' }"
             />
             <button
-              class="rounded bg-accent hover:bg-accent-hover px-3 py-1.5 text-sm disabled:opacity-40"
+              class="btn-primary px-3 py-1.5 text-sm"
               :disabled="busy === s.key || !dirty(s)"
               @click="save(s)"
             >
               Save
             </button>
             <button
-              class="rounded bg-subtle hover:bg-subtle-hover px-3 py-1.5 text-sm disabled:opacity-40"
+              class="btn-secondary px-3 py-1.5 text-sm"
               :disabled="busy === s.key || s.is_default"
               :title="`Reset to default: ${s.default || '(empty)'}`"
               @click="reset(s)"
@@ -170,9 +170,9 @@ onMounted(load);
             </button>
           </div>
           <p class="mt-1.5 text-xs text-faint">
-            <span v-if="s.is_default">Using the default</span>
+            <span v-if="s.is_default">Using the default:</span>
             <span v-else>Customized · default is</span>
-            <code>{{ s.default || '(empty)' }}</code>
+            <code class="ml-1">{{ s.default || '(empty)' }}</code>
           </p>
         </section>
       </div>

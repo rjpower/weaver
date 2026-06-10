@@ -161,14 +161,14 @@ const washClass = computed(() =>
                 </button>
                 <button
                   v-if="ws.status !== 'archived'"
-                  class="rounded bg-subtle px-3 py-1.5 text-xs text-fg hover:bg-subtle-hover"
+                  class="btn-secondary px-3 py-1.5 text-xs"
                   :disabled="busy === 'archive'"
                   @click="archive"
                 >
                   {{ busy === 'archive' ? 'Archiving…' : 'Archive' }}
                 </button>
                 <button
-                  class="ml-auto rounded bg-transparent px-3 py-1.5 text-xs text-block ring-1 ring-inset ring-block-line hover:bg-block-soft"
+                  class="btn-danger ml-auto px-3 py-1.5 text-xs"
                   :disabled="busy === 'remove'"
                   @click="remove"
                 >

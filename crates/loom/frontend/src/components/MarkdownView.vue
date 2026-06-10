@@ -66,7 +66,7 @@ function onClick(e: MouseEvent) {
 
 <template>
   <div class="h-full w-full overflow-auto bg-surface">
-    <p v-if="error" class="m-4 rounded border border-red-400/40 bg-red-500/10 p-3 text-sm text-red-400">
+    <p v-if="error" class="m-4 rounded border border-block-line bg-block-soft p-3 text-sm text-block">
       {{ error }}
     </p>
     <article ref="body" class="markdown-body mx-auto max-w-3xl px-6 py-5" @click="onClick"></article>

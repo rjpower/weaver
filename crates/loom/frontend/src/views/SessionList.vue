@@ -28,8 +28,9 @@ const archivedCount = computed(
 // The archived-aware, filtered set to display (membership only — the tree below
 // imposes the order). Archived rows are hidden by default; a reveal chip brings
 // them back, and they always show when there's nothing else, so the list never
-// reads empty while archived rows exist. Attention is no longer pinned to the
-// top — threading groups related work instead — but attention rows still get
+// reads empty while archived rows exist. Individual attention rows aren't pinned
+// to the top — threading keeps related work grouped — but a whole thread that
+// contains attention floats up (see treeRows), and attention rows still get
 // their loud row wash + pulse, so they stay easy to spot.
 const visibleSessions = computed<Session[]>(() => {
   const all = sessions.value;
@@ -65,9 +66,12 @@ interface TreeRow {
 
 // Group the visible sessions into threads: each hangs under the session that
 // launched it (`parent_id`, a branch id), with top-level sessions under an
-// implicit root. Siblings sort by launch time (newest first) and a parent always
-// sits directly above its children. A parent that's filtered/archived out of the
-// visible set (or was never tracked) drops its orphaned children to the top.
+// implicit root. A parent always sits directly above its children. Threads stay
+// grouped, but a thread containing attention floats to the top: roots and
+// siblings sort by their subtree's urgency first (blocked above attention above
+// ok), then newest-first within the same urgency — so a blocked/attention child
+// can never sink to the bottom of the fleet. A parent that's filtered/archived
+// out of the visible set (or was never tracked) drops its orphaned children up.
 const treeRows = computed<TreeRow[]>(() => {
   const list = visibleSessions.value;
   const present = new Set(list.map((s) => s.branch.id));
@@ -83,9 +87,37 @@ const treeRows = computed<TreeRow[]>(() => {
       roots.push(s);
     }
   }
+  // Attention rank for a single session: blocked is louder than attention is
+  // louder than ok. Used to float urgent threads to the top.
+  const rankOf = (s: Session): number => {
+    const lvl = levelOf(s);
+    return lvl === 'blocked' ? 2 : lvl === 'attention' ? 1 : 0;
+  };
+  // Memoized max attention rank across a session's whole subtree (itself + all
+  // descendants), so a thread surfaces at the urgency of its loudest member.
+  // The cycle guard mirrors walk()'s: a parent link loop can't spin us forever.
+  const rankCache = new Map<string, number>();
+  const ranking = new Set<string>();
+  const subtreeRank = (s: Session): number => {
+    const cached = rankCache.get(s.branch.id);
+    if (cached !== undefined) return cached;
+    if (ranking.has(s.branch.id)) return rankOf(s); // mid-cycle: just self
+    ranking.add(s.branch.id);
+    let max = rankOf(s);
+    for (const kid of children.get(s.branch.id) ?? []) {
+      max = Math.max(max, subtreeRank(kid));
+    }
+    ranking.delete(s.branch.id);
+    rankCache.set(s.branch.id, max);
+    return max;
+  };
   // Newest-first within a sibling group, matching the dashboard's default feel.
   const byNewest = (a: Session, b: Session) =>
     b.created_at < a.created_at ? -1 : b.created_at > a.created_at ? 1 : 0;
+  // Urgent subtree first, then newest-first as the tie-break. When no session
+  // carries attention every rank is 0 and this collapses to plain byNewest.
+  const byUrgencyThenNewest = (a: Session, b: Session) =>
+    subtreeRank(b) - subtreeRank(a) || byNewest(a, b);
 
   const rows: TreeRow[] = [];
   const seen = new Set<string>(); // guard against any cycle in the parent links
@@ -93,7 +125,7 @@ const treeRows = computed<TreeRow[]>(() => {
     if (seen.has(node.branch.id)) return;
     seen.add(node.branch.id);
     rows.push({ session: node, depth, verticals, isLast });
-    const kids = [...(children.get(node.branch.id) ?? [])].sort(byNewest);
+    const kids = [...(children.get(node.branch.id) ?? [])].sort(byUrgencyThenNewest);
     kids.forEach((kid, i) => {
       const last = i === kids.length - 1;
       // The implicit root isn't a drawn column, so a top-level node's children
@@ -102,7 +134,7 @@ const treeRows = computed<TreeRow[]>(() => {
       walk(kid, depth + 1, childVerticals, last);
     });
   };
-  const sortedRoots = [...roots].sort(byNewest);
+  const sortedRoots = [...roots].sort(byUrgencyThenNewest);
   sortedRoots.forEach((r, i) => walk(r, 0, [], i === sortedRoots.length - 1));
   return rows;
 });
@@ -223,6 +255,24 @@ async function loadRecentRepos() {
   }
 }
 
+// Clear the form back to its initial state and hide it. Shared by the create()
+// success path and the Cancel button so the two can't drift apart. The repo path
+// is intentionally left as-is (kept out of create()'s reset) — it's the most
+// reused field across sessions, so a fresh form pre-keeps the last repo typed.
+function resetForm() {
+  title.value = '';
+  goal.value = '';
+  model.value = '';
+  effort.value = '';
+  name.value = '';
+  base.value = '';
+  existingBranch.value = '';
+  scratchFiles.value = [];
+  nameEdited.value = false;
+  branchMode.value = 'new';
+  showForm.value = false;
+}
+
 async function create() {
   // A session needs a repo and at least a title or a goal; the goal alone is
   // optional (an empty goal just starts the agent unprompted).
@@ -253,17 +303,7 @@ async function create() {
       );
     }
     await post('/sessions', body);
-    title.value = '';
-    goal.value = '';
-    model.value = '';
-    effort.value = '';
-    name.value = '';
-    base.value = '';
-    existingBranch.value = '';
-    scratchFiles.value = [];
-    nameEdited.value = false;
-    branchMode.value = 'new';
-    showForm.value = false;
+    resetForm();
     await load();
     await loadRecentRepos();
   } catch (e) {
@@ -285,222 +325,270 @@ onUnmounted(() => clearInterval(timer));
   <div>
     <div class="flex items-center justify-between mb-4">
       <h1 class="text-xl font-semibold">Sessions</h1>
+      <!-- Toggles the create form. Closed → primary (accent) call-to-action;
+           open → a neutral "Cancel" so it never reads as a second primary
+           action competing with the form's own Create button. -->
       <button
-        class="rounded bg-accent hover:bg-accent-hover px-3 py-1.5 text-sm font-medium"
+        :class="[
+          'px-3 py-1.5 text-sm font-medium',
+          showForm ? 'btn-secondary' : 'btn-primary',
+        ]"
         @click="showForm = !showForm"
       >
         {{ showForm ? 'Cancel' : 'New session' }}
       </button>
     </div>
 
+    <!--
+      Grouped into labeled sections so the ~9-field form scans instead of
+      reading as one flat stack: Repository, What to build, Agent, Branch, and
+      Scratch files. The treatment is deliberately light — a small uppercase
+      section label and a hairline top divider per group, no heavy boxes — so it
+      stays consistent with the rest of the app's quiet surfaces.
+    -->
     <form
       v-if="showForm"
-      class="mb-5 rounded border border-line bg-surface p-4 space-y-3"
+      class="mb-5 rounded border border-line bg-surface p-4 space-y-5"
       autocomplete="off"
       @submit.prevent="create"
     >
-      <div class="relative">
-        <label class="block text-xs text-muted mb-1">
-          Repository path (on the server)
-          <span v-if="recentRepos.length" class="text-faint">— or pick a recent one</span>
-        </label>
-        <input
-          v-model="repo"
-          @focus="repoFocused = true"
-          @input="repoFocused = true"
-          @blur="repoFocused = false"
-          placeholder="/home/you/code/project"
-          autocomplete="off"
-          spellcheck="false"
-          class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
-        />
-        <ul
-          v-if="repoFocused && repoMatches.length"
-          data-testid="recent-repos"
-          class="absolute left-0 right-0 z-10 mt-1 max-h-56 overflow-auto rounded border border-line bg-input shadow-lg"
-        >
-          <li v-for="r in repoMatches" :key="r.repo_root">
-            <button
-              type="button"
-              data-testid="recent-repo"
-              @mousedown.prevent="pickRepo(r.repo_root)"
-              class="flex w-full items-center justify-between gap-3 px-2 py-1.5 text-left hover:bg-subtle"
-            >
-              <span class="min-w-0">
-                <span class="block truncate text-sm">{{ repoName(r.repo_root) }}</span>
-                <span class="block truncate text-xs text-muted font-mono">{{ r.repo_root }}</span>
-              </span>
-              <span
-                v-if="r.active_branches"
-                :title="`${r.active_branches} tracked branch(es)`"
-                class="shrink-0 rounded bg-subtle px-1.5 py-0.5 text-xs text-muted"
-              >
-                {{ r.active_branches }}
-              </span>
-            </button>
-          </li>
-        </ul>
-      </div>
-      <div>
-        <label class="block text-xs text-muted mb-1">Title</label>
-        <input
-          v-model="title"
-          placeholder="Health endpoint"
-          autocomplete="off"
-          class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
-        />
-      </div>
-      <div>
-        <label class="block text-xs text-muted mb-1">
-          Goal — optional; leave blank to start the agent with no prompt
-        </label>
-        <textarea
-          v-model="goal"
-          rows="4"
-          placeholder="Add a /health endpoint that returns 200"
-          autocomplete="off"
-          class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent resize-y"
-        ></textarea>
-      </div>
-      <div class="grid grid-cols-2 gap-3">
-        <div>
-          <label class="block text-xs text-muted mb-1">Model</label>
-          <select
-            v-model="model"
-            autocomplete="off"
-            class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
-          >
-            <option value="">Default</option>
-            <option value="haiku">Haiku</option>
-            <option value="sonnet">Sonnet</option>
-            <option value="opus">Opus</option>
-          </select>
-        </div>
-        <div>
-          <label class="block text-xs text-muted mb-1">Effort</label>
-          <select
-            v-model="effort"
-            autocomplete="off"
-            class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
-          >
-            <option value="">Default</option>
-            <option value="low">Low</option>
-            <option value="medium">Medium</option>
-            <option value="high">High</option>
-            <option value="xhigh">X-High</option>
-            <option value="max">Max</option>
-          </select>
-        </div>
-        <p class="col-span-2 -mt-1 text-xs text-faint">
-          Model tier and reasoning effort for the Claude agent. Leave as Default
-          to inherit the configured launch args.
-        </p>
-      </div>
-      <div>
-        <div class="inline-flex rounded border border-line text-xs overflow-hidden mb-2">
-          <button
-            type="button"
-            :class="[
-              'px-3 py-1',
-              branchMode === 'new' ? 'bg-accent text-white' : 'bg-input text-muted hover:bg-subtle',
-            ]"
-            @click="branchMode = 'new'"
-          >
-            New branch
-          </button>
-          <button
-            type="button"
-            :class="[
-              'px-3 py-1 border-l border-line',
-              branchMode === 'existing' ? 'bg-accent text-white' : 'bg-input text-muted hover:bg-subtle',
-            ]"
-            @click="branchMode = 'existing'"
-          >
-            Existing branch
-          </button>
-        </div>
-        <div v-if="branchMode === 'new'" class="space-y-2">
-          <div>
-            <label class="block text-xs text-muted mb-1">
-              Name — the worktree (<code>.worktrees/&lt;name&gt;</code>) and branch
-              (<code>weaver/&lt;name&gt;</code>)
-            </label>
-            <input
-              v-model="name"
-              @input="nameEdited = true"
-              placeholder="health-endpoint"
-              autocomplete="off"
-              spellcheck="false"
-              class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
-            />
-          </div>
-          <div>
-            <label class="block text-xs text-muted mb-1">
-              Base branch — fork point (optional)
-            </label>
-            <input
-              v-model="base"
-              placeholder="origin/main (freshly fetched)"
-              autocomplete="off"
-              spellcheck="false"
-              class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
-            />
-            <p class="mt-1 text-xs text-faint">
-              Leave blank to fork from a freshly-fetched
-              <code>origin/&lt;default branch&gt;</code>.
-            </p>
-          </div>
-        </div>
-        <div v-else class="relative">
+      <!-- Repository: where the work lives, with a recent-repos shortcut. -->
+      <section class="space-y-3">
+        <h2 class="text-xs font-medium uppercase tracking-wide text-faint">Repository</h2>
+        <div class="relative">
           <label class="block text-xs text-muted mb-1">
-            Existing branch — weaver reuses its worktree if one is checked out
+            Repository path (on the server)
+            <span v-if="recentRepos.length" class="text-faint">— or pick a recent one</span>
           </label>
           <input
-            v-model="existingBranch"
-            @focus="branchFocused = true"
-            @input="branchFocused = true"
-            @blur="branchFocused = false"
-            placeholder="feature/foo"
+            v-model="repo"
+            @focus="repoFocused = true"
+            @input="repoFocused = true"
+            @blur="repoFocused = false"
+            placeholder="/home/you/code/project"
             autocomplete="off"
             spellcheck="false"
-            class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
+            class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
           />
-          <p v-if="branchesError" class="mt-1 text-xs text-block">{{ branchesError }}</p>
           <ul
-            v-if="branchFocused && branchMatches.length"
-            data-testid="branch-options"
+            v-if="repoFocused && repoMatches.length"
+            data-testid="recent-repos"
             class="absolute left-0 right-0 z-10 mt-1 max-h-56 overflow-auto rounded border border-line bg-input shadow-lg"
           >
-            <li v-for="b in branchMatches" :key="b.name">
+            <li v-for="r in repoMatches" :key="r.repo_root">
               <button
                 type="button"
-                data-testid="branch-option"
-                @mousedown.prevent="pickBranch(b)"
+                data-testid="recent-repo"
+                @mousedown.prevent="pickRepo(r.repo_root)"
                 class="flex w-full items-center justify-between gap-3 px-2 py-1.5 text-left hover:bg-subtle"
               >
                 <span class="min-w-0">
-                  <span class="block truncate text-sm font-mono">
-                    {{ b.name }}
-                    <span v-if="b.current" class="ml-1 text-xs text-accent">(current)</span>
-                  </span>
-                  <span
-                    v-if="b.worktree"
-                    class="block truncate text-xs text-muted font-mono"
-                  >→ {{ b.worktree }}</span>
+                  <span class="block truncate text-sm">{{ repoName(r.repo_root) }}</span>
+                  <span class="block truncate text-xs text-muted font-mono">{{ r.repo_root }}</span>
+                </span>
+                <span
+                  v-if="r.active_branches"
+                  :title="`${r.active_branches} tracked branch(es)`"
+                  class="shrink-0 rounded bg-subtle px-1.5 py-0.5 text-xs text-muted"
+                >
+                  {{ r.active_branches }}
                 </span>
               </button>
             </li>
           </ul>
         </div>
+      </section>
+
+      <!-- What to build: the human-facing intent — a short title and the goal. -->
+      <section class="space-y-3 border-t border-line pt-3">
+        <h2 class="text-xs font-medium uppercase tracking-wide text-faint">What to build</h2>
+        <div>
+          <label class="block text-xs text-muted mb-1">Title</label>
+          <input
+            v-model="title"
+            placeholder="Health endpoint"
+            autocomplete="off"
+            class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
+          />
+        </div>
+        <div>
+          <label class="block text-xs text-muted mb-1">
+            Goal — optional; leave blank to start the agent with no prompt
+          </label>
+          <textarea
+            v-model="goal"
+            rows="4"
+            placeholder="Add a /health endpoint that returns 200"
+            autocomplete="off"
+            class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent resize-y"
+          ></textarea>
+        </div>
+      </section>
+
+      <!-- Agent: which Claude tier and how hard it reasons. -->
+      <section class="space-y-3 border-t border-line pt-3">
+        <h2 class="text-xs font-medium uppercase tracking-wide text-faint">Agent</h2>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs text-muted mb-1">Model</label>
+            <select
+              v-model="model"
+              autocomplete="off"
+              class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
+            >
+              <option value="">Default</option>
+              <option value="haiku">Haiku</option>
+              <option value="sonnet">Sonnet</option>
+              <option value="opus">Opus</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-muted mb-1">Effort</label>
+            <select
+              v-model="effort"
+              autocomplete="off"
+              class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
+            >
+              <option value="">Default</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="xhigh">X-High</option>
+              <option value="max">Max</option>
+            </select>
+          </div>
+          <p class="col-span-2 -mt-1 text-xs text-faint">
+            Model tier and reasoning effort for the Claude agent. Leave as Default
+            to inherit the configured launch args.
+          </p>
+        </div>
+      </section>
+
+      <!-- Branch: fork a fresh branch or reuse an existing one. -->
+      <section class="space-y-3 border-t border-line pt-3">
+        <h2 class="text-xs font-medium uppercase tracking-wide text-faint">Branch</h2>
+        <div>
+          <div class="inline-flex rounded border border-line text-xs overflow-hidden mb-2">
+            <button
+              type="button"
+              :class="[
+                'px-3 py-1',
+                branchMode === 'new' ? 'bg-accent text-white' : 'bg-input text-muted hover:bg-subtle',
+              ]"
+              @click="branchMode = 'new'"
+            >
+              New branch
+            </button>
+            <button
+              type="button"
+              :class="[
+                'px-3 py-1 border-l border-line',
+                branchMode === 'existing' ? 'bg-accent text-white' : 'bg-input text-muted hover:bg-subtle',
+              ]"
+              @click="branchMode = 'existing'"
+            >
+              Existing branch
+            </button>
+          </div>
+          <div v-if="branchMode === 'new'" class="space-y-2">
+            <div>
+              <label class="block text-xs text-muted mb-1">
+                Name — the worktree (<code>.worktrees/&lt;name&gt;</code>) and branch
+                (<code>weaver/&lt;name&gt;</code>)
+              </label>
+              <input
+                v-model="name"
+                @input="nameEdited = true"
+                placeholder="health-endpoint"
+                autocomplete="off"
+                spellcheck="false"
+                class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
+              />
+            </div>
+            <div>
+              <label class="block text-xs text-muted mb-1">
+                Base branch — fork point (optional)
+              </label>
+              <input
+                v-model="base"
+                placeholder="origin/main (freshly fetched)"
+                autocomplete="off"
+                spellcheck="false"
+                class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
+              />
+              <p class="mt-1 text-xs text-faint">
+                Leave blank to fork from a freshly-fetched
+                <code>origin/&lt;default branch&gt;</code>.
+              </p>
+            </div>
+          </div>
+          <div v-else class="relative">
+            <label class="block text-xs text-muted mb-1">
+              Existing branch — weaver reuses its worktree if one is checked out
+            </label>
+            <input
+              v-model="existingBranch"
+              @focus="branchFocused = true"
+              @input="branchFocused = true"
+              @blur="branchFocused = false"
+              placeholder="feature/foo"
+              autocomplete="off"
+              spellcheck="false"
+              class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
+            />
+            <p v-if="branchesError" class="mt-1 text-xs text-block">{{ branchesError }}</p>
+            <ul
+              v-if="branchFocused && branchMatches.length"
+              data-testid="branch-options"
+              class="absolute left-0 right-0 z-10 mt-1 max-h-56 overflow-auto rounded border border-line bg-input shadow-lg"
+            >
+              <li v-for="b in branchMatches" :key="b.name">
+                <button
+                  type="button"
+                  data-testid="branch-option"
+                  @mousedown.prevent="pickBranch(b)"
+                  class="flex w-full items-center justify-between gap-3 px-2 py-1.5 text-left hover:bg-subtle"
+                >
+                  <span class="min-w-0">
+                    <span class="block truncate text-sm font-mono">
+                      {{ b.name }}
+                      <span v-if="b.current" class="ml-1 text-xs text-accent">(current)</span>
+                    </span>
+                    <span
+                      v-if="b.worktree"
+                      class="block truncate text-xs text-muted font-mono"
+                    >→ {{ b.worktree }}</span>
+                  </span>
+                </button>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- Scratch files: reference material staged into the new worktree. -->
+      <section class="space-y-3 border-t border-line pt-3">
+        <h2 class="text-xs font-medium uppercase tracking-wide text-faint">Scratch files</h2>
+        <ScratchPicker v-model="scratchFiles" />
+      </section>
+
+      <!-- Action row: Create leads (primary), Cancel discards + closes the form. -->
+      <div class="flex items-center gap-2 border-t border-line pt-3">
+        <button
+          type="submit"
+          :disabled="creating"
+          class="btn-primary px-3 py-1.5 text-sm font-medium"
+        >
+          {{ creating ? 'Creating…' : 'Create' }}
+        </button>
+        <button
+          type="button"
+          class="btn-secondary px-3 py-1.5 text-sm font-medium"
+          @click="resetForm"
+        >
+          Cancel
+        </button>
       </div>
-      <ScratchPicker v-model="scratchFiles" />
-      <button
-        type="submit"
-        :disabled="creating"
-        class="rounded bg-accent hover:bg-accent-hover px-3 py-1.5 text-sm font-medium disabled:opacity-50"
-      >
-        {{ creating ? 'Creating…' : 'Create' }}
-      </button>
     </form>
 
     <p v-if="error" class="mb-4 text-sm text-block">{{ error }}</p>
@@ -510,21 +598,30 @@ onUnmounted(() => clearInterval(timer));
     </p>
 
     <div v-if="sessions.length" class="mb-3 flex items-center gap-3">
-      <!-- Attention filter: jump straight to the sessions that need a human. -->
-      <div class="inline-flex rounded border border-line text-xs overflow-hidden">
+      <!-- Attention filter: jump straight to the sessions that need a human.
+           Each segment pairs a label with its count in a small pill so the
+           number reads as a count, not a suffix glued to the word. -->
+      <div class="inline-flex rounded-md border border-line text-xs overflow-hidden">
         <button
           v-for="opt in (['all', 'attention', 'ok'] as const)"
           :key="opt"
           type="button"
           :data-testid="`filter-${opt}`"
           :class="[
-            'px-3 py-1 border-l border-line first:border-l-0',
-            filter === opt ? 'bg-accent text-accent-fg' : 'bg-input text-muted hover:bg-subtle',
+            'flex items-center gap-1.5 px-3 py-1.5 font-medium border-l border-line first:border-l-0 transition-colors',
+            filter === opt
+              ? 'bg-accent text-accent-fg'
+              : 'bg-input text-muted hover:bg-subtle hover:text-fg',
           ]"
           @click="filter = opt"
         >
           {{ opt === 'all' ? 'All' : opt === 'attention' ? 'Needs attention' : 'OK' }}
-          <span class="opacity-70">{{ counts[opt] }}</span>
+          <span
+            :class="[
+              'rounded-full px-1.5 text-[0.7rem] leading-5 tabular-nums',
+              filter === opt ? 'bg-accent-fg/20 text-accent-fg' : 'bg-subtle text-faint',
+            ]"
+          >{{ counts[opt] }}</span>
         </button>
       </div>
 
@@ -546,10 +643,11 @@ onUnmounted(() => clearInterval(timer));
     <!--
       One signal row per session. Left→right: an optional tree gutter threading
       child sessions under their launcher, the agent's single attention signal,
-      the dominant title, its muted current-state line, a neutral lifecycle pill,
-      and the mono branch ref pushed far-right. Rows are grouped into threads
-      (build in script) rather than attention-sorted; attention rows still get a
-      left accent-border + slow pulse so they stand out. Staggered reveal via --i.
+      the dominant title, its muted current-state line, a neutral lifecycle pill
+      (shown only for off-nominal states — running is the silent default), and
+      the mono branch ref pushed far-right. Rows are grouped into threads (built
+      in script), with attention-carrying threads floated up; attention rows also
+      get a left accent-border + slow pulse so they stand out. Stagger via --i.
     -->
     <ul v-if="sessions.length" data-testid="session-list" class="overflow-hidden rounded border border-line bg-surface">
       <li
@@ -597,8 +695,10 @@ onUnmounted(() => clearInterval(timer));
             >
               {{ s.branch.title || s.branch.name }}
             </router-link>
-            <!-- Lifecycle: demoted, neutral, mono pill (StatusBadge). -->
-            <StatusBadge :status="s.status" class="shrink-0" />
+            <!-- Lifecycle: demoted, neutral, mono pill (StatusBadge). Hidden for
+                 the running state — nearly every live row is running, so the pill
+                 would just be repeated noise; only off-nominal states show one. -->
+            <StatusBadge v-if="s.status !== 'running'" :status="s.status" class="shrink-0" />
           </div>
 
           <!-- Current-state headline (agent's set-status message), else the goal. -->

@@ -20,23 +20,28 @@ test.describe('session list view', () => {
     const cardA = page.locator(`[data-session-id="${a.id}"]`);
     await expect(cardA).toContainText('alpha-task');
     await expect(cardA).toContainText('Add a health endpoint');
-    await expect(cardA.getByTestId('status-badge')).toBeVisible();
+    // A live session is `running`, and the list omits the lifecycle badge for
+    // that state — nearly every row is running, so the pill would just be
+    // repeated noise. Non-running states still show it (see the archived test).
+    await expect(cardA.getByTestId('status-badge')).toHaveCount(0);
 
     const cardB = page.locator(`[data-session-id="${b.id}"]`);
     await expect(cardB).toContainText('beta-task');
     await expect(cardB).toContainText('Fix the login bug');
   });
 
-  test('attention and lifecycle live in separate columns', async ({ page, weaver }) => {
+  test('attention is its own badge, separate from the lifecycle axis', async ({ page, weaver }) => {
     const s = await weaver.seedSession({ goal: 'Refactor auth', name: 'auth' });
     await weaver.setStatus(s, 'attention', 'ready for review');
 
     await page.goto(weaver.baseUrl);
     const card = page.locator(`[data-session-id="${s.id}"]`);
-    // The agent's single signal (attention) and the mechanical lifecycle are
-    // each their own badge — not stacked in one cell.
+    // The agent's single signal (attention) is its own badge — never merged into
+    // the lifecycle cell. The session is running, so the lifecycle pill is
+    // omitted from the row (declutter), leaving attention to stand alone; the two
+    // axes co-rendering as distinct badges is covered by the archived test below.
     await expect(card.getByTestId('attention-badge')).toHaveAttribute('data-level', 'attention');
-    await expect(card.getByTestId('status-badge')).toBeVisible();
+    await expect(card.getByTestId('status-badge')).toHaveCount(0);
     await expect(card).toContainText('ready for review');
   });
 

@@ -23,7 +23,8 @@ export function messageOf(s: Session): string {
 // "Waiting for input" slab. Returns a glyph + short label; glyphs are plain
 // unicode (offline-safe, no icon dependency).
 export interface ConvState {
-  glyph: string;   // ⏳ / ▶ / ✓ / ◦
+  glyph: string;   // ● / ▶ / ✓ / ◦ — BMP geometric chars only (emoji like the
+                   // hourglass render as tofu in the system sans/mono stacks)
   label: string;   // e.g. "Blocked — needs input"
   tone: 'block' | 'attn' | 'muted'; // which token family to color it with
 }
@@ -36,8 +37,8 @@ export function conversationState(s: Session): ConvState {
 
   // Then the agent-declared attention axis.
   const level = levelOf(s);
-  if (level === 'blocked') return { glyph: '⏳', label: 'Blocked', tone: 'block' };
-  if (level === 'attention') return { glyph: '⏳', label: 'Needs attention', tone: 'attn' };
+  if (level === 'blocked') return { glyph: '●', label: 'Blocked', tone: 'block' };
+  if (level === 'attention') return { glyph: '●', label: 'Needs attention', tone: 'attn' };
 
   // Otherwise infer working vs idle from lifecycle. "Working"/"Idle" stay
   // neutral so amber/red remains the sole loud signal.

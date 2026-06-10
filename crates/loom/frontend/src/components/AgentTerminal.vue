@@ -296,8 +296,8 @@ onUnmounted(() => {
     <div
       v-if="state !== 'open'"
       data-testid="term-status"
-      class="absolute right-2 top-2 rounded px-2 py-1 text-xs"
-      :class="state === 'error' ? 'bg-red-950/90 text-red-300' : 'bg-input/90 text-amber-300'"
+      class="absolute right-2 top-2 rounded px-2 py-1 text-xs font-medium"
+      :class="state === 'error' ? 'bg-block text-block-fg' : 'bg-attn text-attn-fg'"
     >
       <span v-if="state === 'connecting'">connecting…</span>
       <span v-else-if="state === 'reconnecting'">reconnecting…</span>

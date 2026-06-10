@@ -47,10 +47,13 @@ test.describe('plan on the overview tab', () => {
     await expect(plan.getByText('Feature plan', { exact: true })).toBeVisible();
 
     // The task list projects status from the ledger; before reconcile the
-    // materializing tasks are "planned" (no issue yet).
-    await expect(plan.getByText('Build the API')).toBeVisible();
-    await expect(plan.getByText('Build the UI')).toBeVisible();
-    await expect(plan.getByText('planned').first()).toBeVisible();
+    // materializing tasks are "planned" (no issue yet). Scope to the task list:
+    // the task titles also appear in the dependency-graph's mermaid source, so a
+    // plan-wide getByText would be ambiguous (and races mermaid's SVG render).
+    const tasks = plan.getByTestId('plan-tasks');
+    await expect(tasks.getByText('Build the API')).toBeVisible();
+    await expect(tasks.getByText('Build the UI')).toBeVisible();
+    await expect(tasks.getByText('planned').first()).toBeVisible();
 
     // Both the architecture diagram and the dependency graph render to SVG.
     await expect(plan.locator('.mermaid-diagram svg').first()).toBeVisible();
