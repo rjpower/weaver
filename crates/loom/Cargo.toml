@@ -29,6 +29,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "derive"] }
+# The overlooker engine materializes embedded builtin scripts to a scratch file
+# before running them; the tests reuse it for fixtures.
+tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -38,7 +41,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 croner = "3"
 
 [dev-dependencies]
-tempfile = "3"
 # WebSocket client for the terminal round-trip integration test. 0.29 matches
 # axum 0.8's own tokio-tungstenite, so the two speak the same protocol stack.
 tokio-tungstenite = "0.29"

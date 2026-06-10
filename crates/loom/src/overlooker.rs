@@ -26,10 +26,13 @@
 //! A **round** is one execution ([`fire`]). It is **level-triggered**: the event
 //! that woke it is only a nudge to re-survey the *current* scoped fleet — it
 //! never "handles" the specific event, so firing twice is idempotent. The round
-//! runs a **program** (the declarative `builtin:status` stock program here)
-//! under the non-optional guardrails — no-overlap, cooldown, timeout,
-//! no-recursion — and records every mutating action as both an
-//! `overlooker_runs` action entry and an `events` row (the audit rule).
+//! runs a **program** under the non-optional guardrails — no-overlap, cooldown,
+//! timeout, no-recursion — and records every mutating action as both an
+//! `overlooker_runs` action entry and an `events` row (the audit rule). Three
+//! program shapes share that one substrate ([`run_program`]): the native
+//! `builtin:status` stock program (in-process Rust), the builtin **scripts**
+//! embedded from [`crate::builtins`], and custom program files — the last two
+//! run by the same subprocess executor ([`run_script`]).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -446,20 +449,248 @@ struct RoundResult {
     actions: Value,
 }
 
-/// Dispatch to the program the overlooker names. Today only the declarative
-/// `builtin:status` stock program exists; a custom file path would route to a
-/// Python-subprocess executor (a follow-up, see the module docs).
+/// Dispatch to the program the overlooker names: the native `builtin:status`
+/// stock program, a builtin **script** embedded from [`crate::builtins`], or a
+/// custom program file (an absolute path, conventionally under
+/// `~/.weaver/overlookers/`) — the scripts both run on [`run_script`].
 async fn run_program(
     state: &AppState,
     o: &Overlooker,
     dry_run: bool,
 ) -> anyhow::Result<RoundResult> {
-    match o.program.as_str() {
-        "builtin:status" => builtin_status(state, o, dry_run).await,
-        other => Err(anyhow::anyhow!(
-            "unknown overlooker program '{other}' (only builtin:status is implemented)"
-        )),
+    if o.program == "builtin:status" {
+        return builtin_status(state, o, dry_run).await;
     }
+    if let Some(source) = crate::builtins::find(&o.program).and_then(|b| b.source) {
+        let file_name = program_file_name(&o.program);
+        return run_script(
+            state,
+            o,
+            dry_run,
+            ScriptSource::Embedded { file_name, source },
+        )
+        .await;
+    }
+    let path = std::path::PathBuf::from(&o.program);
+    if path.is_absolute() {
+        return run_script(state, o, dry_run, ScriptSource::File(path)).await;
+    }
+    Err(anyhow::anyhow!(
+        "unknown overlooker program '{}' — expected 'builtin:<name>' or an absolute path",
+        o.program
+    ))
+}
+
+/// A scratch file name for an embedded builtin: `builtin:pr-label` →
+/// `pr-label.py`, so its tracebacks read like the program they came from.
+fn program_file_name(program: &str) -> String {
+    format!("{}.py", program.strip_prefix("builtin:").unwrap_or(program))
+}
+
+/// Where a script program's code comes from: embedded in the binary (a
+/// builtin) or a file on disk (a custom program).
+enum ScriptSource {
+    Embedded {
+        file_name: String,
+        source: &'static str,
+    },
+    File(std::path::PathBuf),
+}
+
+/// Whether a script opts into PEP 723 inline metadata (`# /// script`). Such a
+/// script declares its own dependencies, so the engine prefers `uv run
+/// --script` — which resolves them — when `uv` is installed; a plain script
+/// runs under `python3` directly.
+fn has_pep723(source: &str) -> bool {
+    source.lines().any(|l| l.trim() == "# /// script")
+}
+
+/// Whether the `uv` CLI is usable. Probed once and cached, like
+/// [`crate::github::gh_available`] — absence is normal and shouldn't cost a
+/// process spawn every round.
+async fn uv_available() -> bool {
+    static AVAILABLE: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+    *AVAILABLE
+        .get_or_init(|| async {
+            tokio::process::Command::new("uv")
+                .arg("--version")
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+        .await
+}
+
+/// Run a **script program**: an env-stripped subprocess (the lint-review
+/// precedent, like [`run_agent`]) that reaches the fleet only through the loom
+/// REST API. `$WEAVER_API` carries the daemon's own address and
+/// `$WEAVER_OVERLOOKER` the round config (`{id, name, program, params, scope,
+/// capabilities, dry_run}`); the vendored `weaver_loom` module rides
+/// `PYTHONPATH` so every program can import the API layer with no install
+/// step. The contract is to print one JSON object — `{outcome, summary,
+/// actions}` — as the final stdout line; a non-zero exit or unparseable
+/// stdout errors the round. The wall-clock budget in [`fire`] bounds it, and
+/// `kill_on_drop` reaps the subprocess when that budget cancels the future.
+///
+/// The interpreter is `python3`, or `uv run --script` when the script declares
+/// PEP 723 inline metadata and `uv` is installed (so a custom program can
+/// declare third-party dependencies; the builtins are stdlib-only).
+async fn run_script(
+    state: &AppState,
+    o: &Overlooker,
+    dry_run: bool,
+    src: ScriptSource,
+) -> anyhow::Result<RoundResult> {
+    // One scratch dir per round: the vendored module always lands here (for
+    // PYTHONPATH), an embedded builtin's source too (so a traceback carries a
+    // real file/line). Removed when the round ends.
+    let scratch = tempfile::tempdir().map_err(|e| anyhow::anyhow!("creating scratch dir: {e}"))?;
+    let module = scratch.path().join("weaver_loom.py");
+    tokio::fs::write(&module, crate::builtins::PYTHON_MODULE)
+        .await
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", module.display()))?;
+
+    let (script_path, source) = match &src {
+        ScriptSource::Embedded { file_name, source } => {
+            let path = scratch.path().join(file_name);
+            tokio::fs::write(&path, source)
+                .await
+                .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+            (path, source.to_string())
+        }
+        // The source is read only to detect PEP 723 metadata; a missing file
+        // surfaces as the spawn error below, with the path in it.
+        ScriptSource::File(path) => (
+            path.clone(),
+            tokio::fs::read_to_string(path).await.unwrap_or_default(),
+        ),
+    };
+
+    let pythonpath = match std::env::var("PYTHONPATH") {
+        Ok(existing) if !existing.is_empty() => {
+            format!("{}:{existing}", scratch.path().display())
+        }
+        _ => scratch.path().display().to_string(),
+    };
+
+    let config = json!({
+        "id": o.id,
+        "name": o.name,
+        "program": o.program,
+        "params": o.params(),
+        "scope": serde_json::to_value(o.scope()).unwrap_or(Value::Null),
+        "capabilities": o.capabilities(),
+        "dry_run": dry_run,
+    });
+
+    let interpreter = if has_pep723(&source) && uv_available().await {
+        "uv"
+    } else {
+        "python3"
+    };
+    let mut command = tokio::process::Command::new(interpreter);
+    if interpreter == "uv" {
+        command.args(["run", "--quiet", "--script"]);
+    }
+    command
+        .arg(&script_path)
+        .env("WEAVER_API", api_base(&state.addr))
+        .env("WEAVER_OVERLOOKER", config.to_string())
+        .env("PYTHONPATH", pythonpath)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    for key in STRIPPED_ENV {
+        command.env_remove(key);
+    }
+
+    let out = command.output().await.map_err(|e| {
+        anyhow::anyhow!(
+            "spawning {interpreter} for '{}' failed: {e} (is {interpreter} installed?)",
+            o.program
+        )
+    })?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        anyhow::bail!(
+            "script exited with {}: {}",
+            out.status.code().unwrap_or(-1),
+            tail(&stderr, 400)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_round_result(&stdout).ok_or_else(|| {
+        anyhow::anyhow!(
+            "script printed no result JSON object ({{outcome, summary, actions}}); stdout: {}; stderr: {}",
+            tail(&stdout, 200),
+            tail(&stderr, 200)
+        )
+    })
+}
+
+/// The REST base URL a script subprocess targets — the daemon's own bound
+/// address. A wildcard bind (`0.0.0.0` / `[::]`) is mapped to loopback, since
+/// "every interface" is not a dialable host.
+fn api_base(addr: &str) -> String {
+    let dialable = addr
+        .strip_prefix("0.0.0.0:")
+        .or_else(|| addr.strip_prefix("[::]:"))
+        .map(|port| format!("127.0.0.1:{port}"))
+        .unwrap_or_else(|| addr.to_string());
+    format!("http://{dialable}")
+}
+
+/// Parse a script's stdout into a [`RoundResult`]: the whole stdout as one
+/// JSON object, or — so a script may log progress lines first — the **last**
+/// stdout line that is one. The fields are read leniently: a missing/unknown
+/// `outcome` reads as `ok`, a missing `summary` as empty, a missing/non-array
+/// `actions` as none — so a minimal script stays minimal.
+fn parse_round_result(stdout: &str) -> Option<RoundResult> {
+    let trimmed = stdout.trim();
+    parse_result_object(trimmed).or_else(|| trimmed.lines().rev().find_map(parse_result_object))
+}
+
+/// One candidate result line → [`RoundResult`], if it is a JSON object.
+fn parse_result_object(text: &str) -> Option<RoundResult> {
+    let v: Value = serde_json::from_str(text.trim()).ok()?;
+    let obj = v.as_object()?;
+    let outcome = obj
+        .get("outcome")
+        .and_then(Value::as_str)
+        .filter(|o| ov::OUTCOMES.contains(o))
+        .unwrap_or("ok");
+    let summary = obj
+        .get("summary")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let actions = obj
+        .get("actions")
+        .filter(|a| a.is_array())
+        .cloned()
+        .unwrap_or_else(|| Value::Array(vec![]));
+    Some(RoundResult {
+        outcome: outcome.to_string(),
+        summary: summary.to_string(),
+        actions,
+    })
+}
+
+/// The last `n` bytes-ish of a process stream (on a char boundary), so an
+/// error summary carries the end of a traceback without unbounded length.
+fn tail(s: &str, n: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let start = s
+        .char_indices()
+        .rev()
+        .nth(n - 1)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    format!("…{}", &s[start..])
 }
 
 /// The set of every overlooker's warm session id — the sessions a round must
@@ -951,6 +1182,164 @@ mod tests {
         assert_eq!(iso(next), "2026-06-08T11:00:00.000Z");
         // A malformed expression never schedules.
         assert!(next_cron("not a cron", from).is_none());
+    }
+
+    #[test]
+    fn parse_round_result_is_lenient_but_requires_an_object() {
+        // The full contract round-trips.
+        let r = parse_round_result(
+            r#"{"outcome":"noop","summary":"all calm","actions":[{"would":"mark"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.outcome, "noop");
+        assert_eq!(r.summary, "all calm");
+        assert_eq!(r.actions.as_array().unwrap().len(), 1);
+
+        // A minimal object gets the lenient defaults; an unknown outcome
+        // clamps to `ok` rather than inventing a new state.
+        let r = parse_round_result(r#"{"outcome":"sideways"}"#).unwrap();
+        assert_eq!(r.outcome, "ok");
+        assert_eq!(r.summary, "");
+        assert_eq!(r.actions, Value::Array(vec![]));
+
+        // A script may log progress lines first; the result is the last JSON
+        // object line on stdout.
+        let r = parse_round_result(
+            "surveying...\n3 sessions seen\n{\"outcome\":\"ok\",\"summary\":\"done\"}\n",
+        )
+        .unwrap();
+        assert_eq!(r.summary, "done");
+
+        // Anything without a JSON object is a contract violation.
+        assert!(parse_round_result("").is_none());
+        assert!(parse_round_result("not json").is_none());
+        assert!(parse_round_result("[1, 2]").is_none());
+    }
+
+    #[test]
+    fn has_pep723_detects_the_inline_metadata_block() {
+        assert!(has_pep723(
+            "# /// script\n# dependencies = []\n# ///\nprint()"
+        ));
+        assert!(has_pep723("#!/usr/bin/env python3\n# /// script\n# ///\n"));
+        assert!(!has_pep723("import weaver_loom\n"));
+        assert!(!has_pep723("# script\n# ///\n"));
+    }
+
+    #[test]
+    fn api_base_maps_wildcard_binds_to_loopback() {
+        assert_eq!(api_base("127.0.0.1:7878"), "http://127.0.0.1:7878");
+        assert_eq!(api_base("0.0.0.0:7878"), "http://127.0.0.1:7878");
+        assert_eq!(api_base("[::]:7878"), "http://127.0.0.1:7878");
+    }
+
+    #[test]
+    fn tail_keeps_the_end_of_long_streams() {
+        assert_eq!(tail("short", 10), "short");
+        assert_eq!(tail("a long traceback line", 4), "…line");
+        // Multi-byte chars stay on a boundary.
+        assert_eq!(tail("héllo wörld", 4), "…örld");
+    }
+
+    use crate::builtins::python3_available;
+
+    /// An `AppState` over a fresh in-memory db plus an overlooker registered on
+    /// `program` — the minimum for a [`fire`] round to run a script end to end.
+    async fn script_fixture(program: &str) -> (AppState, Overlooker) {
+        let state = AppState {
+            db: crate::db::connect_in_memory().await.unwrap(),
+            bus: events::EventBus::new(),
+            addr: "127.0.0.1:0".to_string(),
+        };
+        let o = ov::create(
+            &state.db,
+            &ov::NewOverlooker {
+                name: "script-test".to_string(),
+                program: program.to_string(),
+                params: r#"{"label":"weaver"}"#.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        (state, o)
+    }
+
+    /// A custom script file round-trips the whole contract **through the
+    /// vendored `weaver_loom` module**: the engine puts the API layer on
+    /// PYTHONPATH, the `Round` context exposes the `$WEAVER_OVERLOOKER` config
+    /// (params and the dry-run flag included), and `finish()`'s printed
+    /// `{outcome, summary, actions}` lands on the run row.
+    #[tokio::test]
+    async fn run_script_round_trips_the_contract() {
+        if !python3_available() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("echo_config.py");
+        std::fs::write(
+            &script,
+            r#"
+import json
+from weaver_loom import Round
+rnd = Round()
+rnd.would("label", note="from the script")
+rnd.finish("name=%s label=%s dry=%s api=%s" % (
+    rnd.name, rnd.params["label"], json.dumps(rnd.dry_run), rnd.client.base))
+"#,
+        )
+        .unwrap();
+
+        let (state, o) = script_fixture(&script.display().to_string()).await;
+        let run_id = fire(&state, &new_in_flight(), &o, "manual", true)
+            .await
+            .unwrap();
+        let run = ov::recent_runs(&state.db, &o.id, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == run_id)
+            .unwrap();
+        assert_eq!(run.outcome, "ok", "summary: {}", run.summary);
+        assert!(
+            run.summary
+                .contains("name=script-test label=weaver dry=true api=http://127.0.0.1:0"),
+            "the script saw its config through the module: {}",
+            run.summary
+        );
+        let actions: Value = serde_json::from_str(&run.actions).unwrap();
+        assert_eq!(actions[0]["would"], "label");
+    }
+
+    /// A failing script errors the round with the stderr tail in the summary,
+    /// and a missing program file errors rather than wedging.
+    #[tokio::test]
+    async fn run_script_failures_are_recorded_as_errors() {
+        if !python3_available() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("boom.py");
+        std::fs::write(&script, "raise RuntimeError('kaboom')\n").unwrap();
+
+        let (state, o) = script_fixture(&script.display().to_string()).await;
+        let run_id = fire(&state, &new_in_flight(), &o, "manual", false)
+            .await
+            .unwrap();
+        let run = ov::recent_runs(&state.db, &o.id, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == run_id)
+            .unwrap();
+        assert_eq!(run.outcome, "error");
+        assert!(
+            run.summary.contains("kaboom"),
+            "the stderr tail names the failure: {}",
+            run.summary
+        );
     }
 
     #[test]

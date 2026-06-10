@@ -698,6 +698,198 @@ async fn rest_overlooker_lifecycle_and_validation() {
 }
 
 // ---------------------------------------------------------------------------
+// Builtin script programs
+// ---------------------------------------------------------------------------
+
+use loom::builtins::python3_available;
+
+/// A stored PR snapshot for a branch, as the GitHub poll loop would write it.
+fn pr_snapshot(state: &str, number: i64) -> weaver_core::github::GithubStatus {
+    weaver_core::github::GithubStatus {
+        pr_number: number,
+        pr_url: format!("https://example/pr/{number}"),
+        pr_state: state.to_string(),
+        pr_title: "the change".to_string(),
+        is_draft: false,
+        review_decision: None,
+        checks: Some("passing".to_string()),
+        mergeable: None,
+        merged_at: (state == "MERGED").then(db::now_iso),
+        fetched_at: db::now_iso(),
+    }
+}
+
+/// The registry over REST: every builtin carries its defaults, script programs
+/// carry their read-only source, and `validate_program` rejects an unknown
+/// builtin at create time (naming the registry) while accepting a known one.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_lists_builtin_programs_and_validates_program_refs() {
+    let ts = TestServer::start().await;
+
+    let programs = ts.client.get("/api/overlookers/programs").await.unwrap();
+    let arr = programs.as_array().unwrap();
+    let names: Vec<&str> = arr.iter().map(|p| p["program"].as_str().unwrap()).collect();
+    for expected in [
+        "builtin:status",
+        "builtin:pr-label",
+        "builtin:archive-merged",
+    ] {
+        assert!(names.contains(&expected), "{expected} missing: {names:?}");
+    }
+
+    // A script program ships its source and suggested defaults…
+    let archive = arr
+        .iter()
+        .find(|p| p["program"] == "builtin:archive-merged")
+        .unwrap();
+    assert_eq!(archive["kind"], "script");
+    assert!(
+        archive["source"]
+            .as_str()
+            .unwrap()
+            .contains("archive-merged"),
+        "the embedded source is served"
+    );
+    assert!(archive["defaults"]["trigger"]["every"].is_string());
+    assert_eq!(archive["defaults"]["capabilities"][0], "observe");
+    // …a native program has no source to show.
+    let status = arr
+        .iter()
+        .find(|p| p["program"] == "builtin:status")
+        .unwrap();
+    assert_eq!(status["kind"], "native");
+    assert!(status["source"].is_null());
+
+    // An unknown builtin is rejected at create time; a known script accepted.
+    let bad = ts
+        .client
+        .post(
+            "/api/overlookers",
+            json!({ "name": "bad", "program": "builtin:nope" }),
+        )
+        .await;
+    assert!(bad.is_err(), "an unknown builtin program is rejected");
+    let ok = ts
+        .client
+        .post(
+            "/api/overlookers",
+            json!({ "name": "good", "program": "builtin:archive-merged" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok["program"], "builtin:archive-merged");
+}
+
+/// The embedded builtin scripts end to end: each runs as a real `python3`
+/// subprocess against the live test server's REST API. `archive-merged` flags
+/// the session whose stored PR snapshot is merged; `pr-label` flags the one
+/// with an open PR (the fixture repo has no GitHub remote, so the label read
+/// degrades to the ensure-label report). Both are read-only — the fleet is
+/// untouched afterward.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn builtin_scripts_report_merged_and_unlabelled_prs() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let ts = TestServer::start().await;
+    let state = engine_state(&ts).await;
+    let (merged_id, merged_branch, _repo) = make_session(&ts, "merged work").await;
+    let (open_id, open_branch, _repo) = make_session(&ts, "open work").await;
+    loom::github::upsert_status(&state.db, &merged_branch, &pr_snapshot("MERGED", 41))
+        .await
+        .unwrap();
+    loom::github::upsert_status(&state.db, &open_branch, &pr_snapshot("OPEN", 42))
+        .await
+        .unwrap();
+
+    // archive-merged: exactly the merged session is reported, as a would-do.
+    enabled_overlooker(
+        &state,
+        ov::NewOverlooker {
+            name: "archive-watch".to_string(),
+            program: "builtin:archive-merged".to_string(),
+            capabilities: vec!["observe".to_string()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let run_id = overlooker::fire_now(&state, "archive-watch", false, "manual")
+        .await
+        .unwrap();
+    let runs = ts
+        .client
+        .get("/api/overlookers/archive-watch/runs?limit=10")
+        .await
+        .unwrap();
+    let run = runs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == run_id)
+        .unwrap()
+        .clone();
+    assert_eq!(run["outcome"], "ok", "summary: {}", run["summary"]);
+    let actions = run["actions"].as_array().unwrap();
+    assert_eq!(
+        actions.len(),
+        1,
+        "only the merged PR is flagged: {actions:?}"
+    );
+    assert_eq!(actions[0]["would"], "archive");
+    assert_eq!(actions[0]["session"], merged_id.as_str());
+    assert_eq!(actions[0]["pr"], 41);
+
+    // pr-label: exactly the open PR is reported, with the default label.
+    enabled_overlooker(
+        &state,
+        ov::NewOverlooker {
+            name: "label-watch".to_string(),
+            program: "builtin:pr-label".to_string(),
+            capabilities: vec!["observe".to_string()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let run_id = overlooker::fire_now(&state, "label-watch", false, "manual")
+        .await
+        .unwrap();
+    let runs = ts
+        .client
+        .get("/api/overlookers/label-watch/runs?limit=10")
+        .await
+        .unwrap();
+    let run = runs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == run_id)
+        .unwrap()
+        .clone();
+    assert_eq!(run["outcome"], "ok", "summary: {}", run["summary"]);
+    let actions = run["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 1, "only the open PR is flagged: {actions:?}");
+    assert_eq!(actions[0]["would"], "label");
+    assert_eq!(actions[0]["session"], open_id.as_str());
+    assert_eq!(actions[0]["label"], "weaver");
+
+    // Read-only: neither session was archived or otherwise mutated.
+    for id in [&merged_id, &open_id] {
+        let view = ts.client.get(&format!("/api/sessions/{id}")).await.unwrap();
+        assert_ne!(view["status"], "archived", "builtin scripts mutate nothing");
+    }
+
+    for id in [merged_id, open_id] {
+        ts.client
+            .delete(&format!("/api/sessions/{id}"))
+            .await
+            .unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // T12 — Warm-session lifecycle
 // ---------------------------------------------------------------------------
 

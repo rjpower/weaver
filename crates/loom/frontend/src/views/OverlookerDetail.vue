@@ -2,7 +2,7 @@
 import { ref, reactive, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { get, post, patch, del } from '../api';
-import type { Overlooker, OverlookerRun, OverlookerRunResult } from '../types';
+import type { Overlooker, OverlookerRun, OverlookerRunResult, ProgramView } from '../types';
 import OutcomeBadge from '../components/OutcomeBadge.vue';
 import AgentTerminal from '../components/AgentTerminal.vue';
 import { timeAgo } from '../lib/time';
@@ -163,9 +163,26 @@ async function remove() {
 // The capability set as a readable, ordered chip list (observe is implicit).
 const grantedCaps = computed(() => ov.value?.capabilities ?? []);
 
+// The builtin program registry, to label this overlooker's program and render
+// a builtin script's source read-only (it ships inside the loom binary).
+const programs = ref<ProgramView[]>([]);
+const showSource = ref(false);
+const programInfo = computed(
+  () => programs.value.find((p) => p.program === ov.value?.program) ?? null,
+);
+
+async function loadPrograms() {
+  try {
+    programs.value = (await get('/overlookers/programs')) as ProgramView[];
+  } catch {
+    // Supplementary: without the registry the program still shows as its ref.
+  }
+}
+
 onMounted(() => {
   loadOverlooker();
   loadRuns();
+  loadPrograms();
 });
 </script>
 
@@ -305,7 +322,27 @@ onMounted(() => {
             📁 {{ repoLabel(ov.trigger.repo) }}
           </dd>
           <dt class="text-faint">Program</dt>
-          <dd class="font-mono">{{ ov.program }}</dd>
+          <dd>
+            <span class="font-mono">{{ ov.program }}</span>
+            <button
+              v-if="programInfo?.source"
+              type="button"
+              data-testid="program-source-toggle"
+              class="ml-2 text-xs text-accent hover:underline"
+              @click="showSource = !showSource"
+            >
+              {{ showSource ? 'hide source' : 'view source' }}
+            </button>
+            <p v-if="programInfo" class="mt-0.5 text-xs text-faint">
+              {{ programInfo.title }} — a builtin {{ programInfo.kind }} shipped
+              with loom<span v-if="programInfo.source">; the source is read-only</span>.
+            </p>
+            <pre
+              v-if="showSource && programInfo?.source"
+              data-testid="program-source"
+              class="mt-2 max-h-80 overflow-auto rounded bg-input p-3 text-xs font-mono"
+            >{{ programInfo.source }}</pre>
+          </dd>
 
           <dt class="text-faint pt-1">Capabilities</dt>
           <dd>

@@ -61,6 +61,7 @@ enum Cmd {
     /// escalating to you. Author one as a plain file an agent can edit, then
     /// register it and iterate with `--dry-run`:
     ///
+    ///     loom overlooker programs                 # the builtin programs that ship with loom
     ///     loom overlooker new test-watch          # scaffold ~/.weaver/overlookers/test-watch.py
     ///     loom overlooker add status --cron "0 * * * *" --capabilities observe,mark,escalate
     ///     loom overlooker run status --dry-run     # simulate; mutating actions are stubbed
@@ -177,12 +178,20 @@ enum SessionCmd {
 enum OverlookerCmd {
     /// Scaffold a starter program file at `~/.weaver/overlookers/<name>.py`.
     ///
-    /// Writes a commented Python template using the `weaver` module decorators,
-    /// then prints the path. Edit it, then register it with
+    /// Writes a commented Python template against the program contract (the
+    /// fleet over `$WEAVER_API`, round config in `$WEAVER_OVERLOOKER`, result
+    /// JSON on stdout), then prints the path. Edit it, then register it with
     /// `loom overlooker add <name> --program <path>`.
     New {
         /// The overlooker name; also the file stem (`<name>.py`).
         name: String,
+    },
+    /// List the builtin programs that ship with loom (GET /api/overlookers/programs).
+    Programs {
+        /// Print one program's script source instead of the table, e.g.
+        /// `--source builtin:archive-merged` — a working example to start from.
+        #[arg(long)]
+        source: Option<String>,
     },
     /// Register an overlooker from flags (POST /api/overlookers).
     Add(Box<AddOpts>),
@@ -395,6 +404,7 @@ async fn run_session(cmd: SessionCmd) -> Result<()> {
 async fn run_overlooker(cmd: OverlookerCmd) -> Result<()> {
     match cmd {
         OverlookerCmd::New { name } => cmd_overlooker_new(name).await,
+        OverlookerCmd::Programs { source } => cmd_overlooker_programs(source).await,
         OverlookerCmd::Add(opts) => cmd_overlooker_add(*opts).await,
         OverlookerCmd::Rm { name } => cmd_overlooker_rm(name).await,
         OverlookerCmd::Enable { name } => cmd_overlooker_set_enabled(name, true).await,
@@ -1136,56 +1146,45 @@ async fn cmd_open() -> Result<()> {
 // Overlooker commands (the operator + authoring surface)
 // ---------------------------------------------------------------------------
 
-/// The starter program a `loom overlooker new` scaffolds. A small commented
-/// template against the `weaver` module decorators — the file convention an
-/// agent edits. The `{name}` placeholder is the overlooker's name.
+/// The starter program a `loom overlooker new` scaffolds: a small, runnable
+/// template against the `weaver_loom` API layer and the program contract the
+/// engine speaks — the same shape the builtin scripts implement
+/// (`loom overlooker programs --source <name>` prints one as a fuller
+/// example). Plain `replace` rather than `format!`, so the template's literal
+/// braces (JSON, f-strings) stay readable.
 fn scaffold_template(name: &str) -> String {
-    format!(
-        r##""""{name} — a weaver overlooker (a periodic / triggered watch over the fleet).
+    const TEMPLATE: &str = r##"# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
+"""__NAME__ — a weaver overlooker program.
 
-This program is run by the loom overlooker engine as an env-stripped subprocess.
-It uses the `weaver` Python module — the PyO3 binding (`weaver-py`, shipped
-separately) that wraps the same loom REST API the `loom session ...` commands
-use. So the vocabulary you explore the fleet with on the CLI is the vocabulary
-you call here: `ov.sessions(...)`, `s.preview()`, `s.mark(...)`, `s.nudge(...)`.
+The engine runs this as a subprocess with WEAVER_API (the loom REST base URL)
+and WEAVER_OVERLOOKER (the round config JSON) set; `weaver_loom` is on
+PYTHONPATH. `Round.finish` prints the result the engine reads from stdout.
 
-Register this file once you're happy with it:
-
-    loom overlooker add {name} --program {path} \
-        --cron "0 * * * *" --capabilities observe,mark,escalate
-
-Iterate safely — every mutating action is stubbed under --dry-run:
-
-    loom overlooker run {name} --dry-run
+Register:   loom overlooker add __NAME__ --program __PATH__ --every 15m
+Try it:     loom overlooker run __NAME__ --dry-run
 """
 
-import weaver
+from weaver_loom import Round
 
 
-@weaver.on_cron("0 * * * *")  # the trigger — a cron event source (hourly)
-def {ident}(ov):
-    # A round is level-triggered: survey the *current* scoped fleet and
-    # reconcile, rather than reacting to the one event that woke you.
-    for s in ov.sessions(attention="!ok"):
-        # Cheap mechanical rule — no model, no cost.
-        if s.idle_minutes() > 30 and s.pr_checks() == "failing":
-            s.mark("attention", "idle 30m with red CI")
-            continue
+def main():
+    rnd = Round()
+    for session in rnd.sessions():
+        # Decide per session and record findings, e.g.:
+        #     rnd.would("mark", session=session["id"], note="one line on why")
+        pass
+    rnd.finish(f"surveyed {rnd.surveyed}, {len(rnd.actions)} finding(s)")
 
-        # …or a fresh agent for the judgement call.
-        verdict = ov.run_agent(
-            f"Is this session stuck? Screen:\n{{s.preview(200)}}"
-        )
-        s.mark(verdict.level, verdict.note)
 
-        # The nudge rung of the intervention ladder — capability-gated.
-        if verdict.level != "ok" and ov.can("nudge"):
-            s.nudge(verdict.suggestion)
-"##,
-        name = name,
-        ident = name.replace(['-', '.', ' '], "_"),
-        path = overlooker_path(name).display(),
-    )
+if __name__ == "__main__":
+    main()
+"##;
+    TEMPLATE
+        .replace("__NAME__", name)
+        .replace("__PATH__", &overlooker_path(name).display().to_string())
 }
 
 /// The conventional path for an overlooker's program file:
@@ -1221,6 +1220,40 @@ async fn cmd_overlooker_new(name: String) -> Result<()> {
         "    loom overlooker add {name} --program {} --cron \"0 * * * *\"",
         path.display()
     );
+    Ok(())
+}
+
+/// `loom overlooker programs` — list the builtin programs that ship with loom
+/// (the registry the panel offers), or print one program's script source with
+/// `--source` as a working example to start a custom program from.
+async fn cmd_overlooker_programs(source: Option<String>) -> Result<()> {
+    let client = client::default();
+    let rows = client
+        .get("/api/overlookers/programs")
+        .await?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if let Some(want) = source {
+        let row = rows.iter().find(|p| str_field(p, "program") == want);
+        let Some(row) = row else {
+            bail!("no builtin program '{want}' — `loom overlooker programs` lists them");
+        };
+        match row.get("source").and_then(Value::as_str) {
+            Some(src) => print!("{src}"),
+            None => bail!("'{want}' is a native (in-Rust) program with no script source"),
+        }
+        return Ok(());
+    }
+    println!("{:<26}  {:<8}  TITLE", "PROGRAM", "KIND");
+    for p in rows {
+        println!(
+            "{:<26}  {:<8}  {}",
+            str_field(&p, "program"),
+            str_field(&p, "kind"),
+            str_field(&p, "title"),
+        );
+    }
     Ok(())
 }
 
@@ -1536,6 +1569,34 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    /// The scaffold must honor the contract it documents — at minimum, be
+    /// valid Python with the placeholders filled in. Skips without `python3`
+    /// (the same degradation the engine applies).
+    #[test]
+    fn scaffold_template_is_valid_python() {
+        if !loom::builtins::python3_available() {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        let rendered = scaffold_template("test-watch");
+        assert!(rendered.contains("test-watch"), "the name is filled in");
+        assert!(!rendered.contains("__NAME__"), "no placeholder survives");
+        assert!(!rendered.contains("__PATH__"), "no placeholder survives");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-watch.py");
+        std::fs::write(&path, rendered).unwrap();
+        let out = std::process::Command::new("python3")
+            .args(["-m", "py_compile"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "the scaffold does not compile: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     fn terminal_statuses_match_the_session_model() {
         for s in ["done", "error", "archived"] {
@@ -1664,17 +1725,19 @@ mod tests {
         }
     }
 
-    /// The scaffolded program is valid Python: a module docstring, the
-    /// `import weaver`, and a cron-decorated round whose name is a safe ident.
+    /// The scaffolded program carries the pieces an author starts from: the
+    /// PEP 723 block (uv-runnable), a docstring documenting the contract, and
+    /// the `weaver_loom` round context.
     #[test]
     fn scaffold_template_is_well_formed() {
         let out = scaffold_template("test-watch");
+        assert!(out.starts_with("# /// script"), "PEP 723 block leads");
         // The docstring opens with exactly three quotes (a malformed `""` would
         // be the most likely raw-string bug).
-        assert!(out.starts_with("\"\"\"test-watch"), "got: {}", &out[..16]);
-        assert!(out.contains("import weaver"));
-        // `-` in the name becomes `_` so the function name is a valid ident.
-        assert!(out.contains("def test_watch(ov):"));
+        assert!(out.contains("\"\"\"test-watch — "));
+        // It documents the program contract and uses the API layer.
+        assert!(out.contains("WEAVER_OVERLOOKER"));
+        assert!(out.contains("from weaver_loom import Round"));
         assert!(out.contains("loom overlooker add test-watch"));
     }
 
@@ -1689,7 +1752,7 @@ mod tests {
         let path = home.path().join("overlookers").join("scaffolded.py");
         assert!(path.exists(), "the program file was written");
         let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("def scaffolded(ov):"));
+        assert!(body.contains("\"\"\"scaffolded — "));
         // A second `new` of the same name refuses rather than clobbering.
         assert!(cmd_overlooker_new("scaffolded".to_string()).await.is_err());
         std::env::remove_var("WEAVER_HOME");
