@@ -1070,12 +1070,32 @@ async fn cmd_attach(key: String) -> Result<()> {
     let session = ws
         .get("tmux_session")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("session has no tmux session"))?;
-    let target = loom::tmux::exact(session);
-    let err = std::process::Command::new("tmux")
-        .args(["attach-session", "-t", &target])
-        .exec();
-    Err(anyhow!("failed to exec tmux: {err}"))
+        .ok_or_else(|| anyhow!("session has no terminal"))?;
+    // Hand the terminal to the active backend's native attach.
+    let err = match loom::backend::selected() {
+        loom::backend::Backend::Tmux => {
+            let target = loom::tmux::exact(session);
+            std::process::Command::new("tmux")
+                .args(["attach-session", "-t", &target])
+                .exec()
+        }
+        loom::backend::Backend::Tapestry => {
+            // The `tapestry` binary ships beside `loom`; resolve it as a sibling
+            // so an attach works regardless of PATH.
+            let exe = std::env::current_exe().ok();
+            let tapestry = exe
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .map(|d| d.join("tapestry"))
+                .filter(|p| p.exists())
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "tapestry".to_string());
+            std::process::Command::new(tapestry)
+                .args(["attach", session])
+                .exec()
+        }
+    };
+    Err(anyhow!("failed to exec terminal attach: {err}"))
 }
 
 async fn cmd_archive(key: String) -> Result<()> {

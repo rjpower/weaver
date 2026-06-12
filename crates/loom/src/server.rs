@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use crate::events::EventBus;
 use crate::session as session_mod;
 use crate::web::AppState;
-use crate::{config, db, github, monitor, overlooker, tmux, web};
+use crate::{backend, config, db, github, monitor, overlooker, web};
 use weaver_core::branch as branch_mod;
 use weaver_core::overlooker as ov;
 
@@ -148,7 +148,7 @@ async fn reconcile_sessions(state: &AppState) {
         if session_mod::is_terminal(&session.status) {
             continue;
         }
-        if tmux::has_session(&session.tmux_session).await {
+        if backend::has_session(&session.tmux_session).await {
             continue;
         }
         let Ok(Some(branch)) = branch_mod::get(&state.db, &session.branch_id).await else {
@@ -231,7 +231,7 @@ pub async fn reconcile_managed_sessions(state: &AppState) {
         if session_mod::is_terminal(&session.status) {
             continue;
         }
-        if tmux::has_session(&session.tmux_session).await {
+        if backend::has_session(&session.tmux_session).await {
             continue;
         }
         match web::adopt(state, &session, &branch).await {

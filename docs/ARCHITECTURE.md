@@ -54,8 +54,10 @@ needing the daemon to be reachable.
 | `python/weaver-loom/` | the pure-Python layer over the loom REST API (`weaver_loom`: client + overlooker round context); stdlib-only, uv-buildable, vendored onto every script's `PYTHONPATH` by the engine; server-free contract tests in `tests/` (`uv run pytest`, CI's `python-binding` job) |
 | `crates/loom/src/agent.rs` | launching agents into tmux + installing `.claude/settings.local.json` hooks + the one-shot headless agent behind `POST /api/agent/oneshot` |
 | `crates/loom/src/session.rs` | `Session` row + sqlx queries |
-| `crates/loom/src/tmux.rs` | `tmux new-session / capture-pane / kill-session / attach` (exact-match `=name:` targets) |
-| `crates/loom/src/terminal.rs` | WebSocket ⇄ PTY bridge: xterm.js ⇄ `tmux attach` (the live terminal) |
+| `crates/loom/src/backend.rs` | the terminal-management seam: every programmatic terminal op (create/has/capture/send/kill/list) dispatches to the backend chosen by `WEAVER_TERMINAL_BACKEND` (`tmux` default, or `tapestry`) |
+| `crates/loom/src/tmux.rs` | tmux backend: `tmux new-session / capture-pane / kill-session / attach` (exact-match `=name:` targets) |
+| `crates/tapestry/` | tapestry backend: a per-session detached PTY supervisor (PTY + vt100 screen emulator + unix control socket) that outlives loom and streams raw PTY bytes, so an attached xterm owns its own scrollback/search instead of a re-rendered tmux screen |
+| `crates/loom/src/terminal.rs` | WebSocket ⇄ live-terminal bridge: xterm.js ⇄ `tmux attach` (tmux) or ⇄ the tapestry session socket (tapestry) |
 | `crates/loom/src/github.rs` | `gh` CLI shell-out: issue seeding, PR opening, and the PR-status poll loop (snapshots each branch's PR; archives on merge) |
 | `crates/loom/src/client.rs` | HTTP client used by the `loom` CLI to talk to its own daemon |
 | `crates/loom/src/bin/loom.rs` | the orchestrator CLI (`serve`, `launch`, `ps`, `attach`, …) |
@@ -436,5 +438,8 @@ builtins are stdlib-only and need neither).
 | `WEAVER_API` | loom URL (both sides — server binds, CLI talks) | `http://127.0.0.1:7878` |
 | `WEAVER_BRANCH` | override the branch resolver (set by `loom session launch` in the worktree) | — |
 | `WEAVER_TMUX_SOCKET` | pin tmux to a dedicated server (`tmux -L <name>`) so ops can't touch real sessions; set by the test harnesses | unset → default socket |
+| `WEAVER_TERMINAL_BACKEND` | which terminal backend manages sessions: `tmux` or `tapestry` | `tmux` |
+| `WEAVER_TAPESTRY_DIR` | directory holding tapestry's per-session control sockets | `$WEAVER_HOME/sock` |
+| `WEAVER_TAPESTRY_BIN` | the `tapestry` supervisor binary loom re-execs (else a sibling of `loom`); set by the tests | sibling of `loom` |
 | `WEAVER_OVERLOOKER_AGENT_CMD` | the one-shot headless agent command behind `POST /api/agent/oneshot` (judgement calls) | `claude -p` |
 | `RUST_LOG` / `EnvFilter` | tracing filter | `loom=info,weaver_core=info,tower_http=warn` |

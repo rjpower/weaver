@@ -29,6 +29,7 @@ use futures_util::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 use tokio::sync::mpsc;
 
+use crate::backend::{self, Backend};
 use crate::tmux;
 use crate::web::{require_session, AppState};
 
@@ -64,11 +65,11 @@ pub async fn terminal_ws(
         Ok((s, _)) => s,
         Err(_) => return (StatusCode::NOT_FOUND, "no such session").into_response(),
     };
-    // No live tmux means nothing to attach to — the caller should adopt first.
-    if !tmux::has_session(&session.tmux_session).await {
+    // No live supervisor means nothing to attach to — the caller should adopt first.
+    if !backend::has_session(&session.tmux_session).await {
         return (
             StatusCode::CONFLICT,
-            "session has no running tmux — adopt it first",
+            "session has no running terminal — adopt it first",
         )
             .into_response();
     }
@@ -76,10 +77,80 @@ pub async fn terminal_ws(
     ws.max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
         .on_upgrade(move |socket| async move {
-            if let Err(e) = bridge(socket, target).await {
+            let result = match backend::selected() {
+                Backend::Tmux => bridge(socket, target).await,
+                Backend::Tapestry => bridge_tapestry(socket, target).await,
+            };
+            if let Err(e) = result {
                 tracing::debug!(error = %e, "terminal bridge ended with error");
             }
         })
+}
+
+/// Bridge a browser xterm to a tapestry session: the supervisor streams raw PTY
+/// bytes, so this is a straight byte pump with no tmux client to detach and no
+/// stray-Ctrl-D hazard. The wire protocol (`0x00` input / `0x01` resize) is the
+/// same one [`bridge`] speaks; output frames are forwarded verbatim.
+async fn bridge_tapestry(socket: WebSocket, target: String) -> anyhow::Result<()> {
+    let client = tapestry::Client::connect(&target).await?;
+    // Start at 80×24; the client sends a real size in its first fit.
+    let attach = client.attach(80, 24).await?;
+    let (mut input, mut output) = attach.split();
+    let (mut sink, mut stream) = socket.split();
+
+    // PTY output → ws.
+    let mut out_task = tokio::spawn(async move {
+        while let Some(chunk) = output.recv().await {
+            if sink.send(Message::Binary(chunk.into())).await.is_err() {
+                break;
+            }
+        }
+        let _ = sink.send(Message::Close(None)).await;
+    });
+
+    // ws → PTY input / resize.
+    let mut in_task = tokio::spawn(async move {
+        while let Some(msg) = stream.next().await {
+            match msg {
+                Ok(Message::Binary(payload)) => {
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    match payload[0] {
+                        OP_INPUT => {
+                            if input.send_input(&payload[1..]).await.is_err() {
+                                break;
+                            }
+                        }
+                        OP_RESIZE if payload.len() == 5 => {
+                            let cols = u16::from_be_bytes([payload[1], payload[2]]).clamp(1, 1000);
+                            let rows = u16::from_be_bytes([payload[3], payload[4]]).clamp(1, 1000);
+                            if input.resize(cols, rows).await.is_err() {
+                                break;
+                            }
+                        }
+                        _ => continue, // malformed resize / unknown opcode
+                    }
+                }
+                Ok(Message::Text(t)) => {
+                    if input.send_input(t.as_str().as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                Ok(_) => continue, // Ping/Pong handled by axum
+            }
+        }
+    });
+
+    // Whichever pump finishes first, drop the other — dropping `input` closes the
+    // socket write half, which the supervisor sees as a clean detach (the child
+    // keeps running, a refresh reconnects and repaints).
+    tokio::select! {
+        _ = &mut out_task => in_task.abort(),
+        _ = &mut in_task => out_task.abort(),
+    }
+    Ok(())
 }
 
 /// Whether to allow the WebSocket upgrade.

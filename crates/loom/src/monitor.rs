@@ -15,7 +15,7 @@ use serde_json::json;
 
 use crate::session::{self as session_mod, Session};
 use crate::web::AppState;
-use crate::{events, tmux};
+use crate::{backend, events};
 use weaver_core::config as core_config;
 use weaver_core::tags;
 
@@ -115,7 +115,7 @@ pub async fn run(state: AppState) {
                 )
                 .await;
             }
-            if !tmux::has_session(&session.tmux_session).await {
+            if !backend::has_session(&session.tmux_session).await {
                 if session.status != "orphaned" {
                     tracing::info!(
                         id = %session.id,
@@ -139,7 +139,7 @@ pub async fn run(state: AppState) {
             // Hash the pane to detect activity and bump `last_activity_at`.
             // Inferred working→idle demotion is gone: liveness is all we can
             // know, and the agent reports the rest via `weaver set-status`.
-            let screen = tmux::capture(&session.tmux_session, 0)
+            let screen = backend::capture(&session.tmux_session, 0)
                 .await
                 .unwrap_or_default();
             let h = hash(&normalize_screen(&screen));

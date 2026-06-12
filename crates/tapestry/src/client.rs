@@ -148,4 +148,45 @@ impl Attach {
     pub async fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
         protocol::write_frame(&mut self.wr, &req::resize(cols, rows)).await
     }
+
+    /// Split into independent input and output halves, so a bridge can pump each
+    /// direction in its own task (the WebSocket terminal needs this; the CLI
+    /// drives the combined struct in a `select!` instead).
+    pub fn split(self) -> (AttachInput, AttachOutput) {
+        (
+            AttachInput { wr: self.wr },
+            AttachOutput {
+                out_rx: self.out_rx,
+            },
+        )
+    }
+}
+
+/// The input half of a split [`Attach`]: forward keystrokes and resizes.
+pub struct AttachInput {
+    wr: OwnedWriteHalf,
+}
+
+impl AttachInput {
+    /// Forward keystrokes to the PTY.
+    pub async fn send_input(&mut self, data: &[u8]) -> Result<()> {
+        protocol::write_frame(&mut self.wr, &req::input(data.to_vec())).await
+    }
+
+    /// Resize the PTY + emulator.
+    pub async fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        protocol::write_frame(&mut self.wr, &req::resize(cols, rows)).await
+    }
+}
+
+/// The output half of a split [`Attach`]: a stream of PTY output chunks.
+pub struct AttachOutput {
+    out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+impl AttachOutput {
+    /// The next chunk of PTY output, or `None` once the stream ends.
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.out_rx.recv().await
+    }
 }

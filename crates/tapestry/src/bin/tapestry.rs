@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
                 env: &[],
                 cols: 80,
                 rows: 24,
+                supervisor_bin: None, // current_exe is the tapestry binary
             })
             .await?;
             println!("{name}");

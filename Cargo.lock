@@ -1178,6 +1178,7 @@ dependencies = [
  "serial_test",
  "smartdoc",
  "sqlx",
+ "tapestry",
  "tempfile",
  "tokio",
  "tokio-stream",

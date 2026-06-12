@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::path::Path;
 
-use crate::tmux;
+use crate::backend;
 use weaver_core::agent::hooks_json;
 
 /// Accepted per-session reasoning effort levels, increasing. Orthogonal to the
@@ -149,7 +149,7 @@ pub async fn launch(spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<()> {
         ?mode,
         "launching agent session"
     );
-    tmux::new_session(spec.tmux_session, spec.work_dir, &script)
+    backend::new_session(spec.tmux_session, spec.work_dir, &script)
         .await
         .with_context(|| format!("tmux: launching session {}", spec.tmux_session))?;
     tracing::info!(

@@ -24,7 +24,7 @@ pub mod paths;
 pub mod protocol;
 pub mod supervisor;
 
-pub use client::{Attach, Client};
+pub use client::{Attach, AttachInput, AttachOutput, Client};
 pub use supervisor::{run as supervise, SupervisorConfig};
 
 use anyhow::{Context, Result};
@@ -42,6 +42,12 @@ pub struct LaunchOptions<'a> {
     pub env: &'a [(&'a str, &'a str)],
     pub cols: u16,
     pub rows: u16,
+    /// The supervisor binary to re-exec as `<bin> supervise <spec>`. `None` uses
+    /// the current executable — correct when the caller *is* the `tapestry`
+    /// binary (the standalone CLI). A host like loom, whose `current_exe` is
+    /// `loom`, must point this at the sibling `tapestry` binary, which carries
+    /// the `supervise` subcommand.
+    pub supervisor_bin: Option<&'a Path>,
 }
 
 /// Launch a session's supervisor as a **detached** process: it `setsid`s into
@@ -53,7 +59,10 @@ pub struct LaunchOptions<'a> {
 /// launch parameters travel as a single JSON argument so a script with spaces or
 /// quotes needs no shell-escaping.
 pub async fn spawn_detached(opts: &LaunchOptions<'_>) -> Result<()> {
-    let exe = std::env::current_exe().context("resolving tapestry binary")?;
+    let exe = match opts.supervisor_bin {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_exe().context("resolving tapestry binary")?,
+    };
     let spec = serde_json::json!({
         "name": opts.name,
         "cwd": opts.cwd,

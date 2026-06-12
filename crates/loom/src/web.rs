@@ -91,7 +91,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use crate::db::Db;
 use crate::events::{Event, EventBus};
 use crate::session::{self as session_mod, NewSession, Session};
-use crate::{agent, config, db, events, git, github, overlooker as ov_engine, repo, tmux};
+use crate::{agent, backend, config, db, events, git, github, overlooker as ov_engine, repo};
 use weaver_api::{
     AgentOneshotReq, ArtifactMeta, ArtifactRefs, ArtifactView, ArtifactWriteBody, BranchView,
     CreateIssueReq, CreateOverlookerReq, CreateRepoIssueReq, CreateReq, IssueRefStatus, IssueView,
@@ -1058,7 +1058,7 @@ async fn delete_session(
     let (session, branch) = require_session(&st.db, &key).await?;
     let mut warnings: Vec<String> = Vec::new();
 
-    tmux::kill_session(&session.tmux_session).await.ok();
+    backend::kill_session(&session.tmux_session).await.ok();
     let repo_root = PathBuf::from(&branch.repo_root);
     let work_dir = PathBuf::from(&session.work_dir);
     if let Err(e) = git::worktree_remove(&repo_root, &work_dir).await {
@@ -1107,7 +1107,7 @@ pub async fn archive(
 ) -> Result<Vec<String>, AppError> {
     let mut warnings: Vec<String> = Vec::new();
 
-    tmux::kill_session(&session.tmux_session).await.ok();
+    backend::kill_session(&session.tmux_session).await.ok();
     let repo_root = PathBuf::from(&branch.repo_root);
     let work_dir = PathBuf::from(&session.work_dir);
     if work_dir.exists() {
@@ -1303,7 +1303,7 @@ pub async fn create_warm_session(
 
 /// Recreate an orphaned session's tmux and resume its agent.
 pub async fn adopt(st: &AppState, session: &Session, branch: &Branch) -> Result<(), AppError> {
-    if tmux::has_session(&session.tmux_session).await {
+    if backend::has_session(&session.tmux_session).await {
         return Err(AppError::conflict(
             "session already has a running tmux process",
         ));
@@ -1949,7 +1949,7 @@ async fn events_sse(
 /// Guard the pane-driving endpoints: the session must have a live tmux to type
 /// into or capture. An orphaned/torn-down session returns 409.
 async fn require_live_tmux(session: &Session) -> ApiResult<()> {
-    if tmux::has_session(&session.tmux_session).await {
+    if backend::has_session(&session.tmux_session).await {
         Ok(())
     } else {
         Err(AppError::conflict(format!(
@@ -1970,11 +1970,11 @@ async fn send_session(
 ) -> ApiResult<Json<Value>> {
     let (session, branch) = require_session(&st.db, &key).await?;
     require_live_tmux(&session).await?;
-    tmux::send_literal(&session.tmux_session, &req.text)
+    backend::send_literal(&session.tmux_session, &req.text)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if req.submit {
-        tmux::send_enter(&session.tmux_session)
+        backend::send_enter(&session.tmux_session)
             .await
             .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
@@ -1999,7 +1999,7 @@ async fn interrupt_session(
 ) -> ApiResult<Json<Value>> {
     let (session, _) = require_session(&st.db, &key).await?;
     require_live_tmux(&session).await?;
-    tmux::send_key(&session.tmux_session, "Escape")
+    backend::send_key(&session.tmux_session, "Escape")
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({ "interrupted": true })))
@@ -2022,7 +2022,7 @@ async fn preview_session(
 ) -> ApiResult<Json<Value>> {
     let (session, _) = require_session(&st.db, &key).await?;
     require_live_tmux(&session).await?;
-    let screen = tmux::capture(&session.tmux_session, q.lines)
+    let screen = backend::capture(&session.tmux_session, q.lines)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({ "screen": screen })))
