@@ -30,7 +30,8 @@ The bundle leaks everywhere the jobs pull apart:
   explains them, unless it was committed (see above).
 - **Goal and plan say the same thing twice.** `plan new` copies the branch
   goal into the file's "Problem & goal" section once
-  (`weaver-core/src/plan.rs` scaffold); after that the DB goal and the file
+  (`crates/weaver-core/src/plan.rs` scaffold); after that the DB goal and the
+  file
   drift with no link in either direction. Agents are routinely unsure which
   one to update — the confusion that filed #117.
 - **The machinery tax is high for an opt-in feature.** Repo-wide slug
