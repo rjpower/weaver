@@ -1,6 +1,11 @@
-//! The Overlooker engine: the dispatcher's event→trigger matching (T4), a stock
-//! `builtin:status` round landing a mark and its audit row (T5/T11), and the
-//! guardrails (cooldown / no-overlap → `skipped`).
+//! The Overlooker engine's **wiring**: the dispatcher's event→trigger
+//! matching, rounds landing marks and audit rows against the live server, and
+//! the guardrails (cooldown / no-overlap → `skipped`).
+//!
+//! Test placement: a builtin program's *decision logic* is covered
+//! server-free by pytest (`python/weaver-loom/tests/`); these cases prove the
+//! plumbing — the script runs under the engine, reaches the fleet over REST,
+//! and its mutations land with attribution. Don't re-test program logic here.
 //!
 //! These cases drive the engine **directly** on the test server's isolated db
 //! rather than through the spawned background loop: the `overlooker.enabled`
@@ -292,12 +297,16 @@ async fn stale_session_emits_one_event_and_wakes_a_reactive_overlooker() {
         .unwrap();
 }
 
-/// T5 / T11: a `builtin:status` round over a non-ok session lands a triage mark
-/// (rule path, no real claude) and records the action in the run; a `dry_run`
-/// round makes no mark but records a `would`-action.
+/// The status program's wiring proof: a round over a non-ok session lands an
+/// attributed triage mark on the live server and records the action on the
+/// run row. The program's decision logic (judge fallback, dry-run, capability
+/// branches, summaries) is covered server-free in
+/// `python/weaver-loom/tests/test_status_program.py`; dry-run flag
+/// propagation through the executor is covered by the lib test
+/// `run_script_round_trips_the_contract`.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn builtin_status_marks_a_session_and_dry_run_is_safe() {
+async fn builtin_status_round_lands_an_attributed_mark() {
     if !python3_available() {
         eprintln!("skipping: python3 not on PATH");
         return;
@@ -359,40 +368,6 @@ async fn builtin_status_marks_a_session_and_dry_run_is_safe() {
         arr.iter()
             .any(|a| a["action"] == "mark" && a["session"] == session_id.as_str()),
         "the run records a mark action: {actions}"
-    );
-
-    // Clear the mark, then a dry run must NOT re-apply it — it records a `would`.
-    ts.client
-        .delete(&format!("/api/sessions/{session_id}/tags/triage"))
-        .await
-        .unwrap();
-    let dry_run_id = overlooker::fire_now(&state, &o.name, true, "manual")
-        .await
-        .unwrap();
-    let view = ts
-        .client
-        .get(&format!("/api/sessions/{session_id}"))
-        .await
-        .unwrap();
-    assert!(
-        branch_tag(&view, "triage").is_none(),
-        "a dry run applies no mark"
-    );
-    let runs = ov::recent_runs(&state.db, &o.id, 10).await.unwrap();
-    let dry = runs.iter().find(|r| r.id == dry_run_id).unwrap();
-    let actions: serde_json::Value = serde_json::from_str(&dry.actions).unwrap();
-    assert!(
-        actions
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a["would"] == "mark" && a["session"] == session_id.as_str()),
-        "a dry run logs a would-mark instead of marking: {actions}"
-    );
-    assert!(
-        dry.summary.contains("dry run"),
-        "the dry-run summary says so: {}",
-        dry.summary
     );
 
     ts.client
@@ -976,11 +951,11 @@ async fn status_judgement_uses_the_oneshot_agent_when_prompted() {
         "blocked",
         "the agent judgement (not the calm attention mirror) lands as the mark"
     );
-    let tag = branch_tag(&view, "triage").unwrap();
-    assert_eq!(tag["set_by"], "judge-watch");
+    // (Judgement parsing detail — level/note extraction — is pytest-covered in
+    // weaver_loom; here only the through-the-stack outcome matters.)
     assert_eq!(
-        tag["note"], "the judge says so",
-        "the note is the judgement line after its separator"
+        branch_tag(&view, "triage").unwrap()["set_by"],
+        "judge-watch"
     );
 
     // Restore the fixture's no-op agent for the tests that follow.

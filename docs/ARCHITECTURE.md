@@ -50,7 +50,7 @@ needing the daemon to be reachable.
 | `crates/loom/src/monitor.rs` | status detection, orphan marking, hook-event consumer |
 | `crates/loom/src/overlooker.rs` | the overlooker engine: cron timer + event dispatcher + the round executor (the script subprocess executor every program runs on) |
 | `crates/loom/src/builtins.rs` | the builtin overlooker program registry; the script programs are real Python files in `crates/loom/overlookers/`, embedded into the binary |
-| `python/weaver-loom/` | the pure-Python layer over the loom REST API (`weaver_loom`: client + overlooker round context); stdlib-only, uv-buildable, vendored onto every script's `PYTHONPATH` by the engine |
+| `python/weaver-loom/` | the pure-Python layer over the loom REST API (`weaver_loom`: client + overlooker round context); stdlib-only, uv-buildable, vendored onto every script's `PYTHONPATH` by the engine; server-free contract tests in `tests/` (`uv run pytest`, CI's `python-binding` job) |
 | `crates/loom/src/agent.rs` | launching agents into tmux + installing `.claude/settings.local.json` hooks + the one-shot headless agent behind `POST /api/agent/oneshot` |
 | `crates/loom/src/session.rs` | `Session` row + sqlx queries |
 | `crates/loom/src/tmux.rs` | `tmux new-session / capture-pane / kill-session / attach` (exact-match `=name:` targets) |
