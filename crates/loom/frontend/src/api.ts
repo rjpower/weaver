@@ -56,6 +56,11 @@ import type { Issue } from './types';
 export const listIssues = (all = false) =>
   get(`/issues${all ? '?all=true' : ''}`) as Promise<Issue[]>;
 
+/** Create an unclaimed repo-level backlog issue. Tags aren't part of the create
+ *  body — apply them as follow-up `setIssueTag` upserts on the returned id. */
+export const createRepoIssue = (repoRoot: string, title: string, body = '') =>
+  post('/repos/issues', { repo_root: repoRoot, title, body }) as Promise<Issue>;
+
 /** Patch an issue's title, body, and/or status ("open" | "closed"). */
 export const patchIssue = (id: number, body: Partial<Pick<Issue, 'title' | 'body' | 'status'>>) =>
   patch(`/issues/${id}`, body) as Promise<Issue>;
