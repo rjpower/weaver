@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id                 TEXT PRIMARY KEY,
     branch_id          TEXT NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
     work_dir           TEXT NOT NULL,
-    tmux_session       TEXT NOT NULL,
+    term_session       TEXT NOT NULL,
     agent_kind         TEXT NOT NULL DEFAULT 'claude',
     -- Per-session model tier ('', 'haiku', 'sonnet', 'opus', 'fable') and reasoning
     -- effort ('', 'low', 'medium', 'high', 'xhigh', 'max'), spliced into the
@@ -143,6 +143,12 @@ async fn migrate_loom(pool: &Db) -> Result<()> {
             .await
             .with_context(|| format!("running loom migration: {trimmed}"))?;
     }
+    // Rename for databases created when the column was `tmux_session` (loom
+    // backed sessions with tmux before the native terminal supervisor). The
+    // `CREATE TABLE IF NOT EXISTS` above is a no-op on such DBs, so rename the
+    // existing column; a fresh DB already has `term_session`, so the rename finds
+    // nothing and is ignored.
+    rename_column_if_present(pool, "sessions", "tmux_session", "term_session").await?;
     // Additive column migrations for databases created before the column
     // existed. `CREATE TABLE IF NOT EXISTS` above is a no-op on such DBs, so we
     // add the column explicitly and ignore the "duplicate column" error.
@@ -182,6 +188,22 @@ async fn seed_owner(pool: &Db) -> Result<()> {
     Ok(())
 }
 
+/// Run `ALTER TABLE … RENAME COLUMN from TO to`, treating a missing source
+/// column as success (a fresh DB already has the new name, so there is nothing
+/// to rename).
+async fn rename_column_if_present(pool: &Db, table: &str, from: &str, to: &str) -> Result<()> {
+    let sql = format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}");
+    match sqlx::query(&sql).execute(pool).await {
+        Ok(_) => {
+            tracing::info!(%table, %from, %to, "renamed column");
+            Ok(())
+        }
+        // SQLite: "no such column: <from>" once already renamed / fresh schema.
+        Err(e) if e.to_string().contains("no such column") => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("renaming column {table}.{from} -> {to}")),
+    }
+}
+
 /// Run `ALTER TABLE … ADD COLUMN`, treating an already-present column as success.
 async fn add_column_if_missing(pool: &Db, table: &str, column: &str, decl: &str) -> Result<()> {
     let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {decl}");
@@ -210,7 +232,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO sessions (id, branch_id, work_dir, tmux_session, status)
+            "INSERT INTO sessions (id, branch_id, work_dir, term_session, status)
              VALUES ('s1', 't1', '/w', 'weaver-s1', 'running')",
         )
         .execute(&db)

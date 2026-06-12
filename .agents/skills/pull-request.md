@@ -42,7 +42,7 @@ Don't `--no-verify` without a reason.
 
 ## 3. Tests (when relevant)
 
-- `cargo test --workspace` — backend unit + integration (needs git, tmux).
+- `cargo test --workspace` — backend unit + integration (needs git; spawns tapestry PTYs).
 - `cd e2e && npm test` — Playwright UI, when you touched the SPA or a route it hits.
 
 Don't disturb the user's live loom — see AGENTS.md.

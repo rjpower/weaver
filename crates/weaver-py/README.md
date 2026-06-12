@@ -4,7 +4,7 @@ A Pythonic, synchronous wrapper over [`weaver-api`](../weaver-api) — drive the
 loom fleet from Python, capability-gated. This is the out-of-process seam of the
 [overlooker design](../../docs/plans/overlooker.md): a scripted overlooker (or an
 agent iterating on one, or a human at a REPL) talks to the loom daemon through
-the same typed REST surface the `loom` CLI uses, never touching tmux directly.
+the same typed REST surface the `loom` CLI uses, never touching the terminal runtime directly.
 The daemon stays the single owner of the live runtime.
 
 ## Install
@@ -44,7 +44,7 @@ for s in c.sessions():
           tags.get("attention", "calm"), tags.get("triage", "calm"))
 
 s = c.session("abc123")            # by id, branch id, branch name, or repo:branch
-screen = c.preview("abc123", 200)  # tmux pane as text, 200 lines of scrollback
+screen = c.preview("abc123", 200)  # terminal as text, 200 lines of scrollback
 tree = c.diff("abc123")            # worktree file tree + change map
 
 c.set_tag("abc123", "triage", "attention", note="stuck on tests")  # needs "mark"
@@ -119,7 +119,7 @@ the CI coverage — it asserts each mutating method raises when its capability i
 absent, before any request is made.
 
 `tests/test_live_roundtrip.py` is a live round-trip against a **fully-isolated**
-loom (its own temp `WEAVER_HOME` / `WEAVER_DB`, a private `WEAVER_TMUX_SOCKET`,
+loom (its own temp `WEAVER_HOME` / `WEAVER_DB`, its own terminal sockets under that home,
 an ephemeral port, torn down on exit — it never touches your real loom). It is
 opt-in:
 

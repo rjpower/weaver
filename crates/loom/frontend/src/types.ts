@@ -65,13 +65,13 @@ export interface GithubStatus {
   fetched_at: string;
 }
 
-/** A session is loom's view: one tmux + one running agent attached to a
+/** A session is loom's view: one terminal + one running agent attached to a
  *  branch. Branch-level fields live under `branch`. */
 export interface Session {
   id: string;
   status: string;
   work_dir: string;
-  tmux_session: string;
+  term_session: string;
   agent_kind: string;
   /** Model tier ('', 'haiku', 'sonnet', 'opus', 'fable') — spliced in as `--model`. */
   model: string;

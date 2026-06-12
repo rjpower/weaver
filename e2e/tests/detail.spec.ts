@@ -20,7 +20,7 @@ test.describe('session detail view', () => {
 
     // Identity metadata (id, branch, base) lives behind the ⌄ details popover,
     // not cluttering the header. Scope to the popover and match exactly so the
-    // id doesn't also match the `weaver-<id>` tmux line.
+    // id doesn't also match the `weaver-<id>` terminal line.
     await page.getByRole('button', { name: 'details' }).click();
     const details = page.getByTestId('details-popover');
     await expect(details.getByText(s.id, { exact: true })).toBeVisible();

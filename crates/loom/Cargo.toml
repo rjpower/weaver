@@ -28,9 +28,7 @@ clap_complete = "4"
 futures-util = "0.3"
 # Hex-encode the SHA-256 digests we store for API tokens and session cookies.
 hex = "0.4"
-libc = "0.2"
 percent-encoding = "2"
-portable-pty = "0.9"
 rand = "0.9"
 # `rustls-tls` is needed for the GitHub OAuth token/user calls over HTTPS — the
 # rest of loom's HTTP is loopback to its own daemon, but the OAuth dance reaches
@@ -61,6 +59,6 @@ futures-util = "0.3"
 # Raw-body HTTP client for the scratch-upload integration test.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 # The integration tests share a `TestServer` harness that sets process-global
-# env (WEAVER_HOME / WEAVER_API / WEAVER_TMUX_SOCKET), so they must not run
+# env (WEAVER_HOME / WEAVER_API / WEAVER_TAPESTRY_BIN), so they must not run
 # concurrently within the test binary; `#[serial]` serializes them.
 serial_test = "3"

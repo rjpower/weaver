@@ -3,7 +3,7 @@
 //!
 //! This module is **pure storage + parsing**. The engine that actually *runs* an
 //! overlooker — the timer, the dispatcher, the program executor — lives in the
-//! loom daemon, which stays the single owner of the tmux/session runtime. Here
+//! loom daemon, which stays the single owner of the terminal/session runtime. Here
 //! we only describe *what* to watch (the trigger, scope, program, capabilities)
 //! and record *what happened* (each round's outcome and actions).
 

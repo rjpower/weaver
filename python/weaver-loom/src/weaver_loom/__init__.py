@@ -140,7 +140,7 @@ class Client:
         return self._request("GET", f"/sessions/{key}")
 
     def preview(self, key, lines=0):
-        """The session's tmux pane as text, with ``lines`` of scrollback."""
+        """The session's terminal as text, with ``lines`` of scrollback."""
         reply = self._request("GET", f"/sessions/{key}/preview?lines={lines}")
         return (reply or {}).get("screen", "")
 

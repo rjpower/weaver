@@ -82,7 +82,7 @@ def main():
         rnd.did("mark", session=session["id"], level=level, note=note)
 
         # The nudge rung of the intervention ladder: only when capability-
-        # granted. Best-effort; a session with no live tmux just no-ops.
+        # granted. Best-effort; a session with no live terminal just no-ops.
         if can_nudge:
             text = f"[overlooker {rnd.name}] {note}"
             try:

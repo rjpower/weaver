@@ -1,7 +1,7 @@
 //! Talk to a session's supervisor over its control socket.
 //!
-//! [`Client`] is the programmatic surface loom drives — the tapestry analogue of
-//! the `tmux::{has_session, capture, send_*, kill_session}` calls. The
+//! [`Client`] is the programmatic surface loom drives — the
+//! `has_session`/`capture`/`send`/`kill` operations behind `loom::backend`. The
 //! interactive attach (the xterm bridge) uses [`Client::attach`], which splits
 //! the connection into an output stream + an input sink.
 
@@ -11,6 +11,11 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::protocol::{self, op, req, Frame, PongInfo};
+
+/// Buffered output frames an attach holds before the consumer must catch up.
+/// Bounded so a slow reader back-pressures the socket (and thus the supervisor)
+/// rather than buffering without limit on the client side.
+const ATTACH_BUFFER: usize = 256;
 
 /// A connected control client for one session.
 pub struct Client {
@@ -28,9 +33,9 @@ impl Client {
         Ok(Self { stream })
     }
 
-    /// Whether a supervisor is alive for `name` — connect and ping. The
-    /// `tmux has-session` analogue: a stale socket file (no listener) or a
-    /// supervisor reporting a dead child both read as not-alive.
+    /// Whether a supervisor is alive for `name` — connect and ping. A stale
+    /// socket file (no listener) or a supervisor reporting a dead child both read
+    /// as not-alive.
     pub async fn is_alive(name: &str) -> bool {
         match Self::connect(name).await {
             Ok(mut c) => c.ping().await.map(|p| p.alive).unwrap_or(false),
@@ -89,14 +94,19 @@ impl Client {
         protocol::write_frame(&mut stream, &req::attach(cols, rows)).await?;
         let (rd, wr) = stream.into_split();
 
-        // Output: a background reader task drains OUTPUT frames into a channel.
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Output: a background reader task drains OUTPUT frames into a bounded
+        // channel. The `send().await` is the back-pressure hinge — when the
+        // consumer is slow the channel fills, this task stops reading the socket,
+        // and that propagates back to the supervisor (whose own bounded
+        // per-subscriber channel then fills and evicts only a genuinely wedged
+        // client).
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(ATTACH_BUFFER);
         tokio::spawn(async move {
             let mut rd = rd;
             loop {
                 match protocol::read_frame(&mut rd).await {
                     Ok(Some(frame)) if frame.op == op::OUTPUT => {
-                        if out_tx.send(frame.payload).is_err() {
+                        if out_tx.send(frame.payload).await.is_err() {
                             break;
                         }
                     }
@@ -130,7 +140,7 @@ impl Client {
 /// running).
 pub struct Attach {
     wr: OwnedWriteHalf,
-    out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    out_rx: mpsc::Receiver<Vec<u8>>,
 }
 
 impl Attach {
@@ -181,7 +191,7 @@ impl AttachInput {
 
 /// The output half of a split [`Attach`]: a stream of PTY output chunks.
 pub struct AttachOutput {
-    out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    out_rx: mpsc::Receiver<Vec<u8>>,
 }
 
 impl AttachOutput {

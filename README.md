@@ -1,7 +1,7 @@
 # weaver
 
 A lightweight per-branch task tracker, plus an optional orchestrator that runs
-coding agents in tmux.
+coding agents in managed terminals.
 
 weaver ships two binaries:
 
@@ -11,9 +11,10 @@ weaver ships two binaries:
   repo's **issues** (each claimed by a branch or sitting in the shared
   backlog). It works whether or not the orchestrator is running.
 - **`loom`** — the **optional orchestrator**. It runs the REST + SSE server,
-  hosts a Vue dashboard, creates worktrees, launches agents into tmux, and
-  periodically summarizes each branch's diff against its merge base. Without
-  loom, branches and issues still work; tmux + the dashboard do not.
+  hosts a Vue dashboard, creates worktrees, launches agents into managed
+  terminals, and periodically summarizes each branch's diff against its merge
+  base. Without loom, branches and issues still work; the terminals + the
+  dashboard do not.
 
 Both binaries share one sqlite database at `~/.weaver/weaver.db`.
 
@@ -54,13 +55,13 @@ written for it to run; do them yourself if you'd rather.
 Then start the orchestrator and open the dashboard:
 
 ```sh
-loom serve     # REST + SSE server, tmux launcher, background monitor
+loom serve     # REST + SSE server, terminal launcher, background monitor
 loom open      # open the web UI (http://127.0.0.1:7878)
 ```
 
 `weaver` needs no running daemon — it talks straight to the sqlite db — so the
 agent inside a worktree works the moment it's on your PATH. `loom serve` is only
-for the dashboard, tmux sessions, and summaries. See [Usage](#usage) for the
+for the dashboard, terminal sessions, and summaries. See [Usage](#usage) for the
 full command surface, and [AGENTS.md](AGENTS.md) for the build/test loop and how
 to work on weaver itself.
 
@@ -72,7 +73,7 @@ weaver CLI ──sqlite──┐
 loom serve  ─────────┘
   │
   ├─ axum REST + SSE (127.0.0.1:7878)
-  ├─ tmux + git worktree wrappers
+  ├─ terminal supervisors + git worktree wrappers
   ├─ agent launcher (Claude / shell / custom command)
   ├─ background monitor (status, orphan detection, hook ingest)
   ├─ background summarizer (headless agent → branch description)
@@ -87,21 +88,21 @@ key decoupling — the agent CLI never speaks HTTP.
 
 ```sh
 # Orchestrator (optional)
-loom serve                            # run the daemon (REST + UI + tmux + monitor)
-loom session launch "Add a /health endpoint"               # new worktree + tmux + agent, seeded with the task
+loom serve                            # run the daemon (REST + UI + terminals + monitor)
+loom session launch "Add a /health endpoint"               # new worktree + terminal + agent, seeded with the task
 loom session launch "Refactor the parser" --name parser-refactor   # override the branch slug
 loom session launch "Big refactor" --model opus --effort high      # pick model tier + reasoning effort
 loom session poll <session>           # one-shot status (lifecycle + attention)
 loom session wait <session>           # block until it finishes or needs you
 loom session send <session> "try the curl again"   # type a message + Enter (trigger an agent round)
 loom session break <session>          # send Escape — interrupt the current turn
-loom session preview <session>        # print the recent tmux screen
+loom session preview <session>        # print the recent terminal screen
 loom ps                               # list active sessions
 loom show <branch>                    # session detail
-loom attach <branch>                  # exec tmux attach (or use the browser terminal)
-loom archive <branch>                 # tear down tmux + worktree, keep branch + history
-loom adopt <branch>                   # recreate tmux for an orphaned session
-loom rm <branch>                      # remove worktree + tmux + db row
+loom attach <branch>                  # attach your terminal to the session (or use the browser terminal)
+loom archive <branch>                 # tear down terminal + worktree, keep branch + history
+loom adopt <branch>                   # recreate the terminal for an orphaned session
+loom rm <branch>                      # remove worktree + terminal + db row
 loom open                             # open the web UI
 
 # Agent-facing (run from inside the worktree, no daemon required)
@@ -134,9 +135,9 @@ pin a parent with `--base` (also a field in the web create form).
 
 Once a session is up, the other verbs interact with it: `loom session poll`
 reads its status, `loom session wait` blocks until it finishes or raises
-attention, `loom session send` types a message into the agent's pane (and
+attention, `loom session send` types a message into the agent's terminal (and
 submits it to trigger a round), `loom session break` sends Escape to interrupt
-the current turn, and `loom session preview` prints the recent tmux screen.
+the current turn, and `loom session preview` prints the recent terminal screen.
 Each takes a session key — an id, branch id, branch name, or `repo:branch`.
 
 Three flags seed the task from existing work instead of a fresh description:
@@ -191,12 +192,12 @@ workflow.
 
 ## Adoption
 
-A session's tmux process is independent of the loom daemon: it does not
-survive a machine reboot, though the sqlite rows and worktrees do. When the
-monitor finds a session whose tmux has vanished, it marks it `orphaned`
-rather than `done`.
+A session's terminal supervisor is independent of the loom daemon: restarting
+loom leaves it running, though it does not survive a machine reboot (the sqlite
+rows and worktrees do). When the monitor finds a session whose terminal has
+vanished, it marks it `orphaned` rather than `done`.
 
-An orphaned session can be adopted — its tmux session recreated and its
+An orphaned session can be adopted — its terminal recreated and its
 agent resumed (`claude --continue`):
 
 ```sh
@@ -221,7 +222,7 @@ failing / pending). The session's Overview tab has a **Refresh** button to
 re-poll on demand.
 
 Once a branch's PR merges, loom archives the session automatically — tearing
-down its tmux and worktree while keeping the branch and its weaver history, the
+down its terminal and worktree while keeping the branch and its weaver history, the
 same as the Archive button. Turn either behaviour off in **Settings** or from
 the CLI:
 
@@ -241,7 +242,7 @@ Loom serves a JSON API under `/api`; the Vue SPA is the primary consumer.
 - `GET POST /api/sessions`, `GET PATCH DELETE /api/sessions/{id}`,
   `POST /api/sessions/{id}/{note,archive,adopt,github}`,
   `GET /api/sessions/{id}/{diff,log,events}`,
-  `GET /api/sessions/{id}/terminal` (WebSocket: xterm.js ⇄ PTY ⇄ tmux)
+  `GET /api/sessions/{id}/terminal` (WebSocket: xterm.js ⇄ the tapestry PTY)
 - `GET /api/branches`, `GET PATCH /api/branches/{id}`,
   `GET POST /api/branches/{id}/issues` (issues claimed by the branch),
   `GET PATCH DELETE /api/issues/{id}`

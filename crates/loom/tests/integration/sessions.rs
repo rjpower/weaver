@@ -4,12 +4,12 @@
 use serde_json::json;
 use serial_test::serial;
 
-use loom::tmux;
+use loom::backend;
 
 use crate::fixtures::{sh, TestServer};
 
-/// Creating a session provisions a worktree + tmux session and records the repo;
-/// deleting it tears the tmux session down and releases the repo's active count.
+/// Creating a session provisions a worktree + terminal session and records the repo;
+/// deleting it tears the terminal session down and releases the repo's active count.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_lists_and_tears_down() {
@@ -28,7 +28,7 @@ async fn create_lists_and_tears_down() {
         .await
         .unwrap();
     let id = ws["id"].as_str().unwrap().to_string();
-    let session = ws["tmux_session"].as_str().unwrap().to_string();
+    let session = ws["term_session"].as_str().unwrap().to_string();
     let work_dir = ws["work_dir"].as_str().unwrap().to_string();
     let repo_root = ws["branch"]["repo_root"].as_str().unwrap().to_string();
 
@@ -50,7 +50,10 @@ async fn create_lists_and_tears_down() {
         ws["tracking_issue"].as_i64().is_some(),
         "launch returns a tracking issue id, got {ws}"
     );
-    assert!(tmux::has_session(&session).await, "tmux session missing");
+    assert!(
+        backend::has_session(&session).await,
+        "terminal session missing"
+    );
 
     let list = client.get("/api/sessions").await.unwrap();
     assert_eq!(list.as_array().unwrap().len(), 1);
@@ -65,11 +68,11 @@ async fn create_lists_and_tears_down() {
     assert_eq!(recent[0]["repo_root"], repo_root);
     assert_eq!(recent[0]["active_branches"], 1);
 
-    // Deleting the session tears down the tmux session and the DB row.
+    // Deleting the session tears down the terminal session and the DB row.
     client.delete(&format!("/api/sessions/{id}")).await.unwrap();
     assert!(
-        !tmux::has_session(&session).await,
-        "tmux session was not killed"
+        !backend::has_session(&session).await,
+        "terminal session was not killed"
     );
     let list = client.get("/api/sessions").await.unwrap();
     assert_eq!(list.as_array().unwrap().len(), 0);
@@ -150,8 +153,8 @@ async fn bare_session_has_no_goal() {
         .unwrap();
 }
 
-/// Adoption recovers a session whose tmux server was killed out from under loom:
-/// it recreates the tmux session; adopting a live one is rejected.
+/// Adoption recovers a session whose terminal supervisor was killed out from under
+/// loom: it recreates the terminal; adopting a live one is rejected.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adopt_recreates_killed_session() {
@@ -170,11 +173,11 @@ async fn adopt_recreates_killed_session() {
         .await
         .unwrap();
     let id = ws["id"].as_str().unwrap().to_string();
-    let session = ws["tmux_session"].as_str().unwrap().to_string();
+    let session = ws["term_session"].as_str().unwrap().to_string();
 
-    tmux::kill_session(&session).await.unwrap();
+    backend::kill_session(&session).await.unwrap();
     assert!(
-        !tmux::has_session(&session).await,
+        !backend::has_session(&session).await,
         "session should be gone after kill"
     );
 
@@ -187,8 +190,8 @@ async fn adopt_recreates_killed_session() {
         "adopt sets status launching"
     );
     assert!(
-        tmux::has_session(&session).await,
-        "adopt should recreate the tmux session"
+        backend::has_session(&session).await,
+        "adopt should recreate the terminal session"
     );
     assert!(
         client

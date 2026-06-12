@@ -3,11 +3,11 @@
 //! Endpoint layout (post phase-4 rename):
 //!
 //! * `/api/sessions` — list + create active sessions (each session is one
-//!   tmux + one agent attached to a branch).
+//!   terminal + one agent attached to a branch).
 //! * `/api/sessions/{id}` — GET / PATCH / DELETE a single session, plus the
 //!   action subroutes `/archive`, `/adopt`, `/tags/{key}` (PUT to set a tag,
 //!   DELETE to clear it), `/log`, `/events`, and `/terminal` (a WebSocket
-//!   bridged to the session's tmux via a PTY — see `crate::terminal`).
+//!   bridged to the session's terminal via a PTY — see `crate::terminal`).
 //!   Interacting with the agent (keystrokes, keys, TUIs) happens entirely over
 //!   `/terminal`.
 //! * `/api/branches` — list every tracked branch (with or without an active
@@ -30,7 +30,7 @@
 //!   "id": "<session id>",
 //!   "status": "running",            // lifecycle: created|launching|running|orphaned|done|error
 //!   "work_dir": "/path/to/.worktrees/foo",
-//!   "tmux_session": "weaver-abcd1234",
+//!   "term_session": "weaver-abcd1234",
 //!   "agent_kind": "claude",
 //!   "github_repo": null,
 //!   "last_activity_at": "...",
@@ -210,7 +210,7 @@ async fn session_view(db: &Db, session: &Session, branch: &Branch) -> ApiResult<
         id: session.id.clone(),
         status: session.status.clone(),
         work_dir: session.work_dir.clone(),
-        tmux_session: session.tmux_session.clone(),
+        term_session: session.term_session.clone(),
         agent_kind: session.agent_kind.clone(),
         model: session.model.clone(),
         effort: session.effort.clone(),
@@ -395,7 +395,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/log", get(log_session))
         .route("/sessions/{id}/events", get(events_sse))
         .route("/sessions/{id}/terminal", get(crate::terminal::terminal_ws))
-        // Drive a session's tmux pane: type a message, interrupt, peek at it.
+        // Drive a session's terminal pane: type a message, interrupt, peek at it.
         .route("/sessions/{id}/send", post(send_session))
         .route("/sessions/{id}/interrupt", post(interrupt_session))
         .route("/sessions/{id}/preview", get(preview_session))
@@ -795,7 +795,7 @@ async fn create_session(
         Some(f)
     };
 
-    let tmux_session = format!("weaver-{session_id}");
+    let term_session = format!("weaver-{session_id}");
     let base_args = config::get_or(&st.db, "agent.claude_args", "").await;
     let claude_args = agent::combine_args(&base_args, &model, &effort);
     agent::launch(
@@ -803,7 +803,7 @@ async fn create_session(
             branch_id: &branch.id,
             agent_kind: &agent,
             work_dir: &work_dir,
-            tmux_session: &tmux_session,
+            term_session: &term_session,
             goal_file: goal_file.as_deref(),
             server_addr: &st.addr,
             claude_args: &claude_args,
@@ -824,7 +824,7 @@ async fn create_session(
             id: session_id.clone(),
             branch_id: branch.id.clone(),
             work_dir: work_dir.display().to_string(),
-            tmux_session,
+            term_session,
             agent_kind: agent,
             model,
             effort,
@@ -1094,7 +1094,7 @@ async fn delete_session(
     let (session, branch) = require_session(&st.db, &key).await?;
     let mut warnings: Vec<String> = Vec::new();
 
-    backend::kill_session(&session.tmux_session).await.ok();
+    backend::kill_session(&session.term_session).await.ok();
     let repo_root = PathBuf::from(&branch.repo_root);
     let work_dir = PathBuf::from(&session.work_dir);
     if let Err(e) = git::worktree_remove(&repo_root, &work_dir).await {
@@ -1127,7 +1127,7 @@ async fn delete_session(
 // Session actions
 // ---------------------------------------------------------------------------
 
-/// Archive a session: tear down its tmux and remove the worktree, but keep the
+/// Archive a session: tear down its terminal and remove the worktree, but keep the
 /// branch (and its commits), the session row, and run history.
 /// This is the "I'm done with this workstream" action — unlike delete, the
 /// weaver/loom record is preserved for future reference, and the git branch is
@@ -1143,7 +1143,7 @@ pub async fn archive(
 ) -> Result<Vec<String>, AppError> {
     let mut warnings: Vec<String> = Vec::new();
 
-    backend::kill_session(&session.tmux_session).await.ok();
+    backend::kill_session(&session.term_session).await.ok();
     let repo_root = PathBuf::from(&branch.repo_root);
     let work_dir = PathBuf::from(&session.work_dir);
     if work_dir.exists() {
@@ -1214,13 +1214,13 @@ async fn refresh_github_session(
 }
 
 /// Bring up an engine-managed (warm) session for an overlooker, reusing the same
-/// branch/worktree/tmux launch machinery as an ordinary session — the only
+/// branch/worktree/terminal launch machinery as an ordinary session — the only
 /// differences are that it forks a dedicated `weaver/overlooker-<name>` branch
 /// and the row is stamped `managed_by = overlooker.id` so the fleet listing and
 /// every survey hide it.
 ///
 /// A warm session is the watcher's own long-lived agent; its persistence across
-/// rounds (the same tmux/worktree, resumed on adopt) is what gives the overlooker
+/// rounds (the same terminal/worktree, resumed on adopt) is what gives the overlooker
 /// across-round memory. The engine calls this once, on first need
 /// ([`crate::overlooker::ensure_warm_session`]); thereafter it reuses the stored
 /// session id.
@@ -1287,7 +1287,7 @@ pub async fn create_warm_session(
         None => None,
     };
 
-    let tmux_session = format!("weaver-{session_id}");
+    let term_session = format!("weaver-{session_id}");
     let base_args = config::get_or(&st.db, "agent.claude_args", "").await;
     let claude_args = agent::combine_args(&base_args, &overlooker.model, &overlooker.effort);
     agent::launch(
@@ -1295,7 +1295,7 @@ pub async fn create_warm_session(
             branch_id: &branch.id,
             agent_kind: &agent,
             work_dir: &work_dir,
-            tmux_session: &tmux_session,
+            term_session: &term_session,
             goal_file: goal_file.as_deref(),
             server_addr: &st.addr,
             claude_args: &claude_args,
@@ -1316,7 +1316,7 @@ pub async fn create_warm_session(
             id: session_id,
             branch_id: branch.id.clone(),
             work_dir: work_dir.display().to_string(),
-            tmux_session,
+            term_session,
             agent_kind: agent,
             model: overlooker.model.clone(),
             effort: overlooker.effort.clone(),
@@ -1337,11 +1337,11 @@ pub async fn create_warm_session(
     Ok(session)
 }
 
-/// Recreate an orphaned session's tmux and resume its agent.
+/// Recreate an orphaned session's terminal and resume its agent.
 pub async fn adopt(st: &AppState, session: &Session, branch: &Branch) -> Result<(), AppError> {
-    if backend::has_session(&session.tmux_session).await {
+    if backend::has_session(&session.term_session).await {
         return Err(AppError::conflict(
-            "session already has a running tmux process",
+            "session already has a running terminal process",
         ));
     }
     let work_dir = PathBuf::from(&session.work_dir);
@@ -1366,7 +1366,7 @@ pub async fn adopt(st: &AppState, session: &Session, branch: &Branch) -> Result<
             branch_id: &branch.id,
             agent_kind: &session.agent_kind,
             work_dir: &work_dir,
-            tmux_session: &session.tmux_session,
+            term_session: &session.term_session,
             goal_file: goal_file.as_deref(),
             server_addr: &st.addr,
             claude_args: &claude_args,
@@ -1975,21 +1975,21 @@ async fn events_sse(
 }
 
 // ---------------------------------------------------------------------------
-// Driving a session's tmux pane (send / interrupt / preview)
+// Driving a session's terminal pane (send / interrupt / preview)
 //
 // One-shot HTTP primitives for an agent (or script) to drive a child session
 // uniformly, distinct from the interactive terminal WebSocket: type a message,
 // interrupt the current turn, or read back the pane.
 // ---------------------------------------------------------------------------
 
-/// Guard the pane-driving endpoints: the session must have a live tmux to type
+/// Guard the pane-driving endpoints: the session must have a live terminal to type
 /// into or capture. An orphaned/torn-down session returns 409.
-async fn require_live_tmux(session: &Session) -> ApiResult<()> {
-    if backend::has_session(&session.tmux_session).await {
+async fn require_live_terminal(session: &Session) -> ApiResult<()> {
+    if backend::has_session(&session.term_session).await {
         Ok(())
     } else {
         Err(AppError::conflict(format!(
-            "session '{}' has no live tmux to drive",
+            "session '{}' has no live terminal to drive",
             session.id
         )))
     }
@@ -2005,12 +2005,12 @@ async fn send_session(
     Json(req): Json<SendReq>,
 ) -> ApiResult<Json<Value>> {
     let (session, branch) = require_session(&st.db, &key).await?;
-    require_live_tmux(&session).await?;
-    backend::send_literal(&session.tmux_session, &req.text)
+    require_live_terminal(&session).await?;
+    backend::send_literal(&session.term_session, &req.text)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if req.submit {
-        backend::send_enter(&session.tmux_session)
+        backend::send_enter(&session.term_session)
             .await
             .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
@@ -2034,8 +2034,8 @@ async fn interrupt_session(
     Path(key): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let (session, _) = require_session(&st.db, &key).await?;
-    require_live_tmux(&session).await?;
-    backend::send_key(&session.tmux_session, "Escape")
+    require_live_terminal(&session).await?;
+    backend::send_key(&session.term_session, "Escape")
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({ "interrupted": true })))
@@ -2049,7 +2049,7 @@ struct PreviewQuery {
     lines: usize,
 }
 
-/// Capture the session's tmux pane as plain text — "what does the child look
+/// Capture the session's terminal pane as plain text — "what does the child look
 /// like right now". Returns `{ "screen": "<text>" }`.
 async fn preview_session(
     State(st): State<AppState>,
@@ -2057,8 +2057,8 @@ async fn preview_session(
     Query(q): Query<PreviewQuery>,
 ) -> ApiResult<Json<Value>> {
     let (session, _) = require_session(&st.db, &key).await?;
-    require_live_tmux(&session).await?;
-    let screen = backend::capture(&session.tmux_session, q.lines)
+    require_live_terminal(&session).await?;
+    let screen = backend::capture(&session.term_session, q.lines)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({ "screen": screen })))
@@ -3154,7 +3154,7 @@ async fn delete_overlooker(
     Ok(Json(json!({ "deleted": true })))
 }
 
-/// Fire a round now, in the daemon (the single tmux owner), and report its
+/// Fire a round now, in the daemon (the single terminal owner), and report its
 /// outcome. `dry_run` stubs every mutating action — the iteration primitive,
 /// safe to repeat. Re-reads the closed run row to surface outcome + summary.
 async fn run_overlooker(

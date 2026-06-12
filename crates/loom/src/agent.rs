@@ -1,4 +1,4 @@
-//! Launching coding agents into tmux panes and installing status hooks, plus
+//! Launching coding agents into per-session terminals and installing status hooks, plus
 //! the **one-shot headless agent** (`POST /api/agent/oneshot`) — a fresh,
 //! env-stripped `claude -p` run for a judgement call.
 
@@ -44,7 +44,7 @@ pub fn combine_args(base: &str, model: &str, effort: &str) -> String {
         .join(" ")
 }
 
-/// Whether a session's tmux session is being created for the first time or
+/// Whether a session's terminal is being created for the first time or
 /// recreated to recover ("adopt") an existing worktree whose session died.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchMode {
@@ -104,20 +104,20 @@ pub fn launch_script(
     script
 }
 
-/// Everything [`launch`] needs to bring up a session's tmux.
+/// Everything [`launch`] needs to bring up a session's terminal.
 pub struct LaunchSpec<'a> {
     /// The branch id — the agent uses this to resolve "its" branch via
     /// `$WEAVER_BRANCH`.
     pub branch_id: &'a str,
     pub agent_kind: &'a str,
     pub work_dir: &'a Path,
-    pub tmux_session: &'a str,
+    pub term_session: &'a str,
     pub goal_file: Option<&'a Path>,
     pub server_addr: &'a str,
     pub claude_args: &'a str,
 }
 
-/// Bring up the session's tmux running the agent.
+/// Bring up the session's terminal running the agent.
 pub async fn launch(spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<()> {
     let loom_exe = std::env::current_exe().ok();
     let weaver_dir = loom_exe.as_deref().and_then(Path::parent);
@@ -152,17 +152,17 @@ pub async fn launch(spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<()> {
     tracing::debug!(
         branch = spec.branch_id,
         agent_kind = spec.agent_kind,
-        session = spec.tmux_session,
+        session = spec.term_session,
         ?mode,
         "launching agent session"
     );
-    backend::new_session(spec.tmux_session, spec.work_dir, &script)
+    backend::new_session(spec.term_session, spec.work_dir, &script)
         .await
-        .with_context(|| format!("tmux: launching session {}", spec.tmux_session))?;
+        .with_context(|| format!("terminal: launching session {}", spec.term_session))?;
     tracing::info!(
         branch = spec.branch_id,
         agent_kind = spec.agent_kind,
-        session = spec.tmux_session,
+        session = spec.term_session,
         ?mode,
         "agent launched"
     );

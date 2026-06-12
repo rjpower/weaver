@@ -5,7 +5,7 @@ import type { Session } from '../types';
 // it stays out of the always-visible header run, yet reachable from any scroll
 // position (the lifecycle actions used to sit at the bottom of a long Overview,
 // where they scrolled out of sight). Two stacked sections:
-//   • identity / machine metadata (id, branch, base, tmux, worktree, github)
+//   • identity / machine metadata (id, branch, base, terminal, worktree, github)
 //   • lifecycle actions, injected by the header via the #actions slot
 // Read-only metadata; the page owns open-state.
 defineProps<{ ws: Session; open: boolean }>();
@@ -38,8 +38,8 @@ function close() {
           <dd class="min-w-0 break-all font-mono text-muted">base {{ ws.branch.base_branch }}</dd>
         </div>
         <div class="flex gap-2">
-          <dt class="w-16 shrink-0 text-faint">tmux</dt>
-          <dd class="min-w-0 break-all font-mono text-muted">{{ ws.tmux_session }}</dd>
+          <dt class="w-16 shrink-0 text-faint">terminal</dt>
+          <dd class="min-w-0 break-all font-mono text-muted">{{ ws.term_session }}</dd>
         </div>
         <div class="flex gap-2">
           <dt class="w-16 shrink-0 text-faint">worktree</dt>

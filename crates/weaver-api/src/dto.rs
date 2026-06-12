@@ -115,7 +115,7 @@ pub struct SessionView {
     pub id: String,
     pub status: String,
     pub work_dir: String,
-    pub tmux_session: String,
+    pub term_session: String,
     pub agent_kind: String,
     pub model: String,
     pub effort: String,

@@ -84,7 +84,7 @@ pub const REGISTRY: &[SettingSpec] = &[
     SettingSpec {
         key: "agent.default",
         label: "Default agent",
-        description: "Agent launched in each new session's tmux when `loom \
+        description: "Agent launched in each new session's terminal when `loom \
             launch` is given no `--agent`. Use `claude` for the Claude Code \
             TUI, `shell` for a plain shell, or any other command (it receives \
             the goal file's path as its argument).",
@@ -108,7 +108,7 @@ pub const REGISTRY: &[SettingSpec] = &[
     SettingSpec {
         key: "server.auto_adopt",
         label: "Auto-adopt on startup",
-        description: "When enabled, the server recreates the tmux session for \
+        description: "When enabled, the server recreates the terminal session for \
             every recoverable session on startup, rather than leaving them \
             `orphaned` for manual adoption.",
         kind: SettingKind::Bool,
@@ -133,7 +133,7 @@ pub const REGISTRY: &[SettingSpec] = &[
         key: "github.archive_on_merge",
         label: "Archive on PR merge",
         description: "When enabled, loom archives a session automatically once \
-            its pull request is merged — tearing down the tmux session and \
+            its pull request is merged — tearing down the terminal session and \
             removing the worktree, while keeping the branch and its history. \
             Requires GitHub polling.",
         kind: SettingKind::Bool,
@@ -230,7 +230,7 @@ pub const REGISTRY: &[SettingSpec] = &[
         key: "overlooker.adopt_warm",
         label: "Adopt warm sessions on startup",
         description: "When enabled, the server re-adopts each engine-managed \
-            (warm) overlooker session whose tmux is gone on startup — recreating \
+            (warm) overlooker session whose terminal is gone on startup — recreating \
             it so a watcher resumes its across-round memory after a daemon \
             restart. Independent of the fleet-wide `server.auto_adopt`: warm \
             infrastructure is recovered even when ordinary sessions are left \

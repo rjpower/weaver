@@ -1,6 +1,5 @@
 import { test as base, expect } from '@playwright/test';
 import { type ChildProcess, execFileSync, spawn } from 'child_process';
-import { randomBytes } from 'crypto';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -47,7 +46,7 @@ export interface Session {
   id: string;
   status: string;
   work_dir: string;
-  tmux_session: string;
+  term_session: string;
   agent_kind: string;
   pending_prompt: string;
   github_repo: string | null;
@@ -274,7 +273,7 @@ async function deleteAllIssues(baseUrl: string) {
 interface ServerHandle {
   baseUrl: string;
   repoPath: string;
-  /** Env for spawning `weaver` against this server (WEAVER_HOME/DB/TMUX_SOCKET). */
+  /** Env for spawning `weaver` against this server (WEAVER_HOME/DB). */
   childEnv: NodeJS.ProcessEnv;
 }
 
@@ -284,11 +283,11 @@ interface WorkerFixtures {
 
 export const test = base.extend<{ weaver: WeaverFixture }, WorkerFixtures>({
   // One loom server per worker, reused across all of that worker's tests. Booting
-  // a server (build a throwaway repo, spawn `loom serve`, start a private tmux
-  // server) is the expensive part; the per-test `weaver` fixture below just wipes
-  // sessions between tests so each starts from a clean slate. Workers are fully
-  // isolated (own WEAVER_HOME/db, port, and tmux socket), so they run in parallel
-  // safely — see playwright.config.ts.
+  // a server (build a throwaway repo, spawn `loom serve`) is the expensive part;
+  // the per-test `weaver` fixture below just wipes sessions between tests so each
+  // starts from a clean slate. Workers are fully isolated (own WEAVER_HOME/db and
+  // port — the home also scopes the tapestry terminal sockets), so they run in
+  // parallel safely — see playwright.config.ts.
   server: [
     async ({}, use, workerInfo) => {
       const tmpDir = mkdtempSync(join(tmpdir(), 'weaver-e2e-'));
@@ -298,28 +297,17 @@ export const test = base.extend<{ weaver: WeaverFixture }, WorkerFixtures>({
       mkdirSync(weaverHome, { recursive: true });
       makeRepo(repoPath);
 
-      // Pin tmux to a private throwaway server (`tmux -L <name>`), exactly like
-      // the Rust integration harness, so a worker's sessions never land on — or
-      // get torn down from — the machine-global default socket where the user's
-      // real weaver-<id> agents (including the one running you) live.
-      // `socket_args()` prepends `-L <name>` to every loom tmux call (create /
-      // kill / capture / attach), so this one var namespaces the whole worker.
-      // The name is unique per worker; reap any stale server from a crashed run.
-      const tmuxSocket = `weaver-e2e-${process.pid}-w${workerInfo.workerIndex}-${randomBytes(3).toString('hex')}`;
-      try {
-        execFileSync('tmux', ['-L', tmuxSocket, 'kill-server'], { stdio: 'ignore' });
-      } catch {
-        /* no such server yet — fine */
-      }
-
       // Per-worker env: every spawned process (loom + weaver hooks) sees the same
-      // WEAVER_HOME / WEAVER_DB so they share one database, and the same
-      // WEAVER_TMUX_SOCKET so all tmux ops stay on the private server above.
+      // WEAVER_HOME / WEAVER_DB so they share one database. The private WEAVER_HOME
+      // also scopes the tapestry control sockets (`$WEAVER_HOME/sock`), so a
+      // worker's terminals never collide with another worker's or the user's real
+      // sessions. WEAVER_TAPESTRY_BIN points loom at the sibling supervisor binary
+      // built alongside it.
       const childEnv = {
         ...process.env,
         WEAVER_HOME: weaverHome,
         WEAVER_DB: dbPath,
-        WEAVER_TMUX_SOCKET: tmuxSocket,
+        WEAVER_TAPESTRY_BIN: join(WEAVER_ROOT, 'target', 'debug', 'tapestry'),
         RUST_LOG: 'loom=warn,weaver_core=warn',
       };
 
@@ -383,9 +371,10 @@ export const test = base.extend<{ weaver: WeaverFixture }, WorkerFixtures>({
 
       await use({ baseUrl, repoPath, childEnv });
 
-      // --- Worker teardown: stop the server, reap the private tmux server, and
-      // remove temp dirs. Everything here is scoped to this worker's private
-      // socket and db, so the user's real sessions are never touched.
+      // --- Worker teardown: delete every session (which kills its tapestry
+      // supervisor), stop the server, and remove temp dirs. Everything here is
+      // scoped to this worker's private WEAVER_HOME, so the user's real sessions
+      // are never touched.
       await deleteAllSessions(baseUrl);
       await new Promise<void>((resolve) => {
         let done = false;
@@ -405,11 +394,6 @@ export const test = base.extend<{ weaver: WeaverFixture }, WorkerFixtures>({
         });
         server.kill('SIGTERM');
       });
-      try {
-        execFileSync('tmux', ['-L', tmuxSocket, 'kill-server'], { stdio: 'ignore' });
-      } catch {
-        /* already gone */
-      }
       rmSync(tmpDir, { recursive: true, force: true });
     },
     { scope: 'worker' },

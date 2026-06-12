@@ -94,7 +94,7 @@ session's terminal directly, so you can nudge it without attaching:
   sub-agent's pane and submit it, triggering an agent round (e.g. to answer a
   question it asked or redirect it).
 - `loom session break <session>` — send Escape to interrupt its current turn.
-- `loom session preview <session>` — print its recent tmux screen, to see what
+- `loom session preview <session>` — print its recent terminal screen, to see what
   it's doing right now. A session key is an id, branch id, branch name, or
   `repo:branch`.
 
@@ -169,7 +169,7 @@ the work is ready:
   add`) so the user knows to look.
 
 When a session is finished with, the user may **archive** it from the dashboard:
-that tears down this tmux session and removes the worktree, but preserves the
+that tears down this terminal session and removes the worktree, but preserves the
 branch and the weaver history (goal, status, events) for future reference. So
 make sure anything worth keeping is committed to the branch or filed as an issue
 before you consider the task complete.

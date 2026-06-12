@@ -1,9 +1,8 @@
 //! The session supervisor: owns one PTY, a vt100 screen emulator, and a unix
 //! control socket. It is the process that *outlives loom* — start it detached
 //! (see [`spawn_detached`](crate::spawn_detached)) and the agent keeps running
-//! across a loom restart, exactly as a detached tmux session does, but streaming
-//! **raw PTY bytes** instead of a re-rendered tmux screen so an attached xterm
-//! owns its own scrollback/selection/search.
+//! across a loom restart. It streams **raw PTY bytes** to attached clients, so an
+//! xterm owns its own scrollback/selection/search.
 //!
 //! ## Shape
 //!
@@ -12,19 +11,27 @@
 //! resize), and the writer channel. Everything else talks to it over an mpsc of
 //! [`Cmd`]:
 //!
-//! * a blocking **reader thread** pumps PTY output → `Cmd::Output` (its
-//!   `blocking_send` back-pressures the PTY when every consumer is slow);
+//! * a blocking **reader thread** pumps PTY output into a *bounded* channel (its
+//!   `blocking_send` back-pressures the PTY — and thus the child — when viewers
+//!   are slow, so a terminal stream is never silently truncated);
 //! * a blocking **writer thread** drains an mpsc into the PTY;
 //! * a blocking **wait thread** reaps the child → `Cmd::ChildExited`;
 //! * each accepted socket connection is a task issuing control `Cmd`s and, on
 //!   attach, registering an output subscriber.
 //!
-//! Fan-out to subscribers is non-blocking (unbounded per-client channels), so one
-//! slow viewer never stalls the parser or the other viewers.
+//! Output fan-out applies back-pressure: the core *awaits* each subscriber's
+//! bounded channel, so a slow viewer slows the read side rather than dropping
+//! bytes (xterm needs every byte to stay coherent). Back-pressure stops at a
+//! genuinely wedged viewer: a subscriber that accepts nothing for
+//! [`EVICT_AFTER`] is dropped (its client reconnects and repaints) so one dead
+//! viewer can neither stall the child forever nor grow memory without bound.
+//! Control commands are polled ahead of output each iteration, so liveness and
+//! teardown stay responsive.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
@@ -39,6 +46,17 @@ const READ_BUF: usize = 32 * 1024;
 /// with history). xterm keeps its own client-side scrollback off the live
 /// stream; this only bounds what a *programmatic* capture can reach back to.
 const DEFAULT_SCROLLBACK: usize = 1000;
+/// PTY-output backlog (chunks) buffered from the reader thread before its
+/// `blocking_send` parks — the point where back-pressure reaches the child.
+const OUTPUT_BOUND: usize = 256;
+/// Per-subscriber output backlog before the core starts *awaiting* that viewer
+/// (the back-pressure hinge). At up to `READ_BUF` per chunk this is a few MiB of
+/// slack before a viewer's slowness reaches the read side.
+const SUBSCRIBER_BOUND: usize = 256;
+/// How long a single fan-out send may block on one viewer before that viewer is
+/// judged wedged and evicted. Long enough that a merely-slow client is waited
+/// for; short enough that a dead socket cannot freeze the child indefinitely.
+const EVICT_AFTER: Duration = Duration::from_secs(30);
 
 /// What to run under the supervisor.
 pub struct SupervisorConfig {
@@ -46,8 +64,7 @@ pub struct SupervisorConfig {
     pub name: String,
     /// Working directory for the child.
     pub cwd: PathBuf,
-    /// Shell script run as `sh -c <script>` (the same contract as
-    /// `tmux new-session … sh -c <script>`).
+    /// Shell script run as `sh -c <script>`.
     pub script: String,
     /// Extra environment for the child, on top of the inherited environment.
     pub env: Vec<(String, String)>,
@@ -56,10 +73,10 @@ pub struct SupervisorConfig {
     pub rows: u16,
 }
 
-/// Messages to the core task. The single owner of screen + client state.
+/// Control messages to the core task. The single owner of screen + client state.
+/// PTY output travels on its own bounded channel (so the reader can park under
+/// back-pressure), not through here.
 enum Cmd {
-    /// A chunk of PTY output (from the reader thread).
-    Output(Vec<u8>),
     /// Forward bytes to the PTY verbatim.
     Send(Vec<u8>),
     /// Resize PTY + emulator.
@@ -76,7 +93,7 @@ enum Cmd {
     Attach {
         cols: u16,
         rows: u16,
-        out_tx: mpsc::UnboundedSender<Vec<u8>>,
+        out_tx: mpsc::Sender<Vec<u8>>,
         resp: oneshot::Sender<u64>,
     },
     /// Drop a subscriber (its client disconnected).
@@ -137,10 +154,11 @@ pub async fn run(cfg: SupervisorConfig) -> Result<()> {
     // --- helper threads ----------------------------------------------------
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Cmd>();
 
-    // Reader: PTY → Cmd::Output. blocking_send back-pressures the PTY when the
-    // core task (and thus every viewer) is wedged.
+    // Reader: PTY → bounded output channel. `blocking_send` parks the thread when
+    // the channel is full, which stops draining the PTY and back-pressures the
+    // child — the mechanism that keeps a slow viewer from forcing truncation.
+    let (output_tx, mut output_rx) = mpsc::channel::<Vec<u8>>(OUTPUT_BOUND);
     {
-        let cmd_tx = cmd_tx.clone();
         let mut reader = reader;
         std::thread::spawn(move || {
             let mut buf = [0u8; READ_BUF];
@@ -148,8 +166,8 @@ pub async fn run(cfg: SupervisorConfig) -> Result<()> {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if cmd_tx.send(Cmd::Output(buf[..n].to_vec())).is_err() {
-                            break;
+                        if output_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            break; // core gone
                         }
                     }
                 }
@@ -221,66 +239,78 @@ pub async fn run(cfg: SupervisorConfig) -> Result<()> {
 
     // --- core task ---------------------------------------------------------
     let mut parser = vt100::Parser::new(cfg.rows.max(1), cfg.cols.max(1), DEFAULT_SCROLLBACK);
-    let mut subscribers: HashMap<u64, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
+    let mut subscribers: HashMap<u64, mpsc::Sender<Vec<u8>>> = HashMap::new();
     let mut next_id: u64 = 0;
 
-    while let Some(cmd) = cmd_rx.recv().await {
-        match cmd {
-            Cmd::Output(bytes) => {
-                parser.process(&bytes);
-                subscribers.retain(|_, tx| tx.send(bytes.clone()).is_ok());
-            }
-            Cmd::Send(bytes) => {
-                let _ = write_tx.send(bytes);
-            }
-            Cmd::Resize(cols, rows) => {
-                apply_resize(&mut parser, &*master, cols, rows);
-            }
-            Cmd::Capture { history, resp } => {
-                let _ = resp.send(render(&mut parser, history));
-            }
-            Cmd::Ping { resp } => {
-                // The supervisor answers only while the child runs — it tears
-                // down on exit (tmux semantics: the session simply disappears),
-                // so an answered ping always means alive.
-                let (rows, cols) = parser.screen().size();
-                let _ = resp.send(PongInfo {
-                    alive: true,
-                    pid: child_pid,
-                    cols,
-                    rows,
-                    alternate_screen: parser.screen().alternate_screen(),
-                });
-            }
-            Cmd::Attach {
-                cols,
-                rows,
-                out_tx,
-                resp,
-            } => {
-                // Match the PTY to the attaching client so the app repaints at
-                // its size, then hand the client a full repaint of the current
-                // screen so it is correct even if the app does not redraw.
-                let (cur_rows, cur_cols) = parser.screen().size();
-                if (cols, rows) != (cur_cols, cur_rows) && cols > 0 && rows > 0 {
-                    apply_resize(&mut parser, &*master, cols, rows);
+    // Once the PTY reader hits EOF its channel closes; `recv` then returns `None`
+    // immediately, so disable that select arm to avoid a busy-loop while we wait
+    // for the wait thread's `ChildExited`.
+    let mut output_open = true;
+    loop {
+        tokio::select! {
+            // `biased`: poll control before output so ping/resize/kill stay
+            // responsive even while a burst of output is flowing.
+            biased;
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else { break };
+                match cmd {
+                    Cmd::Send(bytes) => {
+                        let _ = write_tx.send(bytes);
+                    }
+                    Cmd::Resize(cols, rows) => {
+                        apply_resize(&mut parser, &*master, cols, rows);
+                    }
+                    Cmd::Capture { history, resp } => {
+                        let _ = resp.send(render(&mut parser, history));
+                    }
+                    Cmd::Ping { resp } => {
+                        // The supervisor answers only while the child runs — it
+                        // tears down on exit (the session simply disappears), so
+                        // an answered ping always means alive.
+                        let (rows, cols) = parser.screen().size();
+                        let _ = resp.send(PongInfo {
+                            alive: true,
+                            pid: child_pid,
+                            cols,
+                            rows,
+                            alternate_screen: parser.screen().alternate_screen(),
+                        });
+                    }
+                    Cmd::Attach { cols, rows, out_tx, resp } => {
+                        // Match the PTY to the attaching client so the app
+                        // repaints at its size, then hand the client a full
+                        // repaint of the current screen so it is correct even if
+                        // the app does not redraw.
+                        let (cur_rows, cur_cols) = parser.screen().size();
+                        if (cols, rows) != (cur_cols, cur_rows) && cols > 0 && rows > 0 {
+                            apply_resize(&mut parser, &*master, cols, rows);
+                        }
+                        let repaint = parser.screen().contents_formatted();
+                        // The channel is fresh and empty, so this first frame fits.
+                        let _ = out_tx.try_send(repaint);
+                        let id = next_id;
+                        next_id += 1;
+                        subscribers.insert(id, out_tx);
+                        let _ = resp.send(id);
+                    }
+                    Cmd::Detach(id) => {
+                        subscribers.remove(&id);
+                    }
+                    Cmd::Kill => {
+                        let _ = killer.kill();
+                        break;
+                    }
+                    Cmd::ChildExited => break,
                 }
-                let repaint = parser.screen().contents_formatted();
-                let _ = out_tx.send(repaint);
-                let id = next_id;
-                next_id += 1;
-                subscribers.insert(id, out_tx);
-                let _ = resp.send(id);
             }
-            Cmd::Detach(id) => {
-                subscribers.remove(&id);
-            }
-            Cmd::Kill => {
-                let _ = killer.kill();
-                break;
-            }
-            Cmd::ChildExited => {
-                break;
+            out = output_rx.recv(), if output_open => {
+                match out {
+                    Some(bytes) => {
+                        parser.process(&bytes);
+                        fan_out(&mut subscribers, &bytes).await;
+                    }
+                    None => output_open = false, // PTY closed; ChildExited follows
+                }
             }
         }
     }
@@ -293,6 +323,29 @@ pub async fn run(cfg: SupervisorConfig) -> Result<()> {
     let _ = std::fs::remove_file(&socket);
     tracing::info!(session = %cfg.name, "supervisor exited");
     Ok(())
+}
+
+/// Deliver one output chunk to every subscriber, applying back-pressure: each
+/// send `await`s its viewer's bounded channel (so a slow viewer slows the read
+/// side rather than losing bytes), but a viewer that accepts nothing for
+/// [`EVICT_AFTER`] — or whose channel is closed — is dropped, so one wedged or
+/// dead client cannot stall the child forever. With no subscribers this is a
+/// no-op and the child runs free.
+async fn fan_out(subscribers: &mut HashMap<u64, mpsc::Sender<Vec<u8>>>, bytes: &[u8]) {
+    if subscribers.is_empty() {
+        return;
+    }
+    let mut wedged = Vec::new();
+    for (id, tx) in subscribers.iter() {
+        match tokio::time::timeout(EVICT_AFTER, tx.send(bytes.to_vec())).await {
+            Ok(Ok(())) => {}
+            // Channel closed (client gone) or no capacity within EVICT_AFTER.
+            _ => wedged.push(*id),
+        }
+    }
+    for id in wedged {
+        subscribers.remove(&id);
+    }
 }
 
 /// Resize both the PTY (so the child gets SIGWINCH) and the emulator (so capture
@@ -410,7 +463,9 @@ async fn handle_attach(
     let (mut rd, mut wr) = stream.into_split();
 
     // Register as a subscriber; the core task sends the initial repaint first.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // Bounded so a wedged client is evicted (see `Cmd::Output`) instead of
+    // growing the supervisor's memory without bound.
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(SUBSCRIBER_BOUND);
     let (id_tx, id_rx) = oneshot::channel();
     cmd_tx
         .send(Cmd::Attach {

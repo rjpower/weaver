@@ -3,9 +3,8 @@
 //! One unix-domain socket per session, named by the session, under a per-machine
 //! run directory. The directory derives from `weaver_home()` (honouring
 //! `$WEAVER_HOME`), so the test harnesses that already pin `WEAVER_HOME` to a
-//! temp dir get socket isolation for free — the tapestry analogue of
-//! `WEAVER_TMUX_SOCKET`. `$WEAVER_TAPESTRY_DIR` overrides the directory outright
-//! for callers that want to place sockets elsewhere.
+//! temp dir get socket isolation for free. `$WEAVER_TAPESTRY_DIR` overrides the
+//! directory outright for callers that want to place sockets elsewhere.
 
 use std::path::PathBuf;
 
@@ -19,11 +18,29 @@ pub fn run_dir() -> PathBuf {
 
 /// The control-socket path for a session name.
 ///
-/// The name is used verbatim as the file stem; callers pass the same opaque
-/// session id loom already mints (`weaver-<id>`), which contains no path
-/// separators.
+/// Callers pass the opaque session id loom already mints (`weaver-<id>`), which
+/// contains no path separators. The name is still [`sanitize`]d to a single path
+/// component as defence-in-depth, so a hostile name can never escape [`run_dir`]
+/// — and because the sanitizer is deterministic, the supervisor that binds and
+/// the client that connects derive the identical path.
 pub fn socket_path(name: &str) -> PathBuf {
-    run_dir().join(format!("{name}.sock"))
+    run_dir().join(format!("{}.sock", sanitize(name)))
+}
+
+/// Reduce a session name to a single safe filename component: ASCII
+/// alphanumerics plus `-`/`_` survive, everything else (path separators, `.`,
+/// NUL, …) becomes `_`. This forecloses `../` traversal and absolute-path
+/// injection through the name.
+fn sanitize(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// List the names of every session that currently has a socket file. A socket's

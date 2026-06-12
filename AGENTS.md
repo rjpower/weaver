@@ -14,7 +14,7 @@ Two binaries over one shared sqlite db (`~/.weaver/weaver.db`, WAL):
 - **`weaver`** — the daemon-less agent CLI: goal, status, issues, hook events.
   Works with or without loom.
 - **`loom`** — the optional orchestrator: REST + SSE server, Vue SPA, per-branch
-  tmux + agent process, the monitor, and `git worktree` / `tmux` shell-outs.
+  terminal supervisor + agent process, the monitor, and `git worktree` shell-outs.
 
 Diagram and module-by-module map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -22,7 +22,7 @@ Diagram and module-by-module map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ```sh
 cargo build              # backend + Vue SPA (build.rs drives npm/rspack)
-cargo test --workspace   # backend unit + integration (needs git, tmux)
+cargo test --workspace   # backend unit + integration (needs git; spawns tapestry PTYs)
 cd e2e && npm test       # Playwright UI suite against a real loom
 cd python/weaver-loom && uv run pytest   # weaver_loom + builtin overlooker program logic (server-free)
 ```
@@ -40,22 +40,24 @@ core.hooksPath .githooks`. Build/test internals and the Playwright setup live in
 
 ## Don't disturb the user's live loom
 
-A real `loom serve` is **machine-global**: one default tmux server and one
-`~/.weaver/weaver.db`, normally running the user's agents — including the one
-running *you*. So unless the user explicitly asks:
+A real `loom serve` is **machine-global**: one shared `~/.weaver/weaver.db` and a
+set of detached `tapestry` terminal supervisors (under `~/.weaver/sock`),
+normally running the user's agents — including the one running *you*. The
+supervisors are detached, so they outlive `loom serve` and a broad kill is what
+wipes them. So unless the user explicitly asks:
 
-- **Don't** start your own `loom serve` / `loom launch`, create or kill
-  `weaver-*` tmux sessions on the default socket, or run broad tmux cleanup
-  (`tmux kill-server`, `pkill -f weaver`). Each wipes the user's agents at a
+- **Don't** start your own `loom serve` / `loom launch` against the default
+  `~/.weaver`, kill the user's terminal supervisors, or run broad process cleanup
+  (`pkill -f tapestry`, `pkill -f weaver`). Each wipes the user's agents at a
   stroke.
 - **If a task seems to need a live loom, ask first.**
 
-To exercise loom/tmux behaviour, extend the test suites — they isolate via a
-private `WEAVER_TMUX_SOCKET` + a temp `WEAVER_HOME`. If you must run loom by
-hand, isolate it the same way:
+To exercise loom behaviour, extend the test suites — they isolate via a temp
+`WEAVER_HOME`, which scopes both the db and the tapestry sockets. If you must run
+loom by hand, isolate it the same way:
 
 ```sh
-WEAVER_TMUX_SOCKET=loom-dev-$$ WEAVER_HOME=$(mktemp -d) loom serve --addr 127.0.0.1:0
+WEAVER_HOME=$(mktemp -d) loom serve --addr 127.0.0.1:0
 ```
 
 ## Landing changes

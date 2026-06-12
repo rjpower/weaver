@@ -1,9 +1,9 @@
 //! The recovery property: a session launched with `spawn_detached` survives the
 //! launching process exiting. We can't kill *this* test process, but the
-//! detached supervisor is a separate `setsid` process reparented to init, so its
-//! survival is observable: spawn it, drop every handle, and confirm it is still
-//! answering and its screen is intact — exactly what "restart loom, the agent
-//! keeps running" relies on.
+//! detached supervisor is a separate `setsid` session leader that is reparented
+//! to init once its launcher goes away, so its survival is observable: spawn it,
+//! drop every handle, and confirm it is still answering and its screen is intact
+//! — exactly what "restart loom, the agent keeps running" relies on.
 //!
 //! Requires the `tapestry` binary to be built (the test resolves it from the
 //! same target dir via `CARGO_BIN_EXE_tapestry`).
@@ -20,7 +20,8 @@ async fn detached_supervisor_outlives_its_launcher() {
     let home = TempDir::new().unwrap();
     std::env::set_var("WEAVER_HOME", home.path());
     // The detached supervisor is the freshly-built `tapestry` binary, driven via
-    // its `spawn` subcommand (which double-forks). It inherits our WEAVER_HOME.
+    // its `spawn` subcommand (which setsid-detaches a supervisor and returns). It
+    // inherits our WEAVER_HOME.
     let bin = env!("CARGO_BIN_EXE_tapestry");
     let name = format!("tap-detach-{}", std::process::id());
     spawn_via_binary(bin, &name, "echo DETACHED_OK; exec sleep 60").await;
@@ -80,8 +81,8 @@ async fn detached_supervisor_outlives_its_launcher() {
     let _ = Client::connect(&name).await.unwrap().kill().await;
 }
 
-/// Drive the `tapestry spawn` subcommand of the built binary, which double-forks
-/// a detached supervisor and returns immediately. Using the CLI (rather than the
+/// Drive the `tapestry spawn` subcommand of the built binary, which setsid-
+/// detaches a supervisor and returns immediately. Using the CLI (rather than the
 /// library `spawn_detached`, which re-execs `current_exe`) makes the supervisor
 /// the real `tapestry` binary even though we run inside the test harness.
 async fn spawn_via_binary(bin: &str, name: &str, script: &str) {

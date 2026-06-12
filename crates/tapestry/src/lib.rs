@@ -1,17 +1,18 @@
-//! Tapestry — a barebones per-session terminal supervisor, the native
-//! replacement for `tmux attach` in loom.
+//! Tapestry — a barebones per-session terminal supervisor; loom's native
+//! terminal backend.
 //!
 //! Each session is one tiny **detached supervisor process** that owns the
 //! agent's PTY, runs a vt100 screen emulator, and serves a unix control socket.
 //! Because the supervisor's lifetime is independent of `loom serve`, restarting
-//! loom leaves a live agent untouched — the same recovery property tmux gives —
+//! loom leaves a live agent untouched (the recovery property loom relies on),
 //! while the interactive surface streams *raw PTY bytes*, so an attached xterm
-//! owns its own scrollback, selection, and search instead of rendering a
-//! re-rendered tmux screen.
+//! owns its own scrollback, selection, and search rather than a server-rendered
+//! screen.
 //!
 //! ## Surface
 //!
-//! * [`spawn_detached`] — launch a session's supervisor, reparented to init.
+//! * [`spawn_detached`] — launch a session's supervisor in its own session, so
+//!   it outlives the launcher.
 //! * [`Client`] — drive a session: [`Client::is_alive`], [`Client::capture`],
 //!   [`Client::send`], [`Client::resize`], [`Client::kill`], and the interactive
 //!   [`Client::attach`].
@@ -32,12 +33,12 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
 
-/// Options for launching a session. Mirrors what loom already passes to
-/// `tmux::new_session` plus the agent environment.
+/// Options for launching a session. Mirrors what loom passes to
+/// `backend::new_session` plus the agent environment.
 pub struct LaunchOptions<'a> {
     pub name: &'a str,
     pub cwd: &'a Path,
-    /// `sh -c <script>` — the same contract as `tmux new-session … sh -c`.
+    /// The shell command the supervisor runs as `sh -c <script>`.
     pub script: &'a str,
     pub env: &'a [(&'a str, &'a str)],
     pub cols: u16,
@@ -51,9 +52,11 @@ pub struct LaunchOptions<'a> {
 }
 
 /// Launch a session's supervisor as a **detached** process: it `setsid`s into
-/// its own session, drops its controlling terminal and stdio, and reparents to
-/// init, so it survives the caller (loom) exiting. Returns once the supervisor
-/// is accepting on its socket.
+/// its own session, dropping its controlling terminal and stdio. With no
+/// controlling terminal it ignores the SIGHUP its launcher's exit would
+/// otherwise deliver, and once the launcher (loom) exits the kernel reparents it
+/// to init — so the supervisor, and the agent under it, survive a loom restart.
+/// Returns once the supervisor is accepting on its socket.
 ///
 /// The supervisor is this very binary re-executed as `tapestry supervise`; the
 /// launch parameters travel as a single JSON argument so a script with spaces or
@@ -78,20 +81,24 @@ pub async fn spawn_detached(opts: &LaunchOptions<'_>) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // setsid in the child so it has no controlling terminal and survives the
-    // parent's process group going away.
+    // setsid in the child so it leads a new session with no controlling
+    // terminal, and so survives the parent's process group going away. setsid
+    // only fails (EPERM) if the caller already leads a process group — which a
+    // freshly-forked child never does — but surface the error rather than swallow
+    // it, so a launch into a half-detached state fails loudly instead of silently
+    // staying attached to loom's session.
     unsafe {
         cmd.pre_exec(|| {
-            // Detach from the controlling terminal / parent session.
-            libc::setsid();
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
     cmd.spawn().context("spawning detached supervisor")?;
 
-    // Wait (bounded) for the socket to come up so callers can immediately drive
-    // the session, mirroring how `tmux new-session` returns only once the
-    // session exists.
+    // Wait (bounded) for the socket to come up so callers can drive the session
+    // as soon as this returns.
     let socket = paths::socket_path(opts.name);
     for _ in 0..200 {
         if tokio::net::UnixStream::connect(&socket).await.is_ok() {
@@ -128,7 +135,7 @@ impl From<LaunchSpec> for SupervisorConfig {
 }
 
 /// Every session that currently has a *live* supervisor (socket present and
-/// answering). The `tmux list-sessions` analogue.
+/// answering).
 pub async fn list_sessions() -> Vec<String> {
     let mut live = Vec::new();
     for name in paths::list_socket_names() {

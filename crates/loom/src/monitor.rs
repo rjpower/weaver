@@ -1,4 +1,4 @@
-//! Background task: detects when a session's tmux has ended and consumes the
+//! Background task: detects when a session's terminal has ended and consumes the
 //! event rows the `weaver` CLI writes — `hook` events (Claude lifecycle) and
 //! `tag` events (`weaver set-status` writing the `attention` tag) — reflecting
 //! them onto the session and the dashboard.
@@ -72,7 +72,7 @@ pub async fn run(state: AppState) {
             Err(e) => tracing::warn!("monitor: reading new events failed: {e}"),
         }
 
-        // 2. Walk every session, check tmux liveness, do stillness detection.
+        // 2. Walk every session, check terminal liveness, do stillness detection.
         let sessions = match session_mod::list(&state.db).await {
             Ok(s) => s,
             Err(e) => {
@@ -115,12 +115,12 @@ pub async fn run(state: AppState) {
                 )
                 .await;
             }
-            if !backend::has_session(&session.tmux_session).await {
+            if !backend::has_session(&session.term_session).await {
                 if session.status != "orphaned" {
                     tracing::info!(
                         id = %session.id,
-                        tmux_session = %session.tmux_session,
-                        "tmux session ended; marking orphaned"
+                        term_session = %session.term_session,
+                        "terminal session ended; marking orphaned"
                     );
                     let _ = session_mod::set_status(&state.db, &session.id, "orphaned").await;
                     let _ = events::record(
@@ -128,7 +128,7 @@ pub async fn run(state: AppState) {
                         &state.bus,
                         &session.branch_id,
                         "status",
-                        json!({ "status": "orphaned", "reason": "tmux session ended" }),
+                        json!({ "status": "orphaned", "reason": "terminal session ended" }),
                     )
                     .await;
                     last_event = events::max_id(&state.db).await.unwrap_or(last_event);
@@ -139,7 +139,7 @@ pub async fn run(state: AppState) {
             // Hash the pane to detect activity and bump `last_activity_at`.
             // Inferred working→idle demotion is gone: liveness is all we can
             // know, and the agent reports the rest via `weaver set-status`.
-            let screen = backend::capture(&session.tmux_session, 0)
+            let screen = backend::capture(&session.term_session, 0)
                 .await
                 .unwrap_or_default();
             let h = hash(&normalize_screen(&screen));
@@ -364,7 +364,7 @@ mod tests {
             id: "s1".to_string(),
             branch_id: "b1".to_string(),
             work_dir: String::new(),
-            tmux_session: String::new(),
+            term_session: String::new(),
             agent_kind: "shell".to_string(),
             model: String::new(),
             effort: String::new(),
