@@ -69,7 +69,10 @@ test.describe('session detail view', () => {
     await expect(panel.getByText('notes.txt')).toBeVisible();
 
     // Dragging a file over the window raises the full-page drop cue; dropping
-    // uploads it. (Synthesized events — Playwright can't drive native OS drag.)
+    // uploads it. Synthesized events (Playwright can't drive native OS drag)
+    // dispatched on body, bubbling up to the panel's window listeners — the
+    // same path a real drag takes (its target is the element under the
+    // cursor); the overlay assertions prove the listeners fired.
     const dataTransfer = await page.evaluateHandle(() => {
       const dt = new DataTransfer();
       dt.items.add(new File(['drop'], 'dropped.txt', { type: 'text/plain' }));

@@ -60,9 +60,12 @@ function onDragEnter(e: DragEvent) {
   dragging.value = true;
 }
 
-function onDragLeave(e: DragEvent) {
-  if (!hasFiles(e)) return;
-  depth = Math.max(0, depth - 1);
+function onDragLeave() {
+  // Unlike dragenter, don't gate on hasFiles: some browsers report empty types
+  // on dragleave, and bailing then would leave the overlay stuck on. Tracking
+  // depth > 0 already implies the drag we're unwinding was a file drag.
+  if (depth === 0) return;
+  depth -= 1;
   if (depth === 0) dragging.value = false;
 }
 
