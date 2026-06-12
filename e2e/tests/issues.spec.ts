@@ -106,4 +106,78 @@ test.describe('issues pane', () => {
     const persisted = await weaver.listIssues(true);
     expect(persisted.find((i) => i.id === issue.id)).toBeUndefined();
   });
+
+  test('creates a backlog issue with a tag through the New issue form', async ({ page, weaver }) => {
+    // A seeded session puts exactly one repo on the board, so the form's repo
+    // field is the static-label case and needs no selection.
+    await weaver.seedSession({ goal: 'g', name: 'feature' });
+
+    await page.goto(`${weaver.baseUrl}/issues`);
+    await page.getByTestId('issue-create-toggle').click();
+    const form = page.getByTestId('issue-create-form');
+    await expect(form).toBeVisible();
+
+    await form.getByTestId('issue-create-title').fill('add a settings page');
+    await form.getByTestId('issue-create-body').fill('with a dark-mode toggle');
+
+    // Stage a tag, which renders as a removable pill before the issue exists.
+    await form.getByTestId('issue-create-tag-input').fill('priority: high');
+    await form.getByTestId('issue-create-tag-add').click();
+    await expect(form.getByTestId('tag-pill')).toContainText('priority: high');
+
+    await form.getByTestId('issue-create-submit').click();
+
+    // The form closes and the new row appears at the top with its tag pill.
+    await expect(form).toBeHidden();
+    const persisted = await weaver.listIssues();
+    const created = persisted.find((i) => i.title === 'add a settings page');
+    expect(created).toBeTruthy();
+    expect(created?.body).toBe('with a dark-mode toggle');
+    expect(created?.claimed_branch).toBeNull(); // an unclaimed backlog item
+    expect((created?.tags ?? []).map((t) => `${t.key}=${t.value}`)).toContain('priority=high');
+
+    const row = page.locator(`[data-issue-id="${created!.id}"]`);
+    await expect(row.getByTestId('issue-title')).toContainText('add a settings page');
+    await expect(row.getByTestId('tag-pill')).toContainText('priority: high');
+  });
+
+  test('rejects an empty title and does not create', async ({ page, weaver }) => {
+    await weaver.seedSession({ goal: 'g', name: 'feature' });
+
+    await page.goto(`${weaver.baseUrl}/issues`);
+    await page.getByTestId('issue-create-toggle').click();
+    const form = page.getByTestId('issue-create-form');
+    await form.getByTestId('issue-create-submit').click();
+
+    await expect(form.getByTestId('issue-create-error')).toContainText('title is required');
+    // No backlog issue was filed (the seeded session's tracking issue carries a
+    // claimed branch, so a backlog item would be the only unclaimed one).
+    const issues = await weaver.listIssues(true);
+    expect(issues.some((i) => i.claimed_branch === null)).toBe(false);
+  });
+
+  test('files the first issue via the free-text repo field on an empty board', async ({
+    page,
+    weaver,
+  }) => {
+    // With no sessions or issues, the board knows of no repo, so the form offers
+    // a free-text path instead of a picker.
+    await page.goto(`${weaver.baseUrl}/issues`);
+    await expect(page.getByTestId('issues-empty')).toBeVisible();
+
+    await page.getByTestId('issue-create-toggle').click();
+    const form = page.getByTestId('issue-create-form');
+    const repo = form.getByTestId('issue-create-repo');
+    await expect(repo).toBeVisible();
+    await repo.fill(weaver.repoPath);
+    await form.getByTestId('issue-create-title').fill('bootstrap the backlog');
+    await form.getByTestId('issue-create-submit').click();
+
+    await expect(form).toBeHidden();
+    const persisted = await weaver.listIssues();
+    const created = persisted.find((i) => i.title === 'bootstrap the backlog');
+    expect(created).toBeTruthy();
+    const row = page.locator(`[data-issue-id="${created!.id}"]`);
+    await expect(row.getByTestId('issue-title')).toContainText('bootstrap the backlog');
+  });
 });
