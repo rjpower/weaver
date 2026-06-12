@@ -1395,7 +1395,7 @@ async fn cmd_config(cmd: ConfigCmd) -> Result<()> {
         }
         ConfigCmd::Rm { key } => {
             config::apply(&db, &[(key.clone(), None)]).await?;
-            println!("unset {key}");
+            println!("removed {key}");
         }
     }
     Ok(())

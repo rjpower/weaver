@@ -37,7 +37,7 @@ parent first and hand it the children. The common reality is the opposite:
 So the missing primitive is a **retroactive, scheduled, fleet-wide watcher**: a
 thing that wakes on a trigger — a clock tick, or a session event — surveys
 whatever sessions exist *right now*, applies judgement, and acts: marks a
-session as fine, tags one that looks stuck, nudges a third, escalates to you. 
+session as fine, tags one that looks stuck, nudges a third, escalates a fourth to you.
 It is not tied to any one workstream. It is infrastructure that watches
 the workstreams.
 
@@ -442,7 +442,7 @@ early. The equivalent **custom** form is the Python program shown
 
 The agent-authored path: you ask a session "make me an overlooker that watches
 for sessions stuck retrying a test"; it runs `loom overlooker new test-watch`,
-explores with `loom session preview`, writes the rule, `loom overlooker run test-watch --dry-run` 
+explores with `loom session preview`, writes the rule, `loom overlooker run test-watch --dry-run`
 until the would-do output looks right, then registers it with `nudge` enabled.
 
 ## Tasks
