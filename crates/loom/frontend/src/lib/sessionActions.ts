@@ -10,8 +10,8 @@ import { post, patch, del } from '../api';
 //   rename       — the one human-authored branch field (the workstream label)
 //   clearTag     — delete any one tag, loud or quiet (a chip's × clears it);
 //                  clearing the agent's `attention` is how a human marks it calm
-//   adopt        — recreate the tmux for an orphaned session
-//   archive      — tear down tmux + worktree, keep the branch/history
+//   adopt        — recreate the terminal for an orphaned session
+//   archive      — tear down terminal + worktree, keep the branch/history
 //   remove        — delete the session entirely, then route back to the list
 //
 // `reload` is called after any write that mutates server state the page shows,
@@ -56,7 +56,7 @@ export function useSessionActions(getId: () => string, reload: () => void | Prom
   const adopt = () =>
     act('adopt', async () => {
       await post(`/sessions/${getId()}/adopt`);
-      notice.value = 'Session adopted — tmux session recreated.';
+      notice.value = 'Session adopted — terminal session recreated.';
       await reload();
     });
 
@@ -64,7 +64,7 @@ export function useSessionActions(getId: () => string, reload: () => void | Prom
     act('archive', async () => {
       if (
         !confirm(
-          'Archive this session? This tears down its tmux and removes the worktree, ' +
+          'Archive this session? This tears down its terminal and removes the worktree, ' +
             'but keeps the branch and its weaver history for reference.',
         )
       )
@@ -76,7 +76,7 @@ export function useSessionActions(getId: () => string, reload: () => void | Prom
 
   const remove = () =>
     act('remove', async () => {
-      if (!confirm('Remove this session, its worktree and tmux session?')) return;
+      if (!confirm('Remove this session, its worktree and terminal session?')) return;
       await del(`/sessions/${getId()}`);
       router.push('/');
     });

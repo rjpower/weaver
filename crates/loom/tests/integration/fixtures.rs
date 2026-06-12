@@ -1,10 +1,11 @@
 //! Shared harness for the loom integration suites: a real server bound to a
-//! random port, backed by an isolated weaver home, a private tmux server, and a
-//! throwaway git repo. See the sibling modules (`sessions`, `terminal`,
-//! `scratch`, `files`, `branches`, `archive`) for the focused cases.
+//! random port, backed by an isolated weaver home (which also isolates the
+//! `tapestry` terminal sockets), and a throwaway git repo. See the sibling
+//! modules (`sessions`, `terminal`, `scratch`, `files`, `branches`, `archive`)
+//! for the focused cases.
 //!
 //! `TestServer::start` mutates process-global env (`WEAVER_HOME` /
-//! `WEAVER_API` / `WEAVER_TMUX_SOCKET`), so every test that uses it is marked
+//! `WEAVER_API` / `WEAVER_TAPESTRY_BIN`), so every test that uses it is marked
 //! `#[serial]` — they share one binary and would otherwise race on that env.
 
 use std::net::SocketAddr;
@@ -31,28 +32,45 @@ pub fn sh(dir: &Path, program: &str, args: &[&str]) {
     assert!(status.success(), "{program} {args:?} failed");
 }
 
-/// Pins tmux to a throwaway server (`tmux -L <name>`) for the test and kills it
-/// on drop — so the suite can never see or disturb the user's real sessions,
-/// even if the test panics. See `loom::tmux::socket_args`.
-struct TmuxSocket(String);
-
-impl TmuxSocket {
-    fn install() -> Self {
-        let name = format!("weaver-test-{}", std::process::id());
-        std::env::set_var("WEAVER_TMUX_SOCKET", &name);
-        // Clear any stale server left by a crashed prior run with this pid.
-        let _ = Command::new("tmux")
-            .args(["-L", &name, "kill-server"])
-            .status();
-        TmuxSocket(name)
-    }
+/// The `tapestry` supervisor binary built alongside this test binary. The
+/// integration test runner lives at `target/<profile>/deps/<bin>`; the sibling
+/// `tapestry` binary is two levels up at `target/<profile>/tapestry`. loom's
+/// `backend` reads `WEAVER_TAPESTRY_BIN` to launch it (so it does not try to
+/// re-exec the test harness as a supervisor).
+fn tapestry_bin() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("test executable path");
+    let bin = exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("target dir")
+        .join("tapestry");
+    assert!(
+        bin.exists(),
+        "tapestry binary missing at {} — run via `cargo test --workspace` (or `cargo build -p tapestry` first)",
+        bin.display()
+    );
+    bin
 }
 
-impl Drop for TmuxSocket {
-    fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", &self.0, "kill-server"])
-            .status();
+/// Best-effort teardown: kill every supervisor whose socket lives under this
+/// test's home, so its detached terminal processes don't outlive the test. Sends
+/// a raw `KILL` frame (`u32`-BE length `1` + the `KILL` opcode `0x13`) on each
+/// socket — synchronous so it is safe to call from `Drop` inside the tokio
+/// runtime (where spinning a new runtime would panic).
+fn kill_supervisors_in(sock_dir: &Path) {
+    use std::io::Write;
+    let Ok(entries) = std::fs::read_dir(sock_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+            continue;
+        }
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) {
+            let _ = stream.write_all(&[0, 0, 0, 1, 0x13]);
+            let _ = stream.flush();
+        }
     }
 }
 
@@ -67,14 +85,22 @@ fn init_repo(dir: &Path) {
 }
 
 /// A running loom server with fully isolated state: its own temp `WEAVER_HOME`
-/// (and therefore its own sqlite db), a private tmux server, and a throwaway git
-/// repo. Drop tears tmux down; the temp dirs clean themselves up.
+/// (and therefore its own sqlite db and `tapestry` socket dir), and a throwaway
+/// git repo. Drop kills any supervisors it spawned; the temp dirs clean
+/// themselves up.
 pub struct TestServer {
     pub client: Client,
     pub addr: SocketAddr,
     repo: TempDir,
     _home: TempDir,
-    _tmux: TmuxSocket,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        // Tear down detached terminal supervisors before the home (and its
+        // sockets) is removed, so they don't outlive the test.
+        kill_supervisors_in(&self._home.path().join("sock"));
+    }
 }
 
 impl TestServer {
@@ -82,11 +108,12 @@ impl TestServer {
     /// answer `/api/health`. The caller must be `#[serial]`: setup writes
     /// process-global env.
     pub async fn start() -> Self {
-        // Isolate weaver state in a temp home (its own db) and tmux on a private
-        // server for the lifetime of the test.
+        // Isolate weaver state in a temp home (its own db) for the lifetime of
+        // the test; that home also scopes the `tapestry` socket dir. Point loom
+        // at the sibling supervisor binary.
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("WEAVER_HOME", home.path());
-        let tmux = TmuxSocket::install();
+        std::env::set_var("WEAVER_TAPESTRY_BIN", tapestry_bin());
 
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path());
@@ -120,7 +147,6 @@ impl TestServer {
             addr,
             repo,
             _home: home,
-            _tmux: tmux,
         }
     }
 

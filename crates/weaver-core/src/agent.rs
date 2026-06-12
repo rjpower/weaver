@@ -1,4 +1,4 @@
-//! Agent-facing helpers that are pure (no tmux, no process spawning): the
+//! Agent-facing helpers that are pure (no terminal management, no process spawning): the
 //! Claude Code hook config and the SessionStart primer (a WEAVER.md).
 
 use serde_json::{json, Value};

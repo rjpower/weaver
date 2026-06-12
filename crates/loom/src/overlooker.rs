@@ -1,5 +1,5 @@
 //! The Overlooker **engine** — the timer, dispatcher, and round executor that
-//! run inside the loom daemon (the single owner of the tmux/session runtime).
+//! run inside the loom daemon (the single owner of the terminal/session runtime).
 //!
 //! The storage + model (`Overlooker`, `Trigger`, `Scope`, the run audit) lives
 //! in [`weaver_core::overlooker`]; this module is the live machinery that turns
@@ -740,7 +740,7 @@ pub async fn fire_now(
 /// rounds and across a daemon restart, which is what gives the overlooker its
 /// across-round memory.
 ///
-/// On first need it forks a dedicated worktree and brings up a real tmux session
+/// On first need it forks a dedicated worktree and brings up a real terminal session
 /// (via [`crate::web::create_warm_session`], the same launch machinery ordinary
 /// sessions use), stamps it `managed_by = o.id` so the fleet hides it, and
 /// records its id on the overlooker.

@@ -3,7 +3,7 @@
 //! Most subcommands talk to the running loom daemon over HTTP (session
 //! lifecycle, archive, adopt). `serve` runs the daemon itself;
 //! `start`/`stop`/`restart`/`status` manage its background lifecycle. To
-//! interact with an agent, `attach` to its tmux (the browser terminal is the
+//! interact with an agent, `attach` to its terminal (the browser terminal is the
 //! other interaction surface).
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -49,7 +49,7 @@ enum Cmd {
     ///     loom session wait weaver/health      # block until done / needs you
     ///     loom session send weaver/health "try the curl again"
     ///     loom session break weaver/health     # interrupt the current turn
-    ///     loom session preview weaver/health   # peek at the tmux screen
+    ///     loom session preview weaver/health   # peek at the terminal screen
     Session {
         #[command(subcommand)]
         cmd: SessionCmd,
@@ -102,13 +102,13 @@ enum Cmd {
     },
     /// Show one session's details.
     Show { branch: String },
-    /// Attach your terminal to a session's tmux.
+    /// Attach your terminal to a session.
     Attach { branch: String },
-    /// Archive a session: tear down tmux + worktree, keep branch + history.
+    /// Archive a session: tear down terminal + worktree, keep branch + history.
     Archive { branch: String },
-    /// Recreate the tmux session for an orphaned session.
+    /// Recreate the terminal session for an orphaned session.
     Adopt { branch: String },
-    /// Remove a session (worktree + tmux + DB row).
+    /// Remove a session (worktree + terminal + DB row).
     Rm {
         branch: String,
         #[arg(long)]
@@ -123,7 +123,7 @@ enum Cmd {
 /// Subcommands under `loom session` — the uniform way to drive a child session.
 #[derive(Subcommand)]
 enum SessionCmd {
-    /// Launch a new session: worktree + tmux + agent, seeded with a task.
+    /// Launch a new session: worktree + terminal + agent, seeded with a task.
     ///
     /// The positional argument is the task the agent should work on — it
     /// becomes the branch goal and the agent's opening prompt:
@@ -176,7 +176,7 @@ enum SessionCmd {
         /// Session key: id, branch id, branch name, or `repo:branch`.
         session: String,
     },
-    /// Print a session's recent tmux screen.
+    /// Print a session's recent terminal screen.
     #[command(alias = "sp")]
     Preview {
         /// Session key: id, branch id, branch name, or `repo:branch`.
@@ -952,7 +952,7 @@ fn wake_reason(ws: &Value, key: &str, lifecycle_only: bool) -> Option<String> {
     }
     if status == "orphaned" {
         return Some(format!(
-            "session {key} is orphaned — its tmux was lost (try `loom adopt {key}`)"
+            "session {key} is orphaned — its terminal was lost (try `loom adopt {key}`)"
         ));
     }
     if !lifecycle_only && branch_attention(ws) != "ok" {
@@ -999,7 +999,7 @@ async fn cmd_session_break(key: String) -> Result<()> {
     Ok(())
 }
 
-/// `loom session preview` — print the session's recent tmux screen.
+/// `loom session preview` — print the session's recent terminal screen.
 async fn cmd_session_preview(key: String, lines: usize) -> Result<()> {
     let client = client::default();
     let res = client
@@ -1124,7 +1124,7 @@ fn print_session(ws: &Value) {
         branch_str(ws, "base_branch")
     );
     println!("  work_dir: {}", str_field(ws, "work_dir"));
-    println!("  session:  {}", str_field(ws, "tmux_session"));
+    println!("  session:  {}", str_field(ws, "term_session"));
     if let Some(repo) = ws.get("github_repo").and_then(Value::as_str) {
         if !repo.is_empty() {
             println!("  github:   {repo}");
@@ -1158,14 +1158,23 @@ async fn cmd_attach(key: String) -> Result<()> {
     let client = client::default();
     let ws = client.get(&format!("/api/sessions/{key}")).await?;
     let session = ws
-        .get("tmux_session")
+        .get("term_session")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("session has no tmux session"))?;
-    let target = loom::tmux::exact(session);
-    let err = std::process::Command::new("tmux")
-        .args(["attach-session", "-t", &target])
+        .ok_or_else(|| anyhow!("session has no terminal"))?;
+    // The `tapestry` binary ships beside `loom`; resolve it as a sibling so an
+    // attach works regardless of PATH, then hand off to its native attach.
+    let tapestry = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .map(|d| d.join("tapestry"))
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "tapestry".to_string());
+    let err = std::process::Command::new(tapestry)
+        .args(["attach", session])
         .exec();
-    Err(anyhow!("failed to exec tmux: {err}"))
+    Err(anyhow!("failed to exec terminal attach: {err}"))
 }
 
 async fn cmd_archive(key: String) -> Result<()> {
@@ -1174,7 +1183,7 @@ async fn cmd_archive(key: String) -> Result<()> {
         .post(&format!("/api/sessions/{key}/archive"), json!({}))
         .await?;
     println!(
-        "archived {} (tmux + worktree removed; branch and history kept)",
+        "archived {} (terminal + worktree removed; branch and history kept)",
         str_field(&res, "branch")
     );
     if let Some(warnings) = res.get("warnings").and_then(Value::as_array) {
@@ -1198,7 +1207,7 @@ async fn cmd_adopt(key: String) -> Result<()> {
         branch_str(&ws, "name")
     );
     println!("  status:  {}", str_field(&ws, "status"));
-    println!("  session: {}", str_field(&ws, "tmux_session"));
+    println!("  session: {}", str_field(&ws, "term_session"));
     println!("  attach:  loom attach {}", str_field(&ws, "id"));
     Ok(())
 }

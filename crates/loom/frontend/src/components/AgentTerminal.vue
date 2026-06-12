@@ -12,9 +12,10 @@ import '@xterm/xterm/css/xterm.css';
 import { get } from '../api';
 import type { SettingView } from '../types';
 
-// A real terminal in the browser: xterm.js bridged over a WebSocket to a
-// server-owned PTY running `tmux attach`. The PTY is the single interaction
-// surface — keystrokes, keys, and full-screen TUIs all go through here.
+// A real terminal in the browser: xterm.js bridged over a WebSocket to the
+// session's terminal supervisor, which streams the raw PTY. The supervisor is
+// the single interaction surface — keystrokes, keys, and full-screen TUIs all
+// go through here.
 //
 // Note: this talks to loom on the page origin, so it only works against the
 // production build served by loom (the rspack dev server is a different origin
@@ -238,7 +239,7 @@ function connect() {
   sock.onopen = () => {
     attempt = 0;
     state.value = 'open';
-    // Re-establish geometry now that we can send (tmux attach repaints).
+    // Re-establish geometry now that we can send (the supervisor repaints).
     lastCols = 0;
     lastRows = 0;
     scheduleFit();
@@ -372,7 +373,7 @@ onMounted(async () => {
   });
 
   // Keystrokes → PTY. Dropped if the socket isn't open (don't queue stale input
-  // into tmux during the connect / reconnect window).
+  // into the terminal during the connect / reconnect window).
   term.onData((data) => sendOpen(inputFrame(data)));
 
   // The ResizeObserver fires once immediately on observe() after the first

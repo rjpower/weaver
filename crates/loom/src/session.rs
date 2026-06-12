@@ -13,7 +13,7 @@ pub struct Session {
     pub id: String,
     pub branch_id: String,
     pub work_dir: String,
-    pub tmux_session: String,
+    pub term_session: String,
     pub agent_kind: String,
     /// Model tier ('', 'haiku', 'sonnet', 'opus', 'fable') — spliced in as
     /// `--model`.
@@ -66,7 +66,7 @@ pub struct NewSession {
     pub id: String,
     pub branch_id: String,
     pub work_dir: String,
-    pub tmux_session: String,
+    pub term_session: String,
     pub agent_kind: String,
     pub model: String,
     pub effort: String,
@@ -84,14 +84,14 @@ pub async fn insert(db: &Db, s: &NewSession) -> Result<Session> {
     let now = now_iso();
     sqlx::query(
         "INSERT INTO sessions
-         (id, branch_id, work_dir, tmux_session, agent_kind, model, effort, status,
+         (id, branch_id, work_dir, term_session, agent_kind, model, effort, status,
           github_repo, parent_branch_id, managed_by, last_activity_at, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&s.id)
     .bind(&s.branch_id)
     .bind(&s.work_dir)
-    .bind(&s.tmux_session)
+    .bind(&s.term_session)
     .bind(&s.agent_kind)
     .bind(&s.model)
     .bind(&s.effort)
@@ -157,7 +157,7 @@ pub async fn list_visible(db: &Db) -> Result<Vec<Session>> {
 
 /// Every engine-managed (warm) session — those owned by an overlooker. The
 /// managed-session reconcile pass walks these to re-adopt a warm session whose
-/// tmux is gone (when `overlooker.adopt_warm` is on) and to clean up one whose
+/// terminal is gone (when `overlooker.adopt_warm` is on) and to clean up one whose
 /// owning overlooker has been deleted.
 pub async fn list_managed(db: &Db) -> Result<Vec<Session>> {
     let rows = sqlx::query_as::<_, Session>(
@@ -248,7 +248,7 @@ mod tests {
             id: id.to_string(),
             branch_id: branch_id.to_string(),
             work_dir: "/w".to_string(),
-            tmux_session: format!("weaver-{id}"),
+            term_session: format!("weaver-{id}"),
             agent_kind: "shell".to_string(),
             model: String::new(),
             effort: String::new(),

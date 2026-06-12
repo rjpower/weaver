@@ -24,35 +24,52 @@ fn sh(dir: &Path, program: &str, args: &[&str]) {
     assert!(status.success(), "{program} {args:?} failed");
 }
 
-/// Pins tmux to a throwaway server (`tmux -L <name>`) for the test and kills it
-/// on drop, so the suite never touches the user's real sessions. See
-/// `loom::tmux::socket_args`.
-struct TmuxSocket(String);
+/// The `tapestry` supervisor binary built beside this test binary (two levels up
+/// from `target/<profile>/deps/<bin>`). loom's `backend` reads
+/// `WEAVER_TAPESTRY_BIN` to launch it.
+fn tapestry_bin() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("test executable path");
+    exe.parent()
+        .and_then(Path::parent)
+        .expect("target dir")
+        .join("tapestry")
+}
 
-impl TmuxSocket {
-    fn install() -> Self {
-        let name = format!("weaver-test-{}", std::process::id());
-        std::env::set_var("WEAVER_TMUX_SOCKET", &name);
-        let _ = Command::new("tmux")
-            .args(["-L", &name, "kill-server"])
-            .status();
-        TmuxSocket(name)
+/// Best-effort: kill every supervisor whose socket lives under `sock_dir` with a
+/// raw `KILL` frame (`u32`-BE length `1` + the `KILL` opcode `0x13`), so detached
+/// terminal processes don't outlive the test. Synchronous, so it is safe in
+/// `Drop` inside the tokio runtime.
+fn kill_supervisors_in(sock_dir: &Path) {
+    use std::io::Write;
+    let Ok(entries) = std::fs::read_dir(sock_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("sock") {
+            continue;
+        }
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) {
+            let _ = stream.write_all(&[0, 0, 0, 1, 0x13]);
+            let _ = stream.flush();
+        }
     }
 }
 
-impl Drop for TmuxSocket {
+/// Temp `WEAVER_HOME` that kills its terminal supervisors on drop.
+struct TestHome(tempfile::TempDir);
+
+impl Drop for TestHome {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", &self.0, "kill-server"])
-            .status();
+        kill_supervisors_in(&self.0.path().join("sock"));
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hook_event_drives_session_status() {
-    let home = tempfile::tempdir().unwrap();
-    std::env::set_var("WEAVER_HOME", home.path());
-    let _tmux = TmuxSocket::install();
+    let home = TestHome(tempfile::tempdir().unwrap());
+    std::env::set_var("WEAVER_HOME", home.0.path());
+    std::env::set_var("WEAVER_TAPESTRY_BIN", tapestry_bin());
 
     let repo = tempfile::tempdir().unwrap();
     sh(repo.path(), "git", &["init", "-b", "main"]);

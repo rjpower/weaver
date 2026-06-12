@@ -596,7 +596,7 @@ mod tests {
                 id: "ghsess1".to_string(),
                 branch_id: branch.id.clone(),
                 work_dir: work_dir.display().to_string(),
-                tmux_session: format!("weaver-ghtest-{}", std::process::id()),
+                term_session: format!("weaver-ghtest-{}", std::process::id()),
                 agent_kind: "shell".to_string(),
                 model: String::new(),
                 effort: String::new(),

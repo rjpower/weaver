@@ -23,7 +23,7 @@ use serial_test::serial;
 
 use loom::events::EventBus;
 use loom::web::AppState;
-use loom::{db, events, monitor, overlooker, server, session as session_mod, tmux};
+use loom::{backend, db, events, monitor, overlooker, server, session as session_mod};
 use weaver_core::config as core_config;
 use weaver_core::overlooker as ov;
 
@@ -987,7 +987,7 @@ async fn insert_managed_session(
     state: &AppState,
     repo_root: &str,
     overlooker_id: &str,
-    tmux_session: &str,
+    term_session: &str,
     work_dir: &str,
 ) -> String {
     let branch =
@@ -1001,7 +1001,7 @@ async fn insert_managed_session(
             id: id.clone(),
             branch_id: branch.id,
             work_dir: work_dir.to_string(),
-            tmux_session: tmux_session.to_string(),
+            term_session: term_session.to_string(),
             agent_kind: "shell".to_string(),
             model: String::new(),
             effort: String::new(),
@@ -1119,7 +1119,7 @@ async fn warm_session_is_hidden_from_fleet_and_survey() {
 
 /// T12: a warm session survives a daemon restart independent of
 /// `server.auto_adopt`. With auto-adopt OFF and `overlooker.adopt_warm` ON, the
-/// managed reconcile pass re-adopts a warm session whose tmux is gone — and the
+/// managed reconcile pass re-adopts a warm session whose terminal is gone — and the
 /// inverse: a warm session whose owning overlooker was deleted is archived, not
 /// adopted.
 #[serial]
@@ -1151,7 +1151,7 @@ async fn warm_session_is_re_adopted_across_restart_independent_of_auto_adopt() {
     )
     .await;
 
-    // First need: the engine creates the warm session (a real shell tmux).
+    // First need: the engine creates the warm session (a real shell terminal).
     let warm_id = overlooker::ensure_warm_session(&state, &o)
         .await
         .unwrap()
@@ -1161,8 +1161,8 @@ async fn warm_session_is_re_adopted_across_restart_independent_of_auto_adopt() {
         .unwrap()
         .unwrap();
     assert!(
-        tmux::has_session(&warm.tmux_session).await,
-        "the warm session has a live tmux"
+        backend::has_session(&warm.term_session).await,
+        "the warm session has a live terminal"
     );
     assert_eq!(
         ov::get(&state.db, &o.id)
@@ -1175,20 +1175,20 @@ async fn warm_session_is_re_adopted_across_restart_independent_of_auto_adopt() {
         "the overlooker is linked to its warm session"
     );
 
-    // Simulate the daemon being down: its tmux is gone, the row remains.
-    tmux::kill_session(&warm.tmux_session).await.ok();
+    // Simulate the daemon being down: its terminal is gone, the row remains.
+    backend::kill_session(&warm.term_session).await.ok();
     assert!(
-        !tmux::has_session(&warm.tmux_session).await,
-        "tmux is gone, as after a restart"
+        !backend::has_session(&warm.term_session).await,
+        "terminal is gone, as after a restart"
     );
 
     // The managed reconcile pass — the startup adopt for warm sessions — runs even
-    // though `server.auto_adopt` is false, and recreates the tmux.
+    // though `server.auto_adopt` is false, and recreates the terminal.
     server::reconcile_managed_sessions(&state).await;
-    // Adoption recreates the SAME row's tmux; poll briefly for the async launch.
+    // Adoption recreates the SAME row's terminal; poll briefly for the async launch.
     let mut recreated = false;
     for _ in 0..40 {
-        if tmux::has_session(&warm.tmux_session).await {
+        if backend::has_session(&warm.term_session).await {
             recreated = true;
             break;
         }
@@ -1196,7 +1196,7 @@ async fn warm_session_is_re_adopted_across_restart_independent_of_auto_adopt() {
     }
     assert!(
         recreated,
-        "the warm session's tmux is recreated by warm-adopt"
+        "the warm session's terminal is recreated by warm-adopt"
     );
 
     // The session id and the overlooker linkage are stable across the restart.
@@ -1222,7 +1222,7 @@ async fn warm_session_is_re_adopted_across_restart_independent_of_auto_adopt() {
     );
 
     // Inverse: a warm session whose owner is gone is archived, not adopted.
-    tmux::kill_session(&still.tmux_session).await.ok();
+    backend::kill_session(&still.term_session).await.ok();
     ov::delete(&state.db, &o.id).await.unwrap();
     server::reconcile_managed_sessions(&state).await;
     let orphaned = session_mod::get(&state.db, &warm_id)
@@ -1234,8 +1234,8 @@ async fn warm_session_is_re_adopted_across_restart_independent_of_auto_adopt() {
         "an owner-less warm session is archived"
     );
     assert!(
-        !tmux::has_session(&orphaned.tmux_session).await,
-        "an archived warm session has no tmux (not re-adopted)"
+        !backend::has_session(&orphaned.term_session).await,
+        "an archived warm session has no terminal (not re-adopted)"
     );
 }
 
@@ -1283,8 +1283,8 @@ async fn ensure_warm_session_reuses_the_same_session() {
         .collect();
     assert_eq!(owned.len(), 1, "no duplicate warm session is spawned");
 
-    // Clean up the warm session's tmux (the harness kills the whole socket too).
+    // Clean up the warm session's terminal (the harness kills the whole socket too).
     if let Some(s) = session_mod::get(&state.db, &first).await.unwrap() {
-        tmux::kill_session(&s.tmux_session).await.ok();
+        backend::kill_session(&s.term_session).await.ok();
     }
 }

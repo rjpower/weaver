@@ -3,7 +3,7 @@
 //! This is the out-of-process seam from the overlooker design: a scripted
 //! overlooker (or an agent iterating on one, or a human at a REPL) drives the
 //! loom fleet through the same typed REST surface the `loom` CLI uses, never
-//! touching tmux directly. The loom daemon stays the single owner of the live
+//! touching the terminal runtime directly. The loom daemon stays the single owner of the live
 //! runtime.
 //!
 //! Two design points worth stating:
@@ -169,7 +169,7 @@ impl Client {
         to_py(py, &view)
     }
 
-    /// The session's tmux pane as plain text, with `lines` of scrollback above
+    /// The session's terminal as plain text, with `lines` of scrollback above
     /// the visible screen (`GET /api/sessions/{key}/preview`).
     #[pyo3(signature = (key, lines=0))]
     fn preview(&self, py: Python<'_>, key: &str, lines: usize) -> PyResult<String> {

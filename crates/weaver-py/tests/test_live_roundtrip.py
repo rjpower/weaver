@@ -7,19 +7,19 @@ Skipped by default. It is opt-in (set `WEAVER_PY_LIVE=1`) because it spawns the
 Safety — this NEVER touches the user's loom. It mirrors the Rust integration
 harness (`crates/loom/tests/integration/fixtures.rs`) exactly:
 
-  * a temp `WEAVER_HOME` (and so its own `server.json`),
+  * a temp `WEAVER_HOME` (and so its own `server.json`; it also scopes the
+    `tapestry` terminal sockets),
   * a temp `WEAVER_DB` under it (its own SQLite file),
-  * a UNIQUE `WEAVER_TMUX_SOCKET` under the temp dir (a private tmux server),
   * an ephemeral 127.0.0.1 port chosen by binding `:0`,
 
-and it kills the server + tears the tmux socket down on teardown.
+and it kills the server on teardown.
 
 What it asserts is the parts that are reproducible without an agent runtime:
 the binding reaches the real server and decodes its typed responses
 (`sessions()` -> []), and gated mutating calls that the capability permits
 (`set_tag`/`clear_tag`/`mark`) reach the server and surface the server's error
 as `WeaverError` (tagging a session that does not exist). Creating a real
-session launches an agent (`claude`) under tmux, which is not reproducible in
+session launches an agent (`claude`) in a terminal, which is not reproducible in
 CI, so the full create-then-tag round-trip is left to a human running this
 locally against a seeded session.
 
@@ -77,12 +77,12 @@ def isolated_loom():
         home_path = Path(home)
         port = _free_port()
         addr = f"127.0.0.1:{port}"
-        socket_name = str(home_path / "tmux.sock")
 
         env = dict(os.environ)
         env["WEAVER_HOME"] = str(home_path)
         env["WEAVER_DB"] = str(home_path / "weaver.db")
-        env["WEAVER_TMUX_SOCKET"] = socket_name
+        # The sibling supervisor binary built alongside loom.
+        env["WEAVER_TAPESTRY_BIN"] = str(Path(binary).parent / "tapestry")
         env["WEAVER_API"] = f"http://{addr}"
 
         proc = subprocess.Popen(
@@ -116,13 +116,6 @@ def isolated_loom():
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
-            # Tear the private tmux server down (best effort).
-            subprocess.run(
-                ["tmux", "-S", socket_name, "kill-server"],
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
 
 
 def test_sessions_decodes_an_empty_fleet(isolated_loom):

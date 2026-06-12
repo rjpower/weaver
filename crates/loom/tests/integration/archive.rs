@@ -1,4 +1,4 @@
-//! Archiving a session tears down its tmux session and worktree but — unlike
+//! Archiving a session tears down its terminal session and worktree but — unlike
 //! delete — keeps the session row (marked `archived`), the git branch, and the
 //! weaver history, and clears the attention tag.
 
@@ -7,7 +7,7 @@ use std::path::Path;
 use serde_json::json;
 use serial_test::serial;
 
-use loom::tmux;
+use loom::backend;
 
 use crate::fixtures::{branch_tag, TestServer};
 
@@ -29,10 +29,10 @@ async fn archive_keeps_branch_and_history() {
         .await
         .unwrap();
     let arch_id = arch["id"].as_str().unwrap().to_string();
-    let arch_session = arch["tmux_session"].as_str().unwrap().to_string();
+    let arch_session = arch["term_session"].as_str().unwrap().to_string();
     let arch_work_dir = arch["work_dir"].as_str().unwrap().to_string();
     assert!(
-        tmux::has_session(&arch_session).await,
+        backend::has_session(&arch_session).await,
         "archive session missing"
     );
     assert!(
@@ -65,8 +65,8 @@ async fn archive_keeps_branch_and_history() {
         .unwrap();
     assert_eq!(res["archived"], true);
     assert!(
-        !tmux::has_session(&arch_session).await,
-        "archive should kill the tmux session"
+        !backend::has_session(&arch_session).await,
+        "archive should kill the terminal session"
     );
     assert!(
         !Path::new(&arch_work_dir).exists(),

@@ -75,8 +75,8 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: crates/loom/frontend/package-lock.json
-      # Integration tests shell out to real `git` and `tmux` (see AGENTS.md).
-      - run: sudo apt-get update && sudo apt-get install -y tmux
+      # Integration tests shell out to real `git` and spawn `tapestry` terminal
+      # supervisors (PTYs); both are available on the runner without extra setup.
       - run: cargo test --workspace --locked
 
   python-binding:

@@ -236,7 +236,7 @@ impl Client {
             .await
     }
 
-    /// Capture the session's tmux pane as plain text, with `lines` of extra
+    /// Capture the session's terminal pane as plain text, with `lines` of extra
     /// scrollback above the visible screen (`GET /api/sessions/{key}/preview`).
     pub async fn preview(&self, key: &str, lines: usize) -> Result<String> {
         let value = self

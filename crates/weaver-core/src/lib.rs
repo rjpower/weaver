@@ -1,6 +1,6 @@
 //! weaver-core — pure model, db, git, events, config, and agent helpers
 //! shared between the `weaver` CLI and the `loom` orchestrator. No HTTP, no
-//! tmux, no process spawning beyond `git`.
+//! terminal management, no process spawning beyond `git`.
 
 pub mod agent;
 pub mod artifact;

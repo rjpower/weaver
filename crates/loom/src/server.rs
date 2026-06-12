@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use crate::events::EventBus;
 use crate::session as session_mod;
 use crate::web::AppState;
-use crate::{config, db, github, monitor, overlooker, tmux, web};
+use crate::{backend, config, db, github, monitor, overlooker, web};
 use weaver_core::branch as branch_mod;
 use weaver_core::overlooker as ov;
 
@@ -100,7 +100,7 @@ pub async fn run(addr: &str) -> Result<()> {
     }
 
     // Two independent startup adopt policies. The fleet-wide one recreates every
-    // recoverable *ordinary* session's tmux, gated on `server.auto_adopt`. The
+    // recoverable *ordinary* session's terminal, gated on `server.auto_adopt`. The
     // warm one recovers engine-managed (overlooker) sessions so a watcher resumes
     // its across-round memory after a restart — gated on its own
     // `overlooker.adopt_warm`, so warm infrastructure is recovered even when
@@ -130,7 +130,7 @@ pub async fn run(addr: &str) -> Result<()> {
     result
 }
 
-/// On startup, adopt every recoverable *ordinary* session whose tmux is gone.
+/// On startup, adopt every recoverable *ordinary* session whose terminal is gone.
 /// Engine-managed (warm) sessions are skipped here — they have their own adopt
 /// policy in [`reconcile_managed_sessions`], gated on `overlooker.adopt_warm`.
 async fn reconcile_sessions(state: &AppState) {
@@ -148,7 +148,7 @@ async fn reconcile_sessions(state: &AppState) {
         if session_mod::is_terminal(&session.status) {
             continue;
         }
-        if tmux::has_session(&session.tmux_session).await {
+        if backend::has_session(&session.term_session).await {
             continue;
         }
         let Ok(Some(branch)) = branch_mod::get(&state.db, &session.branch_id).await else {
@@ -169,13 +169,13 @@ async fn reconcile_sessions(state: &AppState) {
 /// of `server.auto_adopt`. For each managed session:
 ///
 /// * its **owning overlooker is gone** (deleted) → the session is orphaned
-///   infrastructure with no owner, so it is **archived** (tmux killed, worktree
+///   infrastructure with no owner, so it is **archived** (terminal killed, worktree
 ///   removed), not adopted — it would never be surveyed or reused again;
-/// * otherwise, if it is **non-terminal and its tmux is gone** → it is
-///   **re-adopted** (tmux recreated, agent resumed) so the watcher resumes its
+/// * otherwise, if it is **non-terminal and its terminal is gone** → it is
+///   **re-adopted** (terminal recreated, agent resumed) so the watcher resumes its
 ///   across-round memory. Its session id (and the overlooker's
 ///   `warm_session_id` linkage) is stable across the restart — adoption recreates
-///   tmux for the *same* row rather than spawning a new session.
+///   terminal for the *same* row rather than spawning a new session.
 pub async fn reconcile_managed_sessions(state: &AppState) {
     let sessions = match session_mod::list_managed(&state.db).await {
         Ok(s) => s,
@@ -226,12 +226,12 @@ pub async fn reconcile_managed_sessions(state: &AppState) {
             continue;
         }
 
-        // The owner is alive: re-adopt a recoverable warm session whose tmux is
+        // The owner is alive: re-adopt a recoverable warm session whose terminal is
         // gone, so the watcher resumes its across-round memory.
         if session_mod::is_terminal(&session.status) {
             continue;
         }
-        if tmux::has_session(&session.tmux_session).await {
+        if backend::has_session(&session.term_session).await {
             continue;
         }
         match web::adopt(state, &session, &branch).await {

@@ -62,7 +62,7 @@ class StubClient:
 
     def nudge(self, key, text, submit=True, by=None):
         if self.nudge_fails:
-            raise WeaverError("no live tmux")
+            raise WeaverError("no live terminal")
         self.calls.append(("nudge", key, text, by))
 
 
@@ -117,7 +117,7 @@ def test_judge_falls_back_when_agent_is_absent_or_unparseable():
 def test_judge_survives_a_dead_pane():
     class NoPane(StubClient):
         def preview(self, key, lines=0):
-            raise WeaverError("409 no live tmux")
+            raise WeaverError("409 no live terminal")
 
     rnd = make_round(NoPane(agent_reply="ok - all quiet"), params={"prompt": "stuck?"})
     assert status.judge(rnd, session("s")) == ("ok", "all quiet")

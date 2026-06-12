@@ -14,10 +14,10 @@ weaver ships **two binaries** over a **shared sqlite database**:
   issues, set tags, and emit hook events. It **works whether or not `loom` is
   running** — that decoupling is the point of the split.
 - **`loom`** — the **optional orchestrator**: the REST + SSE server, the Vue web
-  UI, the per-branch tmux + agent process (via the `sessions` table), the
-  background monitor, and the `git worktree` / `tmux` shell-outs. Without loom,
-  branches and issues still work; tmux orchestration, the dashboard, and the
-  live screen do not.
+  UI, the per-branch terminal supervisor + agent process (via the `sessions`
+  table), the background monitor, and the `git worktree` shell-outs. Without loom,
+  branches and issues still work; the terminal orchestration, the dashboard, and
+  the live screen do not.
 
 ```
 weaver CLI ──sqlite──┐
@@ -25,7 +25,7 @@ weaver CLI ──sqlite──┐
 loom serve  ─────────┘    │
   │                       │
   ├─ axum REST + SSE      │
-  ├─ tmux + git wrappers  │
+  ├─ terminal + git wrap. │
   ├─ agent launcher       │
   ├─ monitor (consumes    │
   │   `events` rows that  │
@@ -53,16 +53,17 @@ needing the daemon to be reachable.
 | `crates/loom/src/overlooker.rs` | the overlooker engine: cron timer + event dispatcher + the round executor (the script subprocess executor every program runs on) |
 | `crates/loom/src/builtins.rs` | the builtin overlooker program registry; the script programs are real Python files in `crates/loom/overlookers/`, embedded into the binary |
 | `python/weaver-loom/` | the pure-Python layer over the loom REST API (`weaver_loom`: client + overlooker round context); stdlib-only, uv-buildable, vendored onto every script's `PYTHONPATH` by the engine; server-free contract tests in `tests/` (`uv run pytest`, CI's `python-binding` job) |
-| `crates/loom/src/agent.rs` | launching agents into tmux + installing `.claude/settings.local.json` hooks + the one-shot headless agent behind `POST /api/agent/oneshot` |
+| `crates/loom/src/agent.rs` | launching agents into per-session terminals + installing `.claude/settings.local.json` hooks + the one-shot headless agent behind `POST /api/agent/oneshot` |
 | `crates/loom/src/session.rs` | `Session` row + sqlx queries |
-| `crates/loom/src/tmux.rs` | `tmux new-session / capture-pane / kill-session / attach` (exact-match `=name:` targets) |
-| `crates/loom/src/terminal.rs` | WebSocket ⇄ PTY bridge: xterm.js ⇄ `tmux attach` (the live terminal) |
+| `crates/loom/src/backend.rs` | the terminal-management seam: every programmatic terminal op (create/has/capture/send/kill/list) drives the session's `tapestry` supervisor |
+| `crates/tapestry/` | the terminal backend: a per-session detached PTY supervisor (PTY + vt100 screen emulator + unix control socket) that outlives loom and streams raw PTY bytes, so an attached xterm owns its own scrollback/search |
+| `crates/loom/src/terminal.rs` | WebSocket ⇄ live-terminal bridge: xterm.js ⇄ the tapestry session socket |
 | `crates/loom/src/github.rs` | `gh` CLI shell-out: issue seeding, PR opening, and the PR-status poll loop (snapshots each branch's PR; archives on merge) |
 | `crates/loom/src/client.rs` | HTTP client used by the `loom` CLI to talk to its own daemon |
 | `crates/loom/src/bin/loom.rs` | the orchestrator CLI (`serve`, `launch`, `ps`, `attach`, …) |
 | `crates/loom/frontend/` | Vue 3 SPA, rspack, Tailwind. `api.ts` + views in `views/`; the visual rules live in [loom-ui.md](loom-ui.md) |
 | `crates/loom/static/dist/` | Build output (placeholder; real build overwrites) |
-| `crates/loom/tests/` | integration tests: `integration/` (server suites) + `hook_monitor.rs`; need `git` + `tmux` |
+| `crates/loom/tests/` | integration tests: `integration/` (server suites) + `hook_monitor.rs`; need `git` (they spawn `tapestry` supervisors, built by the same `cargo test`) |
 | `e2e/` | Playwright; talks to a real `loom serve`. Separate `package.json` |
 | `crates/loom/build.rs` | Builds the SPA into `static/dist` (npm + rspack); writes a placeholder when Node is unavailable |
 
@@ -76,8 +77,9 @@ There is no skip flag — backend and frontend are separated at the **test** lev
 (`cargo test` for the backend, the Playwright `e2e/` suite for the frontend), not
 the build level.
 
-The integration tests shell out to real `git` and `tmux`. If one hangs, look
-for stray `weaver-test-*` tmux sessions.
+The integration tests shell out to real `git` and spawn `tapestry` terminal
+supervisors (detached PTY processes). The harness kills its supervisors on drop;
+if one hangs, look for stray `tapestry supervise` processes.
 
 ### Agent lint review
 
@@ -110,8 +112,8 @@ commit --no-verify`.
 
 The `e2e/` suite drives the real UI against a real server. It boots **one**
 `loom serve` per Playwright *worker* (not per test) on a random port, each with
-its own `WEAVER_HOME` / sqlite db, a private tmux socket (`WEAVER_TMUX_SOCKET`,
-reaped on teardown), and a throwaway git repo (see `e2e/fixtures/weaver.ts`),
+its own `WEAVER_HOME` / sqlite db (which also scopes the `tapestry` terminal
+sockets) and a throwaway git repo (see `e2e/fixtures/weaver.ts`),
 using the deterministic `shell` agent. The per-test `weaver` fixture wipes every
 session (branch + worktree) between tests, so each starts from a clean slate and
 count-based assertions hold regardless of order. Workers are fully isolated, so
@@ -184,10 +186,10 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `GET /api/sessions/{id}/artifacts` | list the branch's [artifacts](artifacts.md) plus repo-shared ones |
 | `GET PUT /api/sessions/{id}/artifacts/{name}` | read content + projected refs (`rev=N` for a revision) / write a user edit as a new revision |
 | `GET /api/sessions/{id}/{diff,log,events}` | reads + SSE stream |
-| `GET /api/sessions/{id}/terminal` | WebSocket: xterm.js ⇄ PTY ⇄ tmux (the interaction surface) |
-| `POST /api/sessions/{id}/send` | type `{text}` into the agent's tmux pane; `submit` (default true) follows it with Enter to trigger a round |
-| `POST /api/sessions/{id}/interrupt` | send a break (Escape) to the pane — stop the current turn |
-| `GET /api/sessions/{id}/preview?lines=N` | capture the pane as `{screen}`; `lines` adds scrollback above the visible screen |
+| `GET /api/sessions/{id}/terminal` | WebSocket: xterm.js ⇄ the session's tapestry PTY (the interaction surface) |
+| `POST /api/sessions/{id}/send` | type `{text}` into the agent's terminal; `submit` (default true) follows it with Enter to trigger a round |
+| `POST /api/sessions/{id}/interrupt` | send a break (Escape) to the terminal — stop the current turn |
+| `GET /api/sessions/{id}/preview?lines=N` | capture the screen as `{screen}`; `lines` adds scrollback above the visible screen |
 | `GET /api/branches` / `GET PATCH /api/branches/{id}` | list / inspect / edit tracked branches |
 | `GET POST /api/branches/{id}/issues` | issues claimed by the branch / create one |
 | `GET /api/issues?all=…` | the cross-repo issue board (every repo's issues; `all=true` includes closed) — what the loom Issues pane reads |
@@ -208,7 +210,7 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `POST /api/overlookers/{id}/run` / `GET /api/overlookers/{id}/runs` | fire a round now (`{dry_run}` stubs mutations) / the round-history audit |
 
 `SessionView` (`/api/sessions[/...]`) returns session-specific fields
-top-level (`id`, `status`, `work_dir`, `tmux_session`, `agent_kind`, `model`,
+top-level (`id`, `status`, `work_dir`, `term_session`, `agent_kind`, `model`,
 `effort`, `pending_prompt`, `github_repo`, `last_activity_at`,
 `created_at`, `updated_at`, `parent_id`, and — on the create response only —
 `tracking_issue`) plus a nested `branch: BranchView`
@@ -262,11 +264,11 @@ rather than the launching checkout's current branch. A remote-less repo (no
 `origin`) degrades to the local current branch. The caller — the CLI's `--base`
 or the create form's base field — can pin any ref instead.
 
-**Driving the pane.** `send` / `interrupt` / `preview` are one-shot HTTP
-primitives over `tmux send-keys` and `capture-pane` (see `tmux::send_literal`,
+**Driving the terminal.** `send` / `interrupt` / `preview` are one-shot HTTP
+primitives over the supervisor's control socket (see `backend::send_literal`,
 `send_key`, `capture`), distinct from the interactive terminal WebSocket: they
 let an agent or script type into, interrupt, or read back a child session
-uniformly. Each requires a live tmux (else 409). The CLI's `loom session
+uniformly. Each requires a live terminal (else 409). The CLI's `loom session
 {send,break,preview}` wrap them.
 
 ## Runtime conventions
@@ -278,16 +280,17 @@ uniformly. Each requires a live tmux (else 409). The CLI's `loom session
   `details` map of per-field reasons); the `loom` CLI uses `anyhow` and prints
   `error: {e:#}`.
 - **Async:** tokio everywhere on the server side. Long-running subprocesses
-  (tmux, git, gh, the agent) go through `tokio::process::Command`. The
+  (the terminal supervisor, git, gh, the agent) go through
+  `tokio::process::Command`. The
   `weaver` CLI is synchronous-feeling (just a few `sqlx` calls per command).
 - **Events:** state changes flow through `EventBus`; the SSE handler in
   `web.rs` fans them out. `weaver hook` writes directly to the `events`
   table, and loom's monitor tick promotes the new row into a session status
   change and a fresh `EventBus` notification.
 - **No tracking-branch state in the server:** loom can be killed and restarted
-  at any time. tmux sessions and worktrees survive; "orphaned" is a
-  first-class status, recovered via `loom adopt` (or the Adopt button in the
-  UI).
+  at any time. Terminal supervisors and worktrees survive (the supervisor is a
+  detached process, independent of `loom serve`); "orphaned" is a first-class
+  status, recovered via `loom adopt` (or the Adopt button in the UI).
 
 ## Status & tags
 
@@ -327,8 +330,8 @@ orchestrator tracks — it does not infer working/waiting/idle from stillness.
 
 The hooks also nudge the **`attention` tag** where they carry a genuine signal:
 `working` clears it (back to calm) and drops any pending prompt (the user is
-engaged); `waiting` raises it to `attention` and snapshots the tmux pane into
-`pending_prompt` (Claude is blocked asking the user — the snapshot conveys what
+engaged); `waiting` raises it to `attention` and snapshots the terminal screen
+into `pending_prompt` (Claude is blocked asking the user — the snapshot conveys what
 it's waiting on, so no separate note is stored); `idle` (a turn ending) leaves
 the tag untouched, so a finished-but-fine agent isn't mistaken for one that
 needs you.
@@ -349,8 +352,8 @@ snapshotted `pending_prompt`): the agent is gone, so a torn-down workstream
 can't still "need me", and the dashboard stops flagging it. The UI also treats
 any `archived` session as calm regardless of a stale tag left on the branch.
 
-Orphan detection is independent: if `tmux has-session` says no, the session
-becomes `orphaned` and is eligible for `loom adopt`.
+Orphan detection is independent: if the session's supervisor is no longer alive,
+the session becomes `orphaned` and is eligible for `loom adopt`.
 
 ## GitHub integration
 
@@ -374,7 +377,7 @@ than a failure.
 **Archive on merge.** When a poll finds a branch's PR has merged and
 `github.archive_on_merge` is on (the default), loom archives the session
 automatically — the same teardown as the Archive button (`web::archive`, shared
-code): tmux killed, worktree removed, branch and weaver history kept. The
+code): the terminal killed, worktree removed, branch and weaver history kept. The
 worktree is removed with `--force`, so any uncommitted work in it is discarded;
 a merged PR is taken to mean the workstream is done. Turn the behaviour off with
 `weaver config set github.archive_on_merge false` (or in the settings pane).
@@ -436,7 +439,7 @@ button is hidden and `GET /api/auth/me` reports `methods.github = false`.
 **The machine-local token.** On startup loom mints (and persists, 0600, at
 `$WEAVER_HOME/loom-token`) a `kind = 'local'` `api_tokens` row owned by the
 primary user, and injects it as `LOOM_TOKEN` into the environments of its own
-same-host subprocesses (the agent's tmux, overlooker scripts) — and the `loom`
+same-host subprocesses (the agent's terminal, overlooker scripts) — and the `loom`
 CLI reads it. This makes `auth.trust_loopback = false` a fully working mode:
 behind a **same-host reverse proxy** (where forwarded requests look like
 loopback and so trust must be off) local automation still authenticates via this
@@ -512,6 +515,7 @@ builtins are stdlib-only and need neither).
 | `LOOM_TOKEN` | bearer token the `loom` CLI / automation sends; falls back to the machine-local token file on the same host | — |
 | `LOOM_OWNER_GITHUB` | GitHub login seeded as the owner on a fresh database | `rjpower` |
 | `LOOM_GITHUB_CLIENT_ID` / `LOOM_GITHUB_CLIENT_SECRET` | GitHub OAuth app credentials (override the settings-stored values) | — |
-| `WEAVER_TMUX_SOCKET` | pin tmux to a dedicated server (`tmux -L <name>`) so ops can't touch real sessions; set by the test harnesses | unset → default socket |
+| `WEAVER_TAPESTRY_DIR` | directory holding tapestry's per-session control sockets | `$WEAVER_HOME/sock` |
+| `WEAVER_TAPESTRY_BIN` | the `tapestry` supervisor binary loom re-execs (else a sibling of `loom`); set by the tests | sibling of `loom` |
 | `WEAVER_OVERLOOKER_AGENT_CMD` | the one-shot headless agent command behind `POST /api/agent/oneshot` (judgement calls) | `claude -p` |
 | `RUST_LOG` / `EnvFilter` | tracing filter | `loom=info,weaver_core=info,tower_http=warn` |

@@ -523,7 +523,7 @@ pub fn local_token_path() -> PathBuf {
 /// Ensure the machine-local bearer token exists and return its plaintext.
 ///
 /// loom injects this into the environments of its own same-host subprocesses
-/// (the agent's tmux, overlooker scripts) and the `loom` CLI reads it, so local
+/// (the agent's terminal, overlooker scripts) and the `loom` CLI reads it, so local
 /// automation authenticates even when `auth.trust_loopback` is off. The
 /// plaintext is persisted (0600) under `$WEAVER_HOME` and reused across
 /// restarts; if the database is reset but the file survives, the same plaintext
