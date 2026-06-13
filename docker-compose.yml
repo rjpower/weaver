@@ -28,8 +28,10 @@ services:
       # The repos + the worktrees loom creates, shared with the host at the SAME
       # path. HOST_CODE is your repo dir (e.g. /home/you/code); set it in the env.
       - ${HOST_CODE:?set HOST_CODE (host repo dir) in secrets/weaver.env}:${HOST_CODE}
-      # Repos with git@github.com SSH remotes need your key — uncomment & set the
-      # host path (target is the container user's home):
+      # GitHub SSH remotes (git@github.com:) work without a key — the image
+      # rewrites them to HTTPS over the GH_TOKEN helper. Mount your key only for
+      # non-GitHub SSH remotes — uncomment & set the host path (target is the
+      # container user's home):
       # - /home/you/.ssh:/home/app/.ssh:ro
     networks:
       - web
