@@ -37,7 +37,10 @@ RUN if ! getent group "${HOST_GID}" >/dev/null; then groupadd -g "${HOST_GID}" a
     useradd -m -u "${HOST_UID}" -g "${HOST_GID}" -d /home/app -s /bin/bash app
 
 # Let agents `git push` over HTTPS with the injected GH_TOKEN — no mounted SSH
-# key. (Repos with git@github.com SSH remotes need ~/.ssh mounted; see compose.)
+# key. The bind-mounted host repos usually have `git@github.com:` SSH remotes, so
+# also rewrite GitHub SSH URLs to HTTPS: with no key in the container an SSH push
+# fails with "Permission denied (publickey)", but rewritten it rides the token
+# helper below. (Non-GitHub SSH remotes still need ~/.ssh mounted; see compose.)
 RUN <<'EOF'
 cat > /usr/local/bin/git-credential-ghtoken <<'SH'
 #!/bin/sh
@@ -48,6 +51,8 @@ printf 'username=x-access-token\npassword=%s\n' "$GH_TOKEN"
 SH
 chmod +x /usr/local/bin/git-credential-ghtoken
 git config --system credential.https://github.com.helper ghtoken
+git config --system url.https://github.com/.insteadOf git@github.com:
+git config --system url.https://github.com/.insteadOf ssh://git@github.com/
 EOF
 
 # loom resolves the tapestry PTY supervisor as a sibling of its own binary
