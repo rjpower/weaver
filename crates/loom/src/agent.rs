@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::backend;
 use weaver_core::agent::hooks_json;
@@ -127,6 +127,14 @@ pub async fn launch(spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<()> {
 
     if spec.agent_kind == "claude" {
         install_hooks(spec.work_dir, &weaver_bin).await.ok();
+        // A fresh container HOME hasn't cleared Claude Code's first-run gates
+        // (theme picker, workspace trust, API-key + bypass-mode prompts), so an
+        // unattended `claude` would stall — or quit — before reading the goal.
+        // Pre-seed that state so it runs. Pass the resolved args so the
+        // bypass-mode gate is only seeded when we actually launch in that mode.
+        seed_claude_launch_gates(spec.work_dir, spec.claude_args)
+            .await
+            .ok();
     }
 
     let api_url = format!("http://{}", spec.server_addr);
@@ -192,6 +200,127 @@ pub async fn install_hooks(work_dir: &Path, weaver_bin: &str) -> Result<()> {
     root["hooks"] = hooks["hooks"].clone();
     tokio::fs::write(&path, serde_json::to_string_pretty(&root)?).await?;
     tracing::debug!(path = %path.display(), "claude hooks installed");
+    Ok(())
+}
+
+/// Pre-clear Claude Code's first-run interactive gates in the agent user's
+/// global `~/.claude.json` so a detached, unattended `claude` runs its task
+/// instead of stalling — or *quitting* — at a prompt no human can answer.
+///
+/// On a fresh, persisted container HOME these gates fire in sequence and each
+/// wedges the session (it sits at "launching" with no `weaver status`, worktree
+/// idle). Each gate is just state Claude records after a human answers once; we
+/// write the same state ahead of time. Everything here is additive and
+/// idempotent — only missing/false gates are set, existing config is preserved —
+/// so it is safe to re-run before every launch. Gates handled:
+///
+/// * `hasCompletedOnboarding` + `theme` — the first-run theme picker.
+/// * `projects.<repo-root>.hasTrustDialogAccepted` — the workspace-trust dialog.
+///   Claude resolves a git worktree back to its **main repo root** and records
+///   trust there, so trusting the root once covers every worktree under it.
+/// * `customApiKeyResponses.approved` — the "use this `ANTHROPIC_API_KEY`?"
+///   prompt, keyed by the key's last 20 chars; seeded only when that env var is
+///   set (i.e. the agent authenticates by API key).
+/// * `bypassPermissionsModeAccepted` — the one-time "you're in Bypass
+///   Permissions mode" confirmation, **which defaults to *exit***. Seeded only
+///   when this launch actually runs with a bypass flag, since the dialog only
+///   appears then.
+pub async fn seed_claude_launch_gates(work_dir: &Path, claude_args: &str) -> Result<()> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        tracing::debug!("HOME unset; skipping claude launch-gate seed");
+        return Ok(());
+    };
+    let path = home.join(".claude.json");
+    let mut root: Value = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| json!({})),
+        Err(_) => json!({}),
+    };
+    if !root.is_object() {
+        root = json!({});
+    }
+    let obj = root.as_object_mut().expect("root is an object");
+    let mut changed = false;
+
+    // 1. Onboarding / theme picker.
+    if obj.get("hasCompletedOnboarding").and_then(Value::as_bool) != Some(true) {
+        obj.insert("hasCompletedOnboarding".into(), json!(true));
+        changed = true;
+    }
+    if !obj.contains_key("theme") {
+        obj.insert("theme".into(), json!("dark"));
+        changed = true;
+    }
+
+    // 2. Bypass-permissions acceptance — only when we launch in that mode.
+    let bypass = claude_args.contains("--dangerously-skip-permissions")
+        || claude_args.contains("bypassPermissions");
+    if bypass && obj.get("bypassPermissionsModeAccepted").and_then(Value::as_bool) != Some(true) {
+        obj.insert("bypassPermissionsModeAccepted".into(), json!(true));
+        changed = true;
+    }
+
+    // 3. Ambient ANTHROPIC_API_KEY approval (keyed by the key's last 20 chars).
+    if let Some(key) = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| k.len() >= 20) {
+        let tail = key[key.len() - 20..].to_string();
+        let entry = obj
+            .entry("customApiKeyResponses")
+            .or_insert_with(|| json!({"approved": [], "rejected": []}));
+        if !entry.is_object() {
+            *entry = json!({"approved": [], "rejected": []});
+        }
+        let entry = entry.as_object_mut().unwrap();
+        if !entry.get("approved").map(Value::is_array).unwrap_or(false) {
+            entry.insert("approved".into(), json!([]));
+        }
+        let approved = entry.get_mut("approved").unwrap().as_array_mut().unwrap();
+        if !approved.iter().any(|v| v.as_str() == Some(tail.as_str())) {
+            approved.push(json!(tail));
+            changed = true;
+        }
+        if !entry.contains_key("rejected") {
+            entry.insert("rejected".into(), json!([]));
+        }
+    }
+
+    // 4. Workspace trust, recorded at the worktree's main repo root.
+    match weaver_core::git::repo_root(work_dir).await {
+        Ok(repo_root) => {
+            let key = repo_root.to_string_lossy().to_string();
+            let projects = obj.entry("projects").or_insert_with(|| json!({}));
+            if !projects.is_object() {
+                *projects = json!({});
+            }
+            let proj = projects
+                .as_object_mut()
+                .unwrap()
+                .entry(key)
+                .or_insert_with(|| json!({}));
+            if !proj.is_object() {
+                *proj = json!({});
+            }
+            let proj = proj.as_object_mut().unwrap();
+            if proj.get("hasTrustDialogAccepted").and_then(Value::as_bool) != Some(true) {
+                proj.insert("hasTrustDialogAccepted".into(), json!(true));
+                changed = true;
+            }
+        }
+        Err(e) => tracing::debug!(work_dir = %work_dir.display(), error = %e,
+            "could not resolve repo root for trust seed"),
+    }
+
+    if !changed {
+        return Ok(());
+    }
+    tokio::fs::write(&path, serde_json::to_string_pretty(&root)?)
+        .await
+        .with_context(|| format!("seeding {}", path.display()))?;
+    // claude writes this file 0600; preserve that posture.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await;
+    }
+    tracing::info!(path = %path.display(), bypass, "seeded claude launch gates");
     Ok(())
 }
 
