@@ -21,6 +21,7 @@
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
+use axum::http::header::{HOST, ORIGIN};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
@@ -47,6 +48,19 @@ pub async fn terminal_ws(
     // CSWSH defence: CORS does NOT apply to WebSockets, so a localhost bind is
     // not protection — validate the Origin before upgrading. See `origin_ok`.
     if !origin_ok(&headers, &st.addr) {
+        // This rejection used to be silent — invisible behind a reverse proxy,
+        // where it surfaces only as the browser's endless "reconnecting". Log it
+        // with the Origin/Host so a proxy misconfig is one `docker logs` away.
+        let origin = header_str(&headers, ORIGIN);
+        let host = header_str(&headers, HOST);
+        tracing::warn!(
+            session = %key,
+            origin = %origin,
+            host = %host,
+            bound = %st.addr,
+            "terminal websocket rejected: Origin is neither loopback on the bound \
+             port nor the request Host"
+        );
         return (StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response();
     }
     let session = match require_session(&st.db, &key).await {
@@ -62,11 +76,14 @@ pub async fn terminal_ws(
             .into_response();
     }
     let target = session.term_session.clone();
+    tracing::info!(session = %key, target = %target, "terminal websocket attached");
     ws.max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
         .on_upgrade(move |socket| async move {
-            if let Err(e) = bridge(socket, target).await {
-                tracing::debug!(error = %e, "terminal bridge ended with error");
+            if let Err(e) = bridge(socket, target.clone()).await {
+                tracing::debug!(target = %target, error = %e, "terminal bridge ended with error");
+            } else {
+                tracing::debug!(target = %target, "terminal bridge detached cleanly");
             }
         })
 }
@@ -144,19 +161,85 @@ async fn bridge(socket: WebSocket, target: String) -> anyhow::Result<()> {
 /// weaken the browser-CSWSH defence (it only waives same-host non-browser
 /// processes, acceptable under the single-user-localhost assumption).
 ///
-/// A *present* Origin must be a loopback host on our actual bound port. We
-/// deliberately do NOT compare against the request `Host` header: Host is
-/// client-supplied and a DNS-rebinding attacker can make `Origin == Host` even
-/// on the default `127.0.0.1` bind. Pinning to the loopback set + the real bound
-/// port closes that vector.
+/// A *present* Origin is accepted when either:
+///
+/// 1. it is a loopback host on our actual bound port — direct localhost access
+///    (`loom open`, an SSH tunnel), the original single-user posture; or
+/// 2. its host+port equals the request's own `Host` header — i.e. the browser
+///    is talking to the same public origin the front-door proxy serves us under
+///    (`weaver.example.com`). Behind Caddy the loopback rule can never match
+///    (the browser's Origin is the public HTTPS host), so without this the
+///    in-browser terminal is wedged on an endless "reconnecting".
+///
+/// Trusting `Host` reopens the DNS-rebinding vector the loopback pin closed: a
+/// rebinding attacker can force `Origin == Host`. We accept that here because
+/// this build is deployed behind a reverse proxy that publishes no host port —
+/// loom is reachable only through the front door, never directly — so the proxy
+/// is the sole arbiter of `Host`. Do NOT rely on this check alone when loom is
+/// bound to a publicly reachable port.
 fn origin_ok(headers: &HeaderMap, bound_addr: &str) -> bool {
-    match headers.get(axum::http::header::ORIGIN) {
-        None => true,
+    let origin = match headers.get(ORIGIN) {
+        // Non-browser clients (the CLI, tests, tokio-tungstenite) omit Origin.
+        None => return true,
         Some(v) => match v.to_str() {
-            Ok(origin) => origin_is_loopback(origin, bound_addr),
-            Err(_) => false,
+            Ok(o) => o,
+            Err(_) => return false,
         },
+    };
+    if origin_is_loopback(origin, bound_addr) {
+        return true;
     }
+    match headers.get(HOST).and_then(|v| v.to_str().ok()) {
+        Some(host) => origin_matches_host(origin, host),
+        None => false,
+    }
+}
+
+/// Read a header as a `&str`, or `"<none>"` when absent/non-ASCII. For logging.
+fn header_str<'a>(headers: &'a HeaderMap, name: axum::http::HeaderName) -> &'a str {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<none>")
+}
+
+/// Split an authority (`host`, `host:port`, `[::1]`, or `[::1]:port`) into its
+/// host and optional port. Shared by the loopback and proxied-Host checks so
+/// both parse IPv6 literals identically.
+fn split_authority(authority: &str) -> (&str, Option<&str>) {
+    if let Some(after) = authority.strip_prefix('[') {
+        // IPv6 literal: [::1] or [::1]:port
+        match after.split_once(']') {
+            Some((h, tail)) => (h, tail.strip_prefix(':')),
+            None => (authority, None),
+        }
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        (h, Some(p))
+    } else {
+        (authority, None)
+    }
+}
+
+/// True iff `origin` (`http(s)://host[:port]`) names the same host+port as the
+/// request's `Host` header. The browser sends the page's own origin on a WS
+/// handshake, so behind a proxy serving `https://h/` the Origin is `https://h`
+/// and the Host is `h` — they agree once default ports (443/80) are filled in.
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let (scheme, rest) = if let Some(r) = origin.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = origin.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return false;
+    };
+    let origin_authority = rest.split('/').next().unwrap_or(rest);
+    let (o_host, o_port) = split_authority(origin_authority);
+    let (h_host, h_port) = split_authority(host);
+    if o_host.is_empty() || o_host != h_host {
+        return false;
+    }
+    let default = if scheme == "https" { "443" } else { "80" };
+    o_port.unwrap_or(default) == h_port.unwrap_or(default)
 }
 
 /// True iff `origin` is `http(s)://<loopback>[:<port>]` whose port equals the
@@ -174,17 +257,7 @@ fn origin_is_loopback(origin: &str, bound_addr: &str) -> bool {
     };
     // Origin carries no path, but be defensive about a trailing slash.
     let authority = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = if let Some(after) = authority.strip_prefix('[') {
-        // IPv6 literal: [::1] or [::1]:port
-        match after.split_once(']') {
-            Some((h, tail)) => (h, tail.strip_prefix(':')),
-            None => return false,
-        }
-    } else if let Some((h, p)) = authority.rsplit_once(':') {
-        (h, Some(p))
-    } else {
-        (authority, None)
-    };
+    let (host, port) = split_authority(authority);
     let port = port.unwrap_or(if scheme == "https" { "443" } else { "80" });
     if port != want_port {
         return false;
@@ -194,7 +267,7 @@ fn origin_is_loopback(origin: &str, bound_addr: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::origin_is_loopback;
+    use super::{origin_is_loopback, origin_matches_host};
 
     #[test]
     fn accepts_loopback_origins_on_the_bound_port() {
@@ -243,5 +316,40 @@ mod tests {
         ));
         assert!(!origin_is_loopback("null", "127.0.0.1:7878"));
         assert!(!origin_is_loopback("", "127.0.0.1:7878"));
+    }
+
+    #[test]
+    fn accepts_origin_matching_proxied_host() {
+        // Behind Caddy: browser at https://weaver.rjp.io, proxy forwards
+        // Host: weaver.rjp.io. Default https port (443) fills in on both sides.
+        assert!(origin_matches_host(
+            "https://weaver.rjp.io",
+            "weaver.rjp.io"
+        ));
+        assert!(origin_matches_host("https://loom.rjp.io", "loom.rjp.io"));
+        // Explicit matching ports also agree.
+        assert!(origin_matches_host(
+            "https://h.example:8443",
+            "h.example:8443"
+        ));
+        // Plain http with the default port elided on the Origin side.
+        assert!(origin_matches_host("http://box.local", "box.local:80"));
+    }
+
+    #[test]
+    fn rejects_origin_not_matching_host() {
+        // A different host (the cross-site attacker case) never matches.
+        assert!(!origin_matches_host(
+            "https://attacker.example",
+            "weaver.rjp.io"
+        ));
+        // Same host, mismatched explicit port.
+        assert!(!origin_matches_host(
+            "https://weaver.rjp.io:1234",
+            "weaver.rjp.io"
+        ));
+        // Non-http scheme and garbage.
+        assert!(!origin_matches_host("ftp://weaver.rjp.io", "weaver.rjp.io"));
+        assert!(!origin_matches_host("null", "weaver.rjp.io"));
     }
 }
