@@ -94,6 +94,18 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     expires_at   TEXT
 );
 
+-- Operator-managed environment variables exported into every interactive agent
+-- session loom launches (alongside loom's own WEAVER_* / LOOM_TOKEN). A plain
+-- name/value store edited at runtime from the settings pane, so secrets and
+-- tool config (e.g. a registry token, GH_HOST) can be added without rebuilding
+-- the image or editing the deploy env file. NOT applied to the env-stripped
+-- one-shot judgement agent.
+CREATE TABLE IF NOT EXISTS agent_env (
+    name       TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 -- Browser login sessions: the opaque cookie a successful GitHub/password login
 -- sets. Stored hashed like a token; named `auth_sessions` to stay clear of the
 -- agent `sessions` table above. A row is dropped on logout or once `expires_at`

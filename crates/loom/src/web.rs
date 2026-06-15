@@ -93,7 +93,9 @@ use crate::auth::{self, Principal};
 use crate::db::Db;
 use crate::events::{Event, EventBus};
 use crate::session::{self as session_mod, NewSession, Session};
-use crate::{agent, backend, config, db, events, git, github, overlooker as ov_engine, repo};
+use crate::{
+    agent, agent_env, backend, config, db, events, git, github, overlooker as ov_engine, repo,
+};
 use weaver_api::{
     AddUserReq, AgentOneshotReq, ArtifactMeta, ArtifactRefs, ArtifactView, ArtifactWriteBody,
     AuthMethods, BranchView, CreateIssueReq, CreateOverlookerReq, CreateRepoIssueReq, CreateReq,
@@ -428,6 +430,12 @@ pub fn router(state: AppState) -> Router {
             get(list_repo_issues).post(create_repo_issue),
         )
         .route("/settings", get(get_settings).patch(patch_settings))
+        // Operator-managed agent environment variables.
+        .route("/env", get(get_env))
+        .route(
+            "/env/{name}",
+            axum::routing::put(put_env).delete(delete_env),
+        )
         // Overlookers — periodic / triggered watch programs over the fleet.
         .route(
             "/overlookers",
@@ -798,6 +806,7 @@ async fn create_session(
     let term_session = format!("weaver-{session_id}");
     let base_args = config::get_or(&st.db, "agent.claude_args", "").await;
     let claude_args = agent::combine_args(&base_args, &model, &effort);
+    let extra_env = agent_env::pairs(&st.db).await.unwrap_or_default();
     agent::launch(
         &agent::LaunchSpec {
             branch_id: &branch.id,
@@ -807,6 +816,7 @@ async fn create_session(
             goal_file: goal_file.as_deref(),
             server_addr: &st.addr,
             claude_args: &claude_args,
+            extra_env: &extra_env,
         },
         agent::LaunchMode::Fresh,
     )
@@ -1290,6 +1300,7 @@ pub async fn create_warm_session(
     let term_session = format!("weaver-{session_id}");
     let base_args = config::get_or(&st.db, "agent.claude_args", "").await;
     let claude_args = agent::combine_args(&base_args, &overlooker.model, &overlooker.effort);
+    let extra_env = agent_env::pairs(&st.db).await.unwrap_or_default();
     agent::launch(
         &agent::LaunchSpec {
             branch_id: &branch.id,
@@ -1299,6 +1310,7 @@ pub async fn create_warm_session(
             goal_file: goal_file.as_deref(),
             server_addr: &st.addr,
             claude_args: &claude_args,
+            extra_env: &extra_env,
         },
         agent::LaunchMode::Fresh,
     )
@@ -1361,6 +1373,7 @@ pub async fn adopt(st: &AppState, session: &Session, branch: &Branch) -> Result<
     };
     let base_args = config::get_or(&st.db, "agent.claude_args", "").await;
     let claude_args = agent::combine_args(&base_args, &session.model, &session.effort);
+    let extra_env = agent_env::pairs(&st.db).await.unwrap_or_default();
     agent::launch(
         &agent::LaunchSpec {
             branch_id: &branch.id,
@@ -1370,6 +1383,7 @@ pub async fn adopt(st: &AppState, session: &Session, branch: &Branch) -> Result<
             goal_file: goal_file.as_deref(),
             server_addr: &st.addr,
             claude_args: &claude_args,
+            extra_env: &extra_env,
         },
         agent::LaunchMode::Adopt,
     )
@@ -2542,6 +2556,48 @@ async fn patch_settings(
     }
     config::apply(&st.db, &changes).await?;
     settings_envelope(&st.db).await
+}
+
+// ---------------------------------------------------------------------------
+// Agent environment variables
+// ---------------------------------------------------------------------------
+
+async fn env_envelope(db: &Db) -> ApiResult<Json<Value>> {
+    Ok(Json(json!({ "env": agent_env::list(db).await? })))
+}
+
+async fn get_env(State(st): State<AppState>) -> ApiResult<Json<Value>> {
+    env_envelope(&st.db).await
+}
+
+#[derive(serde::Deserialize)]
+struct PutEnvBody {
+    value: String,
+}
+
+/// Upsert one variable. The name comes from the path; the body carries the
+/// value. The name is validated as a shell identifier so it can't corrupt the
+/// launch script that exports it; the value is free-form.
+async fn put_env(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<PutEnvBody>,
+) -> ApiResult<Json<Value>> {
+    if let Err(why) = agent_env::validate_name(&name) {
+        return Err(AppError::bad_request(why));
+    }
+    agent_env::set(&st.db, &name, &body.value).await?;
+    env_envelope(&st.db).await
+}
+
+/// Delete one variable. Returns the refreshed list; a missing name is not an
+/// error (the desired end state — absent — already holds).
+async fn delete_env(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<Value>> {
+    agent_env::remove(&st.db, &name).await?;
+    env_envelope(&st.db).await
 }
 
 // ===========================================================================

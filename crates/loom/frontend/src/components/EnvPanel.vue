@@ -1,0 +1,164 @@
+<script setup lang="ts">
+import { ref, computed, onMounted } from 'vue';
+import * as api from '../api';
+import type { EnvVar } from '../types';
+
+// Operator-managed environment variables, exported into every agent session
+// loom launches (on top of loom's own WEAVER_*/LOOM_TOKEN). A flat name/value
+// store edited at runtime — registry tokens, GH_HOST, ANTHROPIC_BASE_URL, etc.
+const vars = ref<EnvVar[]>([]);
+// Per-name editable draft so an in-progress value edit survives a reload.
+const drafts = ref<Record<string, string>>({});
+const error = ref('');
+const notice = ref('');
+const busy = ref('');
+
+const newName = ref('');
+const newValue = ref('');
+
+// A POSIX shell identifier — what the server enforces, mirrored here so the Add
+// button can disable on an obviously bad name before the round-trip.
+const nameOk = (n: string) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n);
+const newNameValid = computed(() => nameOk(newName.value.trim()));
+
+function sync(list: EnvVar[]) {
+  vars.value = list;
+  drafts.value = Object.fromEntries(list.map((v) => [v.name, v.value]));
+}
+
+async function load() {
+  try {
+    sync(await api.listEnv());
+    error.value = '';
+  } catch (e) {
+    error.value = (e as Error).message;
+  }
+}
+
+function dirty(v: EnvVar): boolean {
+  return drafts.value[v.name] !== v.value;
+}
+
+async function act(key: string, fn: () => Promise<void>) {
+  busy.value = key;
+  error.value = '';
+  notice.value = '';
+  try {
+    await fn();
+  } catch (e) {
+    error.value = (e as Error).message;
+  } finally {
+    busy.value = '';
+  }
+}
+
+const save = (v: EnvVar) =>
+  act(v.name, async () => {
+    sync(await api.setEnv(v.name, drafts.value[v.name] ?? ''));
+    notice.value = `Saved ${v.name}.`;
+  });
+
+const remove = (v: EnvVar) =>
+  act(v.name, async () => {
+    if (!confirm(`Delete ${v.name}? New agent sessions will no longer see it.`)) return;
+    sync(await api.deleteEnv(v.name));
+    notice.value = `Deleted ${v.name}.`;
+  });
+
+const add = () =>
+  act('+add', async () => {
+    const name = newName.value.trim();
+    if (!name || !newNameValid.value) return;
+    sync(await api.setEnv(name, newValue.value));
+    notice.value = `Added ${name}.`;
+    newName.value = '';
+    newValue.value = '';
+  });
+</script>
+
+<template>
+  <div>
+    <h2 class="text-2xs font-semibold uppercase tracking-wider text-muted mb-1.5">
+      Agent environment
+    </h2>
+    <p class="text-xs text-faint mb-3">
+      Variables exported into every interactive agent session loom launches (on top of
+      <code>WEAVER_API</code>/<code>LOOM_TOKEN</code>). Add tool config or secrets — a registry
+      token, <code>GH_HOST</code>, <code>ANTHROPIC_BASE_URL</code> — without rebuilding the image.
+      Changes apply to sessions launched after the save, not running ones. The one-shot judgement
+      agent runs env-stripped and is unaffected.
+    </p>
+
+    <p v-if="error" class="mb-3 text-sm text-block">{{ error }}</p>
+    <p v-if="notice" class="mb-3 text-sm text-accent">{{ notice }}</p>
+
+    <!-- Add form. -->
+    <div class="mb-4 flex flex-wrap items-end gap-2">
+      <label class="flex flex-col gap-1">
+        <span class="text-2xs text-muted">Name</span>
+        <input
+          v-model="newName"
+          placeholder="e.g. GH_HOST"
+          data-testid="env-name"
+          class="rounded bg-input px-2 py-1 font-mono text-sm outline-none focus:ring-1 ring-accent"
+          @keyup.enter="add"
+        />
+      </label>
+      <label class="flex flex-1 flex-col gap-1">
+        <span class="text-2xs text-muted">Value</span>
+        <input
+          v-model="newValue"
+          placeholder="(value)"
+          data-testid="env-value"
+          class="rounded bg-input px-2 py-1 font-mono text-sm outline-none focus:ring-1 ring-accent"
+          @keyup.enter="add"
+        />
+      </label>
+      <button
+        class="btn-primary px-3 py-1.5 text-xs"
+        :disabled="busy === '+add' || !newNameValid"
+        data-testid="env-add"
+        @click="add"
+      >
+        Add
+      </button>
+    </div>
+    <p v-if="newName.trim() && !newNameValid" class="-mt-2 mb-3 text-2xs text-block">
+      A name must start with a letter or underscore and contain only letters, digits, and
+      underscores.
+    </p>
+
+    <!-- Existing variables. -->
+    <div v-if="vars.length" class="overflow-hidden rounded-md border border-line bg-surface">
+      <div
+        v-for="v in vars"
+        :key="v.name"
+        class="flex items-center gap-2 border-b border-line px-3 py-2.5 last:border-0"
+        data-testid="env-row"
+      >
+        <code class="w-44 shrink-0 truncate font-mono text-sm" :title="v.name">{{ v.name }}</code>
+        <input
+          v-model="drafts[v.name]"
+          class="flex-1 rounded bg-input px-2 py-1 font-mono text-sm outline-none focus:ring-1 ring-accent"
+          @keyup.enter="save(v)"
+        />
+        <button
+          class="btn-primary px-2.5 py-1 text-xs"
+          :disabled="busy === v.name || !dirty(v)"
+          @click="save(v)"
+        >
+          Save
+        </button>
+        <button
+          class="btn-secondary px-2.5 py-1 text-xs"
+          :disabled="busy === v.name"
+          data-testid="env-delete"
+          @click="remove(v)"
+        >
+          Delete
+        </button>
+      </div>
+    </div>
+    <p v-else class="text-sm text-muted">No variables yet.</p>
+  </div>
+</template>

@@ -12,6 +12,7 @@ mod fixtures;
 mod archive;
 mod auth;
 mod branches;
+mod env;
 mod files;
 mod overlookers;
 mod pane;

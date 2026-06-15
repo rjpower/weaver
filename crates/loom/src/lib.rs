@@ -6,6 +6,7 @@
 //! loom is purely additive.
 
 pub mod agent;
+pub mod agent_env;
 pub mod auth;
 pub mod backend;
 pub mod builtins;

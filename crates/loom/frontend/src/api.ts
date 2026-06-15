@@ -118,6 +118,25 @@ export const putArtifact = (id: string, name: string, body: ArtifactWriteBody) =
 export const writeFile = (id: string, path: string, content: string) =>
   rawBody('PUT', `/sessions/${id}/file?path=${encodeURIComponent(path)}`, content);
 
+// --- Agent environment variables -------------------------------------------
+
+import type { EnvVar } from './types';
+
+interface EnvEnvelope {
+  env: EnvVar[];
+}
+
+/** The operator-managed env vars exported into every agent session. */
+export const listEnv = () => get('/env').then((r) => (r as EnvEnvelope).env);
+
+/** Upsert a variable by name; returns the refreshed list. */
+export const setEnv = (name: string, value: string) =>
+  put(`/env/${encodeURIComponent(name)}`, { value }).then((r) => (r as EnvEnvelope).env);
+
+/** Delete a variable by name; returns the refreshed list. */
+export const deleteEnv = (name: string) =>
+  del(`/env/${encodeURIComponent(name)}`).then((r) => (r as EnvEnvelope).env);
+
 // --- Authentication --------------------------------------------------------
 
 import type { Me, Token, CreatedToken, User, GithubConfig } from './types';

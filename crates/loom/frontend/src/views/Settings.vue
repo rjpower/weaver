@@ -5,12 +5,15 @@ import type { SettingView } from '../types';
 import ToggleSwitch from '../components/ToggleSwitch.vue';
 import TokensPanel from '../components/TokensPanel.vue';
 import AccountPanel from '../components/AccountPanel.vue';
+import EnvPanel from '../components/EnvPanel.vue';
 
-// In-page tabs: the setting registry (General), API tokens, and the account /
-// access surface (password, approved users, GitHub sign-in config).
-type Tab = 'general' | 'tokens' | 'account';
+// In-page tabs: the setting registry (General), the agent env vars
+// (Environment), API tokens, and the account / access surface (password,
+// approved users, GitHub sign-in config).
+type Tab = 'general' | 'env' | 'tokens' | 'account';
 const tabs: { id: Tab; label: string }[] = [
   { id: 'general', label: 'General' },
+  { id: 'env', label: 'Environment' },
   { id: 'tokens', label: 'Tokens' },
   { id: 'account', label: 'Account' },
 ];
@@ -124,7 +127,8 @@ onMounted(load);
       </button>
     </div>
 
-    <TokensPanel v-if="tab === 'tokens'" />
+    <EnvPanel v-if="tab === 'env'" />
+    <TokensPanel v-else-if="tab === 'tokens'" />
     <AccountPanel v-else-if="tab === 'account'" />
 
     <div v-else>
