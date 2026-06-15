@@ -436,6 +436,10 @@ pub fn router(state: AppState) -> Router {
             "/env/{name}",
             axum::routing::put(put_env).delete(delete_env),
         )
+        // The operator scratch shell — a single persistent login shell in the
+        // container, for one-time setup like `gcloud auth login`.
+        .route("/shell/terminal", get(crate::terminal::shell_ws))
+        .route("/shell/restart", post(restart_shell))
         // Overlookers — periodic / triggered watch programs over the fleet.
         .route(
             "/overlookers",
@@ -2598,6 +2602,14 @@ async fn delete_env(
 ) -> ApiResult<Json<Value>> {
     agent_env::remove(&st.db, &name).await?;
     env_envelope(&st.db).await
+}
+
+/// `POST /api/shell/restart` — reset the operator scratch shell, killing the
+/// current supervisor and spawning a fresh one. Handy after editing operator env
+/// vars (the new shell picks them up) or to clear a wedged session.
+async fn restart_shell(State(st): State<AppState>) -> ApiResult<Json<Value>> {
+    crate::shell::restart(&st).await?;
+    Ok(Json(json!({ "restarted": true })))
 }
 
 // ===========================================================================

@@ -137,6 +137,9 @@ export const setEnv = (name: string, value: string) =>
 export const deleteEnv = (name: string) =>
   del(`/env/${encodeURIComponent(name)}`).then((r) => (r as EnvEnvelope).env);
 
+/** Reset the operator scratch shell — kill it and spawn a fresh login shell. */
+export const restartShell = () => post('/shell/restart');
+
 // --- Authentication --------------------------------------------------------
 
 import type { Me, Token, CreatedToken, User, GithubConfig } from './types';

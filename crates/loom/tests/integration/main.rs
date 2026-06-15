@@ -18,5 +18,6 @@ mod overlookers;
 mod pane;
 mod scratch;
 mod sessions;
+mod shell;
 mod terminal;
 mod typed_client;

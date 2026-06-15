@@ -17,6 +17,7 @@ import Settings from './views/Settings.vue';
 import Issues from './views/Issues.vue';
 import Overlookers from './views/Overlookers.vue';
 import OverlookerDetail from './views/OverlookerDetail.vue';
+import Shell from './views/Shell.vue';
 import Login from './views/Login.vue';
 import { me, loadMe } from './auth';
 import { setUnauthorizedHandler } from './api';
@@ -34,6 +35,7 @@ const router = createRouter({
     { path: '/issues', component: Issues },
     { path: '/overlookers', component: Overlookers },
     { path: '/overlookers/:id', component: OverlookerDetail, props: true },
+    { path: '/shell', component: Shell },
     { path: '/settings', component: Settings },
   ],
 });

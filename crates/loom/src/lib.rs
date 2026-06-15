@@ -19,6 +19,7 @@ pub mod overlooker;
 pub mod repo;
 pub mod server;
 pub mod session;
+pub mod shell;
 pub mod terminal;
 pub mod web;
 
