@@ -93,6 +93,46 @@ pub async fn terminal_ws(
         })
 }
 
+/// `GET /api/shell/terminal` — upgrade to a WebSocket bridged to the operator
+/// scratch shell (see [`crate::shell`]). Same Origin check and byte pump as
+/// [`terminal_ws`], but there is no session to look up: the shell is a single
+/// fixed supervisor, spawned lazily here on first attach so the UI can connect
+/// without a separate "create" step.
+pub async fn shell_ws(
+    ws: WebSocketUpgrade,
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let base_url = crate::config::get(&st.db, "auth.base_url").await;
+    if !origin_ok(&headers, &st.addr, base_url.as_deref()) {
+        let origin = header_str(&headers, ORIGIN);
+        let host = header_str(&headers, HOST);
+        tracing::warn!(
+            origin = %origin,
+            host = %host,
+            bound = %st.addr,
+            "shell websocket rejected: Origin is not loopback, the configured \
+             auth.base_url, nor a proxied (X-Forwarded-*) request's own Host"
+        );
+        return (StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response();
+    }
+    if let Err(e) = crate::shell::ensure(&st).await {
+        tracing::error!(error = %e, "failed to bring up operator scratch shell");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "could not start shell").into_response();
+    }
+    let target = crate::shell::SHELL_SESSION.to_string();
+    tracing::info!(target = %target, "shell websocket attached");
+    ws.max_message_size(MAX_FRAME)
+        .max_frame_size(MAX_FRAME)
+        .on_upgrade(move |socket| async move {
+            if let Err(e) = bridge(socket, target.clone()).await {
+                tracing::debug!(target = %target, error = %e, "shell bridge ended with error");
+            } else {
+                tracing::debug!(target = %target, "shell bridge detached cleanly");
+            }
+        })
+}
+
 /// Bridge a browser xterm to a session's [`tapestry`] supervisor: the supervisor
 /// streams raw PTY bytes, so this is a straight byte pump. Dropping the input
 /// half closes the socket write half, which the supervisor sees as a clean

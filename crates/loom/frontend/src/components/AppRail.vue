@@ -48,6 +48,14 @@ const MAIN: RailItem[] = [
       'M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z',
     ],
   },
+  {
+    to: '/shell',
+    label: 'Shell',
+    title: 'Scratch shell — a login shell in the container (e.g. gcloud auth login)',
+    match: (p) => p.startsWith('/shell'),
+    // terminal — a bare prompt for operator setup.
+    paths: ['m4 17 6-6-6-6', 'M12 19h8'],
+  },
 ];
 
 const SETTINGS: RailItem = {

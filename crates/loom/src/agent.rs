@@ -80,6 +80,15 @@ fn inner_command(
     }
 }
 
+/// Wrap a value in single quotes for safe `export NAME=…` in the launch script,
+/// escaping any embedded single quote the POSIX way (`'\''` — close the quote,
+/// an escaped literal quote, reopen). loom's own values never contain quotes,
+/// but operator-supplied env vars ([`crate::agent_env`]) are arbitrary, so a
+/// stray `'` must not break out of the assignment.
+fn sh_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 pub fn launch_script(
     agent_kind: &str,
     goal_file: Option<&Path>,
@@ -93,7 +102,7 @@ pub fn launch_script(
         script.push_str(&format!("export PATH=\"{}:$PATH\"; ", dir.display()));
     }
     for (k, v) in env {
-        script.push_str(&format!("export {k}='{v}'; "));
+        script.push_str(&format!("export {k}={}; ", sh_single_quote(v)));
     }
     let inner = inner_command(agent_kind, goal_file, mode, claude_args);
     if !inner.is_empty() {
@@ -115,6 +124,10 @@ pub struct LaunchSpec<'a> {
     pub goal_file: Option<&'a Path>,
     pub server_addr: &'a str,
     pub claude_args: &'a str,
+    /// Operator-managed environment variables ([`crate::agent_env`]) exported
+    /// into the session on top of loom's own `WEAVER_*` / `LOOM_TOKEN`. The
+    /// caller reads these from the database; an empty slice adds nothing.
+    pub extra_env: &'a [(String, String)],
 }
 
 /// Bring up the session's terminal running the agent.
@@ -154,6 +167,13 @@ pub async fn launch(spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<()> {
     ];
     if let Some(token) = local_token.as_deref() {
         env.push(("LOOM_TOKEN", token));
+    }
+    // Operator-managed vars are exported last, so for any shared name they'd win.
+    // That's safe because `agent_env::validate_name` reserves loom's own
+    // WEAVER_*/LOOM_ prefixes, so a stored var can never shadow the environment
+    // loom needs — everything else the agent's tools read is theirs to set.
+    for (k, v) in spec.extra_env {
+        env.push((k.as_str(), v.as_str()));
     }
     let script = launch_script(
         spec.agent_kind,
@@ -485,6 +505,24 @@ mod tests {
         assert!(script.contains("export WEAVER_API='http://h:1'; "));
         assert!(script.contains("claude \"$(cat '/x/goal.txt')\"; "));
         assert!(script.ends_with("exec \"${SHELL:-/bin/sh}\""));
+    }
+
+    #[test]
+    fn env_values_with_single_quotes_are_escaped() {
+        // An operator env var whose value contains a single quote must not break
+        // out of the `export NAME='…'` assignment.
+        let script = launch_script(
+            "shell",
+            None,
+            &[("MSG", "it's \"quoted\"")],
+            None,
+            LaunchMode::Fresh,
+            "",
+        );
+        assert!(
+            script.contains(r#"export MSG='it'\''s "quoted"'; "#),
+            "got: {script}"
+        );
     }
 
     #[test]

@@ -21,7 +21,10 @@ import type { SettingView } from '../types';
 // production build served by loom (the rspack dev server is a different origin
 // and the server's same-origin check would reject the upgrade).
 
-const props = defineProps<{ id: string }>();
+// Either drive a session terminal (`id`) or attach to an explicit WebSocket
+// path (`wsPath`, e.g. the operator scratch shell at `/api/shell/terminal`).
+// Exactly one is expected; `wsPath` wins when both are set.
+const props = defineProps<{ id?: string; wsPath?: string }>();
 
 const host = ref<HTMLElement | null>(null);
 type ConnState = 'connecting' | 'open' | 'reconnecting' | 'error';
@@ -185,7 +188,8 @@ async function loadTheme(): Promise<ITheme> {
 function wsUrl(): string {
   // http→ws / https→wss on the page origin.
   const base = location.origin.replace(/^http/, 'ws');
-  return `${base}/api/sessions/${props.id}/terminal`;
+  const path = props.wsPath ?? `/api/sessions/${props.id}/terminal`;
+  return `${base}${path}`;
 }
 
 function inputFrame(data: string): Uint8Array {
