@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::backend;
 use weaver_core::agent::hooks_json;
@@ -126,7 +126,21 @@ pub async fn launch(spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<()> {
         .unwrap_or_else(|| "weaver".to_string());
 
     if spec.agent_kind == "claude" {
-        install_hooks(spec.work_dir, &weaver_bin).await.ok();
+        // Both steps are best-effort — a failure shouldn't abort the launch — but
+        // log it, since a silent failure here resurfaces only as a stalled agent.
+        if let Err(e) = install_hooks(spec.work_dir, &weaver_bin).await {
+            tracing::warn!(work_dir = %spec.work_dir.display(), error = %e,
+                "install_hooks failed; launching agent without weaver hooks");
+        }
+        // A fresh container HOME hasn't cleared Claude Code's first-run gates
+        // (theme picker, workspace trust, API-key + bypass-mode prompts), so an
+        // unattended `claude` would stall — or quit — before reading the goal.
+        // Pre-seed that state so it runs. Pass the resolved args so the
+        // bypass-mode gate is only seeded when we actually launch in that mode.
+        if let Err(e) = seed_claude_launch_gates(spec.work_dir, spec.claude_args).await {
+            tracing::warn!(work_dir = %spec.work_dir.display(), error = %e,
+                "seeding claude launch gates failed; agent may stall on first-run prompts");
+        }
     }
 
     let api_url = format!("http://{}", spec.server_addr);
@@ -193,6 +207,186 @@ pub async fn install_hooks(work_dir: &Path, weaver_bin: &str) -> Result<()> {
     tokio::fs::write(&path, serde_json::to_string_pretty(&root)?).await?;
     tracing::debug!(path = %path.display(), "claude hooks installed");
     Ok(())
+}
+
+/// Pre-clear Claude Code's first-run interactive gates in the agent user's
+/// global `~/.claude.json` so a detached, unattended `claude` runs its task
+/// instead of stalling — or *quitting* — at a prompt no human can answer.
+///
+/// On a fresh, persisted container HOME these gates fire in sequence and each
+/// wedges the session (it sits at "launching" with no `weaver status`, worktree
+/// idle). Each gate is just state Claude records after a human answers once; we
+/// write the same state ahead of time. Everything here is additive and
+/// idempotent — only missing/false gates are set, existing config is preserved —
+/// so it is safe to re-run before every launch. Gates handled:
+///
+/// * `hasCompletedOnboarding` + `theme` — the first-run theme picker.
+/// * `projects.<repo-root>.hasTrustDialogAccepted` — the workspace-trust dialog.
+///   Claude resolves a git worktree back to its **main repo root** and records
+///   trust there, so trusting the root once covers every worktree under it.
+/// * `customApiKeyResponses.approved` — the "use this `ANTHROPIC_API_KEY`?"
+///   prompt, keyed by the key's last 20 chars; seeded only when that env var is
+///   set (i.e. the agent authenticates by API key).
+/// * `bypassPermissionsModeAccepted` — the one-time "you're in Bypass
+///   Permissions mode" confirmation, **which defaults to *exit***. Seeded only
+///   when this launch actually runs with a bypass flag, since the dialog only
+///   appears then.
+pub async fn seed_claude_launch_gates(work_dir: &Path, claude_args: &str) -> Result<()> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        tracing::debug!("HOME unset; skipping claude launch-gate seed");
+        return Ok(());
+    };
+    let path = home.join(".claude.json");
+    // Read any existing config, distinguishing "absent" (fine — start fresh) from
+    // "present but unparseable" (bail). On a parse error we must NOT fall back to
+    // `{}` and write: that would clobber a real config that's momentarily
+    // truncated or mid-write (e.g. a concurrent `claude` writing the file).
+    let mut root: Value = match tokio::fs::read_to_string(&path).await {
+        Ok(s) if s.trim().is_empty() => json!({}),
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e,
+                    "~/.claude.json present but unparseable; skipping launch-gate \
+                     seed rather than overwriting it");
+                return Ok(());
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+
+    let bypass = claude_args.contains("--dangerously-skip-permissions")
+        || claude_args.contains("bypassPermissions");
+    // Approve the ambient ANTHROPIC_API_KEY by its last 20 chars (how claude keys
+    // these), when one is set and long enough to slice.
+    let api_key_tail = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|k| k.len() >= 20)
+        .map(|k| k[k.len() - 20..].to_string());
+    // Workspace trust is recorded at the worktree's *main* repo root, which Claude
+    // resolves a git worktree to, so trusting the root covers every worktree.
+    let repo_root = match weaver_core::git::repo_root(work_dir).await {
+        Ok(r) => Some(r.to_string_lossy().into_owned()),
+        Err(e) => {
+            tracing::debug!(work_dir = %work_dir.display(), error = %e,
+                "could not resolve repo root for trust seed");
+            None
+        }
+    };
+
+    let seed = GateSeed {
+        bypass,
+        api_key_tail: api_key_tail.as_deref(),
+        repo_root: repo_root.as_deref(),
+    };
+    if !apply_launch_gates(&mut root, &seed) {
+        return Ok(());
+    }
+
+    tokio::fs::write(&path, serde_json::to_string_pretty(&root)?)
+        .await
+        .with_context(|| format!("seeding {}", path.display()))?;
+    // claude writes this file 0600; preserve that posture.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await;
+    }
+    tracing::info!(path = %path.display(), bypass, "seeded claude launch gates");
+    Ok(())
+}
+
+/// The environment-derived inputs for [`apply_launch_gates`], gathered by
+/// [`seed_claude_launch_gates`] so the merge itself is a pure function.
+struct GateSeed<'a> {
+    /// Seed `bypassPermissionsModeAccepted` — only when launching with a bypass
+    /// flag, since the dialog appears only then.
+    bypass: bool,
+    /// The ambient `ANTHROPIC_API_KEY`'s last 20 chars to mark approved, if set.
+    api_key_tail: Option<&'a str>,
+    /// The worktree's main repo root, to record workspace trust against.
+    repo_root: Option<&'a str>,
+}
+
+/// Merge the first-run gate state into a parsed `.claude.json` value. Pure,
+/// additive, and idempotent: only missing or `false` keys are written and every
+/// existing value is preserved, so re-running is a no-op and a user's real config
+/// is never clobbered. Returns whether anything changed. Split out from
+/// [`seed_claude_launch_gates`] (which does the env/fs/git I/O) so these merge
+/// paths are unit-testable without touching HOME or a git repo.
+fn apply_launch_gates(root: &mut Value, seed: &GateSeed) -> bool {
+    if !root.is_object() {
+        *root = json!({});
+    }
+    let obj = root.as_object_mut().expect("root is an object");
+    let mut changed = false;
+
+    // 1. Onboarding / theme picker.
+    if obj.get("hasCompletedOnboarding").and_then(Value::as_bool) != Some(true) {
+        obj.insert("hasCompletedOnboarding".into(), json!(true));
+        changed = true;
+    }
+    if !obj.contains_key("theme") {
+        obj.insert("theme".into(), json!("dark"));
+        changed = true;
+    }
+
+    // 2. Bypass-permissions acceptance — only when we launch in that mode.
+    if seed.bypass
+        && obj
+            .get("bypassPermissionsModeAccepted")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        obj.insert("bypassPermissionsModeAccepted".into(), json!(true));
+        changed = true;
+    }
+
+    // 3. Ambient ANTHROPIC_API_KEY approval (keyed by the key's last 20 chars).
+    if let Some(tail) = seed.api_key_tail {
+        let entry = obj
+            .entry("customApiKeyResponses")
+            .or_insert_with(|| json!({"approved": [], "rejected": []}));
+        if !entry.is_object() {
+            *entry = json!({"approved": [], "rejected": []});
+        }
+        let entry = entry.as_object_mut().unwrap();
+        if !entry.get("approved").map(Value::is_array).unwrap_or(false) {
+            entry.insert("approved".into(), json!([]));
+        }
+        let approved = entry.get_mut("approved").unwrap().as_array_mut().unwrap();
+        if !approved.iter().any(|v| v.as_str() == Some(tail)) {
+            approved.push(json!(tail));
+            changed = true;
+        }
+        if !entry.contains_key("rejected") {
+            entry.insert("rejected".into(), json!([]));
+        }
+    }
+
+    // 4. Workspace trust, recorded at the worktree's main repo root.
+    if let Some(repo_root) = seed.repo_root {
+        let projects = obj.entry("projects").or_insert_with(|| json!({}));
+        if !projects.is_object() {
+            *projects = json!({});
+        }
+        let proj = projects
+            .as_object_mut()
+            .unwrap()
+            .entry(repo_root.to_string())
+            .or_insert_with(|| json!({}));
+        if !proj.is_object() {
+            *proj = json!({});
+        }
+        let proj = proj.as_object_mut().unwrap();
+        if proj.get("hasTrustDialogAccepted").and_then(Value::as_bool) != Some(true) {
+            proj.insert("hasTrustDialogAccepted".into(), json!(true));
+            changed = true;
+        }
+    }
+
+    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -329,5 +523,107 @@ mod tests {
             "",
         );
         assert_eq!(script, "claude --continue; exec \"${SHELL:-/bin/sh}\"");
+    }
+
+    fn seed<'a>(
+        bypass: bool,
+        api_key_tail: Option<&'a str>,
+        repo_root: Option<&'a str>,
+    ) -> GateSeed<'a> {
+        GateSeed {
+            bypass,
+            api_key_tail,
+            repo_root,
+        }
+    }
+
+    #[test]
+    fn seeds_all_gates_into_an_empty_config() {
+        let mut root = json!({});
+        assert!(apply_launch_gates(
+            &mut root,
+            &seed(true, Some("KEYTAIL0123456789abc"), Some("/repo"))
+        ));
+        assert_eq!(root["hasCompletedOnboarding"], json!(true));
+        assert_eq!(root["theme"], json!("dark"));
+        assert_eq!(root["bypassPermissionsModeAccepted"], json!(true));
+        assert_eq!(
+            root["customApiKeyResponses"]["approved"],
+            json!(["KEYTAIL0123456789abc"])
+        );
+        assert_eq!(
+            root["projects"]["/repo"]["hasTrustDialogAccepted"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn is_idempotent_and_returns_false_on_a_second_pass() {
+        let mut root = json!({});
+        let s = seed(true, Some("KEYTAIL0123456789abc"), Some("/repo"));
+        assert!(apply_launch_gates(&mut root, &s));
+        let after_first = root.clone();
+        // A second pass changes nothing and reports no change.
+        assert!(!apply_launch_gates(&mut root, &s));
+        assert_eq!(root, after_first);
+        // The approved key is not duplicated.
+        assert_eq!(
+            root["customApiKeyResponses"]["approved"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn preserves_existing_user_config() {
+        // A real config the user already has: a chosen theme, an unrelated
+        // approved key, and an unrelated trusted project with extra fields.
+        let mut root = json!({
+            "theme": "light",
+            "hasCompletedOnboarding": true,
+            "customApiKeyResponses": { "approved": ["existing-key"], "rejected": ["nope"] },
+            "projects": { "/other": { "hasTrustDialogAccepted": true, "keep": 1 } },
+        });
+        assert!(apply_launch_gates(
+            &mut root,
+            &seed(false, Some("KEYTAIL0123456789abc"), Some("/repo"))
+        ));
+        // Existing values untouched...
+        assert_eq!(root["theme"], json!("light"));
+        assert_eq!(root["projects"]["/other"]["keep"], json!(1));
+        assert_eq!(root["customApiKeyResponses"]["rejected"], json!(["nope"]));
+        // ...new approved key appended alongside the existing one...
+        assert_eq!(
+            root["customApiKeyResponses"]["approved"],
+            json!(["existing-key", "KEYTAIL0123456789abc"])
+        );
+        // ...new project trusted, and (bypass=false) no bypass key written.
+        assert_eq!(
+            root["projects"]["/repo"]["hasTrustDialogAccepted"],
+            json!(true)
+        );
+        assert!(root.get("bypassPermissionsModeAccepted").is_none());
+    }
+
+    #[test]
+    fn omits_optional_gates_when_inputs_absent() {
+        let mut root = json!({});
+        assert!(apply_launch_gates(&mut root, &seed(false, None, None)));
+        // Onboarding/theme always seed; the env-dependent gates do not.
+        assert_eq!(root["hasCompletedOnboarding"], json!(true));
+        assert!(root.get("bypassPermissionsModeAccepted").is_none());
+        assert!(root.get("customApiKeyResponses").is_none());
+        assert!(root.get("projects").is_none());
+    }
+
+    #[test]
+    fn replaces_a_non_object_root() {
+        // A corrupt/unexpected shape is reset rather than panicking.
+        let mut root = json!("not an object");
+        assert!(apply_launch_gates(&mut root, &seed(false, None, None)));
+        assert!(root.is_object());
+        assert_eq!(root["hasCompletedOnboarding"], json!(true));
     }
 }

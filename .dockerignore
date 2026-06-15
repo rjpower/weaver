@@ -1,0 +1,9 @@
+# The image build does its own clean `cargo build --release` and `npm install`
+# inside the build stage, so none of these host artifacts belong in the build
+# context — shipping them just bloats the daemon upload (host target/ alone is
+# >1GB) and can shadow a clean build.
+target/
+.git/
+**/node_modules/
+crates/loom/static/dist/
+.env

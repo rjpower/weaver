@@ -21,6 +21,7 @@
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
+use axum::http::header::{HOST, ORIGIN};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
@@ -46,7 +47,25 @@ pub async fn terminal_ws(
 ) -> Response {
     // CSWSH defence: CORS does NOT apply to WebSockets, so a localhost bind is
     // not protection — validate the Origin before upgrading. See `origin_ok`.
-    if !origin_ok(&headers, &st.addr) {
+    // `auth.base_url` (when set) is the operator-declared canonical origin and is
+    // trusted directly; absent that, only loopback or a *proxied* same-Host
+    // Origin is accepted.
+    let base_url = crate::config::get(&st.db, "auth.base_url").await;
+    if !origin_ok(&headers, &st.addr, base_url.as_deref()) {
+        // This rejection used to be silent — invisible behind a reverse proxy,
+        // where it surfaces only as the browser's endless "reconnecting". Log it
+        // with the Origin/Host so a proxy misconfig is one `docker logs` away.
+        let origin = header_str(&headers, ORIGIN);
+        let host = header_str(&headers, HOST);
+        tracing::warn!(
+            session = %key,
+            origin = %origin,
+            host = %host,
+            bound = %st.addr,
+            base_url = base_url.as_deref().unwrap_or("<unset>"),
+            "terminal websocket rejected: Origin is not loopback, the configured \
+             auth.base_url, nor a proxied (X-Forwarded-*) request's own Host"
+        );
         return (StatusCode::FORBIDDEN, "cross-origin websocket rejected").into_response();
     }
     let session = match require_session(&st.db, &key).await {
@@ -62,11 +81,14 @@ pub async fn terminal_ws(
             .into_response();
     }
     let target = session.term_session.clone();
+    tracing::info!(session = %key, target = %target, "terminal websocket attached");
     ws.max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
         .on_upgrade(move |socket| async move {
-            if let Err(e) = bridge(socket, target).await {
-                tracing::debug!(error = %e, "terminal bridge ended with error");
+            if let Err(e) = bridge(socket, target.clone()).await {
+                tracing::debug!(target = %target, error = %e, "terminal bridge ended with error");
+            } else {
+                tracing::debug!(target = %target, "terminal bridge detached cleanly");
             }
         })
 }
@@ -144,19 +166,129 @@ async fn bridge(socket: WebSocket, target: String) -> anyhow::Result<()> {
 /// weaken the browser-CSWSH defence (it only waives same-host non-browser
 /// processes, acceptable under the single-user-localhost assumption).
 ///
-/// A *present* Origin must be a loopback host on our actual bound port. We
-/// deliberately do NOT compare against the request `Host` header: Host is
-/// client-supplied and a DNS-rebinding attacker can make `Origin == Host` even
-/// on the default `127.0.0.1` bind. Pinning to the loopback set + the real bound
-/// port closes that vector.
-fn origin_ok(headers: &HeaderMap, bound_addr: &str) -> bool {
-    match headers.get(axum::http::header::ORIGIN) {
-        None => true,
+/// A *present* Origin is accepted when any of:
+///
+/// 1. it is a loopback host on our actual bound port — direct localhost access
+///    (`loom open`, an SSH tunnel), the original single-user posture; or
+/// 2. it matches the operator-configured `auth.base_url` (the canonical public
+///    origin) — trusted however the request arrived, so it also works behind a
+///    proxy that strips `X-Forwarded-*`; or
+/// 3. it equals the request's own `Host` *and* the request carries an
+///    `X-Forwarded-*` header — i.e. the browser is talking to the same public
+///    origin the front-door proxy serves us under (`weaver.example.com`), and
+///    the request demonstrably transited that proxy. Behind Caddy the loopback
+///    rule never matches (the Origin is the public HTTPS host), so without 2/3
+///    the in-browser terminal wedges on an endless "reconnecting". Rule 3 keeps
+///    multi-vhost deploys zero-config (no need to enumerate every hostname).
+///
+/// Why rule 3 is safe where a bare `Origin == Host` would not be: trusting the
+/// raw `Host` reopens the DNS-rebinding vector the loopback pin closed (a
+/// rebinding page can force `Origin == Host` against a directly bound daemon).
+/// Gating on `X-Forwarded-*` closes it: a reverse proxy adds those headers, and
+/// a browser's WebSocket handshake — the attack vector — cannot set request
+/// headers, so a rebinding page reaching a directly bound daemon has none and is
+/// rejected. (Non-browser clients omit Origin entirely and are handled above.)
+fn origin_ok(headers: &HeaderMap, bound_addr: &str, base_url: Option<&str>) -> bool {
+    let origin = match headers.get(ORIGIN) {
+        // Non-browser clients (the CLI, tests, tokio-tungstenite) omit Origin.
+        None => return true,
         Some(v) => match v.to_str() {
-            Ok(origin) => origin_is_loopback(origin, bound_addr),
-            Err(_) => false,
+            Ok(o) => o,
+            Err(_) => return false,
         },
+    };
+    if origin_is_loopback(origin, bound_addr) {
+        return true;
     }
+    // (a) The operator-declared canonical origin (`auth.base_url`) is trusted
+    // however the request reached us — covers a proxy that strips X-Forwarded-*.
+    if let Some(authority) = base_url.and_then(url_authority) {
+        if origin_matches_host(origin, authority) {
+            return true;
+        }
+    }
+    // (b) Otherwise trust an Origin equal to the request's own Host ONLY when the
+    // request demonstrably transited the reverse proxy (it carries X-Forwarded-*).
+    // This keeps multi-vhost proxied deploys zero-config while closing the
+    // DNS-rebinding / CSWSH vector the loopback pin guarded: a browser-driven
+    // handshake (the attack vector) cannot set X-Forwarded-* — the WebSocket API
+    // forbids custom request headers — so a rebinding page reaching a directly
+    // bound daemon yields Origin == Host but no forwarded header, and is rejected.
+    if via_trusted_proxy(headers) {
+        if let Some(host) = headers.get(HOST).and_then(|v| v.to_str().ok()) {
+            return origin_matches_host(origin, host);
+        }
+    }
+    false
+}
+
+/// The host[:port] authority of a `http(s)://` URL (e.g. `auth.base_url`), or
+/// `None` if it isn't an http(s) URL. Trailing path/slash is dropped.
+fn url_authority(url: &str) -> Option<&str> {
+    let rest = url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| url.trim().strip_prefix("http://"))?;
+    Some(rest.split('/').next().unwrap_or(rest))
+}
+
+/// True iff the request carries a header a reverse proxy adds (`X-Forwarded-*`).
+/// Caddy/nginx set these; a browser's WebSocket handshake cannot, so their
+/// presence is evidence the request reached us *through* the proxy rather than
+/// from a page that rebound a hostname to a directly bound daemon.
+fn via_trusted_proxy(headers: &HeaderMap) -> bool {
+    headers.contains_key("x-forwarded-for")
+        || headers.contains_key("x-forwarded-proto")
+        || headers.contains_key("x-forwarded-host")
+}
+
+/// Read a header as a `&str`, or `"<none>"` when absent/non-ASCII. For logging.
+fn header_str(headers: &HeaderMap, name: axum::http::HeaderName) -> &str {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("<none>")
+}
+
+/// Split an authority (`host`, `host:port`, `[::1]`, or `[::1]:port`) into its
+/// host and optional port. Shared by the loopback and proxied-Host checks so
+/// both parse IPv6 literals identically.
+fn split_authority(authority: &str) -> (&str, Option<&str>) {
+    if let Some(after) = authority.strip_prefix('[') {
+        // IPv6 literal: [::1] or [::1]:port
+        match after.split_once(']') {
+            Some((h, tail)) => (h, tail.strip_prefix(':')),
+            None => (authority, None),
+        }
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        (h, Some(p))
+    } else {
+        (authority, None)
+    }
+}
+
+/// True iff `origin` (`http(s)://host[:port]`) names the same host+port as the
+/// request's `Host` header. The browser sends the page's own origin on a WS
+/// handshake, so behind a proxy serving `https://h/` the Origin is `https://h`
+/// and the Host is `h` — they agree once default ports (443/80) are filled in.
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    let (scheme, rest) = if let Some(r) = origin.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = origin.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return false;
+    };
+    let origin_authority = rest.split('/').next().unwrap_or(rest);
+    let (o_host, o_port) = split_authority(origin_authority);
+    let (h_host, h_port) = split_authority(host);
+    // DNS hostnames are case-insensitive, so compare them that way — else a
+    // browser Origin and proxy Host differing only in ASCII case falsely reject.
+    if o_host.is_empty() || !o_host.eq_ignore_ascii_case(h_host) {
+        return false;
+    }
+    let default = if scheme == "https" { "443" } else { "80" };
+    o_port.unwrap_or(default) == h_port.unwrap_or(default)
 }
 
 /// True iff `origin` is `http(s)://<loopback>[:<port>]` whose port equals the
@@ -174,17 +306,7 @@ fn origin_is_loopback(origin: &str, bound_addr: &str) -> bool {
     };
     // Origin carries no path, but be defensive about a trailing slash.
     let authority = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = if let Some(after) = authority.strip_prefix('[') {
-        // IPv6 literal: [::1] or [::1]:port
-        match after.split_once(']') {
-            Some((h, tail)) => (h, tail.strip_prefix(':')),
-            None => return false,
-        }
-    } else if let Some((h, p)) = authority.rsplit_once(':') {
-        (h, Some(p))
-    } else {
-        (authority, None)
-    };
+    let (host, port) = split_authority(authority);
     let port = port.unwrap_or(if scheme == "https" { "443" } else { "80" });
     if port != want_port {
         return false;
@@ -194,7 +316,21 @@ fn origin_is_loopback(origin: &str, bound_addr: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::origin_is_loopback;
+    use super::{
+        origin_is_loopback, origin_matches_host, origin_ok, url_authority, via_trusted_proxy,
+    };
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
 
     #[test]
     fn accepts_loopback_origins_on_the_bound_port() {
@@ -243,5 +379,155 @@ mod tests {
         ));
         assert!(!origin_is_loopback("null", "127.0.0.1:7878"));
         assert!(!origin_is_loopback("", "127.0.0.1:7878"));
+    }
+
+    #[test]
+    fn accepts_origin_matching_proxied_host() {
+        // Behind Caddy: browser at https://weaver.rjp.io, proxy forwards
+        // Host: weaver.rjp.io. Default https port (443) fills in on both sides.
+        assert!(origin_matches_host(
+            "https://weaver.rjp.io",
+            "weaver.rjp.io"
+        ));
+        assert!(origin_matches_host("https://loom.rjp.io", "loom.rjp.io"));
+        // Explicit matching ports also agree.
+        assert!(origin_matches_host(
+            "https://h.example:8443",
+            "h.example:8443"
+        ));
+        // Plain http with the default port elided on the Origin side.
+        assert!(origin_matches_host("http://box.local", "box.local:80"));
+    }
+
+    #[test]
+    fn rejects_origin_not_matching_host() {
+        // A different host (the cross-site attacker case) never matches.
+        assert!(!origin_matches_host(
+            "https://attacker.example",
+            "weaver.rjp.io"
+        ));
+        // Same host, mismatched explicit port.
+        assert!(!origin_matches_host(
+            "https://weaver.rjp.io:1234",
+            "weaver.rjp.io"
+        ));
+        // Non-http scheme and garbage.
+        assert!(!origin_matches_host("ftp://weaver.rjp.io", "weaver.rjp.io"));
+        assert!(!origin_matches_host("null", "weaver.rjp.io"));
+    }
+
+    #[test]
+    fn host_match_is_case_insensitive() {
+        // DNS is case-insensitive; an Origin/Host casing difference must not reject.
+        assert!(origin_matches_host(
+            "https://Weaver.RJP.io",
+            "weaver.rjp.io"
+        ));
+        assert!(origin_matches_host(
+            "https://weaver.rjp.io",
+            "WEAVER.RJP.IO"
+        ));
+    }
+
+    #[test]
+    fn url_authority_extracts_host_port() {
+        assert_eq!(url_authority("https://loom.rjp.io"), Some("loom.rjp.io"));
+        assert_eq!(url_authority("https://loom.rjp.io/"), Some("loom.rjp.io"));
+        assert_eq!(
+            url_authority("http://h.example:8443/x"),
+            Some("h.example:8443")
+        );
+        assert_eq!(url_authority("ws://loom.rjp.io"), None); // not http(s)
+        assert_eq!(url_authority(""), None);
+    }
+
+    #[test]
+    fn via_trusted_proxy_detects_forwarded_headers() {
+        assert!(via_trusted_proxy(&headers(&[(
+            "x-forwarded-proto",
+            "https"
+        )])));
+        assert!(via_trusted_proxy(&headers(&[(
+            "x-forwarded-for",
+            "1.2.3.4"
+        )])));
+        assert!(via_trusted_proxy(&headers(&[("x-forwarded-host", "h")])));
+        assert!(!via_trusted_proxy(&headers(&[("host", "h")])));
+    }
+
+    #[test]
+    fn proxied_same_host_origin_requires_forwarded_header() {
+        // Behind Caddy: Origin == Host AND X-Forwarded-* present → accepted, even
+        // for a vhost that isn't the configured base_url.
+        assert!(origin_ok(
+            &headers(&[
+                ("origin", "https://weaver.rjp.io"),
+                ("host", "weaver.rjp.io"),
+                ("x-forwarded-proto", "https"),
+            ]),
+            "0.0.0.0:7878",
+            None,
+        ));
+        // DNS-rebinding / CSWSH: a page rebinds a hostname to a directly bound
+        // daemon, so Origin == Host — but a browser handshake can't add a
+        // forwarded header, so it's rejected. This is the hole the gate closes.
+        assert!(!origin_ok(
+            &headers(&[
+                ("origin", "http://evil.example:7878"),
+                ("host", "evil.example:7878"),
+            ]),
+            "0.0.0.0:7878",
+            None,
+        ));
+    }
+
+    #[test]
+    fn base_url_origin_trusted_without_forwarded_header() {
+        let base = Some("https://loom.rjp.io");
+        // The configured canonical origin is trusted however it arrived.
+        assert!(origin_ok(
+            &headers(&[("origin", "https://loom.rjp.io"), ("host", "loom.rjp.io")]),
+            "0.0.0.0:7878",
+            base,
+        ));
+        // A different vhost is NOT the base_url, so without proxy evidence it's
+        // rejected...
+        assert!(!origin_ok(
+            &headers(&[
+                ("origin", "https://weaver.rjp.io"),
+                ("host", "weaver.rjp.io"),
+            ]),
+            "0.0.0.0:7878",
+            base,
+        ));
+        // ...but Caddy supplies that evidence, so the real path still works.
+        assert!(origin_ok(
+            &headers(&[
+                ("origin", "https://weaver.rjp.io"),
+                ("host", "weaver.rjp.io"),
+                ("x-forwarded-for", "1.2.3.4"),
+            ]),
+            "0.0.0.0:7878",
+            base,
+        ));
+    }
+
+    #[test]
+    fn loopback_and_missing_origin_always_ok() {
+        // Loopback on the bound port: no proxy headers or base_url needed.
+        assert!(origin_ok(
+            &headers(&[
+                ("origin", "http://localhost:7878"),
+                ("host", "localhost:7878"),
+            ]),
+            "127.0.0.1:7878",
+            None,
+        ));
+        // A non-browser client (CLI, tests) omits Origin entirely.
+        assert!(origin_ok(
+            &headers(&[("host", "loom.rjp.io")]),
+            "0.0.0.0:7878",
+            None,
+        ));
     }
 }
