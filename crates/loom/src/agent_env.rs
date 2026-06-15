@@ -27,12 +27,21 @@ pub struct EnvVar {
     pub updated_at: String,
 }
 
+/// Names loom owns and exports itself ([`crate::agent::launch`]). Operator vars
+/// are exported *after* these, so allowing one of these names through would let a
+/// stored value shadow `WEAVER_API`/`WEAVER_BRANCH`/`LOOM_TOKEN` and break the
+/// agent's own `loom session …` calls. We reserve the whole `WEAVER_`/`LOOM_`
+/// prefix space rather than just the current names so future loom-owned vars are
+/// covered without a matching validation change.
+const RESERVED_PREFIXES: &[&str] = &["WEAVER_", "LOOM_"];
+
 /// Validate an environment-variable name. Accept the POSIX-portable identifier
 /// shape (`[A-Za-z_][A-Za-z0-9_]*`): a leading letter or underscore, then
 /// letters, digits, or underscores. This is exactly what the `export NAME=…` in
 /// the launch script can carry, and rejecting anything else keeps a stray name
-/// from corrupting the script. The error is a key-free reason so callers can
-/// prefix it with whatever context they like.
+/// from corrupting the script. Names in loom's own [`RESERVED_PREFIXES`] are also
+/// rejected so an operator var can't shadow the environment loom needs. The error
+/// is a key-free reason so callers can prefix it with whatever context they like.
 pub fn validate_name(name: &str) -> std::result::Result<(), String> {
     if name.is_empty() {
         return Err("name must not be empty".to_string());
@@ -47,6 +56,12 @@ pub fn validate_name(name: &str) -> std::result::Result<(), String> {
     if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(format!(
             "name may contain only letters, digits, and underscores, got '{name}'"
+        ));
+    }
+    if let Some(prefix) = RESERVED_PREFIXES.iter().find(|p| name.starts_with(**p)) {
+        return Err(format!(
+            "name '{name}' is reserved: the '{prefix}' prefix is used by loom's own \
+             environment and cannot be overridden"
         ));
     }
     Ok(())
@@ -126,6 +141,16 @@ mod tests {
         assert!(validate_name("FOO BAR").is_err());
         assert!(validate_name("FOO=BAR").is_err());
         assert!(validate_name("café").is_err());
+    }
+
+    #[test]
+    fn validate_name_rejects_loom_reserved_names() {
+        // Operator vars are exported after loom's own, so these must not be
+        // settable or they'd shadow the environment the agent depends on.
+        assert!(validate_name("WEAVER_API").is_err());
+        assert!(validate_name("WEAVER_BRANCH").is_err());
+        assert!(validate_name("LOOM_TOKEN").is_err());
+        assert!(validate_name("WEAVER_ANYTHING").is_err());
     }
 
     #[tokio::test]

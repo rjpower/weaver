@@ -168,9 +168,10 @@ pub async fn launch(spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<()> {
     if let Some(token) = local_token.as_deref() {
         env.push(("LOOM_TOKEN", token));
     }
-    // Operator-managed vars last so the deploy can override nothing loom needs
-    // to function (the WEAVER_*/LOOM_TOKEN names above are not offered for edit),
-    // but everything else the agent's tools read is theirs to set.
+    // Operator-managed vars are exported last, so for any shared name they'd win.
+    // That's safe because `agent_env::validate_name` reserves loom's own
+    // WEAVER_*/LOOM_ prefixes, so a stored var can never shadow the environment
+    // loom needs — everything else the agent's tools read is theirs to set.
     for (k, v) in spec.extra_env {
         env.push((k.as_str(), v.as_str()));
     }

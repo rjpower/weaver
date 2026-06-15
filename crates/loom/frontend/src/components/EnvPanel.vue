@@ -16,14 +16,25 @@ const busy = ref('');
 const newName = ref('');
 const newValue = ref('');
 
-// A POSIX shell identifier — what the server enforces, mirrored here so the Add
-// button can disable on an obviously bad name before the round-trip.
-const nameOk = (n: string) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n);
+// A POSIX shell identifier, excluding loom's own reserved prefixes — what the
+// server enforces, mirrored here so the Add button can disable on an obviously
+// bad name (bad shape, or a name that would shadow loom's WEAVER_*/LOOM_ env)
+// before the round-trip.
+const nameOk = (n: string) =>
+  /^[A-Za-z_][A-Za-z0-9_]*$/.test(n) && !/^(WEAVER_|LOOM_)/.test(n);
 const newNameValid = computed(() => nameOk(newName.value.trim()));
 
 function sync(list: EnvVar[]) {
   vars.value = list;
-  drafts.value = Object.fromEntries(list.map((v) => [v.name, v.value]));
+  // Preserve any in-progress edit for a name that still exists; only seed a
+  // draft for newly-appeared names and drop drafts for names that are gone. This
+  // keeps a refresh (after saving/deleting another row) from clobbering the row
+  // you're typing in.
+  const next: Record<string, string> = {};
+  for (const v of list) {
+    next[v.name] = v.name in drafts.value ? drafts.value[v.name] : v.value;
+  }
+  drafts.value = next;
 }
 
 async function load() {
@@ -34,6 +45,8 @@ async function load() {
     error.value = (e as Error).message;
   }
 }
+
+onMounted(load);
 
 function dirty(v: EnvVar): boolean {
   return drafts.value[v.name] !== v.value;
@@ -125,7 +138,8 @@ const add = () =>
     </div>
     <p v-if="newName.trim() && !newNameValid" class="-mt-2 mb-3 text-2xs text-block">
       A name must start with a letter or underscore and contain only letters, digits, and
-      underscores.
+      underscores, and can't start with <code>WEAVER_</code> or <code>LOOM_</code> (reserved by
+      loom).
     </p>
 
     <!-- Existing variables. -->
