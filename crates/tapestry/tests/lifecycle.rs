@@ -88,6 +88,69 @@ async fn capture_sees_child_output() {
 
 #[tokio::test]
 #[serial]
+async fn kill_reaps_the_whole_process_group() {
+    // A reap must take down everything the agent spawned, not just its top
+    // shell. portable_pty puts the child in its own session, so the supervisor
+    // SIGKILLs the entire process group. Spawn a backgrounded grandchild that
+    // *ignores* SIGHUP (as detached agent helpers do), so only the group-wide
+    // SIGKILL — not the PTY hangup the supervisor's exit delivers — can stop it,
+    // then confirm it is gone after the kill.
+    let pidfile = std::env::temp_dir().join(format!("tap-pg-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pidfile);
+    let script = format!(
+        "nohup sleep 300 >/dev/null 2>&1 & echo $! > {}; exec sleep 300",
+        pidfile.display()
+    );
+    let h = Harness::start("pgroup", &script).await;
+
+    // Wait for the grandchild to record its pid.
+    let mut pid = 0i32;
+    for _ in 0..200 {
+        if let Ok(s) = std::fs::read_to_string(&pidfile) {
+            if let Ok(p) = s.trim().parse::<i32>() {
+                pid = p;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(pid > 0, "grandchild never recorded its pid");
+    assert!(alive(pid), "grandchild should be running before the reap");
+
+    Client::connect(&h.name)
+        .await
+        .unwrap()
+        .kill()
+        .await
+        .unwrap();
+
+    let mut gone = false;
+    for _ in 0..200 {
+        if !alive(pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = std::fs::remove_file(&pidfile);
+    assert!(
+        gone,
+        "grandchild {pid} survived the reap — orphaned, not killed"
+    );
+}
+
+/// Whether `pid` still exists. `kill(pid, 0)` delivers no signal — it only
+/// probes: `Ok` ⇒ alive (or a not-yet-reaped zombie), `EPERM` ⇒ alive but not
+/// ours to signal, `ESRCH` ⇒ gone.
+fn alive(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[tokio::test]
+#[serial]
 async fn send_reaches_the_shell() {
     // A bare shell; type a command and confirm its output appears on screen.
     let h = Harness::start("send", "exec sh").await;

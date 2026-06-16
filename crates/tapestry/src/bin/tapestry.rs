@@ -30,6 +30,37 @@ usage:
     std::process::exit(2);
 }
 
+/// Reap exited children on every `SIGCHLD`. In a supervisor process the only
+/// children are the agent and whatever it reparents to us — we are the session's
+/// subreaper (see the `supervise` arm) — so `waitpid(-1)` over all of them is
+/// correct: it keeps orphaned, detached helpers (a backgrounded `gh`, `sleep`,
+/// an MCP server) from lingering as zombies. The agent's own exit is still
+/// detected inside `supervise`; if a reap here wins that race the wait there
+/// just returns early and the exit is reported all the same.
+#[cfg(target_os = "linux")]
+fn reap_orphans() {
+    use tokio::signal::unix::{signal, SignalKind};
+    tokio::spawn(async {
+        let Ok(mut sigchld) = signal(SignalKind::child()) else {
+            tracing::warn!("cannot watch SIGCHLD; orphaned children may linger as zombies");
+            return;
+        };
+        loop {
+            sigchld.recv().await;
+            // Drain every child that has exited. `WNOHANG` so we never block the
+            // task; 0 (none ready) or -1 (no children) both mean "done — wait
+            // for the next SIGCHLD".
+            loop {
+                let mut status = 0;
+                let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+                if pid <= 0 {
+                    break;
+                }
+            }
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -47,6 +78,18 @@ async fn main() -> Result<()> {
             let spec_json = args.get(1).context("supervise needs a JSON spec")?;
             let spec: LaunchSpec =
                 serde_json::from_str(spec_json).context("parsing supervise spec")?;
+            // This process supervises exactly one session, so make it the
+            // session's subreaper: anything the agent orphans (it backgrounds
+            // gh, sleep, MCP servers, … which then detach) reparents here
+            // instead of escaping up to loom / PID 1, and `reap_orphans` waits
+            // on it. Per-session cleanup that holds whether or not loom runs
+            // under a container init — the standalone-binary case has no init,
+            // and a containerised loom that *is* PID 1 never sees these orphans.
+            #[cfg(target_os = "linux")]
+            {
+                unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+                reap_orphans();
+            }
             tapestry::supervise(spec.into()).await?;
         }
         "spawn" => {
