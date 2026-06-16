@@ -133,9 +133,10 @@ pub const REGISTRY: &[SettingSpec] = &[
         key: "github.archive_on_merge",
         label: "Archive on PR merge",
         description: "When enabled, loom archives a session automatically once \
-            its pull request is merged — tearing down the terminal session and \
-            removing the worktree, while keeping the branch and its history. \
-            Requires GitHub polling.",
+            its pull request is merged — tearing down the terminal session, \
+            removing the worktree, and closing the weaver issues that session \
+            was working, while keeping the branch and its history. Requires \
+            GitHub polling.",
         kind: SettingKind::Bool,
         default: "true",
         group: "GitHub",
