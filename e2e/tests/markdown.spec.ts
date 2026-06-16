@@ -5,8 +5,8 @@ import { join } from 'path';
 // loom's Markdown rendering pipeline (MarkdownView + markdown.ts): GFM
 // tables/task-lists, syntax-highlighted code, inline images resolved against
 // the worktree, and mermaid diagrams. It is exercised here through the Artifacts
-// viewer, which hosts it (the bespoke Files browser that used to is gone — the
-// embedded editor is the file surface now). This drives a real markdown artifact
+// viewer, which hosts it (the bespoke Files browser that used to host it is
+// gone — the embedded editor is the file surface now). This drives a real markdown artifact
 // through the running UI and asserts each surface.
 test.describe('rich markdown rendering', () => {
   const DOC = [

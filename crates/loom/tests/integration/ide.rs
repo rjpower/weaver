@@ -70,7 +70,15 @@ async fn ide_proxy_strips_prefix_redirects_and_passes_websockets() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    // The ETag middleware must leave proxied responses untouched: buffering
+    // code-server's stream to hash it would truncate assets past the 16 MB cap.
+    // A loom ETag here would mean the proxy path slipped through the exclusion.
+    let etag = resp.headers().get(reqwest::header::ETAG).cloned();
     assert_eq!(resp.text().await.unwrap(), "ok-from-upstream");
+    assert!(
+        etag.as_ref().map(|v| v.as_bytes().starts_with(b"\"loom-")) != Some(true),
+        "IDE proxy response must bypass the ETag middleware (got {etag:?})"
+    );
 
     // 2. The bare `…/ide` (no trailing slash) 308-redirects to the slash form,
     //    preserving the query — code-server needs the trailing slash.

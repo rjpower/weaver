@@ -263,7 +263,13 @@ async fn require_branch(db: &Db, key: &str) -> ApiResult<Branch> {
 /// Whether `path` (the `/api`-stripped path) is an embedded-editor proxy route
 /// — `/sessions/<id>/ide` or `/sessions/<id>/ide/…` — as opposed to the small
 /// `ide-info` JSON probe, which is fine to ETag.
+/// Paths under the embedded-editor reverse proxy (`…/sessions/{id}/ide`), which
+/// must bypass the ETag middleware — buffering code-server's stream to hash it
+/// truncates assets past the 16 MB cap. The middleware sees the nest-stripped
+/// `/sessions/…` form, but we strip an optional leading `/api` too so the
+/// exclusion survives if that layer is ever hoisted to the outer router.
 fn is_ide_proxy_path(path: &str) -> bool {
+    let path = path.strip_prefix("/api").unwrap_or(path);
     let Some(rest) = path.strip_prefix("/sessions/") else {
         return false;
     };
@@ -3427,5 +3433,29 @@ mod tests {
         // Hash segment must be exactly 8 hex chars.
         assert!(!is_immutable_asset("/app.abc.js"));
         assert!(!is_immutable_asset("/app.abc123def.js")); // 9 chars
+    }
+
+    #[test]
+    fn is_ide_proxy_path_matches_proxy_and_subpaths_in_both_forms() {
+        // Nest-stripped form (what the middleware actually sees) …
+        assert!(is_ide_proxy_path("/sessions/abc/ide"));
+        assert!(is_ide_proxy_path("/sessions/abc/ide/"));
+        assert!(is_ide_proxy_path("/sessions/abc/ide/static/out/main.js"));
+        // … and the `/api`-prefixed form, in case the layer ever moves outward.
+        assert!(is_ide_proxy_path("/api/sessions/abc/ide"));
+        assert!(is_ide_proxy_path(
+            "/api/sessions/abc/ide/static/out/main.js"
+        ));
+    }
+
+    #[test]
+    fn is_ide_proxy_path_rejects_siblings_and_non_ide_routes() {
+        // `ide-info` is JSON that *should* be ETagged — not the proxy.
+        assert!(!is_ide_proxy_path("/sessions/abc/ide-info"));
+        assert!(!is_ide_proxy_path("/api/sessions/abc/ide-info"));
+        assert!(!is_ide_proxy_path("/sessions/abc/log"));
+        assert!(!is_ide_proxy_path("/sessions/abc"));
+        assert!(!is_ide_proxy_path("/sessions"));
+        assert!(!is_ide_proxy_path("/repos/issues"));
     }
 }

@@ -191,5 +191,3 @@ Monaco (Artifacts), Artifacts.
 - **Built-in port proxy.** code-server's `/proxy/<port>` app-proxy is not wired
   through; if we later want to preview an agent's dev server, that's an additive
   proxy path, not a redesign.
-</content>
-</invoke>
