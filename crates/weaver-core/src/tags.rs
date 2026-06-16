@@ -79,6 +79,15 @@ pub fn is_valid_value(key: &str, value: &str) -> bool {
     }
 }
 
+/// Whether `value` raises a badge — i.e. it sits on the [`ATTENTION_VALUES`]
+/// ladder. **Loudness is carried by the value**, so *any* key holding such a
+/// value is loud (the agent's own `attention`, a watch's typed `review`/`stuck`,
+/// …); the dashboard renders each as a chip labelled by its key. Distinct from
+/// [`is_loud`], which gates the well-known *keys* to the ladder in validation.
+pub fn is_loud_value(value: &str) -> bool {
+    ATTENTION_VALUES.contains(&value)
+}
+
 // ---------------------------------------------------------------------------
 // CRUD
 // ---------------------------------------------------------------------------
@@ -169,6 +178,15 @@ mod tests {
         // A free-form key accepts any non-empty value.
         assert!(is_valid_value("priority", "high"));
         assert!(!is_valid_value("priority", ""));
+
+        // Loudness is value-driven: any key holding a ladder value is loud (a
+        // watch's typed `review`/`stuck`), while a quiet value never is.
+        assert!(is_loud_value("attention"));
+        assert!(is_loud_value("blocked"));
+        assert!(!is_loud_value("high"));
+        assert!(!is_loud_value("ok"));
+        // A free-form key may legitimately carry a loud value (the watch's marks).
+        assert!(is_valid_value("review", "attention"));
     }
 
     #[tokio::test]

@@ -65,6 +65,12 @@ TERMINAL_STATUSES = {"done", "error", "archived"}
 #: axis to calm (the caller then clears the tag rather than marking).
 JUDGED_LEVELS = ("ok", "attention", "blocked")
 
+#: The storable loud values, calm → urgent. ``ok``/empty is never stored (it
+#: clears the tag). A tag whose value is one of these is *loud* — it raises a
+#: badge — regardless of key; the key is the type. Mirrors weaver-core's
+#: ``ATTENTION_VALUES``.
+LOUD_VALUES = ("attention", "blocked")
+
 
 def parse_judgement(text):
     """Parse an agent judgement into ``(level, note)``, or ``None``.
@@ -82,6 +88,55 @@ def parse_judgement(text):
                 note = line[min(cuts) + 1 :].strip() if cuts else ""
                 return level, note or line.strip()
     return None
+
+
+def _slug(text):
+    """A short tag key: lowercased, runs of non-alphanumerics → single hyphens,
+    trimmed. ``"Needs Review!"`` → ``"needs-review"``; ``""`` → ``""``."""
+    cleaned = "".join(c if c.isalnum() else "-" for c in (text or "").strip().lower())
+    return "-".join(p for p in cleaned.split("-") if p)
+
+
+def _json_array(text):
+    """The first ``[`` … last ``]`` slice of ``text``, or ``None`` — a forgiving
+    grab so the array survives surrounding prose or a code fence."""
+    text = text or ""
+    start, end = text.find("["), text.rfind("]")
+    return text[start : end + 1] if 0 <= start < end else None
+
+
+def parse_tag_recommendations(text):
+    """Parse a judge model's reply into a list of ``{key, value, note}`` tags, or
+    ``None`` when the reply carries no recognizable recommendation.
+
+    The reply is expected to be a JSON array of objects (the model may wrap it in
+    prose or a code fence — the first ``[`` … last ``]`` is extracted). Each
+    entry needs a non-empty key and a ``value`` on the loud ladder
+    (:data:`LOUD_VALUES`); malformed entries are dropped and keys are slugged and
+    de-duplicated. An empty array parses to ``[]`` — the explicit "nothing
+    needed" verdict, so the caller clears its marks. ``None`` (no array / invalid
+    JSON) means "no judgement", distinct from a calm verdict: the caller then
+    leaves marks untouched rather than guess."""
+    blob = _json_array(text)
+    if blob is None:
+        return None
+    try:
+        items = json.loads(blob)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(items, list):
+        return None
+    out, seen = [], set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = _slug(item.get("key"))
+        value = str(item.get("value") or "").strip().lower()
+        if not key or value not in LOUD_VALUES or key in seen:
+            continue
+        seen.add(key)
+        out.append({"key": key, "value": value, "note": str(item.get("note") or "").strip()})
+    return out
 
 
 class WeaverError(RuntimeError):

@@ -1,17 +1,17 @@
-/** One (key, value) annotation on a branch. A status axis collapsed into data:
- *  the well-known *loud* keys are `attention` (authored by the agent) and
- *  `triage` (authored by an overlooker or `manual`), both on the
- *  `attention | blocked` ladder; every other key is a quiet, free-form pill.
- *  Absence is the calm state — there is no stored `ok`. Mirrors weaver-api's
- *  `TagView`. */
+/** One (key, value) annotation on a branch. Loudness lives in the VALUE: a tag
+ *  whose value is on the `attention | blocked` ladder is *loud* (raises a badge)
+ *  regardless of key — the agent's own `attention` self-report and a watch's
+ *  typed marks (`review`, `stuck`, …) alike. The key is the type (the chip
+ *  label); every other value is a quiet, free-form pill. Absence is the calm
+ *  state — there is no stored `ok`. Mirrors weaver-api's `TagView`. */
 export interface Tag {
   key: string;
   value: string;
   /** One-line reason accompanying the tag. */
   note: string;
-  /** Who set it — `agent`, an overlooker name, or `manual`. */
+  /** Who set it — `agent`, a watch/overlooker name, or `manual`. */
   set_by: string;
-  /** When it was last set (ISO). The dashboard fades a triage mark stale once
+  /** When it was last set (ISO). The dashboard fades an outside mark stale once
    *  the session's activity advances past this. */
   set_at: string;
 }
@@ -30,8 +30,8 @@ export interface Branch {
    *  via `weaver status` (e.g. "Wired up routes; tests pass"). Shown even
    *  when the branch is calm. */
   description: string;
-  /** Every tag on the branch: the agent's `attention`, an overlooker's
-   *  `triage`, and any free-form key. Empty when the branch is calm and
+  /** Every tag on the branch: the agent's own loud `attention`, a watch's typed
+   *  marks, and any free-form quiet key. Empty when the branch is calm and
    *  unmarked — absence is the default state, there is no `ok` tag. */
   tags: Tag[];
   repo_root: string;

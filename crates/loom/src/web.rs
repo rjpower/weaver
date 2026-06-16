@@ -1168,14 +1168,15 @@ pub async fn archive(
     }
     session_mod::set_status(&st.db, &session.id, "archived").await?;
     // An archived session is finished with: its agent is gone, so it can no
-    // longer "need me". Clear the loud tags (the agent's `attention` and any
-    // overlooker `triage` mark) so the dashboard stops flagging a torn-down
+    // longer "need me". Clear every loud tag — the agent's own `attention` and
+    // any watch's typed marks (loudness is value-driven, so match on the value,
+    // not a fixed key set) — so the dashboard stops flagging a torn-down
     // workstream — absence is the calm state. The history (goal, status, events)
-    // is kept; the `description` message stays too.
-    for key in tags::LOUD_KEYS {
-        if tags::get(&st.db, &branch.id, key).await?.is_some() {
-            tags::clear(&st.db, &branch.id, key).await?;
-            events::record_tag(&st.db, &st.bus, &branch.id, key, "", "", "manual")
+    // is kept; the `description` message stays too, as do any quiet pills.
+    for tag in tags::list(&st.db, &branch.id).await? {
+        if tags::is_loud_value(&tag.value) {
+            tags::clear(&st.db, &branch.id, &tag.key).await?;
+            events::record_tag(&st.db, &st.bus, &branch.id, &tag.key, "", "", "manual")
                 .await
                 .ok();
         }

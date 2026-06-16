@@ -77,7 +77,7 @@ test.describe('session list view', () => {
     const card = page.locator(`[data-session-id="${s.id}"]`);
     const chip = card.locator('[data-testid="signal-chip"][data-signal-key="triage"]');
     await expect(chip).toHaveAttribute('data-level', 'blocked');
-    await expect(chip).toHaveAttribute('data-raised-by', 'triage');
+    await expect(chip).toHaveAttribute('data-raised-by', 'overlooker');
     // It counts toward "needs attention" even though the agent is calm.
     await expect(page.getByTestId('filter-attention')).toContainText('1');
 

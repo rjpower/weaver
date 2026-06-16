@@ -51,6 +51,15 @@ async fn archive_keeps_branch_and_history() {
         )
         .await
         .unwrap();
+    // A watch's typed loud mark (a non-well-known key on the ladder): archiving
+    // must clear it too — loudness is value-driven, not a fixed key set.
+    client
+        .put(
+            &format!("/api/sessions/{arch_id}/tags/review"),
+            json!({ "value": "attention", "by": "status-check" }),
+        )
+        .await
+        .unwrap();
     client
         .patch(
             &format!("/api/sessions/{arch_id}"),
@@ -84,6 +93,10 @@ async fn archive_keeps_branch_and_history() {
     assert!(
         branch_tag(&view, "attention").is_none(),
         "archive should clear the attention tag"
+    );
+    assert!(
+        branch_tag(&view, "review").is_none(),
+        "archive should clear a watch's typed loud mark too"
     );
     assert_eq!(
         view["branch"]["description"], "Waiting for input",

@@ -1,13 +1,14 @@
 """The builtin status program's decision logic, with no server required.
 
-Loads `crates/loom/overlookers/status.py` straight from the repo and drives
-it with stubbed clients: the judge's prompt/fallback split, the ok-clears
-rule, the capability branches, and the summary format all live here. The
-Rust integration suite keeps only the wiring proof — that the script runs
-under the engine against a live loom and its marks/audit rows land.
+Loads `crates/loom/overlookers/status.py` straight from the repo and drives it
+with stubbed clients: the judge's parse + no-judgement split, the reconcile
+(set recommended tags, clear the watch's own dropped ones), the capability
+branches, dry-run, and the summary all live here. The Rust integration suite
+keeps only the wiring proof — that the script runs under the engine against a
+live loom and its writes/audit rows land.
 
-pr-label and archive-merged carry no logic beyond a one-line predicate over
-the PR snapshot, so their coverage stays in the Rust end-to-end test
+pr-label and archive-merged carry no logic beyond a one-line predicate over the
+PR snapshot, so their coverage stays in the Rust end-to-end test
 (`builtin_scripts_report_merged_and_unlabelled_prs`) — a pytest double of a
 one-liner would be duplication, not coverage.
 """
@@ -30,17 +31,17 @@ def load_program(name):
 
 status = load_program("status")
 
+TAGS = '[{"key": "review", "value": "attention", "note": "looks done"}]'
+
 
 class StubClient:
     """The slice of Client the status program touches, scripted per test."""
 
-    def __init__(self, capabilities=None, sessions=None, agent_reply=None,
-                 screen="the pane", nudge_fails=False):
+    def __init__(self, capabilities=None, sessions=None, agent_reply=None, screen="the pane"):
         self.capabilities = capabilities or []
         self._sessions = sessions or []
         self.agent_reply = agent_reply
         self.screen = screen
-        self.nudge_fails = nudge_fails
         self.calls = []
 
     def can(self, cap):
@@ -50,25 +51,29 @@ class StubClient:
         return self._sessions
 
     def preview(self, key, lines=0):
-        self.calls.append(("preview", key))
+        self.calls.append(("preview", key, lines))
         return self.screen
 
     def agent(self, prompt, model="", effort=""):
         self.calls.append(("agent", prompt, model, effort))
         return self.agent_reply
 
-    def mark(self, key, level, note="", by=None):
-        self.calls.append(("mark", key, level, note, by))
+    def set_tag(self, key, tag_key, value, note="", by=None):
+        self.calls.append(("set_tag", key, tag_key, value, note, by))
 
-    def nudge(self, key, text, submit=True, by=None):
-        if self.nudge_fails:
-            raise WeaverError("no live terminal")
-        self.calls.append(("nudge", key, text, by))
+    def clear_tag(self, key, tag_key, by=None):
+        self.calls.append(("clear_tag", key, tag_key, by))
 
 
-def session(id, attention=None):
-    tags = [{"key": "attention", "value": attention}] if attention else []
-    return {"id": id, "status": "running", "branch": {"tags": tags, "repo_root": "/r"}}
+def session(id, attention=None, watch=None, status="running"):
+    """A session dict: an optional `attention` self-report (set_by agent) and any
+    number of watch-authored marks (set_by 'watch', this round's name)."""
+    tags = []
+    if attention:
+        tags.append({"key": "attention", "value": attention, "set_by": "agent"})
+    for key, value in (watch or {}).items():
+        tags.append({"key": key, "value": value, "set_by": "watch"})
+    return {"id": id, "status": status, "branch": {"tags": tags, "repo_root": "/r"}}
 
 
 def make_round(client, **config):
@@ -82,31 +87,54 @@ def run_main(client, capsys, **config):
     return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
 
 
-# -- judge: fallback rule vs prompt path ---------------------------------------
+def sets(client):
+    return [c for c in client.calls if c[0] == "set_tag"]
 
 
-def test_judge_mirrors_attention_without_a_prompt():
-    rnd = make_round(StubClient())
-    assert status.judge(rnd, session("s", "blocked")) == ("blocked", "attention is blocked")
-    assert status.judge(rnd, session("s")) == ("ok", "attention is ok")
+def clears(client):
+    return [c for c in client.calls if c[0] == "clear_tag"]
 
 
-def test_judge_prompt_path_asks_the_agent_with_screen_and_model():
-    client = StubClient(agent_reply="blocked: stuck on a test")
-    rnd = make_round(client, params={"prompt": "stuck?"}, model="haiku", effort="low")
-    assert status.judge(rnd, session("s")) == ("blocked", "stuck on a test")
+# -- judge: parse the agent's tag set, no-judgement vs calm verdict ------------
+
+
+def test_judge_parses_the_agents_tag_set():
+    client = StubClient(agent_reply=TAGS)
+    rnd = make_round(client)
+    assert status.judge_tags(rnd, session("s")) == [
+        {"key": "review", "value": "attention", "note": "looks done"}
+    ]
+
+
+def test_judge_is_none_without_an_agent():
+    # No agent (empty reply) → None ("no judgement"), distinct from a calm []
+    # verdict: the caller leaves the session's marks untouched.
+    for reply in (None, ""):
+        rnd = make_round(StubClient(agent_reply=reply))
+        assert status.judge_tags(rnd, session("s")) is None
+
+
+def test_judge_empty_array_is_the_calm_verdict():
+    rnd = make_round(StubClient(agent_reply="nothing needed: []"))
+    assert status.judge_tags(rnd, session("s")) == []
+
+
+def test_judge_uses_the_default_prompt_with_screen_and_model():
+    client = StubClient(agent_reply=TAGS)
+    rnd = make_round(client, model="haiku", effort="low")
+    status.judge_tags(rnd, session("s"))
+    assert ("preview", "s", status.SCREEN_LINES) in client.calls
     kind, prompt, model, effort = client.calls[-1]
     assert (kind, model, effort) == ("agent", "haiku", "low")
-    assert prompt.startswith("stuck?") and "the pane" in prompt
+    assert prompt.startswith(status.DEFAULT_PROMPT) and "the pane" in prompt
 
 
-def test_judge_falls_back_when_agent_is_absent_or_unparseable():
-    for reply in (None, "no verdict here"):
-        rnd = make_round(StubClient(agent_reply=reply), params={"prompt": "stuck?"})
-        assert status.judge(rnd, session("s", "attention")) == (
-            "attention",
-            "attention is attention",
-        )
+def test_judge_honours_a_configured_prompt():
+    client = StubClient(agent_reply=TAGS)
+    rnd = make_round(client, params={"prompt": "MY PROMPT"})
+    status.judge_tags(rnd, session("s"))
+    _, prompt, *_ = client.calls[-1]
+    assert prompt.startswith("MY PROMPT")
 
 
 def test_judge_survives_a_dead_pane():
@@ -114,66 +142,99 @@ def test_judge_survives_a_dead_pane():
         def preview(self, key, lines=0):
             raise WeaverError("409 no live terminal")
 
-    rnd = make_round(NoPane(agent_reply="ok - all quiet"), params={"prompt": "stuck?"})
-    assert status.judge(rnd, session("s")) == ("ok", "all quiet")
+    client = NoPane(agent_reply=TAGS)
+    rnd = make_round(client, params={"prompt": "judge"})
+    assert status.judge_tags(rnd, session("s")) == [
+        {"key": "review", "value": "attention", "note": "looks done"}
+    ]
+    # The agent was still consulted, with an empty screen.
+    assert any(c[0] == "agent" for c in client.calls)
 
 
-# -- main: marking, clearing, capabilities, dry-run, summary --------------------
+# -- main: apply + reconcile, capabilities, dry-run, summary -------------------
 
 
-def test_marks_loud_sessions_and_clears_calm_ones(capsys):
+def test_applies_tags_and_reconciles_its_own_dropped_marks(capsys):
+    # The watch previously marked `stuck`; the new judgement recommends `review`,
+    # so `review` is set and the watch's own `stuck` is cleared.
     client = StubClient(
         capabilities=["mark"],
-        sessions=[session("loud", "blocked"), session("calm")],
+        agent_reply=TAGS,
+        sessions=[session("s", watch={"stuck": "blocked"})],
     )
     result = run_main(client, capsys)
-    assert ("mark", "loud", "blocked", "attention is blocked", "watch") in client.calls
-    assert ("mark", "calm", "ok", "", "watch") in client.calls  # ok ⇒ clear
+    assert ("set_tag", "s", "review", "attention", "looks done", "watch") in client.calls
+    assert ("clear_tag", "s", "stuck", "watch") in client.calls
     assert result["outcome"] == "ok"
-    assert result["summary"] == "surveyed 2, marked 1 (1 blocked)"
-    assert result["actions"] == [
-        {"action": "mark", "session": "loud", "level": "blocked",
-         "note": "attention is blocked"}
-    ]
+    assert result["summary"] == "assessed 1 of 1, applied 1 tag(s)"
+
+
+def test_empty_verdict_clears_the_watchs_own_marks(capsys):
+    client = StubClient(
+        capabilities=["mark"],
+        agent_reply="[]",
+        sessions=[session("s", watch={"review": "attention"})],
+    )
+    result = run_main(client, capsys)
+    assert sets(client) == []
+    assert ("clear_tag", "s", "review", "watch") in client.calls
+    assert result["summary"] == "assessed 1 of 1, applied 0 tag(s)"
+
+
+def test_no_judgement_leaves_every_mark_untouched(capsys):
+    # Agent absent → None: the round must not clear the watch's existing marks.
+    client = StubClient(
+        capabilities=["mark"],
+        agent_reply=None,
+        sessions=[session("s", watch={"review": "attention"})],
+    )
+    result = run_main(client, capsys)
+    assert sets(client) == [] and clears(client) == []
+    assert result == {
+        "outcome": "noop",
+        "summary": "assessed 0 of 1, applied 0 tag(s)",
+        "actions": [],
+    }
+
+
+def test_never_touches_the_agents_own_self_report(capsys):
+    # The agent self-reports `attention`; the judge says nothing is needed. Only
+    # watch-authored marks are reconciled, so the agent's tag is never cleared.
+    client = StubClient(
+        capabilities=["mark"],
+        agent_reply="[]",
+        sessions=[session("s", attention="attention")],
+    )
+    run_main(client, capsys)
+    assert not any(c[0] == "clear_tag" and c[2] == "attention" for c in client.calls)
+    assert clears(client) == []
 
 
 def test_without_mark_capability_only_observes(capsys):
-    client = StubClient(sessions=[session("loud", "attention")])
+    client = StubClient(agent_reply=TAGS, sessions=[session("s")])
     result = run_main(client, capsys)
-    assert client.calls == []  # no mutation attempted
+    assert sets(client) == [] and clears(client) == []
     assert result["actions"] == [
-        {"action": "observe", "session": "loud", "level": "attention",
-         "note": "attention is attention"}
+        {"action": "observe", "session": "s", "key": "review",
+         "value": "attention", "note": "looks done"}
     ]
 
 
-def test_dry_run_mutates_nothing_and_says_so(capsys):
-    client = StubClient(capabilities=["mark"],
-                        sessions=[session("loud", "blocked"), session("calm")])
+def test_dry_run_records_would_and_mutates_nothing(capsys):
+    client = StubClient(
+        capabilities=["mark"],
+        agent_reply=TAGS,
+        sessions=[session("s", watch={"stuck": "blocked"})],
+    )
     result = run_main(client, capsys, dry_run=True)
-    assert client.calls == []
-    assert result["actions"] == [
-        {"would": "mark", "session": "loud", "level": "blocked",
-         "note": "attention is blocked"}
-    ]
-    assert result["summary"] == "surveyed 2, would mark 1 (1 blocked) (dry run, no marks applied)"
+    assert sets(client) == [] and clears(client) == []
+    assert {"would": "tag", "session": "s", "key": "review",
+            "value": "attention", "note": "looks done"} in result["actions"]
+    assert {"would": "clear", "session": "s", "key": "stuck"} in result["actions"]
+    assert result["summary"] == "assessed 1 of 1, would apply 1 tag(s) (dry run, no writes applied)"
 
 
-def test_nudge_follows_a_mark_and_a_dead_pane_no_ops(capsys):
-    client = StubClient(capabilities=["mark", "nudge"],
-                        sessions=[session("loud", "blocked")])
-    result = run_main(client, capsys)
-    assert ("nudge", "loud", "[overlooker watch] attention is blocked", "watch") in client.calls
-    assert {"action": "nudge", "session": "loud",
-            "text": "[overlooker watch] attention is blocked"} in result["actions"]
-
-    dead = StubClient(capabilities=["mark", "nudge"],
-                      sessions=[session("loud", "blocked")], nudge_fails=True)
-    result = run_main(dead, capsys)
-    assert not any(a.get("action") == "nudge" for a in result["actions"])
-
-
-def test_empty_scope_is_a_noop(capsys):
+def test_empty_survey_is_a_noop(capsys):
     result = run_main(StubClient(capabilities=["mark"]), capsys)
     assert result == {"outcome": "noop", "summary": "surveyed 0 sessions in scope",
                       "actions": []}
