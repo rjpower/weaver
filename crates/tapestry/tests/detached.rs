@@ -81,6 +81,103 @@ async fn detached_supervisor_outlives_its_launcher() {
     let _ = Client::connect(&name).await.unwrap().kill().await;
 }
 
+/// The supervisor is its session's subreaper: a process the agent detaches and
+/// orphans must reparent to the supervisor (not escape to PID 1) and then get
+/// reaped when it dies, instead of lingering as a zombie. Without this a
+/// long-lived agent that shells out to detached helpers (`gh`, `sleep`, MCP
+/// servers) accretes zombies for the life of the session.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[serial]
+async fn detached_supervisor_reaps_orphaned_descendants() {
+    let home = TempDir::new().unwrap();
+    std::env::set_var("WEAVER_HOME", home.path());
+    let bin = env!("CARGO_BIN_EXE_tapestry");
+    let name = format!("tap-reap-{}", std::process::id());
+
+    // The subshell backgrounds `sleep` then exits immediately, orphaning it; with
+    // the supervisor as subreaper the orphan reparents to the supervisor. The
+    // foreground `sleep` keeps the session (and supervisor) alive meanwhile.
+    let pidfile = std::env::temp_dir().join(format!("tap-reap-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pidfile);
+    let script = format!(
+        "(sleep 300 & echo $! > {}); exec sleep 300",
+        pidfile.display()
+    );
+    spawn_via_binary(bin, &name, &script).await;
+
+    // Read the orphan's pid.
+    let mut orphan = String::new();
+    for _ in 0..200 {
+        if let Ok(s) = std::fs::read_to_string(&pidfile) {
+            if !s.trim().is_empty() {
+                orphan = s.trim().to_string();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!orphan.is_empty(), "orphan pid never recorded");
+
+    // It reparents to the supervisor (a `tapestry` process), not to init —
+    // proof the subreaper attribute took effect.
+    let mut reparented = false;
+    for _ in 0..200 {
+        if let Some(ppid) = proc_field(&orphan, 1) {
+            if ppid != "1" && proc_comm(&ppid).as_deref() == Some("tapestry") {
+                reparented = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        reparented,
+        "orphan {orphan} did not reparent to the supervisor"
+    );
+
+    // Kill it; the supervisor must reap it — /proc/<pid> disappears rather than
+    // sticking around as a zombie (state 'Z').
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &orphan])
+        .status();
+    let mut reaped = false;
+    for _ in 0..200 {
+        if proc_field(&orphan, 0).is_none() {
+            reaped = true; // /proc entry gone → reaped
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = std::fs::remove_file(&pidfile);
+    let _ = Client::connect(&name).await.unwrap().kill().await;
+    assert!(
+        reaped,
+        "orphan {orphan} was not reaped — lingered as a zombie"
+    );
+}
+
+/// Field `n` (0-based) of `/proc/<pid>/stat` *after* the parenthesised comm —
+/// so field 0 is state, field 1 is ppid. `None` if the process is gone. Reading
+/// after the last `)` sidesteps spaces/parens inside comm.
+#[cfg(target_os = "linux")]
+fn proc_field(pid: &str, n: usize) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(n).map(str::to_string)
+}
+
+/// `/proc/<pid>/comm` (the executable name), or `None` if the process is gone.
+#[cfg(target_os = "linux")]
+fn proc_comm(pid: &str) -> Option<String> {
+    Some(
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()?
+            .trim()
+            .to_string(),
+    )
+}
+
 /// Drive the `tapestry spawn` subcommand of the built binary, which setsid-
 /// detaches a supervisor and returns immediately. Using the CLI (rather than the
 /// library `spawn_detached`, which re-execs `current_exe`) makes the supervisor
