@@ -45,15 +45,18 @@ pub const BUILTINS: &[BuiltinProgram] = &[
     BuiltinProgram {
         name: "status",
         title: "Status check",
-        description: "Survey the scoped fleet and stamp a triage mark on each \
-                      session — judgement via the configured prompt (the \
-                      daemon's one-shot agent when available), else mirroring \
-                      the agent's own attention tag.",
+        description: "When a session goes idle (the agent's finished-turn hook), \
+                      ask the judge model (the daemon's one-shot agent) for the \
+                      set of attention tags it warrants and reconcile the watch's \
+                      own marks to that set. Names the kind of attention (review, \
+                      question, stuck, …) rather than a generic mark; with no \
+                      judge model available it no-ops, never mirroring the \
+                      agent's own attention tag.",
         source: include_str!("../overlookers/status.py"),
-        default_trigger: r#"{"cron":"0 * * * *"}"#,
-        default_scope: r#"{"attention":"!ok"}"#,
+        default_trigger: r#"{"on":["session.idle"]}"#,
+        default_scope: "{}",
         default_params: "{}",
-        default_capabilities: &["observe", "mark", "escalate"],
+        default_capabilities: &["observe", "mark"],
     },
     BuiltinProgram {
         name: "pr-label",

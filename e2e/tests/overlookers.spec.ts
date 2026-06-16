@@ -169,7 +169,7 @@ test.describe('overlooker panel', () => {
     const status = rows.filter({ hasText: 'builtin:status' });
     await status.getByTestId('program-source-toggle').click();
     await expect(status.getByTestId('program-source')).toContainText(
-      'stamp a triage mark',
+      'assess when the agent goes quiet',
     );
 
     // "Use" opens the create form prefilled with the program and a name.

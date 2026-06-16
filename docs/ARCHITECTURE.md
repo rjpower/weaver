@@ -301,14 +301,21 @@ branch.
 **Tags** are single-valued `(key, value)` annotations on a branch, each with a
 `note`, `set_by`, and `set_at`, stored in the shared `tags` table (one row per
 `(branch_id, key)`, registry in [`weaver_core::tags`](../crates/weaver-core/WEAVER.md)).
-The well-known keys are **`attention`** (the agent's own self-report) and
-**`triage`** (an overlooker's assessment); both are *loud* (they raise a badge)
-and hold `attention` | `blocked`. Any other key is a free-form, quiet pill.
-**Absence is the calm/default state** — there is no stored `ok`; returning to
-calm *clears* the tag. A tag is **stale** when its `set_at` predates the
-session's `last_activity_at` (the session moved on since it was set). The
-dashboard resolves the louder of the agent's `attention` tag and the non-stale
-`triage` tag into one attention signal, with attribution.
+**Loudness lives in the value, not the key:** a tag whose value is on the
+`attention` | `blocked` ladder is *loud* (raises a badge) regardless of key, so
+agents and watches both add loud tags without a privileged key registry. A tag's
+**key is its type** (the chip label — `attention`, `review`, `stuck`, …) and its
+**value is the severity**; every other value is a free-form, quiet pill. The
+agent authors the well-known **`attention`** key for its own self-report; a watch
+authors its own typed keys. **Absence is the calm/default state** — there is no
+stored `ok`; returning to calm *clears* the tag. A tag is **stale** when its
+`set_at` predates the session's `last_activity_at` (the session moved on since it
+was set). The dashboard resolves the loudest non-stale loud tag into one
+attention signal, with attribution (the agent's own, or an outside mark). The
+agent's own `attention` self-report stays the *server-side* signal — what
+`weaver status`, `resolve_attention`, and `weaver issue wait` read — so a watch's
+outside marks surface on the dashboard without spuriously waking sub-agent
+tracking.
 
 **Lifecycle** is driven by Claude Code hooks. `loom session launch` merges a `hooks`
 block into the worktree's `.claude/settings.local.json` (see
@@ -344,11 +351,13 @@ SSE. A bare `weaver status <level>` changes only the level and keeps the last
 message. Last write wins, so an explicit declaration overrides the hook-inferred
 default. The general `weaver tag set|rm|ls` group writes any key the same way;
 the `PUT`/`DELETE /api/sessions/{id}/tags/{key}` routes do it over HTTP for the
-UI and the [overlooker](plans/overlooker.md) (whose `mark` writes the `triage`
-tag).
+UI and the [overlooker](plans/overlooker.md). The builtin status watch, when a
+session goes idle (the agent's finished-turn hook), asks the judge model for the
+set of tags the session warrants and reconciles its own typed marks to that set
+— never mirroring the agent's own `attention`.
 
-Archiving a session clears its `attention` (and `triage`) tags (and drops any
-snapshotted `pending_prompt`): the agent is gone, so a torn-down workstream
+Archiving a session clears its loud tags (and drops any snapshotted
+`pending_prompt`): the agent is gone, so a torn-down workstream
 can't still "need me", and the dashboard stops flagging it. The UI also treats
 any `archived` session as calm regardless of a stale tag left on the branch.
 

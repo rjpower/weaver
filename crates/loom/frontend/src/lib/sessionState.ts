@@ -2,31 +2,29 @@ import type { Session, Tag } from '../types';
 
 export type Attention = 'ok' | 'attention' | 'blocked';
 
-// The well-known LOUD tag keys, both on the attention | blocked ladder. Every
-// other key is a quiet, free-form pill. Mirrors weaver-core's tag registry.
-export const ATTENTION_KEY = 'attention';
-export const TRIAGE_KEY = 'triage';
-const LOUD_KEYS = new Set<string>([ATTENTION_KEY, TRIAGE_KEY]);
+// Loudness lives in the tag VALUE, not the key. Any tag whose value is on this
+// ladder raises a badge — regardless of key — so agents and watches both add
+// loud tags without a hardcoded key registry. A tag's KEY is its type (the chip
+// label); its VALUE is the severity. Every other value is a quiet, free-form
+// pill. Mirrors weaver-core's `ATTENTION_VALUES`.
+const SEVERITY: Record<string, number> = { attention: 1, blocked: 2 };
 
-// Severity order for the loud ladder. Absence (no tag) is `ok`, the calm floor.
-const SEVERITY: Record<Attention, number> = { ok: 0, attention: 1, blocked: 2 };
-
-// One branch tag by key, or undefined when absent (the calm state).
-function tagOf(s: Session, key: string): Tag | undefined {
-  return s.branch.tags?.find((t) => t.key === key);
+// Severity of a tag value: 0 is quiet (a pill), >0 is loud (a badge).
+function severityOf(value: string | undefined): number {
+  return (value && SEVERITY[value]) || 0;
 }
 
-// Normalize a stored loud value to the ladder; anything unexpected is `ok`.
-function normalize(value: string | undefined): Attention {
-  return value === 'attention' || value === 'blocked' ? value : 'ok';
+// A loud tag's value, narrowed to the ladder (loud tags only — callers guard
+// with severityOf first).
+function levelValue(value: string): Exclude<Attention, 'ok'> {
+  return value === 'blocked' ? 'blocked' : 'attention';
 }
 
-// Agent-declared attention, read off the `attention` tag. Archived sessions are
-// forced quiet (the agent is gone); an absent tag is the calm `ok` floor.
-// Mirrors the backend; keeps stale/archived rows from shouting.
-export function levelOf(s: Session): Attention {
-  if (s.status === 'archived') return 'ok';
-  return normalize(tagOf(s, ATTENTION_KEY)?.value);
+// An agent's own self-report vs an outside mark (a watch/overlooker, or a
+// manual mark). The agent authors the well-known `attention` key; anything else
+// loud is an outside assessment, rendered with the ⊙ "watched" treatment.
+function isAgentTag(tag: Tag): boolean {
+  return tag.key === 'attention' || tag.set_by === 'agent';
 }
 
 // The current-state message (Branch.description). Suppressed for archived
@@ -36,18 +34,8 @@ export function messageOf(s: Session): string {
   return s.branch.description ?? '';
 }
 
-// The overlooker's triage mark, read off the `triage` tag. '' means unmarked
-// (no badge). Distinct from levelOf(): that is the agent's own attention; this
-// is an outside assessment stamped by an overlooker. Archived sessions show
-// nothing.
-export function triageOf(s: Session): '' | Attention {
-  if (s.status === 'archived') return '';
-  const t = tagOf(s, TRIAGE_KEY);
-  return t ? normalize(t.value) : '';
-}
-
 // Whether a tag predates the session's latest activity — the session has "moved
-// on" since the tag was set, so a triage mark may no longer hold. The badge
+// on" since the tag was set, so an outside mark may no longer hold. The badge
 // renders this faded with a stale hint. No tag, or no activity timestamp, is
 // never stale.
 export function tagStale(tag: Tag | undefined, lastActivityAt: string): boolean {
@@ -55,140 +43,116 @@ export function tagStale(tag: Tag | undefined, lastActivityAt: string): boolean 
   return lastActivityAt > tag.set_at;
 }
 
+// The loud tags on a session (value on the ladder), archived shown none.
+function loudTags(s: Session): Tag[] {
+  if (s.status === 'archived') return [];
+  return (s.branch.tags ?? []).filter((t) => severityOf(t.value) > 0);
+}
+
 // Who raised the resolved attention signal: the agent's own self-report, or an
-// overlooker's outside assessment (triage). The pages render the agent's signal
-// as the plain loud badge and an overlooker's with the ⊙ "watched" treatment.
+// outside assessment. The pages render the agent's signal as the plain loud
+// badge and an outside mark with the ⊙ "watched" treatment.
 export interface EffectiveAttention {
   level: Attention;
-  /** Which axis is loudest: 'agent' (its own `attention`) or 'triage' (an
-   *  overlooker). 'none' when calm. */
-  raisedBy: 'none' | 'agent' | 'triage';
+  /** Which axis is loudest: 'agent' (its own loud tag) or 'overlooker' (an
+   *  outside mark). 'none' when calm. */
+  raisedBy: 'none' | 'agent' | 'overlooker';
   /** The `set_by` of the loudest tag (the overlooker name, or 'agent'). */
   by: string;
+  /** The key of the loudest tag — its type, e.g. 'attention', 'review'. */
+  key: string;
   /** One-line reason from the loudest tag. */
   note: string;
-  /** True when a triage mark is the loudest signal but the session has moved on
-   *  since it was set, so it should fade. */
+  /** True when an outside mark is the loudest signal but the session has moved
+   *  on since it was set, so it should fade. */
   stale: boolean;
 }
 
-// The single resolved attention signal the dashboard renders: the louder of the
-// agent's `attention` tag and the *non-stale* `triage` tag. The agent saying
-// calm while an overlooker says attention surfaces as "needs attention (raised
-// by <overlooker>)". A stale triage mark is ignored for the resolved level (the
-// session has moved on) but still flagged when it is the only signal, so an
-// hour-old "looks stuck" fades rather than lies.
-export function effectiveAttention(s: Session): EffectiveAttention {
-  if (s.status === 'archived') {
-    return { level: 'ok', raisedBy: 'none', by: '', note: '', stale: false };
-  }
-
-  const agentTag = tagOf(s, ATTENTION_KEY);
-  const triageTag = tagOf(s, TRIAGE_KEY);
-  const agentLevel = normalize(agentTag?.value);
-  const triageLevel = normalize(triageTag?.value);
-  const triageIsStale = tagStale(triageTag, s.last_activity_at);
-
-  // A stale triage mark doesn't drive the resolved level; only a live one does.
-  const liveTriage = triageTag && !triageIsStale ? triageLevel : 'ok';
-
-  // The louder axis wins; on a tie the agent's own report takes precedence
-  // (its self-report is the primary signal).
-  if (SEVERITY[liveTriage] > SEVERITY[agentLevel]) {
-    return {
-      level: liveTriage,
-      raisedBy: 'triage',
-      by: triageTag!.set_by || 'overlooker',
-      note: triageTag!.note,
-      stale: false,
-    };
-  }
-  if (agentLevel !== 'ok') {
-    return {
-      level: agentLevel,
-      raisedBy: 'agent',
-      by: agentTag?.set_by || 'agent',
-      note: agentTag?.note ?? messageOf(s),
-      stale: false,
-    };
-  }
-  // The agent is calm. Surface a stale triage mark, faded, as the lone signal so
-  // it stays visible (with attribution) without claiming the session is live.
-  if (triageTag) {
-    return {
-      level: triageLevel,
-      raisedBy: 'triage',
-      by: triageTag.set_by || 'overlooker',
-      note: triageTag.note,
-      stale: triageIsStale,
-    };
-  }
-  return { level: 'ok', raisedBy: 'none', by: '', note: '', stale: false };
+// Severity-then-agent ordering: the louder tag wins; on a tie the agent's own
+// self-report leads (its self-report is the primary signal).
+function louder(a: Tag, b: Tag): number {
+  const d = severityOf(b.value) - severityOf(a.value);
+  if (d !== 0) return d;
+  return Number(isAgentTag(b)) - Number(isAgentTag(a));
 }
 
-// One loud tag (`attention` or `triage`) surfaced as an individually-dismissable
-// chip. Unlike effectiveAttention (which resolves the single loudest level for
-// filtering, sorting and counts), this surfaces EACH present loud tag so a human
-// can clear them independently: the agent's own `attention` and an overlooker's
-// `triage` are separate rows, and each gets its own × . Clearing a chip DELETEs
-// that tag — the calm state is its absence, so there is no "Mark OK" verb, just
-// the same chip-delete gesture as any quiet tag.
+// The attribution a loud tag carries: its type (key), severity (level), author
+// (by/raisedBy) and reason (note, with the agent's message as fallback).
+// effectiveAttention and signalChips both build on this so the rules stay in one
+// place; they differ only in how each treats staleness.
+function markOf(s: Session, tag: Tag): Omit<SignalChip, 'stale'> {
+  const agent = isAgentTag(tag);
+  return {
+    key: tag.key,
+    level: levelValue(tag.value),
+    by: tag.set_by || (agent ? 'agent' : 'overlooker'),
+    raisedBy: agent ? 'agent' : 'overlooker',
+    note: tag.note || (tag.key === 'attention' ? messageOf(s) : ''),
+  };
+}
+
+// The single resolved attention signal the dashboard renders: the loudest of a
+// session's loud tags. A *non-stale* mark always beats a stale one (the session
+// has moved on past a stale mark); a stale mark surfaces, faded, only when it is
+// the lone signal — so an hour-old "looks stuck" fades rather than lies.
+export function effectiveAttention(s: Session): EffectiveAttention {
+  const calm: EffectiveAttention = {
+    level: 'ok',
+    raisedBy: 'none',
+    by: '',
+    key: '',
+    note: '',
+    stale: false,
+  };
+  const tags = loudTags(s);
+  if (tags.length === 0) return calm;
+
+  const live = tags.filter((t) => !tagStale(t, s.last_activity_at));
+  const pool = live.length ? live : tags;
+  const stale = live.length === 0;
+  const top = [...pool].sort(louder)[0];
+
+  return { ...markOf(s, top), stale };
+}
+
+// One loud tag surfaced as an individually-dismissable chip. Unlike
+// effectiveAttention (which resolves the single loudest level for filtering,
+// sorting and counts), this surfaces EACH loud tag so a human can clear them
+// independently: the agent's own `attention` and a watch's typed marks are
+// separate rows, each gets its own × . Clearing a chip DELETEs that tag — the
+// calm state is its absence, so there is no "Mark OK" verb, just the same
+// chip-delete gesture as any quiet tag.
 export interface SignalChip {
-  /** The tag key to DELETE when the chip is cleared: 'attention' | 'triage'. */
+  /** The tag key to DELETE when the chip is cleared, and the chip's type label. */
   key: string;
   level: Exclude<Attention, 'ok'>;
-  /** Who set it: 'agent', or the overlooker's name. */
+  /** Who set it: 'agent', or the overlooker's / mark's name. */
   by: string;
-  /** Which axis: 'agent' (its own `attention`) or 'triage' (an overlooker). */
-  raisedBy: 'agent' | 'triage';
+  /** Which axis: 'agent' (its own loud tag) or 'overlooker' (an outside mark). */
+  raisedBy: 'agent' | 'overlooker';
   /** One-line reason from the tag. */
   note: string;
-  /** A triage mark the session has moved on past — shown faded, still clearable. */
+  /** An outside mark the session has moved on past — shown faded, still clearable. */
   stale: boolean;
 }
 
-// The loud signals on a session as dismissable chips, in severity-then-axis
-// order. The agent's `attention` and an overlooker's `triage` each render as
-// their own chip so either can be cleared on its own — which is the whole point:
-// a stale overlooker mark is no longer a thing you "can't resolve", it's just a
-// chip with an × . Archived sessions show none (the agent is gone).
+// The loud signals on a session as dismissable chips, in severity-then-agent
+// order. Each loud tag renders as its own chip so any one can be cleared on its
+// own — which is the whole point: a stale mark is no longer a thing you "can't
+// resolve", it's just a chip with an × . Archived sessions show none.
 export function signalChips(s: Session): SignalChip[] {
-  if (s.status === 'archived') return [];
-  const chips: SignalChip[] = [];
-  const agentTag = tagOf(s, ATTENTION_KEY);
-  const agentLevel = normalize(agentTag?.value);
-  if (agentTag && agentLevel !== 'ok') {
-    chips.push({
-      key: ATTENTION_KEY,
-      level: agentLevel,
-      by: agentTag.set_by || 'agent',
-      raisedBy: 'agent',
-      note: agentTag.note || messageOf(s),
-      stale: false,
-    });
-  }
-  const triageTag = tagOf(s, TRIAGE_KEY);
-  const triageLevel = normalize(triageTag?.value);
-  if (triageTag && triageLevel !== 'ok') {
-    chips.push({
-      key: TRIAGE_KEY,
-      level: triageLevel,
-      by: triageTag.set_by || 'overlooker',
-      raisedBy: 'triage',
-      note: triageTag.note,
-      stale: tagStale(triageTag, s.last_activity_at),
-    });
-  }
-  // Blocked before attention, so the louder chip leads.
-  return chips.sort((a, b) => SEVERITY[b.level] - SEVERITY[a.level]);
+  return loudTags(s)
+    .slice()
+    .sort(louder)
+    .map((t) => ({ ...markOf(s, t), stale: tagStale(t, s.last_activity_at) }));
 }
 
-// The session's quiet tags: every tag whose key is not loud, for the pill row.
+// The session's quiet tags: every tag whose value is not loud, for the pill row.
 // These are free-form, deletable annotations (priority, needs-rebase, …).
 // Archived sessions show none.
 export function quietTags(s: Session): Tag[] {
   if (s.status === 'archived') return [];
-  return (s.branch.tags ?? []).filter((t) => !LOUD_KEYS.has(t.key));
+  return (s.branch.tags ?? []).filter((t) => severityOf(t.value) === 0);
 }
 
 // Compact conversation-state line for the detail header (#5): a derived
@@ -208,8 +172,8 @@ export function conversationState(s: Session): ConvState {
   if (s.status === 'orphaned') return { glyph: '◦', label: 'Orphaned — detached', tone: 'muted' };
   if (s.status === 'error') return { glyph: '◦', label: 'Error', tone: 'muted' };
 
-  // Then the resolved attention signal (agent's own, or a non-stale overlooker
-  // mark — whichever is louder).
+  // Then the resolved attention signal (the loudest live loud tag — the agent's
+  // own, or an outside mark).
   const level = effectiveAttention(s).level;
   if (level === 'blocked') return { glyph: '●', label: 'Blocked', tone: 'block' };
   if (level === 'attention') return { glyph: '●', label: 'Needs attention', tone: 'attn' };

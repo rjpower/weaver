@@ -1,112 +1,122 @@
-"""status — survey the scoped fleet and stamp a triage mark on each session.
+"""status — when a session goes idle, judge it and stamp the watch's own tags.
 
-The judgement is best-effort-LLM with a deterministic fallback, so the round
-works fully without a real agent:
+On the agent's finished-turn hook (``session.idle``) this watch re-assesses just
+that session: it asks the judge model (the daemon's one-shot agent) for advice on
+a set of attention tags to apply given the recent screen, then reconciles its own
+marks to that set — setting the recommended tags and clearing any it set earlier
+that no longer apply.
 
-* when a prompt is configured (params.prompt), ask the daemon's one-shot
-  agent for a level + note from the session's screen preview (parsed
-  leniently via parse_judgement);
-* otherwise — or when the agent is absent or unparseable — fall back to a
-  rule that mirrors the session's own `attention` tag as the mark.
-
-An `ok` judgement returns the triage axis to calm (clears the tag) rather
-than marking. With the `nudge` capability, a freshly marked session is also
-nudged with the note. Honours dry_run: would-be marks are logged as
-`{would: "mark"}` actions and nothing mutates.
+User attention is expensive, so the default prompt tells the model to flag a
+session ONLY when it genuinely needs the human, and to name the *kind* of
+attention (the tag key — `review`, `question`, `stuck`, …) rather than a generic
+"needs attention". The watch never mirrors the agent's own ``attention``
+self-report; that is the agent's signal, on its own key. With no judge model
+available (no agent, or an empty/garbled reply), the round is a no-op — it leaves
+every mark untouched rather than guess. Honours dry_run: would-be writes are
+logged as actions and nothing mutates.
 """
 
-from weaver_loom import Round, WeaverError, parse_judgement
+from weaver_loom import Round, WeaverError, parse_tag_recommendations
 
-#: The storable triage values; `ok` is the absence of the tag.
-STORABLE = ("attention", "blocked")
+#: Wake on the agent's finished-turn hook — "assess when the agent goes quiet".
+TRIGGERS = {"on": ["session.idle"]}
 
-#: A scheduled survey of the whole scoped fleet — the engine reads this in
-#: register mode. (A status sweep is inherently fleet-wide, so it stays on a
-#: cadence rather than a per-session event.)
-TRIGGERS = {"cron": "0 * * * *"}
+#: Lines of terminal scrollback handed to the judge as context.
+SCREEN_LINES = 200
+
+#: The default judge prompt, overridable via params.prompt. Asks for a JSON array
+#: of {key, value, note} tags, or [] when the human is not needed.
+DEFAULT_PROMPT = (
+    "You are triaging a detached coding-agent session for a human operator who "
+    "reviews many sessions asynchronously. Their attention is expensive: flag a "
+    "session ONLY when it genuinely needs the human now. Read the recent session "
+    "screen below and decide which attention tags apply.\n\n"
+    "Reply with ONLY a JSON array of objects "
+    '{"key": "<short-type>", "value": "attention" | "blocked", "note": "<one '
+    'line>"}. Use an empty array [] when the session does not need the human. '
+    "The key names the KIND of attention; pick the few that fit, e.g.:\n"
+    '  - "review"   — work looks finished / a PR is ready to look at (value "attention")\n'
+    '  - "question" — waiting on a decision only the operator can make (value "attention")\n'
+    '  - "stuck"    — looping or erroring with no progress (value "blocked")\n'
+    '  - "idle"     — went quiet mid-task for no clear reason (value "attention")\n'
+    "Do not invent noise, and do not restate the agent's own self-reported "
+    "status — add only what an outside observer would flag."
+)
 
 
-def attention_value(session):
-    """The session's own `attention` tag value — `ok` when absent (calm)."""
-    for tag in (session.get("branch") or {}).get("tags") or []:
-        if tag.get("key") == "attention":
-            return tag.get("value") or "ok"
-    return "ok"
+def judge_tags(rnd, session):
+    """Ask the judge model for the set of tags to apply to ``session``.
+
+    Returns the parsed list (possibly empty — the "nothing needed" verdict that
+    clears the watch's marks), or ``None`` for "no judgement" (no agent, or an
+    unparseable reply) so the caller leaves the session's marks untouched."""
+    prompt = rnd.params.get("prompt") or DEFAULT_PROMPT
+    try:
+        screen = rnd.client.preview(session["id"], SCREEN_LINES)
+    except WeaverError:
+        screen = ""
+    out = rnd.client.agent(f"{prompt}\n\nSession screen:\n{screen}\n", rnd.model, rnd.effort)
+    if not out:
+        return None
+    return parse_tag_recommendations(out)
 
 
-def judge(rnd, session):
-    """Decide a (level, note) for one session: best-effort LLM judgement when
-    a prompt is configured, else mirror the agent's self-reported attention."""
-    prompt = rnd.params.get("prompt") or ""
-    if prompt:
-        try:
-            screen = rnd.client.preview(session["id"], 200)
-        except WeaverError:
-            screen = ""
-        out = rnd.client.agent(
-            f"{prompt}\n\nSession screen:\n{screen}\n", rnd.model, rnd.effort
-        )
-        judged = parse_judgement(out) if out else None
-        if judged:
-            return judged
-
-    attention = attention_value(session)
-    level = attention if attention in STORABLE else "ok"
-    return level, f"attention is {attention}"
+def watch_tags(rnd, session):
+    """The keys of tags on ``session`` that THIS watch authored — the marks it
+    owns and may reconcile (never the agent's own or another author's)."""
+    return {
+        tag.get("key")
+        for tag in (session.get("branch") or {}).get("tags") or []
+        if tag.get("set_by") == rnd.name and tag.get("key")
+    }
 
 
 def main(rnd):
     can_mark = rnd.can("mark")
-    can_nudge = rnd.can("nudge")
-    marked = 0
-    counts = {}
+    assessed = 0
+    tagged = 0
 
-    for session in rnd.sessions():
-        level, note = judge(rnd, session)
+    # Reactive on session.idle: act on just the session that went quiet. A manual
+    # run (no trigger session) falls back to the whole scoped fleet.
+    for session in rnd.triggered_sessions():
+        desired = judge_tags(rnd, session)
+        if desired is None:
+            continue  # no judgement available — leave this session's marks alone
+        assessed += 1
+        sid = session["id"]
+        stale = watch_tags(rnd, session) - {t["key"] for t in desired}
 
-        # An `ok` judgement returns the triage axis to calm rather than
-        # marking: clear the tag (the server records the cleared-tag event —
-        # the audit rule). The dry-run path mutates nothing.
-        if level not in STORABLE:
-            if can_mark and not rnd.dry_run:
-                rnd.client.mark(session["id"], "ok", by=rnd.name)
-            continue
-
+        # Without `mark`, the round is read-only: report what it would tag.
         if not can_mark:
-            rnd.did("observe", session=session["id"], level=level, note=note)
+            for t in desired:
+                rnd.did("observe", session=sid, **t)
             continue
 
-        marked += 1
-        counts[level] = counts.get(level, 0) + 1
-        if rnd.dry_run:
-            rnd.would("mark", session=session["id"], level=level, note=note)
-            continue
-
-        rnd.client.mark(session["id"], level, note, by=rnd.name)
-        rnd.did("mark", session=session["id"], level=level, note=note)
-
-        # The nudge rung of the intervention ladder: only when capability-
-        # granted. Best-effort; a session with no live terminal just no-ops.
-        if can_nudge:
-            text = f"[overlooker {rnd.name}] {note}"
-            try:
-                rnd.client.nudge(session["id"], text, by=rnd.name)
-                rnd.did("nudge", session=session["id"], text=text)
-            except WeaverError:
-                pass
+        tagged += len(desired)
+        for t in desired:
+            if rnd.dry_run:
+                rnd.would("tag", session=sid, **t)
+            else:
+                rnd.client.set_tag(sid, t["key"], t["value"], t["note"], by=rnd.name)
+                rnd.did("tag", session=sid, **t)
+        # Reconcile: clear the watch's own marks the new judgement dropped.
+        for key in sorted(stale):
+            if rnd.dry_run:
+                rnd.would("clear", session=sid, key=key)
+            else:
+                rnd.client.clear_tag(sid, key, by=rnd.name)
+                rnd.did("clear", session=sid, key=key)
 
     if rnd.surveyed == 0:
         rnd.finish("surveyed 0 sessions in scope", outcome="noop")
         return
 
-    breakdown = ", ".join(f"{n} {level}" for level, n in sorted(counts.items()))
-    dry = " (dry run, no marks applied)" if rnd.dry_run else ""
-    verb = "would mark" if rnd.dry_run else "marked"
-    if breakdown:
-        summary = f"surveyed {rnd.surveyed}, {verb} {marked} ({breakdown}){dry}"
-    else:
-        summary = f"surveyed {rnd.surveyed}, {verb} 0{dry}"
-    rnd.finish(summary, outcome="ok")
+    dry = " (dry run, no writes applied)" if rnd.dry_run else ""
+    verb = "would apply" if rnd.dry_run else "applied"
+    rnd.finish(
+        f"assessed {assessed} of {rnd.surveyed}, {verb} {tagged} tag(s){dry}",
+        outcome="ok" if rnd.actions else "noop",
+    )
 
 
 if __name__ == "__main__":

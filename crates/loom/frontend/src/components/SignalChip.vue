@@ -2,23 +2,29 @@
 import { computed } from 'vue';
 import type { SignalChip } from '../lib/sessionState';
 
-// A loud attention signal as an individually-dismissable chip: severity fill
-// (amber for attention, red for blocked), the agent's plain dot or an
-// overlooker's ⊙ "watched" glyph, and a × that clears the underlying tag. This
-// replaces the old full-tile wash + "Mark OK" control — every signal is now a
-// chip you delete, the agent's `attention` and an overlooker's `triage` each on
-// its own. A stale triage mark (the session has moved on since it was set) fades
-// but stays clearable, so it can never get "stuck" lit. Quiet free-form tags use
-// TagPill; the loud amber/red fill is reserved for these. Tokens auto-swap
-// light/dark. `readonly` drops the × for contexts that show but don't edit.
+// A loud signal as an individually-dismissable chip: severity fill (amber for
+// attention, red for blocked) from the tag's VALUE, a label from the tag's KEY
+// (its type — `attention`, `review`, `stuck`, …), the agent's plain dot or an
+// outside mark's ⊙ "watched" glyph, and a × that clears the underlying tag.
+// Every signal is a chip you delete — the agent's own loud tags and a watch's
+// typed marks each on its own. A stale mark (the session has moved on since it
+// was set) fades but stays clearable, so it can never get "stuck" lit. Quiet
+// free-form tags use TagPill; the loud amber/red fill is reserved for these.
+// Tokens auto-swap light/dark. `readonly` drops the × for contexts that show
+// but don't edit.
 const props = defineProps<{ chip: SignalChip; busy?: boolean; readonly?: boolean }>();
 const emit = defineEmits<{ clear: [key: string] }>();
 
-const label = computed(() => (props.chip.level === 'blocked' ? 'Blocked' : 'Needs attention'));
+// The chip's label is its tag key, humanized — the type of attention it names.
+const label = computed(() =>
+  props.chip.key
+    .replace(/[-_]/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase()),
+);
 const cls = computed(() =>
   props.chip.level === 'blocked' ? 'bg-block text-block-fg' : 'bg-attn text-attn-fg',
 );
-const fromOverlooker = computed(() => props.chip.raisedBy === 'triage');
+const fromOverlooker = computed(() => props.chip.raisedBy === 'overlooker');
 
 const tooltip = computed(() => {
   if (fromOverlooker.value) {

@@ -17,6 +17,7 @@ from weaver_loom import (
     Client,
     Round,
     parse_judgement,
+    parse_tag_recommendations,
 )
 
 
@@ -72,6 +73,48 @@ def test_parse_judgement_scans_lines_and_degrades_to_none():
     assert parse_judgement("looks fine to me, carry on") is None
     assert parse_judgement("") is None
     assert parse_judgement(None) is None
+
+
+# -- parse_tag_recommendations -----------------------------------------------
+
+
+def test_parse_tag_recommendations_validates_and_slugs():
+    out = parse_tag_recommendations(
+        '[{"key": "Needs Review!", "value": "Attention", "note": "PR is up"},'
+        ' {"key": "stuck", "value": "blocked", "note": ""}]'
+    )
+    assert out == [
+        {"key": "needs-review", "value": "attention", "note": "PR is up"},
+        {"key": "stuck", "value": "blocked", "note": ""},
+    ]
+
+
+def test_parse_tag_recommendations_drops_malformed_and_dedupes():
+    out = parse_tag_recommendations(
+        '[{"key": "review", "value": "ok"},'        # value off the loud ladder
+        ' {"key": "", "value": "attention"},'        # no key
+        ' "not-an-object",'                           # not a dict
+        ' {"key": "review", "value": "attention"},'   # first review wins
+        ' {"key": "review", "value": "blocked"}]'     # dupe key dropped
+    )
+    assert out == [{"key": "review", "value": "attention", "note": ""}]
+
+
+def test_parse_tag_recommendations_extracts_an_array_from_prose():
+    out = parse_tag_recommendations(
+        'Sure — here you go:\n```json\n[{"key": "review", "value": "attention"}]\n```\n'
+    )
+    assert out == [{"key": "review", "value": "attention", "note": ""}]
+
+
+def test_parse_tag_recommendations_none_vs_empty():
+    # An explicit empty array is the calm verdict ([]); no array / invalid JSON
+    # is "no judgement" (None) — the caller treats the two differently.
+    assert parse_tag_recommendations("nothing to flag: []") == []
+    assert parse_tag_recommendations("looks fine, carry on") is None
+    assert parse_tag_recommendations("[not json]") is None
+    assert parse_tag_recommendations("") is None
+    assert parse_tag_recommendations(None) is None
 
 
 # -- the survey's scope filter -------------------------------------------------

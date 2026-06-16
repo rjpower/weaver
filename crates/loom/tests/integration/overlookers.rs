@@ -314,16 +314,33 @@ async fn stale_session_emits_one_event_and_wakes_a_reactive_overlooker() {
         .unwrap();
 }
 
-/// The status program's wiring proof: a round over a non-ok session lands an
-/// attributed triage mark on the live server and records the action on the
-/// run row. The program's decision logic (judge fallback, dry-run, capability
-/// branches, summaries) is covered server-free in
-/// `python/weaver-loom/tests/test_status_program.py`; dry-run flag
-/// propagation through the executor is covered by the lib test
+/// Write a one-shot fake judge agent that ignores its stdin (the composed
+/// prompt) and prints `out`, point `WEAVER_OVERLOOKER_AGENT_CMD` at it, and
+/// return its path. Robust where `cat` is not: the round feeds a real terminal
+/// screen into the prompt, and a shell screen can carry brackets that would
+/// corrupt an echo-then-parse. Reused paths overwrite, so a test can re-stub
+/// between fires. Restore `WEAVER_OVERLOOKER_AGENT_CMD=true` after.
+fn fake_judge_agent(name: &str, out: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::temp_dir().join(name);
+    let script = format!("#!/bin/sh\ncat >/dev/null 2>&1\ncat <<'WEAVER_EOF'\n{out}\nWEAVER_EOF\n");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("WEAVER_OVERLOOKER_AGENT_CMD", path.to_str().unwrap());
+    path
+}
+
+/// The status program's wiring proof: an idle-triggered round asks the judge for
+/// a set of tags and reconciles its own marks — a recommended tag lands as its
+/// own typed key (never the agent's `attention` axis — no mirror), and a
+/// follow-up "nothing needed" verdict clears it. The program's decision logic
+/// (parse, no-judgement vs calm, capability branches, summaries) is covered
+/// server-free in `python/weaver-loom/tests/test_status_program.py`; dry-run
+/// flag propagation through the executor is covered by the lib test
 /// `run_script_round_trips_the_contract`.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn builtin_status_round_lands_an_attributed_mark() {
+async fn builtin_status_round_applies_typed_tags_and_reconciles() {
     if !python3_available() {
         eprintln!("skipping: python3 not on PATH");
         return;
@@ -332,21 +349,18 @@ async fn builtin_status_round_lands_an_attributed_mark() {
     let state = engine_state(&ts).await;
     let (session_id, _branch_id, _repo_root) = make_session(&ts, "status me").await;
 
-    // The session reports `attention` about itself → it's in a `!ok` scope.
-    ts.client
-        .put(
-            &format!("/api/sessions/{session_id}/tags/attention"),
-            json!({ "value": "attention", "by": "agent" }),
-        )
-        .await
-        .unwrap();
+    // The judge model is stubbed: a fixed tag set the round should apply.
+    let _agent = fake_judge_agent(
+        "weaver-fake-judge-status",
+        r#"[{"key":"review","value":"attention","note":"looks done"}]"#,
+    );
 
     let o = enabled_overlooker(
         &state,
         ov::NewOverlooker {
             name: "status-check".to_string(),
-            trigger_spec: json!({ "cron": "0 * * * *" }).to_string(),
-            scope: json!({ "attention": "!ok" }).to_string(),
+            trigger_spec: json!({ "on": ["session.idle"] }).to_string(),
+            scope: json!({}).to_string(),
             program: "builtin:status".to_string(),
             capabilities: vec!["observe".to_string(), "mark".to_string()],
             ..Default::default()
@@ -359,34 +373,56 @@ async fn builtin_status_round_lands_an_attributed_mark() {
         .await
         .unwrap();
 
-    // The mark landed on the session's branch.
+    // The judged tag landed on its own typed key, attributed to the watch.
     let view = ts
         .client
         .get(&format!("/api/sessions/{session_id}"))
         .await
         .unwrap();
     assert_eq!(
-        branch_tag_value(&view, "triage"),
+        branch_tag_value(&view, "review"),
         "attention",
-        "the round marks the in-scope session"
+        "the round applies the judge's typed tag"
     );
     assert_eq!(
-        branch_tag(&view, "triage").unwrap()["set_by"],
+        branch_tag(&view, "review").unwrap()["set_by"],
         "status-check"
     );
+    assert!(
+        branch_tag(&view, "attention").is_none(),
+        "the watch never mirrors onto the agent's own `attention` axis"
+    );
 
-    // The run row records the mark action.
+    // The run row records a `tag` action (not the old generic `mark`).
     let runs = ov::recent_runs(&state.db, &o.id, 10).await.unwrap();
     let run = runs.iter().find(|r| r.id == run_id).unwrap();
     assert_eq!(run.outcome, "ok");
     let actions: serde_json::Value = serde_json::from_str(&run.actions).unwrap();
     let arr = actions.as_array().unwrap();
     assert!(
-        arr.iter()
-            .any(|a| a["action"] == "mark" && a["session"] == session_id.as_str()),
-        "the run records a mark action: {actions}"
+        arr.iter().any(|a| a["action"] == "tag"
+            && a["session"] == session_id.as_str()
+            && a["key"] == "review"),
+        "the run records a tag action: {actions}"
     );
 
+    // Reconcile: a follow-up "nothing needed" verdict clears the watch's own mark.
+    let _calm = fake_judge_agent("weaver-fake-judge-status", "[]");
+    overlooker::fire_now(&state, &o.name, false, "manual")
+        .await
+        .unwrap();
+    let view = ts
+        .client
+        .get(&format!("/api/sessions/{session_id}"))
+        .await
+        .unwrap();
+    assert!(
+        branch_tag(&view, "review").is_none(),
+        "the empty verdict clears the watch's own mark"
+    );
+
+    // Restore the fixture's no-op agent for the tests that follow.
+    std::env::set_var("WEAVER_OVERLOOKER_AGENT_CMD", "true");
     ts.client
         .delete(&format!("/api/sessions/{session_id}"))
         .await
@@ -579,7 +615,8 @@ async fn rest_overlooker_lifecycle_and_validation() {
         return;
     }
     let ts = TestServer::start().await;
-    // A non-ok session so the dry-run round has something in scope to "would-mark".
+    // A session in scope plus a stubbed judge that recommends a tag, so the
+    // dry-run round has something to "would-tag".
     let (session_id, _branch_id, _repo_root) = make_session(&ts, "rest me").await;
     ts.client
         .put(
@@ -588,6 +625,10 @@ async fn rest_overlooker_lifecycle_and_validation() {
         )
         .await
         .unwrap();
+    let _agent = fake_judge_agent(
+        "weaver-fake-judge-lifecycle",
+        r#"[{"key":"review","value":"attention","note":"looks done"}]"#,
+    );
 
     // Create: structured trigger/scope/params JSON in, an OverlookerView out.
     let created = ts
@@ -683,7 +724,7 @@ async fn rest_overlooker_lifecycle_and_validation() {
         .await
         .unwrap();
     assert!(
-        branch_tag(&view, "triage").is_none(),
+        branch_tag(&view, "review").is_none(),
         "a dry run applies no mark"
     );
 
@@ -778,9 +819,11 @@ async fn rest_lists_builtin_programs_and_validates_program_refs() {
         .find(|p| p["program"] == "builtin:status")
         .unwrap();
     assert!(
-        status["source"].as_str().unwrap().contains("triage"),
+        status["source"].as_str().unwrap().contains("session.idle"),
         "the status program is a script like every other builtin"
     );
+    // The status builtin wakes on the agent's finished-turn hook, not a timer.
+    assert_eq!(status["defaults"]["trigger"]["on"][0], "session.idle");
 
     // An unknown builtin is rejected at create time; a known script accepted.
     let bad = ts
@@ -910,25 +953,23 @@ async fn builtin_scripts_report_merged_and_unlabelled_prs() {
     }
 }
 
-/// The LLM judgement path end to end: with a prompt configured and the
-/// one-shot agent stubbed (`WEAVER_OVERLOOKER_AGENT_CMD=cat` echoes the
-/// prompt back), the status script calls the daemon's `POST /api/agent/oneshot`
-/// and parses the level + note out of the reply — the mark carries the
-/// agent's judgement, not the attention mirror. Also drives the endpoint
-/// directly: a stubbed agent echoes, and an empty prompt is rejected.
+/// The LLM judgement path end to end: the status script calls the daemon's
+/// `POST /api/agent/oneshot` for its verdict and applies the parsed tag set.
+/// First drives the endpoint directly (a stubbed `cat` echoes the prompt; an
+/// empty prompt 400s), then runs a round whose stubbed judge recommends a
+/// `blocked` mark on an otherwise-calm session — the tag lands attributed,
+/// proving the verdict (not a mirror) drove it.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn status_judgement_uses_the_oneshot_agent_when_prompted() {
+async fn status_judgement_uses_the_oneshot_agent() {
     if !python3_available() {
         eprintln!("skipping: python3 not on PATH");
         return;
     }
     let ts = TestServer::start().await;
-    // `cat` echoes the composed prompt (prompt + screen) straight back, so the
-    // judgement parser sees the prompt's own first line.
-    std::env::set_var("WEAVER_OVERLOOKER_AGENT_CMD", "cat");
 
-    // The endpoint itself: output echoes the prompt; an empty prompt 400s.
+    // The endpoint itself: `cat` echoes the prompt; an empty prompt 400s.
+    std::env::set_var("WEAVER_OVERLOOKER_AGENT_CMD", "cat");
     let reply = ts
         .client
         .post("/api/agent/oneshot", json!({ "prompt": "ping" }))
@@ -943,17 +984,21 @@ async fn status_judgement_uses_the_oneshot_agent_when_prompted() {
         "an empty prompt is rejected"
     );
 
-    // A calm session (no attention tag): the fallback rule would clear, so a
-    // `blocked` mark proves the agent judgement was used.
+    // A calm session (no attention tag): a `blocked` verdict proves the judge
+    // drove the mark — there is no fallback that would have invented one.
     let state = engine_state(&ts).await;
     let (session_id, _branch_id, _repo_root) = make_session(&ts, "judge me").await;
+    let _agent = fake_judge_agent(
+        "weaver-fake-judge-oneshot",
+        r#"[{"key":"stuck","value":"blocked","note":"the judge says so"}]"#,
+    );
     let o = enabled_overlooker(
         &state,
         ov::NewOverlooker {
             name: "judge-watch".to_string(),
-            trigger_spec: json!({ "cron": "0 * * * *" }).to_string(),
+            trigger_spec: json!({ "on": ["session.idle"] }).to_string(),
             program: "builtin:status".to_string(),
-            params: json!({ "prompt": "blocked - the judge says so" }).to_string(),
+            params: json!({ "prompt": "is it stuck?" }).to_string(),
             capabilities: vec!["observe".to_string(), "mark".to_string()],
             ..Default::default()
         },
@@ -969,16 +1014,13 @@ async fn status_judgement_uses_the_oneshot_agent_when_prompted() {
         .await
         .unwrap();
     assert_eq!(
-        branch_tag_value(&view, "triage"),
+        branch_tag_value(&view, "stuck"),
         "blocked",
-        "the agent judgement (not the calm attention mirror) lands as the mark"
+        "the judge's verdict lands as a typed mark"
     );
-    // (Judgement parsing detail — level/note extraction — is pytest-covered in
+    // (Parsing detail — the JSON tag-set extraction — is pytest-covered in
     // weaver_loom; here only the through-the-stack outcome matters.)
-    assert_eq!(
-        branch_tag(&view, "triage").unwrap()["set_by"],
-        "judge-watch"
-    );
+    assert_eq!(branch_tag(&view, "stuck").unwrap()["set_by"], "judge-watch");
 
     // Restore the fixture's no-op agent for the tests that follow.
     std::env::set_var("WEAVER_OVERLOOKER_AGENT_CMD", "true");
