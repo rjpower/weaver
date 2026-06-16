@@ -432,6 +432,17 @@ onUnmounted(() => clearInterval(timer));
       section label and a hairline top divider per group, no heavy boxes — so it
       stays consistent with the rest of the app's quiet surfaces.
     -->
+    <!--
+      Autofill suppression: Chrome's address/payment classifier deliberately
+      IGNORES autocomplete="off", so it kept reading "Title"/"Name" as a contact
+      profile and offering to save the form as a "card" on submit. The reliable
+      lever is an *unrecognized* autocomplete token per field — Chrome opts a
+      field out of autofill (and out of profile import, so no save prompt) when
+      it sees a value it doesn't know. Hence the bespoke "loom-*" tokens below;
+      they are intentional, not typos — don't "fix" them back to "off".
+      <form autocomplete> only accepts on/off, so the form keeps "off" as the
+      umbrella default and each field carries its own opt-out token.
+    -->
     <form
       v-if="showForm"
       class="mb-4 max-w-3xl rounded-md border border-line bg-surface p-4 space-y-5"
@@ -452,7 +463,7 @@ onUnmounted(() => clearInterval(timer));
             @input="repoFocused = true"
             @blur="repoFocused = false"
             placeholder="/home/you/code/project"
-            autocomplete="off"
+            autocomplete="loom-repo"
             spellcheck="false"
             class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
           />
@@ -493,7 +504,7 @@ onUnmounted(() => clearInterval(timer));
           <input
             v-model="title"
             placeholder="Health endpoint"
-            autocomplete="off"
+            autocomplete="loom-title"
             class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
           />
         </div>
@@ -505,7 +516,7 @@ onUnmounted(() => clearInterval(timer));
             v-model="goal"
             rows="4"
             placeholder="Add a /health endpoint that returns 200"
-            autocomplete="off"
+            autocomplete="loom-goal"
             class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent resize-y"
           ></textarea>
         </div>
@@ -519,7 +530,7 @@ onUnmounted(() => clearInterval(timer));
             <label class="block text-xs text-muted mb-1">Model</label>
             <select
               v-model="model"
-              autocomplete="off"
+              autocomplete="loom-model"
               class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
             >
               <option value="">Default</option>
@@ -533,7 +544,7 @@ onUnmounted(() => clearInterval(timer));
             <label class="block text-xs text-muted mb-1">Effort</label>
             <select
               v-model="effort"
-              autocomplete="off"
+              autocomplete="loom-effort"
               class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
             >
               <option value="">Default</option>
@@ -587,7 +598,7 @@ onUnmounted(() => clearInterval(timer));
                 v-model="name"
                 @input="nameEdited = true"
                 placeholder="health-endpoint"
-                autocomplete="off"
+                autocomplete="loom-branch-name"
                 spellcheck="false"
                 class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
               />
@@ -599,7 +610,7 @@ onUnmounted(() => clearInterval(timer));
               <input
                 v-model="base"
                 placeholder="origin/main (freshly fetched)"
-                autocomplete="off"
+                autocomplete="loom-base-branch"
                 spellcheck="false"
                 class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
               />
@@ -619,7 +630,7 @@ onUnmounted(() => clearInterval(timer));
               @input="branchFocused = true"
               @blur="branchFocused = false"
               placeholder="feature/foo"
-              autocomplete="off"
+              autocomplete="loom-existing-branch"
               spellcheck="false"
               class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent font-mono"
             />
