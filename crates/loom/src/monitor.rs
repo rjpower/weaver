@@ -238,9 +238,12 @@ fn parse_iso(ts: &str) -> Option<DateTime<Utc>> {
 /// Returns the new event watermark (it records its own bus events). `None` when
 /// there is no active session for the branch.
 ///
-/// Mapping rationale: hooks drive only liveness and a soothing idle signal. Any
-/// hook means the agent process is alive → `running` (this also promotes a
-/// freshly-`launching` session). Beyond that:
+/// Mapping rationale: the work hooks drive only liveness and a soothing idle
+/// signal. A `working` / `waiting` / `idle` hook means the agent process is
+/// alive → `running` (this also promotes a freshly-`launching` session).
+/// `session-start` is returned early below — it is recorded for the primer
+/// injection (in the `weaver hook` CLI) but the launch path owns the initial
+/// status, so it carries no liveness or tag signal here. Beyond liveness:
 ///
 /// * `working` (a prompt was submitted — the user is engaged) clears the calm
 ///   `idle` mark *and* the agent's `attention` tag back to calm: an engaged
@@ -260,7 +263,8 @@ async fn apply_hook(state: &AppState, branch_id: &str, kind: &str) -> Option<i64
     // The tag mutations the hook implies: `(key, value)` where an empty value
     // clears the tag (absence is the calm/default state). `working` returns the
     // agent to calm (clearing both axes it might carry); the quiet signals stamp
-    // the soothing `idle` mark. `session-start` and the unknown carry none.
+    // the soothing `idle` mark. `session-start` and any unknown kind return early
+    // — they neither prove liveness here nor carry a tag signal.
     let mutations: &[(&str, &str)] = match kind {
         "working" => &[(tags::ATTENTION_KEY, ""), (tags::IDLE_KEY, "")],
         "waiting" | "idle" => &[(tags::IDLE_KEY, tags::IDLE_VALUE)],

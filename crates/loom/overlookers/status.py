@@ -23,7 +23,7 @@ every mark untouched (including ``idle``) rather than guess. Honours dry_run:
 would-be writes are logged as actions and nothing mutates.
 """
 
-from weaver_loom import IDLE_KEY, Round, WeaverError, parse_tag_recommendations
+from weaver_loom import IDLE_KEY, IDLE_VALUE, Round, WeaverError, parse_tag_recommendations
 
 #: Wake on the agent's finished-turn hook — "assess when the agent goes quiet".
 TRIGGERS = {"on": ["session.idle"]}
@@ -83,9 +83,11 @@ def watch_tags(rnd, session):
 
 def _has_idle(session):
     """Whether ``session`` carries the soothing ``idle`` mark the idle hook
-    stamps — the calm state a real status should replace."""
+    stamps — the calm state a real status should replace. Matches the canonical
+    ``(idle, idle)`` mark exactly (key AND value), so a stray free-form tag that
+    merely shares the ``idle`` key is never mistaken for it and cleared."""
     return any(
-        tag.get("key") == IDLE_KEY
+        tag.get("key") == IDLE_KEY and tag.get("value") == IDLE_VALUE
         for tag in (session.get("branch") or {}).get("tags") or []
     )
 

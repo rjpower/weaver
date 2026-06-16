@@ -279,6 +279,22 @@ def test_no_idle_mark_means_nothing_to_replace(capsys):
     assert not any(c[0] == "clear_tag" and c[2] == "idle" for c in client.calls)
 
 
+def test_stray_idle_keyed_tag_is_not_cleared(capsys):
+    # A free-form tag that merely shares the `idle` key but isn't the canonical
+    # (idle, idle) mark must NOT be cleared when a real status is applied.
+    sess = {
+        "id": "s",
+        "status": "running",
+        "branch": {
+            "repo_root": "/r",
+            "tags": [{"key": "idle", "value": "paused", "set_by": "manual"}],
+        },
+    }
+    client = StubClient(capabilities=["mark"], agent_reply=TAGS, sessions=[sess])
+    run_main(client, capsys)
+    assert not any(c[0] == "clear_tag" and c[2] == "idle" for c in client.calls)
+
+
 def test_dry_run_would_clear_the_idle_mark(capsys):
     client = StubClient(
         capabilities=["mark"],

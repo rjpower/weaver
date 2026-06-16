@@ -169,9 +169,17 @@ the work is ready:
   unless the user has told you otherwise. Most teams gate integration on review
   and CI; respect that. Use the project's normal PR workflow (e.g. `gh pr
   create`).
-- Raise `weaver status attention "ready for review"` (the message doubles as
-  your concise summary, and file any follow-ups as issues with `weaver issue
-  add`) so the user knows to look.
+- **Drive the PR to green — opening it is the start of integration, not the
+  end.** Do not walk away the moment it's open. Watch CI to completion
+  (`gh pr checks <N> --watch`) and fetch review feedback — both the top-level
+  reviews (`gh pr view <N> --json reviews,comments`) and inline code comments
+  (`gh api repos/{owner}/{repo}/pulls/<N>/comments`). Local green is not CI
+  green: fix any failing check and address every review comment with follow-up
+  commits on the same branch, then re-watch. Keep `weaver status` honest while
+  you wait (`weaver status ok "waiting on CI"`).
+- Once CI is green and review is addressed, raise `weaver status attention
+  "ready for review"` (the message doubles as your concise summary, and file any
+  follow-ups as issues with `weaver issue add`) so the user knows to look.
 
 When a session is finished with, the user may **archive** it from the dashboard:
 that tears down this terminal session and removes the worktree, but preserves the

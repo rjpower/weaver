@@ -334,9 +334,11 @@ block into the worktree's `.claude/settings.local.json` (see
 
 `weaver hook` writes an `events` row keyed on the branch resolved from
 `$WEAVER_BRANCH` (set by the launcher) — no HTTP. Loom's monitor (`apply_hook`)
-consumes new `hook` rows on its next tick. Any hook means the agent process is
-alive, so all three set `status = running` (this also promotes a freshly
-`launching` session). Liveness is all a hook proves, so that is all the
+consumes new `hook` rows on its next tick. A `working` / `waiting` / `idle` hook
+means the agent process is alive, so each sets `status = running` (this also
+promotes a freshly `launching` session); `session-start` is recorded for the
+primer injection but the launch path owns the initial status, so it drives no
+liveness here. Liveness is all a work hook proves, so that is all the
 orchestrator tracks — it does not infer working/waiting/idle from stillness.
 
 The hooks also stamp a soothing, **quiet `idle` tag** — the calm "resting, no one
