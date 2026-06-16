@@ -8,8 +8,8 @@
 //! * **PR status polling** ([`poll`], [`refresh`], [`fetch_pr`]) — the
 //!   background loop that snapshots each active session's pull request (link,
 //!   review decision, check rollup) into the `branch_github` table, and
-//!   archives a session once its PR merges. The snapshot rides along on
-//!   `BranchView`; the dashboard renders it.
+//!   archives a session — closing the weaver issues it was working — once its PR
+//!   merges. The snapshot rides along on `BranchView`; the dashboard renders it.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -342,9 +342,9 @@ pub async fn upsert_status(db: &Db, branch_id: &str, s: &GithubStatus) -> Result
 
 /// Fetch a branch's PR, store the snapshot, announce a meaningful change on the
 /// activity feed, and — when `archive_on_merge` is set and the PR has merged —
-/// archive the still-live session. Returns the fresh snapshot, or `None` when
-/// the branch has no PR. The single code path behind both the poller and the
-/// on-demand refresh endpoint.
+/// archive the still-live session and close the weaver issues it was working.
+/// Returns the fresh snapshot, or `None` when the branch has no PR. The single
+/// code path behind both the poller and the on-demand refresh endpoint.
 pub async fn refresh(
     state: &AppState,
     session: &Session,
@@ -360,9 +360,10 @@ pub async fn refresh(
 }
 
 /// Persist a freshly-fetched snapshot, announce a meaningful change on the
-/// activity feed, and archive a still-live session whose PR has merged (when
-/// `archive_on_merge` is set). Split from [`refresh`] so the storage and
-/// merge-archive behaviour is testable without invoking `gh`.
+/// activity feed, and — when `archive_on_merge` is set — archive a still-live
+/// session whose PR has merged and close the weaver issues that session claimed.
+/// Split from [`refresh`] so the storage and merge-archive behaviour is testable
+/// without invoking `gh`.
 async fn apply_snapshot(
     state: &AppState,
     session: &Session,
@@ -431,11 +432,14 @@ async fn apply_snapshot(
         // The merge is already on the record as a `github` event (above) and the
         // archive records a `status` event, so no extra log line is needed.
         match crate::web::archive(state, session, branch).await {
-            Ok(_) => tracing::info!(
-                branch = %branch.branch,
-                pr = snap.pr_number,
-                "archived session after PR merge"
-            ),
+            Ok(_) => {
+                tracing::info!(
+                    branch = %branch.branch,
+                    pr = snap.pr_number,
+                    "archived session after PR merge"
+                );
+                close_claimed_issues(state, branch, snap.pr_number).await;
+            }
             Err(e) => tracing::warn!(
                 branch = %branch.branch,
                 error = %e.message(),
@@ -444,6 +448,41 @@ async fn apply_snapshot(
         }
     }
     Ok(())
+}
+
+/// Close every open weaver issue the merged branch was working and log each
+/// closure to its activity feed. The session is being torn down because its PR
+/// shipped, so the tracking issues it claimed close out with it — emitting the
+/// same `issue_closed` event `weaver issue close` records, so the dashboard
+/// reacts identically whether a person or the merge closed them. Best-effort:
+/// the archive has already happened, so a hiccup here only loses the auto-close,
+/// it must not surface as an error.
+async fn close_claimed_issues(state: &AppState, branch: &Branch, pr: i64) {
+    let closed = match weaver_core::issue::close_for_branch(
+        &state.db,
+        &branch.repo_root,
+        &branch.branch,
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(branch = %branch.branch, error = %e, "closing claimed issues on PR merge failed");
+            return;
+        }
+    };
+    for id in closed {
+        events::record(
+            &state.db,
+            &state.bus,
+            &branch.id,
+            "issue_closed",
+            json!({ "id": id, "reason": "pr_merged", "pr": pr }),
+        )
+        .await
+        .ok();
+        tracing::info!(branch = %branch.branch, issue = id, pr, "closed claimed issue after PR merge");
+    }
 }
 
 /// Background loop: snapshot every active session's PR on a fixed cadence. A
@@ -770,6 +809,41 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.pr_state, "MERGED");
+    }
+
+    #[tokio::test]
+    async fn merged_pr_closes_the_branchs_claimed_issues() {
+        let f = fixture().await;
+        let issue = weaver_core::issue::add(
+            &f.state.db,
+            &weaver_core::issue::NewIssue {
+                repo_root: f.branch.repo_root.clone(),
+                claimed_branch: Some(f.branch.branch.clone()),
+                title: "ship the feature".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        apply_snapshot(&f.state, &f.session, &f.branch, &snapshot("MERGED"), true)
+            .await
+            .unwrap();
+
+        // The tracking issue closes out with the merged session…
+        let closed = weaver_core::issue::get(&f.state.db, issue.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed.status, "closed");
+        // …and the closure lands on the activity feed as an `issue_closed` event,
+        // just as `weaver issue close` would have recorded it.
+        let logged = events::history(&f.state.db, &f.branch.id, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|e| e.kind == "issue_closed" && e.data["id"] == issue.id);
+        assert!(logged, "an issue_closed event was recorded for the merge");
     }
 
     #[tokio::test]

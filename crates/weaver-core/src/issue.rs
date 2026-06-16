@@ -220,6 +220,27 @@ pub async fn unclaim_branch(db: &Db, repo_root: &str, branch: &str) -> Result<u6
     Ok(res.rows_affected())
 }
 
+/// Close every open issue claimed by `branch` in `repo_root`, returning the ids
+/// that were closed. Used when a session is torn down on PR merge: the work the
+/// branch claimed shipped, so its tracking issues close out with it. Contrast
+/// [`unclaim_branch`], which releases the claim but leaves the issue open for
+/// another branch to pick up.
+pub async fn close_for_branch(db: &Db, repo_root: &str, branch: &str) -> Result<Vec<i64>> {
+    let now = now_iso();
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "UPDATE issues SET status = 'closed', closed_at = ?, updated_at = ?
+         WHERE repo_root = ? AND claimed_branch = ? AND status = 'open'
+         RETURNING id",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(repo_root)
+    .bind(branch)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
 pub async fn close(db: &Db, id: i64) -> Result<()> {
     let now = now_iso();
     sqlx::query("UPDATE issues SET status = 'closed', closed_at = ?, updated_at = ? WHERE id = ?")
@@ -421,6 +442,41 @@ mod tests {
         );
         assert_eq!(list_backlog(&db, "/r", false).await.unwrap().len(), 2);
         assert_eq!(list_for_repo(&db, "/r", false).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn close_for_branch_closes_only_that_branchs_open_issues() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let a = add(&db, &claimed("/r", "feature", "task one"))
+            .await
+            .unwrap();
+        let b = add(&db, &claimed("/r", "feature", "task two"))
+            .await
+            .unwrap();
+        // Already closed on `feature` — must not reappear in the closed set.
+        let done = add(&db, &claimed("/r", "feature", "done")).await.unwrap();
+        close(&db, done.id).await.unwrap();
+        // A different branch's claim is untouched.
+        let other = add(&db, &claimed("/r", "other", "theirs")).await.unwrap();
+
+        let mut closed = close_for_branch(&db, "/r", "feature").await.unwrap();
+        closed.sort_unstable();
+        assert_eq!(closed, vec![a.id, b.id]);
+        assert_eq!(
+            open_count_for_branch(&db, "/r", "feature").await.unwrap(),
+            0
+        );
+        assert_eq!(
+            get(&db, other.id).await.unwrap().unwrap().status,
+            "open",
+            "another branch's claim is left alone"
+        );
+
+        // Idempotent: a second call finds nothing open to close.
+        assert!(close_for_branch(&db, "/r", "feature")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
