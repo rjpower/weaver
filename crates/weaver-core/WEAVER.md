@@ -123,7 +123,7 @@ message. This replaces the old guessed working/waiting/idle indicator, which was
 often wrong (e.g. it read "idle" while you were really waiting on a workflow).
 
 Under the hood, status is stored as **tags** on your branch. A tag is a single
-`(key, value)` annotation with a note, an author, and a timestamp. Two keys are
+`(key, value)` annotation with a note, an author, and a timestamp. Three keys are
 well known:
 
 - `attention` — your self-report, the value being `attention` or `blocked`. This
@@ -134,6 +134,11 @@ well known:
   `attention`/`blocked` ladder but authored by an overlooker (or `manual`), never
   by you. It is independent of your `attention` tag and carries its own reason
   and attribution.
+- `idle` — a soothing, *quiet* mark stamped mechanically when your agent goes
+  quiet (a finished turn or a lull): the calm "resting, no one needed" state. It
+  is **not** loud — an idle agent does not read as needing the user — and you
+  never set it yourself. The status watch may replace it with a real `attention`
+  status once it judges the session genuinely needs a human.
 
 Your prose `description` is separate from the tags and is shown even when you are
 calm. Any other key is a free-form, quiet tag. A tag is stale once your session
@@ -164,9 +169,17 @@ the work is ready:
   unless the user has told you otherwise. Most teams gate integration on review
   and CI; respect that. Use the project's normal PR workflow (e.g. `gh pr
   create`).
-- Raise `weaver status attention "ready for review"` (the message doubles as
-  your concise summary, and file any follow-ups as issues with `weaver issue
-  add`) so the user knows to look.
+- **Drive the PR to green — opening it is the start of integration, not the
+  end.** Do not walk away the moment it's open. Watch CI to completion
+  (`gh pr checks <N> --watch`) and fetch review feedback — both the top-level
+  reviews (`gh pr view <N> --json reviews,comments`) and inline code comments
+  (`gh api repos/{owner}/{repo}/pulls/<N>/comments`). Local green is not CI
+  green: fix any failing check and address every review comment with follow-up
+  commits on the same branch, then re-watch. Keep `weaver status` honest while
+  you wait (`weaver status ok "waiting on CI"`).
+- Once CI is green and review is addressed, raise `weaver status attention
+  "ready for review"` (the message doubles as your concise summary, and file any
+  follow-ups as issues with `weaver issue add`) so the user knows to look.
 
 When a session is finished with, the user may **archive** it from the dashboard:
 that tears down this terminal session and removes the worktree, but preserves the
