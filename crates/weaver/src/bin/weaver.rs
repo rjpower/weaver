@@ -103,6 +103,17 @@ enum Cmd {
         #[arg(long, default_value = "20")]
         limit: i64,
     },
+    /// Render the agent's conversation transcript as a markdown log. With no
+    /// `--file`, locates the current worktree's transcript (Claude Code or
+    /// Codex); `--json` prints the normalized iris format instead of markdown.
+    Chatlog {
+        /// Render this raw transcript file instead of locating one.
+        #[arg(long)]
+        file: Option<String>,
+        /// Print the normalized iris JSON rather than rendered markdown.
+        #[arg(long)]
+        json: bool,
+    },
     /// Record an agent hook event. Writes an `events` row; loom's monitor
     /// consumes it on its next tick.
     #[command(hide = true)]
@@ -331,6 +342,7 @@ async fn run() -> Result<()> {
         Cmd::Artifact { cmd } => cmd_artifact(cmd).await,
         Cmd::Where => cmd_where().await,
         Cmd::Log { limit } => cmd_log(limit).await,
+        Cmd::Chatlog { file, json } => cmd_chatlog(file, json),
         Cmd::Hook { event } => cmd_hook(event).await,
         Cmd::Config { cmd } => cmd_config(cmd).await,
         Cmd::Completions { shell } => {
@@ -533,6 +545,51 @@ fn next_action_hint(open: &[issue::Issue], delegated: &[issue::Issue]) -> String
         "no open tasks — wrap up and open a PR (`gh pr create`), or `weaver issue add` to track more"
             .to_string()
     }
+}
+
+/// Ascend from `start` to the enclosing git worktree root (the directory holding
+/// a `.git` entry — a dir in a normal clone, a file in a linked worktree).
+/// Falls back to `start` when none is found, so a non-repo path still resolves.
+fn worktree_root(start: &std::path::Path) -> std::path::PathBuf {
+    let mut dir = start;
+    loop {
+        if dir.join(".git").exists() {
+            return dir.to_path_buf();
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return start.to_path_buf(),
+        }
+    }
+}
+
+/// Render the current worktree's (or a named file's) agent transcript. No DB
+/// access — pure filesystem, so it works whether or not loom is up.
+fn cmd_chatlog(file: Option<String>, as_json: bool) -> Result<()> {
+    use weaver_core::transcript;
+    let log = match file {
+        Some(path) => {
+            let raw = std::fs::read_to_string(&path).map_err(|e| anyhow!("reading {path}: {e}"))?;
+            transcript::parse(&raw)
+                .ok_or_else(|| anyhow!("{path}: unrecognized transcript format"))?
+        }
+        None => {
+            // Agents key their transcript off the worktree root (where the agent
+            // was launched), so resolve that rather than the possibly-deeper cwd.
+            let cwd = std::env::current_dir()?;
+            let root = worktree_root(&cwd);
+            let (_, files) = transcript::locate(&root)
+                .ok_or_else(|| anyhow!("no agent transcript found for {}", root.display()))?;
+            transcript::parse_files(&files)
+                .ok_or_else(|| anyhow!("transcript found but could not be parsed"))?
+        }
+    };
+    if as_json {
+        println!("{}", log.to_json());
+    } else {
+        print!("{}", log.render_markdown());
+    }
+    Ok(())
 }
 
 async fn cmd_where() -> Result<()> {

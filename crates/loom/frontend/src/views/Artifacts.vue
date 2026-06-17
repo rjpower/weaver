@@ -23,7 +23,7 @@ const router = useRouter();
 
 // Selecting a work-area tab returns to the session page, carrying which tab so
 // Overview lands on Overview (Terminal is the default).
-function selectTab(t: 'terminal' | 'overview') {
+function selectTab(t: 'terminal' | 'overview' | 'conversation') {
   router.push(t === 'terminal' ? `/s/${props.id}` : `/s/${props.id}?tab=${t}`);
 }
 

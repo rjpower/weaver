@@ -9,7 +9,77 @@ use serial_test::serial;
 
 use loom::backend;
 
-use crate::fixtures::{branch_tag, TestServer};
+use crate::fixtures::{branch_tag, plant_claude_transcript, HomeGuard, TestServer};
+
+/// Archiving captures the agent's conversation log: it locates the Claude Code
+/// transcript for the worktree (under `~/.claude/projects/<munged-cwd>/`),
+/// normalizes it, and writes a rendered `chat.md` and an iris `chat.json` under
+/// the configured session log dir — all before the worktree is torn down.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_captures_the_conversation_log() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    // Point HOME (transcript source) and the log dir (capture sink) at temp dirs.
+    let home = tempfile::tempdir().unwrap();
+    let _home_guard = HomeGuard::set(home.path());
+    let logs = tempfile::tempdir().unwrap();
+
+    let sess = client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "log me", "cwd": ts.cwd(), "agent": "shell" }),
+        )
+        .await
+        .unwrap();
+    let id = sess["id"].as_str().unwrap().to_string();
+    let work_dir = sess["work_dir"].as_str().unwrap().to_string();
+
+    // Set the capture sink via the settings API.
+    client
+        .patch(
+            "/api/settings",
+            json!({ "session.log_dir": logs.path().to_string_lossy() }),
+        )
+        .await
+        .unwrap();
+
+    // Plant a Claude transcript where the agent would have written it.
+    plant_claude_transcript(
+        home.path(),
+        &work_dir,
+        "implement the thing",
+        "Done — shipped it.",
+    );
+
+    let res = client
+        .post(&format!("/api/sessions/{id}/archive"), json!({}))
+        .await
+        .unwrap();
+    assert_eq!(res["archived"], true);
+    let branch = res["branch"].as_str().unwrap();
+    let slug = branch.replace('/', "-");
+
+    // Both the rendered markdown and the normalized iris JSON are written.
+    let md = std::fs::read_to_string(logs.path().join(&slug).join("chat.md"))
+        .expect("chat.md should be captured on archive");
+    assert!(md.contains("# Conversation log"), "rendered markdown: {md}");
+    assert!(
+        md.contains("implement the thing"),
+        "user turn captured: {md}"
+    );
+    assert!(
+        md.contains("Done — shipped it."),
+        "assistant turn captured: {md}"
+    );
+
+    let raw_json = std::fs::read_to_string(logs.path().join(&slug).join("chat.json"))
+        .expect("chat.json should be captured on archive");
+    let iris: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
+    assert_eq!(iris["source"], "claude");
+    assert_eq!(iris["messages"].as_array().unwrap().len(), 2);
+}
 
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

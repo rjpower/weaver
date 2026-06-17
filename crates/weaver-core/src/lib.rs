@@ -14,5 +14,6 @@ pub mod issue;
 pub mod migrations;
 pub mod overlooker;
 pub mod tags;
+pub mod transcript;
 
 pub use db::Db;

@@ -121,6 +121,7 @@ weaver issue wait 7                   # block until a sub-session finishes or ne
 weaver status                     # read: goal + status + open-issue count
 weaver where                          # debug: print resolved repo / branch / branch-id
 weaver log --limit 50                 # recent events for the current branch
+weaver chatlog                        # render this worktree's agent conversation as markdown
 ```
 
 `loom session` is the uniform surface for driving a child session. `loom
@@ -220,6 +221,17 @@ surfaces the result on the dashboard: a link straight to the PR, its state
 requested / review required), and a rolled-up CI verdict (checks passing /
 failing / pending). The session's Overview tab has a **Refresh** button to
 re-poll on demand.
+
+Every session detail has a **Conversation** tab that renders the agent's chat
+with the model — user turns, replies, thinking, and tool calls — live and
+(via the archive capture below) still there to review after the terminal is gone.
+
+Whenever a session is archived — by the Archive button or automatically on merge
+— loom first captures that conversation to disk: it finds the agent's transcript
+(Claude Code or Codex), normalizes it, and writes a machine-readable `chat.json`
+plus a readable `chat.md` under `session.log_dir`
+(default `~/.iris/logs/sessions/<branch>/`). `weaver chatlog` renders the same
+log for a live session on the command line.
 
 Once a branch's PR merges, loom archives the session automatically — tearing
 down its terminal and worktree while keeping the branch and its weaver history, the
@@ -332,6 +344,10 @@ Notable settings:
   check status (on by default; a no-op without `gh` or a GitHub remote).
 - `github.archive_on_merge` — archive a session automatically once its PR
   merges (on by default).
+- `session.log_dir` — where a session's agent conversation log is captured on
+  archive (a normalized `chat.json` + a rendered `chat.md` under
+  `<dir>/<branch>/`). Blank ⇒ `~/.iris/logs/sessions`; point it at a persistent
+  path when the home dir isn't a mounted volume.
 - `terminal.theme` — colour palette for the in-browser terminal: `dark` (the
   classic black background, default) or `light`.
 - `auth.trust_loopback` — trust loopback requests as the machine owner (on by

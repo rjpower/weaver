@@ -9,6 +9,7 @@ import ScratchPanel from '../components/ScratchPanel.vue';
 import SessionPageHeader from '../components/SessionPageHeader.vue';
 import SessionTabs from '../components/SessionTabs.vue';
 import SessionOverview from '../components/SessionOverview.vue';
+import SessionConversation from '../components/SessionConversation.vue';
 
 const props = defineProps<{ id: string }>();
 const route = useRoute();
@@ -25,7 +26,10 @@ const error = ref('');
 // `?tab=overview` query deep-links the Overview tab (e.g. the list's open-issue
 // link). Files are no longer a tab — they live in the embedded editor panel.
 const initialTab = route.query.tab;
-const tab = ref<'terminal' | 'overview'>(initialTab === 'overview' ? 'overview' : 'terminal');
+type WorkTab = 'terminal' | 'overview' | 'conversation';
+const tab = ref<WorkTab>(
+  initialTab === 'overview' || initialTab === 'conversation' ? initialTab : 'terminal',
+);
 
 const issueCount = computed(() => issues.value.length + backlog.value.length);
 
@@ -202,6 +206,13 @@ onUnmounted(() => {
             :issues="issues"
             :backlog="backlog"
           />
+        </div>
+
+        <!-- Conversation — the agent's chat with the model (live, or the
+             archived capture). Mounted only when selected; it fetches on its
+             own and re-fetches via its Refresh button. -->
+        <div v-if="tab === 'conversation'" class="h-full">
+          <SessionConversation :id="props.id" />
         </div>
       </div>
     </div>
