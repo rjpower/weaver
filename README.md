@@ -222,13 +222,16 @@ requested / review required), and a rolled-up CI verdict (checks passing /
 failing / pending). The session's Overview tab has a **Refresh** button to
 re-poll on demand.
 
+Every session detail has a **Conversation** tab that renders the agent's chat
+with the model — user turns, replies, thinking, and tool calls — live and
+(via the archive capture below) still there to review after the terminal is gone.
+
 Whenever a session is archived — by the Archive button or automatically on merge
-— loom first captures the agent's conversation log: it finds the agent's
-transcript (Claude Code or Codex), normalizes it, and writes a machine-readable
-`chat.json` plus a readable `chat.md` under `session.log_dir`
-(default `~/.iris/logs/sessions/<branch>/`), so the conversation is reviewable
-after the worktree is gone. `weaver chatlog` renders the same log for a live
-session on demand.
+— loom first captures that conversation to disk: it finds the agent's transcript
+(Claude Code or Codex), normalizes it, and writes a machine-readable `chat.json`
+plus a readable `chat.md` under `session.log_dir`
+(default `~/.iris/logs/sessions/<branch>/`). `weaver chatlog` renders the same
+log for a live session on the command line.
 
 Once a branch's PR merges, loom archives the session automatically — tearing
 down its terminal and worktree while keeping the branch and its weaver history, the

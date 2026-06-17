@@ -1,17 +1,22 @@
-//! Capturing a session's agent conversation when it is archived.
+//! Capturing and serving a session's agent conversation.
 //!
 //! Archiving tears down a session's worktree, but its agent's conversation
 //! transcript lives outside the worktree (`~/.claude/projects/…`,
-//! `~/.codex/sessions/…`) and survives. At archive time we locate that
-//! transcript, normalize it to the [iris format](weaver_core::transcript::iris),
-//! and write two files under `<log_dir>/<branch>/`:
+//! `~/.codex/sessions/…`) and survives. At archive time [`capture`] locates that
+//! transcript, normalizes it to the [iris format](weaver_core::transcript::iris),
+//! and writes two files under `<log_dir>/<branch>/`:
 //!
 //! * `chat.json` — the normalized iris log (machine-readable, re-renderable).
 //! * `chat.md` — a readable markdown render for review.
 //!
+//! [`conversation`] loads the same iris log for the dashboard's Conversation
+//! view, working for both a live session (parse the transcript fresh) and an
+//! archived one (the live transcript usually still exists; the captured
+//! `chat.json` is the durable fallback if it's been cleaned up).
+//!
 //! `log_dir` is the `session.log_dir` setting, defaulting to
-//! `~/.iris/logs/sessions`. Everything here is best-effort: a capture failure
-//! returns a warning and never blocks the archive.
+//! `~/.iris/logs/sessions`. Capture is best-effort: a failure returns a warning
+//! and never blocks the archive.
 
 use std::path::{Path, PathBuf};
 
@@ -57,6 +62,49 @@ fn branch_slug(branch: &Branch) -> String {
     }
 }
 
+/// Locate a session's live agent transcript files (oldest first). Claude's are a
+/// cheap path lookup, so always try them; Codex needs a `~/.codex` directory
+/// walk, so only fall back to it for an agent that could be Codex — never for a
+/// plain `shell`/`none` session, which has no conversation and would pay for the
+/// scan for nothing. Empty when none are found.
+fn locate(session: &Session) -> Vec<PathBuf> {
+    let work_dir = PathBuf::from(&session.work_dir);
+    let files = transcript::claude_transcripts_for(&work_dir);
+    if !files.is_empty() {
+        return files;
+    }
+    if matches!(session.agent_kind.as_str(), "shell" | "none") {
+        return Vec::new();
+    }
+    transcript::codex_transcripts_for(&work_dir)
+}
+
+/// The captured iris-JSON path for a session's branch (`<log_dir>/<branch>/
+/// chat.json`), whether or not it exists yet. `None` only when the log dir can't
+/// be resolved.
+pub async fn captured_json_path(db: &Db, branch: &Branch) -> Option<PathBuf> {
+    Some(
+        log_dir(db)
+            .await?
+            .join(branch_slug(branch))
+            .join("chat.json"),
+    )
+}
+
+/// The session's conversation as an iris [`Log`](transcript::Log), for the
+/// dashboard viewer. Prefers the live transcript (always fresh); falls back to
+/// the captured `chat.json` for an archived session whose transcript files have
+/// since been cleaned up. `None` when neither is available.
+pub async fn conversation(db: &Db, session: &Session, branch: &Branch) -> Option<transcript::Log> {
+    let files = locate(session);
+    if let Some(log) = transcript::parse_files(&files) {
+        return Some(log);
+    }
+    let path = captured_json_path(db, branch).await?;
+    let raw = tokio::fs::read_to_string(&path).await.ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
 /// Capture `session`'s conversation log to `<log_dir>/<branch>/`. Returns any
 /// warnings (no transcript found, write failure) — never an error, so a capture
 /// problem can't abort the archive. Returns the written markdown path on success
@@ -67,26 +115,14 @@ pub async fn capture(
     branch: &Branch,
 ) -> (Option<PathBuf>, Vec<String>) {
     let mut warnings = Vec::new();
-    let work_dir = PathBuf::from(&session.work_dir);
-
-    // Claude's transcript is a cheap path lookup, so always try it. Codex needs a
-    // `~/.codex` directory walk, so only fall back to it for an agent that could
-    // be Codex — never for a plain `shell`/`none` session, which has no
-    // conversation and would pay for the scan for nothing.
-    let mut source = transcript::Source::Claude;
-    let mut files = transcript::claude_transcripts_for(&work_dir);
-    let conversational = !matches!(session.agent_kind.as_str(), "shell" | "none");
-    if files.is_empty() && conversational {
-        files = transcript::codex_transcripts_for(&work_dir);
-        source = transcript::Source::Codex;
-    }
+    let files = locate(session);
     if files.is_empty() {
         // Missing transcript for a real agent is worth a warning; for a shell
         // session it's expected, so stay quiet.
-        if conversational {
+        if !matches!(session.agent_kind.as_str(), "shell" | "none") {
             warnings.push(format!(
                 "no agent transcript found for {}",
-                work_dir.display()
+                session.work_dir
             ));
         }
         return (None, warnings);
@@ -107,7 +143,7 @@ pub async fn capture(
     match write_log(&dest, &log).await {
         Ok(md_path) => {
             tracing::info!(
-                branch = %branch.branch, source = ?source,
+                branch = %branch.branch, source = %log.source,
                 messages = log.messages.len(), path = %md_path.display(),
                 "captured conversation log"
             );

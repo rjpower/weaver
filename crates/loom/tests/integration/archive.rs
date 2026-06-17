@@ -9,26 +9,7 @@ use serial_test::serial;
 
 use loom::backend;
 
-use crate::fixtures::{branch_tag, TestServer};
-
-/// Restores `$HOME` on drop, so a test that points it at a temp dir (to exercise
-/// transcript capture, which reads `~/.claude`) can't leak that into siblings.
-struct HomeGuard(Option<std::ffi::OsString>);
-impl HomeGuard {
-    fn set(path: &Path) -> Self {
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", path);
-        HomeGuard(prev)
-    }
-}
-impl Drop for HomeGuard {
-    fn drop(&mut self) {
-        match &self.0 {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-}
+use crate::fixtures::{branch_tag, plant_claude_transcript, HomeGuard, TestServer};
 
 /// Archiving captures the agent's conversation log: it locates the Claude Code
 /// transcript for the worktree (under `~/.claude/projects/<munged-cwd>/`),
@@ -64,24 +45,13 @@ async fn archive_captures_the_conversation_log() {
         .await
         .unwrap();
 
-    // Plant a Claude transcript where the agent would have written it: keyed off
-    // the worktree path the same way Claude Code munges it.
-    let proj = home.path().join(".claude").join("projects").join(
-        weaver_core::transcript::claude_project_dir_name(Path::new(&work_dir)),
+    // Plant a Claude transcript where the agent would have written it.
+    plant_claude_transcript(
+        home.path(),
+        &work_dir,
+        "implement the thing",
+        "Done — shipped it.",
     );
-    std::fs::create_dir_all(&proj).unwrap();
-    let transcript = [
-        json!({"type": "user", "sessionId": "abc", "timestamp": "2026-06-17T10:00:00.000Z",
-               "message": {"role": "user", "content": "implement the thing"}}),
-        json!({"type": "assistant", "sessionId": "abc", "timestamp": "2026-06-17T10:00:01.000Z",
-               "message": {"role": "assistant", "model": "claude-opus-4-8",
-                           "content": [{"type": "text", "text": "Done — shipped it."}]}}),
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect::<Vec<_>>()
-    .join("\n");
-    std::fs::write(proj.join("session.jsonl"), transcript).unwrap();
 
     let res = client
         .post(&format!("/api/sessions/{id}/archive"), json!({}))

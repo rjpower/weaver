@@ -180,6 +180,50 @@ impl TestServer {
     }
 }
 
+/// Restores `$HOME` on drop, so a test that points it at a temp dir (to exercise
+/// transcript capture / the conversation view, which read `~/.claude`) can't leak
+/// that into siblings. The suite is `#[serial]`, so the swap is safe.
+pub struct HomeGuard(Option<std::ffi::OsString>);
+impl HomeGuard {
+    pub fn set(path: &Path) -> Self {
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", path);
+        HomeGuard(prev)
+    }
+}
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
+/// Plant a minimal two-turn Claude transcript where the agent would have written
+/// it for `work_dir` (`$HOME/.claude/projects/<munged-cwd>/session.jsonl`), so a
+/// test can exercise capture / the conversation view without a real agent run.
+pub fn plant_claude_transcript(home: &Path, work_dir: &str, user: &str, assistant: &str) {
+    let proj = home.join(".claude").join("projects").join(
+        weaver_core::transcript::claude_project_dir_name(Path::new(work_dir)),
+    );
+    std::fs::create_dir_all(&proj).unwrap();
+    let transcript = [
+        serde_json::json!({"type": "user", "sessionId": "abc",
+            "timestamp": "2026-06-17T10:00:00.000Z",
+            "message": {"role": "user", "content": user}}),
+        serde_json::json!({"type": "assistant", "sessionId": "abc",
+            "timestamp": "2026-06-17T10:00:01.000Z",
+            "message": {"role": "assistant", "model": "claude-opus-4-8",
+                        "content": [{"type": "text", "text": assistant}]}}),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join("\n");
+    std::fs::write(proj.join("session.jsonl"), transcript).unwrap();
+}
+
 /// One tag off a `SessionView` (or `BranchView`) JSON `branch.tags` array by
 /// key, or `None` when the branch carries no tag for that key. The status axes
 /// — the agent's `attention` and an overlooker's `triage` — are tags, so this is

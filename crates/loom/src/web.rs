@@ -434,6 +434,7 @@ pub fn router(state: AppState) -> Router {
                 .delete(delete_scratch),
         )
         .route("/sessions/{id}/log", get(log_session))
+        .route("/sessions/{id}/conversation", get(conversation_session))
         .route("/sessions/{id}/events", get(events_sse))
         .route("/sessions/{id}/terminal", get(crate::terminal::terminal_ws))
         // Drive a session's terminal pane: type a message, interrupt, peek at it.
@@ -1889,6 +1890,20 @@ async fn log_session(
 ) -> ApiResult<Json<Vec<Event>>> {
     let branch = require_branch(&st.db, &key).await?;
     Ok(Json(events::history(&st.db, &branch.id, 200).await?))
+}
+
+/// The session's agent conversation as a normalized iris log — the live
+/// transcript when present, else the capture archived alongside it. 404 when the
+/// session has no conversation (e.g. a `shell` session, or none recorded yet).
+async fn conversation_session(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<weaver_core::transcript::Log>> {
+    let (session, branch) = require_session(&st.db, &key).await?;
+    match crate::chatlog::conversation(&st.db, &session, &branch).await {
+        Some(log) => Ok(Json(log)),
+        None => Err(AppError::not_found("conversation")),
+    }
 }
 
 async fn events_sse(

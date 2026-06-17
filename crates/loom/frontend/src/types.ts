@@ -430,3 +430,32 @@ export interface GithubConfig {
   client_id: string;
   callback_path: string;
 }
+
+// --- Conversation log (iris format) ----------------------------------------
+// The normalized agent conversation served by `GET /sessions/{id}/conversation`.
+// Mirrors `weaver_core::transcript::iris`: a list of role-tagged messages, each
+// an ordered list of content blocks. The Conversation tab renders this.
+
+/** A content block, discriminated by `kind` (serde `tag = "kind"`). */
+export type IrisBlock =
+  | { kind: 'text'; text: string }
+  | { kind: 'thinking'; text: string }
+  | { kind: 'tool_use'; name: string; input: unknown }
+  | { kind: 'tool_result'; output: string; is_error: boolean }
+  | { kind: 'image' };
+
+/** One message: who said it, when, and its content blocks. */
+export interface IrisMessage {
+  role: 'user' | 'assistant' | 'context';
+  timestamp?: string;
+  blocks: IrisBlock[];
+}
+
+/** A whole normalized conversation. Mirrors `iris::Log`. */
+export interface IrisLog {
+  source: string;
+  session_id?: string;
+  model?: string;
+  cwd?: string;
+  messages: IrisMessage[];
+}

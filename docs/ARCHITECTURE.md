@@ -55,7 +55,7 @@ needing the daemon to be reachable.
 | `python/weaver-loom/` | the pure-Python layer over the loom REST API (`weaver_loom`: client + overlooker round context); stdlib-only, uv-buildable, vendored onto every script's `PYTHONPATH` by the engine; server-free contract tests in `tests/` (`uv run pytest`, CI's `python-binding` job) |
 | `crates/loom/src/agent.rs` | launching agents into per-session terminals + installing `.claude/settings.local.json` hooks + the one-shot headless agent behind `POST /api/agent/oneshot` |
 | `crates/loom/src/session.rs` | `Session` row + sqlx queries |
-| `crates/loom/src/chatlog.rs` | conversation-log capture at archive: locate the worktree's agent transcript, write the iris `chat.json` + rendered `chat.md` under `session.log_dir` |
+| `crates/loom/src/chatlog.rs` | conversation log: capture at archive (write the iris `chat.json` + rendered `chat.md` under `session.log_dir`) and serve it for the Conversation tab (`conversation()` — live transcript, else the capture) |
 | `crates/loom/src/backend.rs` | the terminal-management seam: every programmatic terminal op (create/has/capture/send/kill/list) drives the session's `tapestry` supervisor |
 | `crates/tapestry/` | the terminal backend: a per-session detached PTY supervisor (PTY + vt100 screen emulator + unix control socket) that outlives loom and streams raw PTY bytes, so an attached xterm owns its own scrollback/search |
 | `crates/loom/src/terminal.rs` | WebSocket ⇄ live-terminal bridge: xterm.js ⇄ the tapestry session socket |
@@ -187,6 +187,7 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `GET /api/sessions/{id}/artifacts` | list the branch's [artifacts](artifacts.md) plus repo-shared ones |
 | `GET PUT /api/sessions/{id}/artifacts/{name}` | read content + projected refs (`rev=N` for a revision) / write a user edit as a new revision |
 | `GET /api/sessions/{id}/{diff,log,events}` | reads + SSE stream |
+| `GET /api/sessions/{id}/conversation` | the agent conversation as a normalized iris log (live transcript, else the archive capture); 404 when there is none — backs the Conversation tab |
 | `GET /api/sessions/{id}/terminal` | WebSocket: xterm.js ⇄ the session's tapestry PTY (the interaction surface) |
 | `POST /api/sessions/{id}/send` | type `{text}` into the agent's terminal; `submit` (default true) follows it with Enter to trigger a round |
 | `POST /api/sessions/{id}/interrupt` | send a break (Escape) to the terminal — stop the current turn |
@@ -385,6 +386,13 @@ rendered markdown log), and writes `chat.json` (iris) + `chat.md` under
 is a logged warning, never a failed archive. The same conversion/render pipeline
 backs `weaver chatlog`, which renders the current worktree's (or a named file's)
 transcript on demand.
+
+The dashboard surfaces this as a **Conversation tab** on the session detail,
+backed by `GET /api/sessions/{id}/conversation` (`chatlog::conversation` →
+the live transcript when present, else the archived `chat.json`). The Vue viewer
+renders the iris log natively — user/assistant turns, collapsible thinking, and
+each tool call with its result — so a session stays reviewable in the UI after
+its terminal is gone.
 
 Orphan detection is independent: if the session's supervisor is no longer alive,
 the session becomes `orphaned` and is eligible for `loom adopt`.

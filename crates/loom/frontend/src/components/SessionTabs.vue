@@ -10,7 +10,7 @@
 // Overview tab as a quiet pill rather than owning a tab of its own. Artifacts is
 // the agent's out-of-repo documents (designs, reports, the plan). The worktree
 // files live in the embedded editor (the side panel), not a tab.
-type Tab = 'terminal' | 'overview' | 'artifacts';
+type Tab = 'terminal' | 'overview' | 'conversation' | 'artifacts';
 
 // The Artifacts tab is a real navigation; the rest are local.
 type LocalTab = Exclude<Tab, 'artifacts'>;
@@ -21,6 +21,9 @@ defineEmits<{ select: [LocalTab] }>();
 const LOCAL_TABS: { key: LocalTab; label: string }[] = [
   { key: 'terminal', label: 'Terminal' },
   { key: 'overview', label: 'Overview' },
+  // The agent's chat with the model — live, and (via the archive capture) still
+  // here to review after the terminal is gone.
+  { key: 'conversation', label: 'Conversation' },
 ];
 </script>
 
