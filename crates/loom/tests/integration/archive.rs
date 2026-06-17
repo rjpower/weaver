@@ -11,6 +11,106 @@ use loom::backend;
 
 use crate::fixtures::{branch_tag, TestServer};
 
+/// Restores `$HOME` on drop, so a test that points it at a temp dir (to exercise
+/// transcript capture, which reads `~/.claude`) can't leak that into siblings.
+struct HomeGuard(Option<std::ffi::OsString>);
+impl HomeGuard {
+    fn set(path: &Path) -> Self {
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", path);
+        HomeGuard(prev)
+    }
+}
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
+/// Archiving captures the agent's conversation log: it locates the Claude Code
+/// transcript for the worktree (under `~/.claude/projects/<munged-cwd>/`),
+/// normalizes it, and writes a rendered `chat.md` and an iris `chat.json` under
+/// the configured session log dir — all before the worktree is torn down.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_captures_the_conversation_log() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    // Point HOME (transcript source) and the log dir (capture sink) at temp dirs.
+    let home = tempfile::tempdir().unwrap();
+    let _home_guard = HomeGuard::set(home.path());
+    let logs = tempfile::tempdir().unwrap();
+
+    let sess = client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "log me", "cwd": ts.cwd(), "agent": "shell" }),
+        )
+        .await
+        .unwrap();
+    let id = sess["id"].as_str().unwrap().to_string();
+    let work_dir = sess["work_dir"].as_str().unwrap().to_string();
+
+    // Set the capture sink via the settings API.
+    client
+        .patch(
+            "/api/settings",
+            json!({ "session.log_dir": logs.path().to_string_lossy() }),
+        )
+        .await
+        .unwrap();
+
+    // Plant a Claude transcript where the agent would have written it: keyed off
+    // the worktree path the same way Claude Code munges it.
+    let proj = home.path().join(".claude").join("projects").join(
+        weaver_core::transcript::claude_project_dir_name(Path::new(&work_dir)),
+    );
+    std::fs::create_dir_all(&proj).unwrap();
+    let transcript = [
+        json!({"type": "user", "sessionId": "abc", "timestamp": "2026-06-17T10:00:00.000Z",
+               "message": {"role": "user", "content": "implement the thing"}}),
+        json!({"type": "assistant", "sessionId": "abc", "timestamp": "2026-06-17T10:00:01.000Z",
+               "message": {"role": "assistant", "model": "claude-opus-4-8",
+                           "content": [{"type": "text", "text": "Done — shipped it."}]}}),
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join("\n");
+    std::fs::write(proj.join("session.jsonl"), transcript).unwrap();
+
+    let res = client
+        .post(&format!("/api/sessions/{id}/archive"), json!({}))
+        .await
+        .unwrap();
+    assert_eq!(res["archived"], true);
+    let branch = res["branch"].as_str().unwrap();
+    let slug = branch.replace('/', "-");
+
+    // Both the rendered markdown and the normalized iris JSON are written.
+    let md = std::fs::read_to_string(logs.path().join(&slug).join("chat.md"))
+        .expect("chat.md should be captured on archive");
+    assert!(md.contains("# Conversation log"), "rendered markdown: {md}");
+    assert!(
+        md.contains("implement the thing"),
+        "user turn captured: {md}"
+    );
+    assert!(
+        md.contains("Done — shipped it."),
+        "assistant turn captured: {md}"
+    );
+
+    let raw_json = std::fs::read_to_string(logs.path().join(&slug).join("chat.json"))
+        .expect("chat.json should be captured on archive");
+    let iris: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
+    assert_eq!(iris["source"], "claude");
+    assert_eq!(iris["messages"].as_array().unwrap().len(), 2);
+}
+
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn archive_keeps_branch_and_history() {

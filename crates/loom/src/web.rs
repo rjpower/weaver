@@ -1197,6 +1197,12 @@ pub async fn archive(
 ) -> Result<Vec<String>, AppError> {
     let mut warnings: Vec<String> = Vec::new();
 
+    // Capture the agent's conversation log before teardown. The transcript lives
+    // outside the worktree so it would survive removal, but capturing first keeps
+    // it whole regardless. Best-effort: failures are warnings, never fatal.
+    let (_, log_warnings) = crate::chatlog::capture(&st.db, session, branch).await;
+    warnings.extend(log_warnings);
+
     backend::kill_session(&session.term_session).await.ok();
     st.ide.kill(&session.id);
     let repo_root = PathBuf::from(&branch.repo_root);

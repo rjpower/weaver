@@ -43,9 +43,9 @@ needing the daemon to be reachable.
 
 | Path | What's in it |
 |---|---|
-| `crates/weaver-core/` | lib: `branches`, `issues`, `events`, `db`, `migrations` (ordered SQL + `schema_migrations` indicator), `git`, `config`, `artifacts` (versioned documents), `repo_config` (`.weaver/config.toml`), agent helpers. Pure logic; used by both binaries. |
+| `crates/weaver-core/` | lib: `branches`, `issues`, `events`, `db`, `migrations` (ordered SQL + `schema_migrations` indicator), `git`, `config`, `artifacts` (versioned documents), `repo_config` (`.weaver/config.toml`), `transcript` (agent conversation logs: raw → iris format → markdown), agent helpers. Pure logic; used by both binaries. |
 | `crates/smartdoc/` | the markdown-convention layer: parse references (`#N`, `artifact:<name>`), project live status into the render. Dependency-free of weaver. See [artifacts.md](artifacts.md). |
-| `crates/weaver/src/bin/weaver.rs` | the slim agent-facing CLI (`goal`, `summary`, `readme`, `status` [read or set level + message], `tag` [`set`/`rm`/`ls` a branch tag], `issue …`, `where`, `log`, `hook`, `config`) |
+| `crates/weaver/src/bin/weaver.rs` | the slim agent-facing CLI (`goal`, `summary`, `readme`, `status` [read or set level + message], `tag` [`set`/`rm`/`ls` a branch tag], `issue …`, `where`, `log`, `chatlog` [render the agent's conversation transcript], `hook`, `config`) |
 | `crates/loom/src/web.rs` | axum routes, request/response types, SSE — **the API surface** (incl. the auth middleware + login/token/user handlers) |
 | `crates/loom/src/auth.rs` | authentication core: token/password crypto, the `users`/`api_tokens`/`auth_sessions` tables, the machine-local token, and the GitHub OAuth calls. `axum`-free so it unit-tests directly |
 | `crates/loom/src/server.rs` | bind, write `server.json`, spawn bg tasks |
@@ -55,6 +55,7 @@ needing the daemon to be reachable.
 | `python/weaver-loom/` | the pure-Python layer over the loom REST API (`weaver_loom`: client + overlooker round context); stdlib-only, uv-buildable, vendored onto every script's `PYTHONPATH` by the engine; server-free contract tests in `tests/` (`uv run pytest`, CI's `python-binding` job) |
 | `crates/loom/src/agent.rs` | launching agents into per-session terminals + installing `.claude/settings.local.json` hooks + the one-shot headless agent behind `POST /api/agent/oneshot` |
 | `crates/loom/src/session.rs` | `Session` row + sqlx queries |
+| `crates/loom/src/chatlog.rs` | conversation-log capture at archive: locate the worktree's agent transcript, write the iris `chat.json` + rendered `chat.md` under `session.log_dir` |
 | `crates/loom/src/backend.rs` | the terminal-management seam: every programmatic terminal op (create/has/capture/send/kill/list) drives the session's `tapestry` supervisor |
 | `crates/tapestry/` | the terminal backend: a per-session detached PTY supervisor (PTY + vt100 screen emulator + unix control socket) that outlives loom and streams raw PTY bytes, so an attached xterm owns its own scrollback/search |
 | `crates/loom/src/terminal.rs` | WebSocket ⇄ live-terminal bridge: xterm.js ⇄ the tapestry session socket |
@@ -371,6 +372,19 @@ Archiving a session clears its loud tags **and** the soothing `idle` mark: the
 agent is gone, so a torn-down workstream can't still "need me" nor is it
 "resting", and the dashboard stops flagging or labelling it. The UI also treats
 any `archived` session as calm regardless of a stale tag left on the branch.
+
+Archiving also **captures the agent's conversation log** (`crate::chatlog`,
+inside the shared `web::archive`, so both the Archive button and the
+merge-archive poller get it). The agent's transcript lives outside the worktree —
+Claude Code under `~/.claude/projects/<munged-cwd>/`, Codex under
+`~/.codex/sessions/` — so it survives the worktree removal; capture locates it,
+normalizes it through `weaver_core::transcript` (raw → **iris format** → a
+rendered markdown log), and writes `chat.json` (iris) + `chat.md` under
+`<session.log_dir>/<branch>/` (`session.log_dir` defaults to
+`~/.iris/logs/sessions`). It is best-effort: a missing or unreadable transcript
+is a logged warning, never a failed archive. The same conversion/render pipeline
+backs `weaver chatlog`, which renders the current worktree's (or a named file's)
+transcript on demand.
 
 Orphan detection is independent: if the session's supervisor is no longer alive,
 the session becomes `orphaned` and is eligible for `loom adopt`.

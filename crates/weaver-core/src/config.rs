@@ -289,6 +289,19 @@ pub const REGISTRY: &[SettingSpec] = &[
         group: "Editor",
         options: &[],
     },
+    SettingSpec {
+        key: "session.log_dir",
+        label: "Session log directory",
+        description: "Where the agent's conversation log is captured when a \
+            session is archived: a normalized `chat.json` and a rendered \
+            `chat.md` are written under `<dir>/<branch>/`. Empty uses \
+            `~/.iris/logs/sessions`. Point it at a persistent path when running \
+            in a container where the default home isn't a mounted volume.",
+        kind: SettingKind::String,
+        default: "",
+        group: "Sessions",
+        options: &[],
+    },
 ];
 
 /// Whether the Overlooker engine master switch is on. On by default.
