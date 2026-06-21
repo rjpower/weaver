@@ -169,16 +169,24 @@ export function quietTags(s: Session): Tag[] {
 // a *live* agent resting between turns: a terminal/detached lifecycle (done,
 // error, archived, orphaned) reads through its own badge, not "resting". And
 // only when genuinely calm — any loud signal (the agent's own or an outside
-// mark) supersedes the resting state — and the mark is itself live (not stale:
-// the session hasn't moved on past it). Drives the calm "Idle" presentation in
+// mark) supersedes the resting state. Drives the calm "Idle" presentation in
 // the list and header.
+//
+// Unlike a loud outside mark, the idle mark is deliberately NOT subject to
+// activity-staleness: it is the agent's own lifecycle self-report, retracted
+// event-driven by the `working` hook (monitor `apply_hook` clears IDLE_KEY when
+// a prompt is submitted), not by `last_activity_at` advancing. Comparing it
+// against activity would misfire two ways: (1) the very turn-ending output that
+// triggers the `waiting`/`idle` hook also changes the pane, and the monitor's
+// pane-hash touch bumps `last_activity_at` a millisecond *after* the mark's
+// `set_at` — so the mark would be born stale and a finished turn would never read
+// "Idle"; and (2) sub-agent or shell pane activity under an idle mark is, by
+// design, still "resting" (see monitor `apply_hook`), not a reason to retract it.
 const LIVE_STATUSES = new Set(['launching', 'running']);
 export function idleTag(s: Session): Tag | null {
   if (!LIVE_STATUSES.has(s.status)) return null;
   if (loudTags(s).length > 0) return null;
-  const tag = (s.branch.tags ?? []).find((t) => t.key === IDLE_KEY);
-  if (!tag || tagStale(tag, s.last_activity_at)) return null;
-  return tag;
+  return (s.branch.tags ?? []).find((t) => t.key === IDLE_KEY) ?? null;
 }
 
 // Compact conversation-state line for the detail header (#5): a derived

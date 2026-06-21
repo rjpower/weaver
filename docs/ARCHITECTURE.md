@@ -313,7 +313,12 @@ authors its own typed keys. The well-known **`idle`** key is a *quiet* exception
 loom stamps it mechanically when an agent goes quiet (the soothing "resting, no
 one needed" state), carrying the non-loud value `idle` so it never raises a badge
 — the dashboard surfaces it as a calm "Idle" mark, and the status watch may
-replace it with a real loud status. **Absence is the calm/default state** — there
+replace it with a real loud status. Unlike a loud outside mark it is *not* subject
+to activity-staleness (below): it is the agent's own lifecycle mark, cleared
+event-driven by the next `working` hook (a submitted prompt), not retired by
+`last_activity_at` advancing — the turn-ending output that fires the idle hook is
+itself a pane change that bumps `last_activity_at`, so a stale-check would retire
+the mark the instant it lands. **Absence is the calm/default state** — there
 is no stored `ok`; returning to calm *clears* the tag. A tag is **stale** when its
 `set_at` predates the session's `last_activity_at` (the session moved on since it
 was set). The dashboard resolves the loudest non-stale loud tag into one

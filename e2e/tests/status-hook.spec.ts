@@ -1,7 +1,7 @@
 import { test, expect } from '../fixtures/weaver';
 
 test.describe('status reflects hook and attention events', () => {
-  test('detail view: hooks drive lifecycle and a waiting lull stays calm', async ({
+  test('detail view: hooks drive lifecycle and a waiting lull reads as a calm "Idle"', async ({
     page,
     weaver,
   }) => {
@@ -30,6 +30,12 @@ test.describe('status reflects hook and attention events', () => {
     await expect(
       page.locator('[data-testid="signal-chip"][data-signal-key="attention"]'),
     ).toHaveCount(0);
+    // …and the detail strip resolves to the calm "Idle" — the restful state, not
+    // stuck on "Working". #247 regression guard: the idle mark must outlive the
+    // monitor's pane-hash touch that bumps `last_activity_at` just after the
+    // mark's `set_at`, or `idleTag()` reads the mark as stale and the strip never
+    // leaves "Working".
+    await expect(conv).toContainText('Idle');
   });
 
   test('detail view: weaver status sets level + message via SSE', async ({ page, weaver }) => {
