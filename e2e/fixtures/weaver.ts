@@ -464,9 +464,11 @@ export const test = base.extend<{ weaver: WeaverFixture }, WorkerFixtures>({
       async seedConversation(session, log) {
         // The conversation endpoint prefers a live agent transcript, but a
         // seeded `shell` session has none — so it falls back to the captured
-        // `chat.json` under the configured log dir. Point that at a temp folder
-        // and drop the log there, slugging the branch the same way the server does.
-        const logRoot = mkdtempSync(join(tmpdir(), 'weaver-conv-'));
+        // `chat.json` under the configured log dir. Point that at a folder under
+        // this worker's WEAVER_HOME (reaped in worker teardown, so no stray
+        // /tmp/weaver-conv-* dirs leak across runs) and drop the log there,
+        // slugging the branch the same way the server does.
+        const logRoot = mkdtempSync(join(childEnv.WEAVER_HOME!, 'conv-'));
         await fetchJson(`${baseUrl}/api/settings`, {
           method: 'PATCH',
           body: JSON.stringify({ 'session.log_dir': logRoot }),

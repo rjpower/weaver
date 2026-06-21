@@ -154,9 +154,14 @@ test.describe('overlooker panel', () => {
 
     // The registry section lists the stock programs that ship with loom.
     const rows = page.getByTestId('program-row');
-    await expect(rows).toHaveCount(3);
+    await expect(rows).toHaveCount(4);
     const section = page.getByTestId('builtin-programs');
-    for (const name of ['builtin:status', 'builtin:pr-label', 'builtin:archive-merged']) {
+    for (const name of [
+      'builtin:status',
+      'builtin:resume',
+      'builtin:pr-label',
+      'builtin:archive-merged',
+    ]) {
       await expect(section).toContainText(name);
     }
 

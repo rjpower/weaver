@@ -21,6 +21,11 @@ const errorMsg = ref('');
 
 async function load() {
   state.value = 'loading';
+  // Fold keys are per-render row indices (`ctx-0`, `tg-1-0`) and the highlight
+  // tracks this session's turns — so reset both when the session changes, or the
+  // next session would inherit the previous one's open folds and active anchor.
+  open.value = new Set();
+  activeAnchor.value = '';
   try {
     const data = (await get(`/sessions/${props.id}/conversation`)) as IrisLog;
     log.value = data;
@@ -204,7 +209,13 @@ function toggle(k: string) {
   s.has(k) ? s.delete(k) : s.add(k);
   open.value = s;
 }
-const allOpen = computed(() => model.value.foldKeys.length > 0 && open.value.size >= model.value.foldKeys.length);
+// True only when *every current* fold is open — checking membership rather than
+// a size comparison, so stale keys left in `open` (from a prior render model)
+// can't mislabel the toggle as "Collapse all".
+const allOpen = computed(() => {
+  const keys = model.value.foldKeys;
+  return keys.length > 0 && keys.every((k) => open.value.has(k));
+});
 function toggleAll() {
   open.value = allOpen.value ? new Set() : new Set(model.value.foldKeys);
 }
@@ -359,12 +370,19 @@ const groupHasError = (g: ToolGroup) => g.items.some((it) => it.result?.is_error
         <template v-for="row in visibleRows" :key="row.key">
           <!-- Injected context (primers, system/permissions) — folded away. -->
           <div v-if="row.type === 'context'" class="overflow-hidden rounded border border-line bg-subtle/30">
-            <button type="button" class="fold-head text-muted" @click="toggle('ctx-' + row.key)">
+            <button
+              type="button"
+              class="fold-head text-muted"
+              :aria-expanded="isOpen('ctx-' + row.key)"
+              :aria-controls="'ctx-' + row.key + '-panel'"
+              @click="toggle('ctx-' + row.key)"
+            >
               <span class="chev" :class="{ open: isOpen('ctx-' + row.key) }">▸</span>
               <span>📎 Context</span>
             </button>
             <pre
               v-if="isOpen('ctx-' + row.key)"
+              :id="'ctx-' + row.key + '-panel'"
               class="conv-pre border-t border-line text-muted"
               >{{ row.text }}</pre>
           </div>
@@ -395,12 +413,19 @@ const groupHasError = (g: ToolGroup) => g.items.some((it) => it.result?.is_error
 
           <!-- Thinking — folded. -->
           <div v-else-if="row.type === 'thinking'" class="overflow-hidden rounded border border-line bg-subtle/30">
-            <button type="button" class="fold-head text-muted" @click="toggle('think-' + row.key)">
+            <button
+              type="button"
+              class="fold-head text-muted"
+              :aria-expanded="isOpen('think-' + row.key)"
+              :aria-controls="'think-' + row.key + '-panel'"
+              @click="toggle('think-' + row.key)"
+            >
               <span class="chev" :class="{ open: isOpen('think-' + row.key) }">▸</span>
               <span>💭 Thinking</span>
             </button>
             <pre
               v-if="isOpen('think-' + row.key)"
+              :id="'think-' + row.key + '-panel'"
               class="conv-pre border-t border-line text-muted"
               >{{ row.text }}</pre>
           </div>
@@ -413,7 +438,13 @@ const groupHasError = (g: ToolGroup) => g.items.some((it) => it.result?.is_error
               class="overflow-hidden rounded border border-line bg-subtle/30"
               data-testid="tool-fold"
             >
-              <button type="button" class="fold-head" @click="toggle(`tg-${row.key}-${gi}`)">
+              <button
+                type="button"
+                class="fold-head"
+                :aria-expanded="isOpen(`tg-${row.key}-${gi}`)"
+                :aria-controls="`tg-${row.key}-${gi}-panel`"
+                @click="toggle(`tg-${row.key}-${gi}`)"
+              >
                 <span class="chev" :class="{ open: isOpen(`tg-${row.key}-${gi}`) }">▸</span>
                 <span class="shrink-0">🔧</span>
                 <span class="shrink-0 font-mono text-fg">{{ g.name }}</span>
@@ -421,7 +452,7 @@ const groupHasError = (g: ToolGroup) => g.items.some((it) => it.result?.is_error
                 <span v-else class="min-w-0 truncate font-mono text-faint">{{ preview(g.items[0]) }}</span>
                 <span v-if="groupHasError(g)" class="ml-auto shrink-0 text-2xs font-medium text-block">error</span>
               </button>
-              <div v-if="isOpen(`tg-${row.key}-${gi}`)" class="border-t border-line">
+              <div v-if="isOpen(`tg-${row.key}-${gi}`)" :id="`tg-${row.key}-${gi}-panel`" class="border-t border-line">
                 <div
                   v-for="(it, ii) in g.items"
                   :key="ii"

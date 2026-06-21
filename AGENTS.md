@@ -78,6 +78,12 @@ when you're ready to land. The rules it enforces:
   build). After pushing, block on `gh pr checks <n> --watch --fail-fast`, answer
   comments in-thread, and fix failures until green. Only **then** raise `weaver
   status attention "ready for review"`; while CI runs you are `ok`, not done.
+- **Wait for the bot reviewers — they're slower than CI.** GitHub's Copilot/Codex
+  reviewers post inline comments minutes after the PR opens (not instantly, and
+  after the checks pass). Don't call a PR done the moment it's pushed: block for
+  their review, or check back after ~30 min — `gh pr view <n> --json reviews,comments`
+  plus `gh api repos/{owner}/{repo}/pulls/<n>/comments` for the inline threads —
+  then address or reply to each before handing off.
 
 ## Conventions
 
