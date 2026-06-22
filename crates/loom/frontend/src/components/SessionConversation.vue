@@ -28,7 +28,14 @@ const errorMsg = ref('');
 // folds, scroll, and highlight) from a fresh load (mount / session switch /
 // manual Refresh: reset them). On a preserved refresh a transient fetch error is
 // swallowed — the rendered log stays put and the next edge (or Refresh) recovers.
+//
+// A monotonic token guards against out-of-order responses: a session switch or a
+// fast auto-refresh can leave an earlier fetch in flight, and its late response
+// must not clobber a newer load's transcript. Each call claims the next token
+// and abandons its result once a newer load has started.
+let loadSeq = 0;
 async function load({ preserve = false }: { preserve?: boolean } = {}) {
+  const seq = ++loadSeq;
   if (!preserve) {
     state.value = 'loading';
     // Fold keys are per-render row indices (`ctx-0`, `tg-1-0`) and the highlight
@@ -40,9 +47,11 @@ async function load({ preserve = false }: { preserve?: boolean } = {}) {
   const stick = preserve && nearBottom();
   try {
     const data = (await get(`/sessions/${id.value}/conversation`)) as IrisLog;
+    if (seq !== loadSeq) return;
     log.value = data;
     state.value = data && data.messages.length ? 'ready' : 'empty';
   } catch (e) {
+    if (seq !== loadSeq) return;
     // A 404 means nothing's been recorded (a shell session, or not yet) — that's
     // an empty state, not an error worth shouting about.
     const msg = (e as Error).message ?? '';
@@ -54,6 +63,7 @@ async function load({ preserve = false }: { preserve?: boolean } = {}) {
     }
   }
   await nextTick();
+  if (seq !== loadSeq) return;
   // Chat behaviour: only follow the conversation to the newest message when the
   // reader was already at the foot — never yank them down out of the history.
   if (stick) scrollToBottom();
@@ -119,12 +129,13 @@ const composerVisible = computed(
 );
 
 async function submitPrompt() {
-  const text = draft.value.trim();
-  if (!text || sending.value) return;
+  // Trim only to decide emptiness — send the raw draft so intentional leading
+  // indentation or newlines in a multi-line prompt reach the agent unchanged.
+  if (!draft.value.trim() || sending.value) return;
   sending.value = true;
   sendError.value = '';
   try {
-    await sendMessage(id.value, text);
+    await sendMessage(id.value, draft.value);
     draft.value = '';
     scheduleRefresh();
   } catch (e) {
