@@ -66,7 +66,9 @@ fn inner_command(
     };
     match agent_kind {
         "shell" | "none" => String::new(),
-        "claude" => match mode {
+        // The concierge is a Claude agent with a fleet-ops primer (see
+        // `is_claude_runtime`): same command, hooks, and launch gates.
+        k if is_claude_runtime(k) => match mode {
             LaunchMode::Adopt => format!("claude --continue{args}"),
             LaunchMode::Fresh => match goal_file {
                 Some(f) => format!("claude{args} \"$(cat '{}')\"", f.display()),
@@ -78,6 +80,29 @@ fn inner_command(
             None => other.to_string(),
         },
     }
+}
+
+/// The agent kind for the fleet **concierge** — a Claude agent seeded with the
+/// [`concierge_primer`] instead of a workstream goal, hidden from the fleet list
+/// and resolved as a singleton by the Chat surface.
+pub const CONCIERGE_KIND: &str = "concierge";
+
+/// Whether `agent_kind` runs the Claude runtime — the `claude` command plus the
+/// weaver hooks and first-run launch gates. The `concierge` kind is Claude with a
+/// different opening prompt, so it rides the same launch path; everything else is
+/// run as a bare command name.
+pub fn is_claude_runtime(agent_kind: &str) -> bool {
+    matches!(agent_kind, "claude" | "concierge")
+}
+
+/// The builtin concierge primer — how the fleet concierge explores and acts on
+/// the fleet. Catted in at build time like [`weaver_core::agent::builtin_weaver_md`],
+/// and used as a concierge session's opening prompt.
+const BUILTIN_CONCIERGE_MD: &str = include_str!("../CONCIERGE.md");
+
+/// The concierge primer text, seeded as a concierge session's opening prompt.
+pub fn concierge_primer() -> &'static str {
+    BUILTIN_CONCIERGE_MD
 }
 
 /// Wrap a value in single quotes for safe `export NAME=…` in the launch script,
@@ -138,7 +163,7 @@ pub async fn launch(spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<()> {
         .map(|d| d.join("weaver").display().to_string())
         .unwrap_or_else(|| "weaver".to_string());
 
-    if spec.agent_kind == "claude" {
+    if is_claude_runtime(spec.agent_kind) {
         // Both steps are best-effort — a failure shouldn't abort the launch — but
         // log it, since a silent failure here resurfaces only as a stalled agent.
         if let Err(e) = install_hooks(spec.work_dir, &weaver_bin).await {
@@ -505,6 +530,28 @@ mod tests {
         assert!(script.contains("export WEAVER_API='http://h:1'; "));
         assert!(script.contains("claude \"$(cat '/x/goal.txt')\"; "));
         assert!(script.ends_with("exec \"${SHELL:-/bin/sh}\""));
+    }
+
+    #[test]
+    fn concierge_runs_the_claude_command_with_its_primer() {
+        // The concierge kind is Claude with a different opening prompt: it must
+        // produce the same `claude "$(cat …)"` invocation, not try to exec a
+        // `concierge` binary.
+        assert!(is_claude_runtime(CONCIERGE_KIND));
+        let script = launch_script(
+            CONCIERGE_KIND,
+            Some(Path::new("/x/goal.txt")),
+            &[],
+            None,
+            LaunchMode::Fresh,
+            "",
+        );
+        assert!(
+            script.contains("claude \"$(cat '/x/goal.txt')\"; "),
+            "got: {script}"
+        );
+        // And the primer it is seeded with is the real fleet-ops doc.
+        assert!(concierge_primer().contains("fleet concierge"));
     }
 
     #[test]

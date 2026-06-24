@@ -6,7 +6,7 @@ use serial_test::serial;
 
 use loom::backend;
 
-use crate::fixtures::{sh, TestServer};
+use crate::fixtures::{sh, HomeGuard, TestServer};
 
 /// Creating a session provisions a worktree + terminal session and records the repo;
 /// deleting it tears the terminal session down and releases the repo's active count.
@@ -123,6 +123,69 @@ async fn launch_forks_from_fresh_origin_default() {
 
     let id = ws["id"].as_str().unwrap().to_string();
     client.delete(&format!("/api/sessions/{id}")).await.unwrap();
+}
+
+/// The Chat surface's concierge (`GET /api/chat`) is get-or-created as a
+/// singleton, hidden from the fleet list, and needs a repo to live in.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_get_or_creates_a_hidden_singleton_concierge() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+    // The concierge runs the Claude launch path (hooks + first-run gates), which
+    // writes under $HOME — isolate it so the test can't touch the real home.
+    let home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(home.path());
+
+    // With no repo used yet, there is nowhere for the concierge to live.
+    assert!(
+        client.get("/api/chat").await.is_err(),
+        "no repo yet ⇒ GET /api/chat should fail"
+    );
+
+    // Record a repo by launching an ordinary session.
+    let work = client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "ordinary work", "cwd": ts.cwd(), "agent": "shell" }),
+        )
+        .await
+        .unwrap();
+    let work_id = work["id"].as_str().unwrap().to_string();
+
+    // First GET creates the concierge — a `concierge`-kind session, no tracking
+    // issue (it has no deliverable to track).
+    let chat = client.get("/api/chat").await.unwrap();
+    let chat_id = chat["id"].as_str().unwrap().to_string();
+    assert_eq!(chat["agent_kind"], "concierge");
+    assert!(
+        chat["tracking_issue"].is_null(),
+        "concierge has no tracking issue"
+    );
+    assert_ne!(chat_id, work_id);
+
+    // Second GET returns the *same* session — a singleton, not a fresh one.
+    let again = client.get("/api/chat").await.unwrap();
+    assert_eq!(
+        again["id"].as_str().unwrap(),
+        chat_id,
+        "the concierge is a singleton"
+    );
+
+    // It is hidden from the fleet list — only the ordinary session shows.
+    let list = client.get("/api/sessions").await.unwrap();
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 1, "concierge must not appear in the fleet list");
+    assert_eq!(list[0]["id"].as_str().unwrap(), work_id);
+
+    client
+        .delete(&format!("/api/sessions/{chat_id}"))
+        .await
+        .unwrap();
+    client
+        .delete(&format!("/api/sessions/{work_id}"))
+        .await
+        .unwrap();
 }
 
 /// A session can be created with no goal at all — just a title.

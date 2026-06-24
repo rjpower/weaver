@@ -400,6 +400,7 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         // Sessions
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/chat", get(get_chat))
         .route(
             "/sessions/{id}",
             get(get_session).patch(patch_session).delete(delete_session),
@@ -587,6 +588,13 @@ async fn create_session(
     State(st): State<AppState>,
     Json(req): Json<CreateReq>,
 ) -> ApiResult<Json<SessionView>> {
+    Ok(Json(create_session_core(st, req).await?))
+}
+
+/// The session-creation core, shared by `POST /api/sessions` and the Chat
+/// surface's concierge get-or-create ([`get_chat`]). Returns the view directly so
+/// the caller can shape its own response.
+async fn create_session_core(st: AppState, req: CreateReq) -> ApiResult<SessionView> {
     let cwd = PathBuf::from(&req.cwd);
     let repo_root = git::repo_root(&cwd)
         .await
@@ -599,6 +607,10 @@ async fn create_session(
         Some(a) => a,
         None => config::get_or(&st.db, "agent.default", config::DEFAULT_AGENT).await,
     };
+    // The concierge is the fleet Chat agent, not a workstream: it gets the
+    // fleet-ops primer as its opening prompt and no tracking issue (it has no
+    // deliverable to track), and is hidden from the fleet list by its kind.
+    let is_concierge = agent == agent::CONCIERGE_KIND;
 
     // Normalize and validate the model / effort selections. Blank means
     // "inherit the configured default"; anything non-blank must be known.
@@ -817,18 +829,22 @@ async fn create_session(
     // Open this session's tracking issue before the launch prompt is written,
     // so the agent can be told its issue number. When an agent delegated this
     // work (`parent_branch`), the parent becomes the issue's `source_branch`.
-    let tracking_issue = create_tracking_issue(
-        &st,
-        &branch,
-        parent_branch_name.as_deref(),
-        &title,
-        &goal,
-        &description,
-        github_repo.as_deref(),
-        github_issue,
-        claimed_issue_id,
-    )
-    .await?;
+    let tracking_issue = if is_concierge {
+        None
+    } else {
+        create_tracking_issue(
+            &st,
+            &branch,
+            parent_branch_name.as_deref(),
+            &title,
+            &goal,
+            &description,
+            github_repo.as_deref(),
+            github_issue,
+            claimed_issue_id,
+        )
+        .await?
+    };
 
     let session_id = branch_mod::new_id();
     let run_dir = db::run_dir(&session_id);
@@ -841,14 +857,20 @@ async fn create_session(
     // the dashboard.
     let scratch_names = write_initial_scratch(&work_dir, &req.scratch).await?;
     let mut prompt_parts: Vec<String> = Vec::new();
-    if !goal.is_empty() {
-        prompt_parts.push(goal.clone());
-    }
-    if let Some(note) = scratch_note(&scratch_names) {
-        prompt_parts.push(note);
-    }
-    if let Some(id) = tracking_issue {
-        prompt_parts.push(tracking_note(id));
+    if is_concierge {
+        // The concierge's opening prompt is its fleet-ops primer — no goal text,
+        // scratch, or tracking note.
+        prompt_parts.push(agent::concierge_primer().to_string());
+    } else {
+        if !goal.is_empty() {
+            prompt_parts.push(goal.clone());
+        }
+        if let Some(note) = scratch_note(&scratch_names) {
+            prompt_parts.push(note);
+        }
+        if let Some(id) = tracking_issue {
+            prompt_parts.push(tracking_note(id));
+        }
     }
     let launch_prompt = prompt_parts.join("\n\n");
     let goal_file = if launch_prompt.is_empty() {
@@ -924,7 +946,36 @@ async fn create_session(
 
     let mut view = session_view(&st.db, &session, &branch).await?;
     view.tracking_issue = tracking_issue;
-    Ok(Json(view))
+    Ok(view)
+}
+
+/// `GET /api/chat` — the Chat surface's concierge. Get-or-create the singleton
+/// fleet concierge: return the live one if it exists, else launch a new concierge
+/// session in the most-recently-used repo (its home — it doesn't touch the code,
+/// but the session machinery needs a worktree). 400 when there is no repo yet.
+async fn get_chat(State(st): State<AppState>) -> ApiResult<Json<SessionView>> {
+    if let Some(session) = session_mod::active_concierge(&st.db).await? {
+        let branch = branch_mod::get(&st.db, &session.branch_id)
+            .await?
+            .ok_or_else(|| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "branch vanished"))?;
+        return Ok(Json(session_view(&st.db, &session, &branch).await?));
+    }
+    let home = repo::recent(&st.db, 1)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            AppError::bad_request(
+                "the concierge needs a repo to live in — open a session in a repo first",
+            )
+        })?;
+    let req = CreateReq {
+        cwd: home.repo_root,
+        agent: Some(agent::CONCIERGE_KIND.to_string()),
+        title: Some("Fleet concierge".to_string()),
+        ..Default::default()
+    };
+    Ok(Json(create_session_core(st, req).await?))
 }
 
 /// A line appended to a session's launch prompt telling the agent which weaver
