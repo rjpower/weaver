@@ -200,12 +200,14 @@ ARCHITECTURE table implies); "what did it change" comes from the conversation or
 ## The concierge as a session kind
 
 `agent_kind` *selects the agent command* — only `"claude"` gets the Claude hooks
-and launch-gates; any other value is run as an executable name. So the concierge
-is a new kind that **maps to the Claude runtime**: `agent_kind = "concierge"`
-runs the same `claude` command and takes the same `install_hooks` +
-`seed_claude_launch_gates` path as a normal claude session, and is *distinguished*
-from it only as a marker — what hides it from the fleet, finds the singleton, and
-selects its primer. Two deltas at launch, both small:
+and launch-gates; any other value is run as an executable name. The concierge is a
+new kind, but `agent_kind = "concierge"` is a **role marker**, not a runtime: it is
+what hides the session from the fleet, finds the singleton, and selects the primer.
+The runtime it *actually* launches is resolved separately from the
+**`concierge.runtime`** setting (claude default, codex opt-in — see below), so the
+role and the binary stay decoupled. With the default, the concierge runs the same
+`claude` command and takes the same `install_hooks` + `seed_claude_launch_gates`
+path as a normal claude session. Two deltas at launch, both small:
 
 1. **Seed the primer.** The concierge's opening prompt is the `CONCIERGE.md`
    primer (the launch path already writes a `goal.txt` opening prompt; for a
@@ -231,6 +233,21 @@ from the session list; the **Chat** view finds the singleton by the same kind.
 scale and the user's "a new Chat tab which gives us an agent." Multiple named
 chats (one per investigation) are a clean later extension — a chat is a session,
 and loom already lists many.
+
+### Runtime: claude (default) or codex
+
+The **`concierge.runtime`** setting (Agents group; enum `claude` | `codex`,
+default `claude`) chooses the agent that backs the concierge — the one place the
+role-vs-runtime split surfaces to the operator. `claude` is the full-fidelity
+path: the Claude Code TUI with weaver's lifecycle hooks, so the Chat view shows
+live working/idle status and auto-refreshes on each reply. `codex` runs Codex with
+the same primer-as-opening-prompt — its conversation renders in the Chat view
+(transcript support already exists), but **Codex does not fire weaver's hooks**, so
+the concierge gets no live status and the view won't auto-refresh per reply (use
+Refresh). A codex-backed session therefore launches `running` (it is live
+immediately) rather than `launching` (which waits for a hook that never comes), and
+its launch skips `install_hooks` / `seed_claude_launch_gates` (Codex reads
+neither). Wiring Codex into the weaver status hooks is the obvious Phase-1 upgrade.
 
 ### The primer (`CONCIERGE.md`) — the tips
 
@@ -433,6 +450,11 @@ concierge scaffolds and dry-runs an overlooker from a chat turn.
   `interrupt`, `launch`), because the operator drives it turn by turn; the
   conversation is the permission gate. A later unattended/multi-user mode can dial
   it back per concierge.
+- **Role vs. runtime** — `agent_kind = "concierge"` is the *role* (hidden, singleton,
+  primed); the *runtime* is the `concierge.runtime` setting (claude default, codex
+  opt-in). Keeping them separate means a runtime swap moves nothing else, and codex
+  rides the existing transcript support. The known cost — no live status for codex
+  until its hooks are wired — is documented in the setting and on the Chat view.
 
 ## Open questions
 

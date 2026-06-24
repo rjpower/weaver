@@ -591,6 +591,30 @@ async fn create_session(
     Ok(Json(create_session_core(st, req).await?))
 }
 
+/// Resolve the **runtime** a session of `agent_kind` launches with. Every kind is
+/// its own runtime, except the concierge role-kind, which launches whatever
+/// `concierge.runtime` names (claude|codex). Keeps the stored kind (the role)
+/// separate from the binary that runs.
+async fn launch_runtime(db: &Db, agent_kind: &str) -> String {
+    if agent_kind == agent::CONCIERGE_KIND {
+        config::get_or(db, "concierge.runtime", config::DEFAULT_CONCIERGE_RUNTIME).await
+    } else {
+        agent_kind.to_string()
+    }
+}
+
+/// A freshly launched session's lifecycle status. A Claude runtime starts
+/// `launching` because its `SessionStart`/work hook will promote it to `running`;
+/// a hookless runtime (shell, codex, a bare command) never gets that hook, so it
+/// is `running` from the start rather than stuck `launching`.
+fn initial_status(runtime: &str) -> &'static str {
+    if agent::is_claude_runtime(runtime) {
+        "launching"
+    } else {
+        "running"
+    }
+}
+
 /// The session-creation core, shared by `POST /api/sessions` and the Chat
 /// surface's concierge get-or-create ([`get_chat`]). Returns the view directly so
 /// the caller can shape its own response.
@@ -885,10 +909,13 @@ async fn create_session_core(st: AppState, req: CreateReq) -> ApiResult<SessionV
     let base_args = config::get_or(&st.db, "agent.claude_args", "").await;
     let claude_args = agent::combine_args(&base_args, &model, &effort);
     let extra_env = agent_env::pairs(&st.db).await.unwrap_or_default();
+    // The stored kind is the role; the runtime is what we actually launch (the
+    // concierge resolves to its `concierge.runtime` setting).
+    let runtime = launch_runtime(&st.db, &agent).await;
     agent::launch(
         &agent::LaunchSpec {
             branch_id: &branch.id,
-            agent_kind: &agent,
+            runtime: &runtime,
             work_dir: &work_dir,
             term_session: &term_session,
             goal_file: goal_file.as_deref(),
@@ -901,11 +928,9 @@ async fn create_session_core(st: AppState, req: CreateReq) -> ApiResult<SessionV
     .await
     .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let status = if matches!(agent.as_str(), "shell" | "none") {
-        "running"
-    } else {
-        "launching"
-    };
+    // Only a Claude runtime emits the hook that promotes `launching` → `running`;
+    // a hookless runtime (shell, codex, a bare command) is live on launch.
+    let status = initial_status(&runtime);
     let session = session_mod::insert(
         &st.db,
         &NewSession {
@@ -1442,10 +1467,11 @@ pub async fn create_warm_session(
     let base_args = config::get_or(&st.db, "agent.claude_args", "").await;
     let claude_args = agent::combine_args(&base_args, &overlooker.model, &overlooker.effort);
     let extra_env = agent_env::pairs(&st.db).await.unwrap_or_default();
+    // A warm session never carries the concierge role, so its runtime is its kind.
     agent::launch(
         &agent::LaunchSpec {
             branch_id: &branch.id,
-            agent_kind: &agent,
+            runtime: &agent,
             work_dir: &work_dir,
             term_session: &term_session,
             goal_file: goal_file.as_deref(),
@@ -1458,11 +1484,7 @@ pub async fn create_warm_session(
     .await
     .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let status = if matches!(agent.as_str(), "shell" | "none") {
-        "running"
-    } else {
-        "launching"
-    };
+    let status = initial_status(&agent);
     let session = session_mod::insert(
         &st.db,
         &NewSession {
@@ -1515,10 +1537,11 @@ pub async fn adopt(st: &AppState, session: &Session, branch: &Branch) -> Result<
     let base_args = config::get_or(&st.db, "agent.claude_args", "").await;
     let claude_args = agent::combine_args(&base_args, &session.model, &session.effort);
     let extra_env = agent_env::pairs(&st.db).await.unwrap_or_default();
+    let runtime = launch_runtime(&st.db, &session.agent_kind).await;
     agent::launch(
         &agent::LaunchSpec {
             branch_id: &branch.id,
-            agent_kind: &session.agent_kind,
+            runtime: &runtime,
             work_dir: &work_dir,
             term_session: &session.term_session,
             goal_file: goal_file.as_deref(),
@@ -1530,13 +1553,16 @@ pub async fn adopt(st: &AppState, session: &Session, branch: &Branch) -> Result<
     )
     .await
     .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    session_mod::set_status(&st.db, &session.id, "launching").await?;
+    // A hookless runtime (codex, a bare command) won't get the hook that would
+    // promote `launching` → `running`, so mark it live now rather than stranding it.
+    let status = initial_status(&runtime);
+    session_mod::set_status(&st.db, &session.id, status).await?;
     events::record(
         &st.db,
         &st.bus,
         &branch.id,
         "status",
-        json!({ "status": "launching", "reason": "session adopted" }),
+        json!({ "status": status, "reason": "session adopted" }),
     )
     .await
     .ok();
