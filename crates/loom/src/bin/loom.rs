@@ -396,6 +396,12 @@ struct LaunchOpts {
     /// (see `weaver config get agent.default`).
     #[arg(long)]
     agent: Option<String>,
+    /// Repo to launch into: a path to (any directory inside) the target repo's
+    /// checkout. The new worktree is cut from this repo's mainline. Defaults to
+    /// the current directory — so without it you launch into whatever repo you
+    /// happen to be standing in, which is the wrong one when you mean another.
+    #[arg(long)]
+    repo: Option<std::path::PathBuf>,
     /// Branch to fork the new worktree from. Defaults to a freshly-fetched
     /// `origin/<default branch>` (the repo's mainline), so new work starts from
     /// the latest upstream rather than the launching checkout.
@@ -806,6 +812,7 @@ struct LaunchArgs {
     goal: String,
     name: Option<String>,
     agent: Option<String>,
+    repo: Option<std::path::PathBuf>,
     base: Option<String>,
     title: Option<String>,
     issue: Option<i64>,
@@ -821,6 +828,7 @@ impl From<LaunchOpts> for LaunchArgs {
             goal: o.task.join(" "),
             name: o.name,
             agent: o.agent,
+            repo: o.repo,
             base: o.base,
             title: o.title,
             issue: o.issue,
@@ -853,6 +861,21 @@ const LAUNCH_HINT: &str = "nothing to do — give the agent a task or something 
   loom session launch --name <slug> --agent shell      # an empty named worktree (no task)
 See `loom session launch --help` for all options.";
 
+/// The directory a launch forks from — `--repo` if given, else the current
+/// directory. `loom session launch` has no separate repo selector beyond this:
+/// the server resolves the target repo from this path (its main worktree), so
+/// any directory inside the intended checkout works. We canonicalize, which
+/// anchors a relative `--repo` to the CLI's cwd (not the daemon's) and turns a
+/// typo into a clear error here rather than an opaque server-side failure.
+fn resolve_launch_cwd(repo: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
+    match repo {
+        Some(p) => p
+            .canonicalize()
+            .with_context(|| format!("--repo path not found: {}", p.display())),
+        None => std::env::current_dir().context("could not read the current directory"),
+    }
+}
+
 async fn cmd_launch(a: LaunchArgs) -> Result<()> {
     if launch_underspecified(&a) {
         bail!("{LAUNCH_HINT}");
@@ -861,6 +884,7 @@ async fn cmd_launch(a: LaunchArgs) -> Result<()> {
         goal,
         name,
         agent,
+        repo,
         base,
         title,
         issue,
@@ -870,7 +894,7 @@ async fn cmd_launch(a: LaunchArgs) -> Result<()> {
         effort,
     } = a;
     let client = client::default();
-    let cwd = std::env::current_dir()?;
+    let cwd = resolve_launch_cwd(repo.as_deref())?;
     // When an agent in a weaver session runs `loom session launch`,
     // `$WEAVER_BRANCH` is its own branch id — pass it so the tracking issue is
     // attributed to the launching (parent) agent. A human shell launch leaves it
@@ -1851,6 +1875,7 @@ mod tests {
             goal: String::new(),
             name: None,
             agent: None,
+            repo: None,
             base: None,
             title: None,
             issue: None,
@@ -1859,6 +1884,23 @@ mod tests {
             model: None,
             effort: None,
         }
+    }
+
+    #[test]
+    fn resolve_launch_cwd_honors_repo_and_rejects_a_bad_path() {
+        // No `--repo` falls back to the current directory.
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(resolve_launch_cwd(None).unwrap(), here);
+
+        // `--repo` selects (and canonicalizes) the given checkout.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_launch_cwd(Some(dir.path())).unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+
+        // A typo'd `--repo` fails here, not as an opaque server error.
+        assert!(resolve_launch_cwd(Some(&dir.path().join("nope"))).is_err());
     }
 
     #[test]
