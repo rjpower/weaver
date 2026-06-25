@@ -130,6 +130,10 @@ export const sendMessage = (id: string, text: string, submit = true) =>
  *  been used yet (the concierge needs one to live in). */
 export const getChat = () => get('/chat') as Promise<Session>;
 
+/** Start a clean conversation: archive the current concierge (capturing its
+ *  transcript) and launch a fresh one. Returns the new session view. */
+export const resetChat = () => post('/chat/reset') as Promise<Session>;
+
 // --- Agent environment variables -------------------------------------------
 
 import type { EnvVar } from './types';

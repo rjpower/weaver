@@ -266,7 +266,10 @@ watch([repo, branchMode], ([, mode]) => {
 
 async function load() {
   try {
-    sessions.value = (await get('/sessions')) as Session[];
+    // The fleet view owns its own "show N archived" toggle, so it needs the
+    // full set — the API hides archived by default (for the agent's `ls`), so
+    // ask for them explicitly.
+    sessions.value = (await get('/sessions?archived=true')) as Session[];
     error.value = '';
   } catch (e) {
     error.value = (e as Error).message;

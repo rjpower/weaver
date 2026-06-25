@@ -236,6 +236,173 @@ async fn concierge_runtime_codex_launches_hookless() {
         .unwrap();
 }
 
+/// The fleet listing hides archived sessions by default (so the agent's `loom
+/// session ls` sees only live work), includes them on `?archived=true`, and
+/// narrows by substring on `?q=` — over the title, branch, and goal. A rename
+/// (PATCH title) is reflected in that search.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_hides_archived_by_default_and_searches() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    let alpha = client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "alpha search target", "cwd": ts.cwd(), "agent": "shell", "name": "alpha" }),
+        )
+        .await
+        .unwrap();
+    let alpha_id = alpha["id"].as_str().unwrap().to_string();
+
+    let beta = client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "beta other work", "cwd": ts.cwd(), "agent": "shell", "name": "beta" }),
+        )
+        .await
+        .unwrap();
+    let beta_id = beta["id"].as_str().unwrap().to_string();
+
+    // Archive beta — it leaves the active fleet.
+    client
+        .post(&format!("/api/sessions/{beta_id}/archive"), json!({}))
+        .await
+        .unwrap();
+
+    // Default: only the live session, archived hidden.
+    let list = client.get("/api/sessions").await.unwrap();
+    let ids: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![alpha_id.as_str()], "archived hidden by default");
+
+    // Opt in: both, beta marked archived.
+    let all = client.get("/api/sessions?archived=true").await.unwrap();
+    let all = all.as_array().unwrap();
+    assert_eq!(all.len(), 2, "?archived=true includes the archived session");
+    let beta_row = all.iter().find(|s| s["id"] == beta_id.as_str()).unwrap();
+    assert_eq!(beta_row["status"], "archived");
+
+    // Search over title / branch / goal, on the live set.
+    let hit = client.get("/api/sessions?q=alpha").await.unwrap();
+    assert_eq!(
+        hit.as_array().unwrap().len(),
+        1,
+        "alpha matches its goal/name"
+    );
+    let miss = client.get("/api/sessions?q=nope-nothing").await.unwrap();
+    assert!(miss.as_array().unwrap().is_empty(), "no match ⇒ empty");
+
+    // An archived session is excluded from a default search, included when asked.
+    let beta_hidden = client.get("/api/sessions?q=beta").await.unwrap();
+    assert!(
+        beta_hidden.as_array().unwrap().is_empty(),
+        "archived excluded from the default search"
+    );
+    let beta_shown = client
+        .get("/api/sessions?q=beta&archived=true")
+        .await
+        .unwrap();
+    assert_eq!(
+        beta_shown.as_array().unwrap().len(),
+        1,
+        "archived search opt-in finds beta"
+    );
+
+    // Renaming a session (the title PATCH the `loom session rename` CLI wraps) is
+    // reflected in the search.
+    client
+        .patch(
+            &format!("/api/sessions/{alpha_id}"),
+            json!({ "title": "renamed-zeta" }),
+        )
+        .await
+        .unwrap();
+    let renamed = client.get("/api/sessions?q=zeta").await.unwrap();
+    assert_eq!(
+        renamed.as_array().unwrap().len(),
+        1,
+        "rename is reflected in search"
+    );
+
+    client
+        .delete(&format!("/api/sessions/{alpha_id}"))
+        .await
+        .unwrap();
+    client
+        .delete(&format!("/api/sessions/{beta_id}"))
+        .await
+        .unwrap();
+}
+
+/// `POST /api/chat/reset` archives the live concierge (capturing its transcript
+/// to history) and launches a fresh one in its place — a new session id, the old
+/// one terminal/`archived`, and the singleton now resolving to the new one.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_reset_archives_and_starts_fresh() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+    // The concierge runs the Claude launch path (writes under $HOME) — isolate it.
+    let home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(home.path());
+
+    // A repo for the concierge to live in.
+    let work = client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "ordinary work", "cwd": ts.cwd(), "agent": "shell" }),
+        )
+        .await
+        .unwrap();
+    let work_id = work["id"].as_str().unwrap().to_string();
+
+    // The first concierge.
+    let chat = client.get("/api/chat").await.unwrap();
+    let chat_id = chat["id"].as_str().unwrap().to_string();
+    assert_eq!(chat["agent_kind"], "concierge");
+
+    // Reset: a brand-new concierge, with a different id.
+    let fresh = client.post("/api/chat/reset", json!({})).await.unwrap();
+    let fresh_id = fresh["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        fresh["agent_kind"], "concierge",
+        "the fresh one is a concierge"
+    );
+    assert_ne!(fresh_id, chat_id, "reset launches a new concierge");
+
+    // The old concierge is archived — kept as history, not deleted.
+    let old = client
+        .get(&format!("/api/sessions/{chat_id}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        old["status"], "archived",
+        "reset archives the old concierge"
+    );
+
+    // get-or-create now resolves to the fresh one (a singleton again).
+    let again = client.get("/api/chat").await.unwrap();
+    assert_eq!(
+        again["id"].as_str().unwrap(),
+        fresh_id,
+        "the fresh concierge is the live singleton"
+    );
+
+    client
+        .delete(&format!("/api/sessions/{fresh_id}"))
+        .await
+        .unwrap();
+    client
+        .delete(&format!("/api/sessions/{work_id}"))
+        .await
+        .unwrap();
+}
+
 /// A session can be created with no goal at all — just a title.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

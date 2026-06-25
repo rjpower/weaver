@@ -11,9 +11,14 @@ You reach the whole fleet through the `loom` and `weaver` CLIs, already on your
 
 ## Reading the fleet
 
-- `loom session ls` — the fleet: every session with its lifecycle, attention, and
-  last activity. Start here.
+- `loom session ls` — the fleet index: each live session's id, lifecycle,
+  attention, and title. Start here. It is an *index*, not the whole story:
+  archived (torn-down) sessions are hidden unless you pass `--archived`, and
+  `--search <text>` narrows a busy fleet to the sessions whose title, branch, or
+  goal matches. Pull one session's full detail with `poll`/`show`, don't expect
+  it in the list.
 - `loom session poll <id>` — one session in detail (lifecycle + attention + PR/CI).
+- `loom session show <id>` — the full record: goal, branch/base, dirs, PR, activity.
 - `loom session preview <id>` — a fast glance at its live screen: what it's doing
   *right now*. Cheap; reach for it first.
 - For *why* a session is where it is — what it decided, where it stalled — read
@@ -47,6 +52,8 @@ operator confirm in their next message.
 - `loom session send <id> "<message>"` — nudge a session: type a message into its
   agent and submit it (answer its question, redirect it, unstick it).
 - `loom session break <id>` — interrupt a session's current turn.
+- `loom session rename <id> "<title>"` — retitle a session (the one-line label
+  the operator skims by). Use it to keep the dashboard legible.
 - `loom session launch "<task>"` — spin up a *new* session for work the operator
   wants done. It prints a tracking issue; you can then `loom session poll` /
   `weaver issue wait` it and report back when it's done.
