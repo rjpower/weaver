@@ -49,6 +49,7 @@ enum Cmd {
     ///     loom session send weaver/health "try the curl again"
     ///     loom session break weaver/health     # interrupt the current turn
     ///     loom session preview weaver/health   # peek at the terminal screen
+    ///     loom session rename weaver/health "Health endpoint + test"
     ///
     /// The three you reach for constantly have top-level shortcuts: `loom
     /// launch`, `loom ps`, `loom attach`.
@@ -208,7 +209,27 @@ enum SessionCmd {
         lines: usize,
     },
     /// List active sessions (also `loom ps`).
-    Ls,
+    ///
+    /// Archived (torn-down) sessions are hidden by default — pass `--archived`
+    /// to include them. `--search <text>` narrows to sessions whose title,
+    /// branch name, or goal contains the text. The list is an index: it shows
+    /// each session's id, lifecycle, attention, and title — pull the full detail
+    /// (goal, PR, dirs, activity) for one with `loom session show <id>`.
+    Ls {
+        /// Include archived (torn-down) sessions.
+        #[arg(long)]
+        archived: bool,
+        /// Case-insensitive substring filter over title / branch / goal.
+        #[arg(long)]
+        search: Option<String>,
+    },
+    /// Rename a session: set the one-line title shown on the dashboard.
+    Rename {
+        /// Session key: id, branch id, branch name, or `repo:branch`.
+        session: String,
+        /// The new title. Multiple words are joined, so quoting is optional.
+        title: Vec<String>,
+    },
     /// Show one session's details.
     Show { branch: String },
     /// Attach your terminal to a session (also `loom attach`).
@@ -423,7 +444,7 @@ async fn run() -> Result<()> {
         Cmd::Overlooker { cmd } => run_overlooker(cmd).await,
         Cmd::Token { cmd } => run_token(cmd).await,
         Cmd::Launch(opts) => cmd_launch(opts.into()).await,
-        Cmd::Ps => cmd_ps().await,
+        Cmd::Ps => cmd_ps(false, None).await,
         Cmd::Attach { branch } => cmd_attach(branch).await,
         Cmd::Open => cmd_open().await,
         Cmd::Completions { shell } => {
@@ -474,7 +495,8 @@ async fn run_session(cmd: SessionCmd) -> Result<()> {
         } => cmd_session_send(session, message.join(" "), !no_enter).await,
         SessionCmd::Break { session } => cmd_session_break(session).await,
         SessionCmd::Preview { session, lines } => cmd_session_preview(session, lines).await,
-        SessionCmd::Ls => cmd_ps().await,
+        SessionCmd::Ls { archived, search } => cmd_ps(archived, search).await,
+        SessionCmd::Rename { session, title } => cmd_session_rename(session, title.join(" ")).await,
         SessionCmd::Show { branch } => cmd_show(branch).await,
         SessionCmd::Attach { branch } => cmd_attach(branch).await,
         SessionCmd::Archive { branch } => cmd_archive(branch).await,
@@ -1062,12 +1084,30 @@ async fn cmd_session_preview(key: String, lines: usize) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_ps() -> Result<()> {
+async fn cmd_ps(archived: bool, search: Option<String>) -> Result<()> {
     let client = client::default();
-    let list = client.get("/api/sessions").await?;
+    // Hide archived sessions by default; `--search` narrows by substring. Both
+    // ride the same query the dashboard uses, so the CLI and UI stay one surface.
+    let mut query = Vec::new();
+    if archived {
+        query.push("archived=true".to_string());
+    }
+    if let Some(s) = search.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        query.push(format!("q={}", encode_query(s)));
+    }
+    let path = if query.is_empty() {
+        "/api/sessions".to_string()
+    } else {
+        format!("/api/sessions?{}", query.join("&"))
+    };
+    let list = client.get(&path).await?;
     let rows = list.as_array().cloned().unwrap_or_default();
     if rows.is_empty() {
-        println!("no sessions — start one with `loom session launch \"<task>\"`");
+        let hint = match search {
+            Some(s) if !s.trim().is_empty() => format!("no sessions match '{}'", s.trim()),
+            _ => "no sessions — start one with `loom session launch \"<task>\"`".to_string(),
+        };
+        println!("{hint}");
         return Ok(());
     }
     println!(
@@ -1133,6 +1173,26 @@ async fn cmd_show(key: String) -> Result<()> {
     let client = client::default();
     let ws = client.get(&format!("/api/sessions/{key}")).await?;
     print_session(&ws);
+    Ok(())
+}
+
+/// `loom session rename` — set a session's one-line dashboard title via
+/// `PATCH /api/sessions/{key}`. The agent's parity with the dashboard's inline
+/// title edit: anything the operator can do from the UI, the concierge can do too.
+async fn cmd_session_rename(key: String, title: String) -> Result<()> {
+    let title = title.trim();
+    if title.is_empty() {
+        bail!("nothing to rename to — provide a new title");
+    }
+    let client = client::default();
+    let ws = client
+        .patch(&format!("/api/sessions/{key}"), json!({ "title": title }))
+        .await?;
+    println!(
+        "renamed {} → {}",
+        str_field(&ws, "id"),
+        branch_str(&ws, "title")
+    );
     Ok(())
 }
 

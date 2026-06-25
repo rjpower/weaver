@@ -401,6 +401,7 @@ pub fn router(state: AppState) -> Router {
         // Sessions
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/chat", get(get_chat))
+        .route("/chat/reset", post(reset_chat))
         .route(
             "/sessions/{id}",
             get(get_session).patch(patch_session).delete(delete_session),
@@ -550,7 +551,26 @@ pub fn router(state: AppState) -> Router {
 // Session CRUD
 // ---------------------------------------------------------------------------
 
-async fn list_sessions(State(st): State<AppState>) -> ApiResult<Json<Vec<SessionView>>> {
+/// Query for `GET /api/sessions`: trim the fleet listing for the caller.
+#[derive(Debug, Default, Deserialize)]
+struct ListSessionsQuery {
+    /// Include archived (torn-down) sessions. Defaults to `false` — an archived
+    /// session is out of the active fleet, so the agent's `loom session ls` and
+    /// any survey see only live work unless they ask. The dashboard, which has
+    /// its own "show archived" toggle, opts in with `?archived=true`.
+    #[serde(default)]
+    archived: bool,
+    /// Case-insensitive substring filter over a session's title, branch name,
+    /// and goal — so the concierge can narrow a large fleet to the one it wants
+    /// (`loom session ls --search auth`). Absent/blank matches everything.
+    #[serde(default)]
+    q: Option<String>,
+}
+
+async fn list_sessions(
+    State(st): State<AppState>,
+    Query(q): Query<ListSessionsQuery>,
+) -> ApiResult<Json<Vec<SessionView>>> {
     // The fleet listing shows work, not infrastructure: engine-managed (warm)
     // sessions are excluded here, so neither the dashboard nor an overlooker
     // round's survey (scripts read this route) ever sees a watcher's own
@@ -563,13 +583,32 @@ async fn list_sessions(State(st): State<AppState>) -> ApiResult<Json<Vec<Session
         .into_iter()
         .filter_map(|o| o.warm_session_id)
         .collect();
+    // A blank `q` is no filter; otherwise match case-insensitively.
+    let needle =
+        q.q.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase);
     let sessions = session_mod::list_visible(&st.db).await?;
     let mut views: Vec<SessionView> = Vec::with_capacity(sessions.len());
     for s in sessions {
         if warm.contains(&s.id) {
             continue;
         }
+        // Archived sessions are torn down — hidden unless the caller opts in.
+        if !q.archived && s.status == "archived" {
+            continue;
+        }
         if let Some(branch) = branch_mod::get(&st.db, &s.branch_id).await? {
+            if let Some(needle) = &needle {
+                // Match the identifiers a human searches by: the title, the branch
+                // name, and the goal.
+                let hay =
+                    format!("{} {} {}", branch.title, branch.branch, branch.goal).to_lowercase();
+                if !hay.contains(needle) {
+                    continue;
+                }
+            }
             views.push(session_view(&st.db, &s, &branch).await?);
         }
     }
@@ -985,6 +1024,14 @@ async fn get_chat(State(st): State<AppState>) -> ApiResult<Json<SessionView>> {
             .ok_or_else(|| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "branch vanished"))?;
         return Ok(Json(session_view(&st.db, &session, &branch).await?));
     }
+    Ok(Json(create_concierge(st).await?))
+}
+
+/// Launch a fresh fleet concierge in the most-recently-used repo and return its
+/// view. The shared creation path behind [`get_chat`] (when none is live) and
+/// [`reset_chat`] (after the old one is archived). 400 when no repo has been
+/// used yet — the concierge needs a worktree to live in.
+async fn create_concierge(st: AppState) -> ApiResult<SessionView> {
     let home = repo::recent(&st.db, 1)
         .await?
         .into_iter()
@@ -1000,7 +1047,25 @@ async fn get_chat(State(st): State<AppState>) -> ApiResult<Json<SessionView>> {
         title: Some("Fleet concierge".to_string()),
         ..Default::default()
     };
-    Ok(Json(create_session_core(st, req).await?))
+    create_session_core(st, req).await
+}
+
+/// `POST /api/chat/reset` — start a clean conversation with the concierge. The
+/// live concierge (if any) is archived — its terminal and worktree torn down,
+/// its transcript captured to history — and a brand-new one is launched in its
+/// place, so the operator gets a fresh agent with none of the prior context.
+/// Returns the new session view, exactly as [`get_chat`] would.
+async fn reset_chat(State(st): State<AppState>) -> ApiResult<Json<SessionView>> {
+    if let Some(session) = session_mod::active_concierge(&st.db).await? {
+        if let Some(branch) = branch_mod::get(&st.db, &session.branch_id).await? {
+            // Best-effort teardown of the old concierge; a warning here must not
+            // block the fresh start the operator asked for.
+            if let Err(e) = archive(&st, &session, &branch).await {
+                tracing::warn!(session = %session.id, error = ?e, "reset: archiving old concierge failed");
+            }
+        }
+    }
+    Ok(Json(create_concierge(st).await?))
 }
 
 /// A line appended to a session's launch prompt telling the agent which weaver

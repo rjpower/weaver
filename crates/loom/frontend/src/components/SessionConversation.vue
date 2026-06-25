@@ -2,7 +2,7 @@
 import { ref, reactive, computed, onMounted, onUnmounted, watch, nextTick } from 'vue';
 import { get, sendMessage } from '../api';
 import type { IrisLog, IrisBlock, Session } from '../types';
-import { canSend } from '../lib/sessionState';
+import { canSend, conversationState, TONE_TEXT } from '../lib/sessionState';
 import MarkdownView from './MarkdownView.vue';
 
 // The Conversation tab: the agent's chat with the model, rendered for review and
@@ -18,6 +18,39 @@ import MarkdownView from './MarkdownView.vue';
 // agent's lifecycle edges so a reply lands without a manual reload.
 const props = defineProps<{ session: Session }>();
 const id = computed(() => props.session.id);
+
+// ── Live agent state ─────────────────────────────────────────────────────────
+// A second, lighter view of the session itself, kept fresh off the same turn
+// edges as the transcript so the foot of the chat can show what the agent is
+// doing *right now* — a pulsing "Working…" while a turn runs, the loud state
+// when it needs the operator. Seeded from the prop (re-seeded when a parent
+// refreshes it, as the detail page does), and re-fetched on each SSE edge.
+const live = ref<Session>(props.session);
+watch(
+  () => props.session,
+  (s) => {
+    live.value = s;
+  },
+);
+async function refreshSession() {
+  try {
+    live.value = (await get(`/sessions/${id.value}`)) as Session;
+  } catch {
+    /* keep the last-known state; the next edge (or the parent) recovers */
+  }
+}
+// The derived conversation state (glyph + label + tone) — the same deriver the
+// detail header uses, so the chat and the dashboard read the agent identically.
+const convState = computed(() => conversationState(live.value));
+// Mid-turn: a live pane, running but not resting (no idle mark) and calm. This
+// is the "progress" cue the operator watches for after they hit Send.
+const agentWorking = computed(() => convState.value.label === 'Working');
+// Surface the status line only when it says something: the agent is working, or
+// it has raised a loud signal. A resting (Idle) agent shows nothing — the
+// composer placeholder already invites the next turn.
+const showAgentStatus = computed(
+  () => canSend(live.value) && (agentWorking.value || convState.value.tone !== 'muted'),
+);
 
 type LoadState = 'loading' | 'ready' | 'empty' | 'error';
 const log = ref<IrisLog | null>(null);
@@ -82,8 +115,11 @@ function scheduleRefresh() {
   if (refreshTimer) return;
   refreshTimer = setTimeout(() => {
     refreshTimer = null;
-    // Only when there's something rendered (or an empty live session) — never
-    // clobber an error view or a manual load mid-flight.
+    // A turn edge fired: refresh the live agent state (the "Working…" cue) and,
+    // when there's something rendered, the transcript. The session refresh is
+    // independent of the transcript load — it must run even on an error view so
+    // the status line tracks the agent.
+    refreshSession();
     if (state.value === 'ready' || state.value === 'empty') load({ preserve: true });
   }, 400);
 }
@@ -102,6 +138,7 @@ function closeStream() {
 
 onMounted(() => {
   load();
+  refreshSession();
   openStream();
 });
 onUnmounted(closeStream);
@@ -111,6 +148,7 @@ watch(
   () => {
     closeStream();
     load();
+    refreshSession();
     openStream();
   },
 );
@@ -615,6 +653,23 @@ const groupHasError = (g: ToolGroup) => g.items.some((it) => it.result?.is_error
       </nav>
     </div>
 
+    <!-- Live agent status — the progress cue at the foot of the chat: a pulsing
+         "Working…" while a turn runs, the loud state when the agent needs the
+         operator. Hidden while the agent rests, so it only ever signals. -->
+    <div
+      v-if="showAgentStatus"
+      class="mt-3 flex shrink-0 items-center gap-1.5 text-xs font-medium"
+      :class="TONE_TEXT[convState.tone]"
+      data-testid="agent-status"
+      role="status"
+      aria-live="polite"
+    >
+      <span class="agent-glyph" :class="{ working: agentWorking }" aria-hidden="true">{{
+        convState.glyph
+      }}</span>
+      <span>{{ convState.label }}<span v-if="agentWorking">…</span></span>
+    </div>
+
     <!-- Composer — send a new prompt straight to the agent's terminal. Enter
          sends; Shift+Enter inserts a newline. Hidden once the agent is gone, so
          a torn-down session stays a read-only log. -->
@@ -654,6 +709,31 @@ const groupHasError = (g: ToolGroup) => g.items.some((it) => it.result?.is_error
 /* Anchored user turns sit a touch below the top edge when jumped to. */
 .conv-anchor {
   scroll-margin-top: 0.5rem;
+}
+
+/* The live-status glyph pulses while the agent is mid-turn, so "Working…" reads
+   as motion, not a static label. Steady (no animation) for the loud states. */
+.agent-glyph {
+  display: inline-block;
+  font-size: 0.625rem;
+  line-height: 1;
+}
+.agent-glyph.working {
+  animation: agent-pulse 1.4s ease-in-out infinite;
+}
+@keyframes agent-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-glyph.working {
+    animation: none;
+  }
 }
 
 /* The shared MarkdownView wraps prose in a padded, centred surface card — right

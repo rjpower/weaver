@@ -135,6 +135,28 @@ test.describe('conversation view', () => {
       .toBe(true);
   });
 
+  // A live session surfaces a foot-of-chat progress cue: "Working…" while a turn
+  // runs, gone once the agent rests — so the operator sees something move after
+  // they send. Driven off the same lifecycle SSE edges as the transcript.
+  test('the live status line tracks Working ↔ idle', async ({ page, weaver }) => {
+    const s = await openConversation(page, weaver);
+    const status = page.getByTestId('agent-status');
+
+    // A running session with no idle mark reads as Working.
+    await expect(status).toBeVisible();
+    await expect(status).toContainText('Working');
+
+    // The agent goes idle (a finished-turn hook) → the cue retracts; a resting
+    // agent shows nothing, leaving the composer to invite the next turn.
+    await weaver.hook(s, 'idle');
+    await expect(status).toBeHidden();
+
+    // A new turn starts (a working hook) → the cue returns.
+    await weaver.hook(s, 'working');
+    await expect(status).toBeVisible();
+    await expect(status).toContainText('Working');
+  });
+
   // The tab follows a live session: a new turn landing in the transcript shows
   // up without a manual Refresh, driven off the agent's lifecycle SSE edges.
   test('the log auto-refreshes when the agent reaches a turn boundary', async ({ page, weaver }) => {

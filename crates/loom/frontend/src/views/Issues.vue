@@ -49,10 +49,12 @@ const busy = reactive<Record<number, boolean>>({});
 
 async function load() {
   try {
-    // Fetch everything (including closed) once; `showClosed` filters client-side.
+    // Fetch everything (including closed issues / archived sessions) once;
+    // `showClosed` filters client-side, and archived sessions still reference
+    // their issues. The API hides archived by default, so ask for them.
     const [iss, ses] = await Promise.all([
       listIssues(true),
-      get('/sessions') as Promise<Session[]>,
+      get('/sessions?archived=true') as Promise<Session[]>,
     ]);
     issues.value = iss;
     sessions.value = ses;

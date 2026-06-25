@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
-import { getChat } from '../api';
+import { getChat, resetChat } from '../api';
 import type { Session } from '../types';
 import SessionConversation from '../components/SessionConversation.vue';
 
@@ -28,17 +28,67 @@ async function load() {
   }
 }
 
+// Reset the conversation: archive the current concierge (its transcript is kept
+// in history) and mount a fresh one. A two-step click guards the teardown — the
+// first arms it, the second confirms — so a stray click never wipes the agent's
+// context. The new session has a new id, so the keyed conversation remounts clean.
+const resetting = ref(false);
+const armed = ref(false);
+let disarmTimer: ReturnType<typeof setTimeout> | null = null;
+
+function armReset() {
+  armed.value = true;
+  if (disarmTimer) clearTimeout(disarmTimer);
+  disarmTimer = setTimeout(() => (armed.value = false), 4000);
+}
+
+async function reset() {
+  if (!armed.value) {
+    armReset();
+    return;
+  }
+  if (disarmTimer) clearTimeout(disarmTimer);
+  armed.value = false;
+  resetting.value = true;
+  errorMsg.value = '';
+  try {
+    session.value = await resetChat();
+    state.value = 'ready';
+  } catch (e) {
+    errorMsg.value = e instanceof Error ? e.message : String(e);
+    state.value = 'error';
+  } finally {
+    resetting.value = false;
+  }
+}
+
 onMounted(load);
 </script>
 
 <template>
   <div class="flex min-h-0 flex-1 flex-col px-5 py-3">
-    <header class="mb-3 shrink-0">
-      <h1 class="text-sm font-semibold text-fg">Chat</h1>
-      <p class="text-xs text-muted">
-        Ask the concierge about your fleet — stale sessions, what needs you — and
-        have it act on your behalf.
-      </p>
+    <header class="mb-3 flex shrink-0 items-start gap-3">
+      <div class="min-w-0 flex-1">
+        <h1 class="text-sm font-semibold text-fg">Chat</h1>
+        <p class="text-xs text-muted">
+          Ask the concierge about your fleet — stale sessions, what needs you — and
+          have it act on your behalf.
+        </p>
+      </div>
+      <!-- Reset: archive this concierge (its transcript is kept) and start a
+           fresh one. Two-step — the first click arms, the second confirms. -->
+      <button
+        v-if="state === 'ready'"
+        type="button"
+        class="btn-secondary shrink-0 px-2 py-0.5 text-xs"
+        :class="{ 'text-block': armed }"
+        :disabled="resetting"
+        :title="armed ? 'Click again to confirm — the current conversation is archived' : 'Start a fresh conversation'"
+        data-testid="chat-reset"
+        @click="reset"
+      >
+        {{ resetting ? 'Resetting…' : armed ? 'Confirm reset' : 'Reset' }}
+      </button>
     </header>
 
     <p v-if="state === 'loading'" class="text-sm text-muted">Waking the concierge…</p>
