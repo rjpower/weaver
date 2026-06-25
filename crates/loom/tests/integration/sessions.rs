@@ -162,6 +162,15 @@ async fn chat_get_or_creates_a_hidden_singleton_concierge() {
         chat["status"], "launching",
         "the default (claude) concierge waits for its first hook to go running"
     );
+    // It boots primed-but-idle (no positional prompt ⇒ no turn ⇒ no `Stop` hook),
+    // so creation seeds the soothing `idle` mark itself — otherwise the chat would
+    // read "Working…" forever though the agent is doing nothing.
+    let tags = chat["branch"]["tags"].as_array().unwrap();
+    assert!(
+        tags.iter()
+            .any(|t| t["key"] == "idle" && t["value"] == "idle"),
+        "a freshly booted concierge carries the idle mark so it reads Idle, not Working: {tags:?}"
+    );
     assert!(
         chat["tracking_issue"].is_null(),
         "concierge has no tracking issue"

@@ -546,7 +546,7 @@ const groupHasError = (g: ToolGroup) => g.items.some((it) => it.result?.is_error
           >
             <header class="mb-1 flex items-center gap-2 text-xs font-medium text-accent">
               <span class="turn-badge">{{ row.n }}</span>
-              <span>🧑 User</span>
+              <span>▍ You</span>
               <span v-if="row.time" class="font-normal text-muted">{{ shortTime(row.time) }}</span>
             </header>
             <template v-for="(b, j) in row.blocks" :key="j">

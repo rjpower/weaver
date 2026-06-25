@@ -1007,6 +1007,43 @@ async fn create_session_core(st: AppState, req: CreateReq) -> ApiResult<SessionV
     )
     .await
     .ok();
+
+    // The concierge boots primed-but-idle: with no positional prompt it takes no
+    // turn on launch, so claude's `Stop`/`Notification` hooks never fire and the
+    // soothing `idle` mark that those hooks stamp is never set — leaving a freshly
+    // booted concierge reading "Working…" forever though it is doing nothing.
+    // Stamp the mark ourselves at creation so it reads the calm "Idle" it actually
+    // is. The lifecycle then self-heals: the operator's first message fires the
+    // `working` hook (which clears this), and each finished turn re-stamps it. A
+    // normal session seeds a positional prompt and runs a turn on launch, so its
+    // own hooks drive this mark — only the idle-booting concierge needs the seed.
+    if is_concierge {
+        if let Err(e) = tags::set(
+            &st.db,
+            &branch.id,
+            tags::IDLE_KEY,
+            tags::IDLE_VALUE,
+            "",
+            "agent",
+        )
+        .await
+        {
+            tracing::warn!(branch = %branch.id, error = %e, "failed to stamp concierge idle mark");
+        } else {
+            events::record_tag(
+                &st.db,
+                &st.bus,
+                &branch.id,
+                tags::IDLE_KEY,
+                tags::IDLE_VALUE,
+                "",
+                "agent",
+            )
+            .await
+            .ok();
+        }
+    }
+
     tracing::info!(
         branch = %branch.id,
         session = %session.id,
