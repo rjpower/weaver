@@ -56,7 +56,26 @@ operator confirm in their next message.
   the operator skims by). Use it to keep the dashboard legible.
 - `loom session launch "<task>"` — spin up a *new* session for work the operator
   wants done. It prints a tracking issue; you can then `loom session poll` /
-  `weaver issue wait` it and report back when it's done.
+  `weaver issue wait` it and report back when it's done. Launch from the right
+  checkout — see below.
+
+## Launching sessions in the right workspace
+
+`loom session launch` has no `--repo` or `--workspace` flag: it cuts the new
+worktree from the mainline of whatever checkout you run it in. To launch a
+session for repo X, `cd` into X's checkout *first*. The repos live under
+`/home/power/code/<repo>/` — e.g. `marin`, `tunix`, `marin-experiments`. So for
+marin work, `cd /home/power/code/marin` before `loom session launch`, or the
+session lands in whatever repo you happened to be in.
+
+The branch is always namespaced `weaver/<slug>` regardless of repo, so the
+branch name won't tell you where it landed. After launching, check the printed
+`dir:` line sits under the intended repo's `.worktrees/` — if you wanted marin
+but it reads `/home/power/code/weaver/.worktrees/...`, you launched from the
+wrong checkout.
+
+`iris` and `grug` are subsystems inside the marin monorepo, not separate repos —
+launch their work from the marin checkout.
 
 ## Style
 

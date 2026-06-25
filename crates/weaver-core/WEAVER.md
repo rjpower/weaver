@@ -102,6 +102,25 @@ This duplicates some of a coding agent's builtin sub-agents, but a weaver
 sub-session is fully decoupled: it survives independently, has its own git
 history, and you can hand it off or revisit it later.
 
+## Launching sessions in the right workspace
+
+`loom session launch` has no `--repo` or `--workspace` flag: it cuts the new
+worktree from the mainline of whatever checkout you run it in. To launch a
+session for repo X, `cd` into X's checkout *first*. The repos live under
+`/home/power/code/<repo>/` — e.g. `marin`, `tunix`, `marin-experiments`. So for
+marin work, `cd /home/power/code/marin` before `loom session launch`, or the
+session forks from the repo you happened to be in (`--base` only pins the
+branch, not the repo).
+
+The branch is always namespaced `weaver/<slug>` regardless of repo, so the
+branch name won't tell you where it landed. After launching, check the printed
+`dir:` line sits under the intended repo's `.worktrees/` — if you wanted marin
+but it reads `/home/power/code/weaver/.worktrees/...`, you launched from the
+wrong checkout.
+
+`iris` and `grug` are subsystems inside the marin monorepo, not separate repos —
+launch their work from the marin checkout.
+
 ## Signalling your status
 
 The user scans the dashboard for sessions that need them. Keep your status
