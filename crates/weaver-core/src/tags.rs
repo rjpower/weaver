@@ -100,6 +100,26 @@ pub fn is_loud_value(value: &str) -> bool {
     ATTENTION_VALUES.contains(&value)
 }
 
+/// The quiet values that **park** a branch *below* the calm default in the
+/// dashboard's fleet sort — the opposite end of the ladder from
+/// [`ATTENTION_VALUES`]. A parked branch is waiting on an external actor (a human
+/// PR reviewer, a CI run) and needs nothing from the user, so a scanning user can
+/// skip past it: the dashboard sinks it under the live-but-calm rows it should
+/// look at first. The value names *what is awaited* (`review`, …); the key is the
+/// axis (e.g. the review watch's `awaiting`). Quiet by design — these never raise
+/// a badge — so a parked row renders as a plain pill, never a loud chip.
+/// Mirrored by the frontend's `PARKED` map and `weaver_loom.PARKED_VALUES`.
+pub const PARKED_VALUES: &[&str] = &["review"];
+
+/// Whether `value` parks a branch — i.e. it sits on the [`PARKED_VALUES`] ladder,
+/// sinking the row below the calm default in the fleet sort. Like
+/// [`is_loud_value`], the signal is **value-driven**: any key holding such a
+/// value parks, so a watch picks its own axis key and the value carries the
+/// meaning. A value is never both parked and loud (the two ladders are disjoint).
+pub fn is_parked_value(value: &str) -> bool {
+    PARKED_VALUES.contains(&value)
+}
+
 // ---------------------------------------------------------------------------
 // CRUD
 // ---------------------------------------------------------------------------
@@ -206,6 +226,23 @@ mod tests {
         assert!(!is_loud_value("ok"));
         // A free-form key may legitimately carry a loud value (the watch's marks).
         assert!(is_valid_value("review", "attention"));
+
+        // Parking is the value-driven mirror of loudness: a parked value sinks
+        // the row below the calm default, and the two ladders are disjoint (a
+        // value is never both). Parked values are quiet — never loud.
+        assert!(is_parked_value("review"));
+        assert!(!is_parked_value("attention"));
+        assert!(!is_parked_value("waiting"));
+        assert!(!is_loud_value("review"));
+        for v in PARKED_VALUES {
+            assert!(
+                !ATTENTION_VALUES.contains(v),
+                "ladders must stay disjoint: {v}"
+            );
+            assert!(!is_loud_value(v));
+        }
+        // A parked mark stores fine on a free-form axis key (any non-empty value).
+        assert!(is_valid_value("awaiting", "review"));
     }
 
     #[tokio::test]

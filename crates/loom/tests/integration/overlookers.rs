@@ -884,10 +884,27 @@ async fn rest_lists_builtin_programs_and_validates_program_refs() {
         "builtin:status",
         "builtin:resume",
         "builtin:pr-label",
+        "builtin:review-wait",
         "builtin:archive-merged",
     ] {
         assert!(names.contains(&expected), "{expected} missing: {names:?}");
     }
+
+    // review-wait wakes on the review-decision edge and opts into `mark` so it
+    // can park / un-park the row (the others here are read-only).
+    let review = arr
+        .iter()
+        .find(|p| p["program"] == "builtin:review-wait")
+        .unwrap();
+    assert_eq!(review["defaults"]["trigger"]["on"][0], "pr.review_changed");
+    assert!(
+        review["defaults"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "mark"),
+        "review-wait requests the mark capability to park the row"
+    );
 
     // The resume builtin wakes on the quiet signals and opts into `nudge`.
     let resume = arr
@@ -1056,6 +1073,85 @@ async fn builtin_scripts_report_merged_and_unlabelled_prs() {
             .await
             .unwrap();
     }
+}
+
+/// review-wait end to end: the embedded script runs as a real `python3`
+/// subprocess against the live server and *mutates* — it parks a session whose
+/// PR awaits an external review (`REVIEW_REQUIRED`) with the quiet
+/// `awaiting: review` mark, and un-parks it once the review lands. Proves the
+/// wiring (script → REST → tag, attributed) and the park/un-park reconcile that
+/// pytest covers in isolation.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_wait_parks_and_unparks_a_session_awaiting_review() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let ts = TestServer::start().await;
+    let state = engine_state(&ts).await;
+    let (sid, branch, _repo) = make_session(&ts, "review me").await;
+
+    // A PR open and awaiting an external review.
+    let mut snap = pr_snapshot("OPEN", 7);
+    snap.review_decision = Some("REVIEW_REQUIRED".to_string());
+    loom::github::upsert_status(&state.db, &branch, &snap)
+        .await
+        .unwrap();
+
+    enabled_overlooker(
+        &state,
+        ov::NewOverlooker {
+            name: "review-wait".to_string(),
+            program: "builtin:review-wait".to_string(),
+            capabilities: vec!["observe".to_string(), "mark".to_string()],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Park: the round stamps `awaiting: review`, attributed to the watch.
+    overlooker::fire_now(&state, "review-wait", false, "manual")
+        .await
+        .unwrap();
+    let view = ts
+        .client
+        .get(&format!("/api/sessions/{sid}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        branch_tag_value(&view, "awaiting"),
+        "review",
+        "the session awaiting review is parked"
+    );
+    assert_eq!(
+        branch_tag(&view, "awaiting").unwrap()["set_by"],
+        "review-wait",
+        "the parked mark carries the watch's attribution"
+    );
+
+    // Review lands → un-park: the next round clears the watch's own mark.
+    snap.review_decision = Some("APPROVED".to_string());
+    loom::github::upsert_status(&state.db, &branch, &snap)
+        .await
+        .unwrap();
+    overlooker::fire_now(&state, "review-wait", false, "manual")
+        .await
+        .unwrap();
+    let view = ts
+        .client
+        .get(&format!("/api/sessions/{sid}"))
+        .await
+        .unwrap();
+    assert!(
+        branch_tag(&view, "awaiting").is_none(),
+        "the session is un-parked once the review lands"
+    );
+
+    ts.client
+        .delete(&format!("/api/sessions/{sid}"))
+        .await
+        .unwrap();
 }
 
 /// The LLM judgement path end to end: the status script calls the daemon's

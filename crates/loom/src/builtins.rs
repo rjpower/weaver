@@ -90,6 +90,25 @@ pub const BUILTINS: &[BuiltinProgram] = &[
         default_capabilities: &["observe"],
     },
     BuiltinProgram {
+        name: "review-wait",
+        title: "Review wait",
+        description: "Park sessions waiting on an external human PR reviewer. \
+                      When a session's pull request is open, not a draft, and \
+                      needs a review that hasn't landed yet (GitHub \
+                      review_decision REVIEW_REQUIRED), the ball is in the \
+                      reviewer's court — nothing for the user to do. It stamps a \
+                      quiet `awaiting: review` tag that both labels the session \
+                      and sinks it below the calm default in the fleet sort, so \
+                      a scanning user skips past it. Clears the mark the moment \
+                      review lands, the PR merges, or the draft flag flips. \
+                      Needs `mark` to park / un-park.",
+        source: include_str!("../overlookers/review_wait.py"),
+        default_trigger: r#"{"on":["pr.review_changed","pr.opened","pr.merged"]}"#,
+        default_scope: "{}",
+        default_params: "{}",
+        default_capabilities: &["observe", "mark"],
+    },
+    BuiltinProgram {
         name: "archive-merged",
         title: "Archive merged",
         description: "Flag live sessions whose pull request has merged — \
