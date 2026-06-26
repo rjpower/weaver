@@ -236,6 +236,11 @@ enum GoalCmd {
 enum ArtifactCmd {
     /// Write an artifact: append a new revision (creating it if absent). Reads
     /// `<file>`, or stdin when `<file>` is `-` or omitted.
+    ///
+    /// An image file (`.png`, `.jpg`, `.gif`, `.webp`, `.svg`, …; raster formats
+    /// are also recognised from stdin by their magic bytes) is embedded as a
+    /// base64 data-URI in a markdown wrapper, so it renders inline in loom — no
+    /// need to hand-roll the data URI.
     Write {
         /// The artifact name (its identity within the scope), e.g. `plan`.
         name: String,
@@ -244,7 +249,8 @@ enum ArtifactCmd {
         /// A human title for the artifact (envelope metadata).
         #[arg(long, default_value = "")]
         title: String,
-        /// The content kind; defaults to `markdown`.
+        /// The content kind; defaults to `markdown`. Ignored for image files,
+        /// which are always wrapped as markdown.
         #[arg(long, default_value = "markdown")]
         kind: String,
         /// Publish repo-shared (visible to every branch) instead of scoping it
@@ -269,6 +275,17 @@ enum ArtifactCmd {
         /// Print the envelope metadata instead of the content.
         #[arg(long)]
         meta: bool,
+    },
+    /// Remove an artifact and its entire revision history. Resolves the name
+    /// branch-scoped first, then repo-shared (what `show` would display); pass
+    /// `--repo` to target the repo-shared one when a branch copy shadows it.
+    Rm {
+        /// The artifact name to remove.
+        name: String,
+        /// Remove the repo-shared artifact (`branch_id IS NULL`) of this name,
+        /// not the branch-scoped one.
+        #[arg(long)]
+        repo: bool,
     },
 }
 
@@ -374,6 +391,84 @@ fn read_file_or_stdin(path: Option<&str>) -> Result<String> {
             Ok(buf)
         }
     }
+}
+
+/// Read raw bytes from a file path, or stdin when `path` is `None` or `"-"`. The
+/// binary-safe twin of [`read_file_or_stdin`], used where content may be an image.
+fn read_bytes_or_stdin(path: Option<&str>) -> Result<Vec<u8>> {
+    use std::io::Read;
+    match path {
+        Some(p) if p != "-" => std::fs::read(p).map_err(|e| anyhow!("reading {p}: {e}")),
+        _ => {
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .map_err(|e| anyhow!("reading stdin: {e}"))?;
+            Ok(buf)
+        }
+    }
+}
+
+/// The largest image we embed inline. base64 inflates by ~⅓, and the data URI
+/// rides in the artifact's content column / JSON views / SSE — a few MB is a
+/// generous ceiling for a screenshot or diagram; past it, downscale first.
+const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// The image MIME type for a filename's extension, or `None` if it isn't a
+/// recognised image extension. Case-insensitive.
+fn image_mime_from_ext(name: &str) -> Option<&'static str> {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase())?;
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        _ => return None,
+    })
+}
+
+/// Sniff a raster image's MIME type from its leading magic bytes — for content
+/// read from stdin, where there is no extension to go by. Only the unambiguous
+/// binary formats are sniffed; text-ish SVG is recognised by extension alone, so
+/// that markdown which merely embeds an `<svg>` is never mistaken for an image.
+fn image_mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// If `bytes` is a recognised image (by `filename` extension, else raster magic
+/// bytes), wrap it as a markdown document embedding it as a base64 data URI, so
+/// it renders inline in loom with no binary storage. `None` means "not an image
+/// — treat as text". `alt` is the image's alt text (the artifact title or name).
+fn embed_image_markdown(alt: &str, filename: Option<&str>, bytes: &[u8]) -> Result<Option<String>> {
+    use base64::Engine;
+    let mime = filename
+        .and_then(image_mime_from_ext)
+        .or_else(|| image_mime_from_magic(bytes));
+    let Some(mime) = mime else { return Ok(None) };
+    if bytes.len() > MAX_IMAGE_BYTES {
+        bail!(
+            "image is {:.1} MB; the inline limit is {} MB — downscale it first",
+            bytes.len() as f64 / (1024.0 * 1024.0),
+            MAX_IMAGE_BYTES / (1024 * 1024)
+        );
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let alt = if alt.is_empty() { "image" } else { alt };
+    Ok(Some(format!("![{alt}](data:{mime};base64,{b64})\n")))
 }
 
 /// Print the goal, or set it. With no subcommand prints the current goal;
@@ -1125,7 +1220,28 @@ async fn cmd_artifact(cmd: ArtifactCmd) -> Result<()> {
             kind,
             repo,
         } => {
-            let content = read_file_or_stdin(file.as_deref())?;
+            let raw = read_bytes_or_stdin(file.as_deref())?;
+            let alt = if title.trim().is_empty() {
+                name.trim()
+            } else {
+                title.trim()
+            };
+            // An image is auto-wrapped as a base64 data-URI markdown doc (kind
+            // forced to markdown so loom renders it inline); everything else is
+            // stored as text under the requested kind.
+            let (kind, content): (String, String) =
+                match embed_image_markdown(alt, file.as_deref(), &raw)? {
+                    Some(md) => ("markdown".to_string(), md),
+                    None => {
+                        let text = String::from_utf8(raw).map_err(|_| {
+                            anyhow!(
+                                "artifact content is not valid UTF-8 — \
+                                 only text and image files are supported"
+                            )
+                        })?;
+                        (kind.trim().to_string(), text)
+                    }
+                };
             // `--repo` writes the repo-shared scope (branch_id = NULL); otherwise
             // the artifact is scoped to this branch.
             let branch_id = (!repo).then_some(b.id.as_str());
@@ -1135,7 +1251,7 @@ async fn cmd_artifact(cmd: ArtifactCmd) -> Result<()> {
                     repo_root: &b.repo_root,
                     branch_id,
                     name: name.trim(),
-                    kind: kind.trim(),
+                    kind: &kind,
                     title: title.trim(),
                     content: &content,
                     author: "agent",
@@ -1223,6 +1339,29 @@ async fn cmd_artifact(cmd: ArtifactCmd) -> Result<()> {
                     a.name
                 ),
             }
+        }
+        ArtifactCmd::Rm { name, repo } => {
+            // `--repo` targets the repo-shared row explicitly; the default
+            // resolves branch-scoped first, then shared — what `show` displays.
+            let a = if repo {
+                artifact::get_shared(&db, &b.repo_root, name.trim()).await?
+            } else {
+                artifact::get(&db, &b.repo_root, &b.id, name.trim()).await?
+            }
+            .ok_or_else(|| anyhow!("no artifact '{}' — see `weaver artifact ls`", name.trim()))?;
+            artifact::delete(&db, a.id).await?;
+            events::record_local(
+                &db,
+                &b.id,
+                "artifact_deleted",
+                json!({ "name": a.name, "branch_id": a.branch_id }),
+            )
+            .await?;
+            let scope = match &a.branch_id {
+                Some(bid) => format!("branch {bid}"),
+                None => "repo-shared".to_string(),
+            };
+            println!("deleted {} ({scope}, was rev {})", a.name, a.rev);
         }
     }
     Ok(())
@@ -1476,5 +1615,74 @@ mod tests {
     fn truncate_respects_the_max_length() {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("a very long string", 6), "a ver…");
+    }
+
+    #[test]
+    fn image_extensions_map_to_mime_case_insensitively() {
+        assert_eq!(image_mime_from_ext("shot.png"), Some("image/png"));
+        assert_eq!(image_mime_from_ext("./a/b/Photo.JPG"), Some("image/jpeg"));
+        assert_eq!(image_mime_from_ext("logo.svg"), Some("image/svg+xml"));
+        assert_eq!(image_mime_from_ext("anim.webp"), Some("image/webp"));
+        // Not images: plain docs and extension-less names.
+        assert_eq!(image_mime_from_ext("design.md"), None);
+        assert_eq!(image_mime_from_ext("plan"), None);
+    }
+
+    #[test]
+    fn raster_magic_bytes_are_sniffed_but_text_is_not() {
+        assert_eq!(
+            image_mime_from_magic(b"\x89PNG\r\n\x1a\n....."),
+            Some("image/png")
+        );
+        assert_eq!(
+            image_mime_from_magic(&[0xFF, 0xD8, 0xFF, 0x00]),
+            Some("image/jpeg")
+        );
+        assert_eq!(image_mime_from_magic(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(
+            image_mime_from_magic(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some("image/webp")
+        );
+        // Markdown that merely contains an <svg> is text, never sniffed as image.
+        assert_eq!(image_mime_from_magic(b"# Notes\n<svg>...</svg>\n"), None);
+    }
+
+    #[test]
+    fn embed_wraps_an_image_and_passes_text_through() {
+        // A PNG by extension → a markdown image with a base64 data URI + alt text.
+        let png = b"\x89PNG\r\n\x1a\nzzzz";
+        let md = embed_image_markdown("My shot", Some("shot.png"), png)
+            .unwrap()
+            .expect("png embeds");
+        assert!(md.starts_with("![My shot](data:image/png;base64,"));
+        assert!(md.trim_end().ends_with(')'));
+
+        // Extension-less stdin still embeds via magic bytes; empty alt → "image".
+        let md = embed_image_markdown("", None, png)
+            .unwrap()
+            .expect("magic embeds");
+        assert!(md.starts_with("![image](data:image/png;base64,"));
+
+        // SVG (text) embeds by extension so it renders as an image, not source.
+        let svg = b"<svg xmlns='http://www.w3.org/2000/svg'></svg>";
+        let md = embed_image_markdown("d", Some("d.svg"), svg)
+            .unwrap()
+            .expect("svg embeds");
+        assert!(md.starts_with("![d](data:image/svg+xml;base64,"));
+
+        // Non-image content is left for the text path.
+        assert!(embed_image_markdown("notes", Some("notes.md"), b"# Hi")
+            .unwrap()
+            .is_none());
+        assert!(embed_image_markdown("notes", None, b"plain text")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn embed_rejects_an_oversized_image() {
+        let mut big = b"\x89PNG\r\n\x1a\n".to_vec();
+        big.resize(MAX_IMAGE_BYTES + 1, 0);
+        assert!(embed_image_markdown("x", Some("x.png"), &big).is_err());
     }
 }

@@ -33,9 +33,12 @@ It is on your `PATH`. From anywhere in the worktree you can run:
 - `weaver artifact write <name> [<file>]` — write a versioned document to
   weaver (a design, a report, a diagram, a plan) for the user to read. Prints a
   dashboard URL to hand them. Reads stdin with `-`; `--repo` makes it
-  repo-shared so a fan-out of child sessions sees one copy. `weaver artifact ls`
-  lists this branch's plus the shared ones; `weaver artifact show <name> [--rev
-  N]` prints content.
+  repo-shared so a fan-out of child sessions sees one copy. An image file
+  (`.png`, `.svg`, …) is embedded as a base64 data-URI markdown doc, so it
+  renders inline — just `weaver artifact write shot screenshot.png`. `weaver
+  artifact ls` lists this branch's plus the shared ones; `weaver artifact show
+  <name> [--rev N]` prints content; `weaver artifact rm <name>` removes it and
+  its history (`--repo` targets the shared one).
 - `weaver goal set <file|->` — set the branch goal from a file or stdin (long
   markdown goals without the shell-quoting pain). `weaver goal` prints it.
 - Division of labor: **goal = the charter (what to do); issues = the only task

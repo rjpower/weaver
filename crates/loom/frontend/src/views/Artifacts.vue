@@ -2,7 +2,7 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue';
 import { useRouter } from 'vue-router';
 import type * as Monaco from 'monaco-editor';
-import { get, getArtifacts, getArtifact, putArtifact } from '../api';
+import { get, getArtifacts, getArtifact, putArtifact, deleteArtifact } from '../api';
 import type { Session, ArtifactMeta, ArtifactView } from '../types';
 import { theme } from '../theme';
 import { loadMonaco, monacoTheme, languageForPath } from '../monaco';
@@ -60,6 +60,7 @@ const loading = ref(false);
 const viewError = ref('');
 const editing = ref(false);
 const saving = ref(false);
+const removing = ref(false);
 
 // Markdown gets the rendered Preview; other kinds show source in Monaco.
 const isMarkdown = computed(() => (view.value?.meta.kind ?? 'markdown') === 'markdown');
@@ -196,6 +197,42 @@ async function save() {
   }
 }
 
+// --- Delete ----------------------------------------------------------------
+
+// Remove the open artifact (every revision). After it's gone, fall back to the
+// next artifact in the list, or the empty state when none remain.
+async function remove() {
+  if (!view.value || removing.value) return;
+  const name = selected.value;
+  const count = view.value.versions.length;
+  if (
+    !confirm(
+      `Delete artifact "${name}" and all ${count} revision${count === 1 ? '' : 's'}? ` +
+        `This cannot be undone.`,
+    )
+  )
+    return;
+  removing.value = true;
+  viewError.value = '';
+  try {
+    await deleteArtifact(props.id, name);
+    view.value = null;
+    teardownEditor();
+    await loadList();
+    const next = list.value[0]?.name;
+    if (next) {
+      await openArtifact(next);
+    } else {
+      selected.value = '';
+      router.replace(`/s/${props.id}/artifacts`);
+    }
+  } catch (e) {
+    viewError.value = (e as Error).message;
+  } finally {
+    removing.value = false;
+  }
+}
+
 // --- Scope badge -----------------------------------------------------------
 
 function scopeBadge(a: ArtifactMeta): { label: string; title: string } {
@@ -216,6 +253,17 @@ function openStream() {
     // mid-edit), refresh the viewer to its new latest.
     if (d?.name && d.name === selected.value && !editing.value) {
       openArtifact(selected.value).catch(() => {});
+    }
+  });
+  source.addEventListener('artifact_deleted', (e) => {
+    const d = JSON.parse((e as MessageEvent).data).data as { name?: string };
+    loadList().catch(() => {});
+    // The open artifact was removed elsewhere (CLI, or another tab) — clear the
+    // viewer back to the empty state. Our own delete already advanced the view.
+    if (d?.name && d.name === selected.value) {
+      view.value = null;
+      teardownEditor();
+      selected.value = '';
     }
   });
 }
@@ -338,6 +386,14 @@ onUnmounted(() => {
               <template v-if="!editing">
                 <button class="btn-secondary px-2.5 py-1 text-xs" :disabled="!onLatest" @click="edit">
                   Edit
+                </button>
+                <button
+                  class="btn-danger px-2.5 py-1 text-xs"
+                  data-testid="artifact-delete"
+                  :disabled="removing"
+                  @click="remove"
+                >
+                  {{ removing ? 'Deleting…' : 'Delete' }}
                 </button>
               </template>
               <template v-else>

@@ -107,6 +107,59 @@ test.describe('artifacts surface', () => {
     // Back in preview, the edited content shows.
     await expect(page.locator('.markdown-body')).toContainText('A user revision.');
   });
+
+  test('deleting an artifact removes it and falls back to the next', async ({ page, weaver }) => {
+    const session = await weaver.seedSession({ goal: 'cleanup', name: 'artifacts-delete' });
+    await weaver.writeArtifact(session, 'keep', '# Keep me\n', { title: 'Keep' });
+    await weaver.writeArtifact(session, 'scratch', '# Throwaway\n', { title: 'Scratch' });
+
+    await page.goto(`${weaver.baseUrl}/s/${session.id}/artifacts/scratch`);
+    await expect(page.locator('.markdown-body h1')).toContainText('Throwaway');
+
+    // Confirm the destructive prompt, then delete.
+    page.once('dialog', (d) => d.accept());
+    await page.getByTestId('artifact-delete').click();
+
+    // The row is gone and the viewer falls back to the remaining `keep`.
+    await expect(page.locator('[data-artifact="scratch"]')).toHaveCount(0);
+    await expect(page.locator('[data-artifact="keep"]')).toBeVisible();
+    await expect(page.locator('.markdown-body h1')).toContainText('Keep me');
+  });
+
+  test('a CLI `artifact rm` removes it and the list updates over SSE', async ({ page, weaver }) => {
+    const session = await weaver.seedSession({ goal: 'cli rm', name: 'artifacts-cli-rm' });
+    await weaver.writeArtifact(session, 'doomed', '# Doomed\n', { title: 'Doomed' });
+
+    await page.goto(`${weaver.baseUrl}/s/${session.id}/artifacts/doomed`);
+    await expect(page.locator('[data-artifact="doomed"]')).toBeVisible();
+    await expect(page.locator('.markdown-body h1')).toContainText('Doomed');
+
+    // Remove it out-of-band via the CLI; the `artifact_deleted` event is
+    // re-broadcast over SSE and the list updates without a reload.
+    await weaver.removeArtifact(session, 'doomed');
+    await expect(page.locator('[data-artifact="doomed"]')).toHaveCount(0, { timeout: 15_000 });
+  });
+
+  test('an image file is embedded as a base64 data-URI and renders inline', async ({
+    page,
+    weaver,
+  }) => {
+    const session = await weaver.seedSession({ goal: 'shots', name: 'artifacts-image' });
+    // A 1×1 transparent PNG, piped as raw bytes (no extension): the CLI sniffs
+    // it from its magic bytes and wraps it as a base64 data-URI markdown doc.
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    await weaver.writeArtifact(session, 'shot', png, { title: 'Screenshot' });
+
+    await page.goto(`${weaver.baseUrl}/s/${session.id}/artifacts/shot`);
+
+    // Preview renders the embedded image inline (alt = the title), src a data URI.
+    const img = page.locator('.markdown-body img');
+    await expect(img).toHaveAttribute('src', /^data:image\/png;base64,/);
+    await expect(img).toHaveAttribute('alt', 'Screenshot');
+  });
 });
 
 test.describe('overview', () => {

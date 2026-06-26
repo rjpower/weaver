@@ -124,13 +124,18 @@ export interface WeaverFixture {
   seedConversation(session: Session, log: unknown): Promise<void>;
   /** Write an artifact via `weaver artifact write` — creates it on first call,
    *  appends an immutable revision after. Content is piped on stdin; `--repo`
-   *  publishes it repo-shared instead of scoping it to the branch. */
+   *  publishes it repo-shared instead of scoping it to the branch. A `Buffer`
+   *  exercises the binary path — an image is sniffed from its magic bytes and
+   *  embedded as a base64 data-URI markdown doc. */
   writeArtifact(
     session: Session,
     name: string,
-    content: string,
+    content: string | Buffer,
     opts?: { title?: string; repo?: boolean },
   ): Promise<void>;
+  /** Remove an artifact via `weaver artifact rm` — drops it and its whole
+   *  history. `--repo` targets the repo-shared row when a branch copy shadows it. */
+  removeArtifact(session: Session, name: string, opts?: { repo?: boolean }): Promise<void>;
   /** Set (upsert) a free-form label on an issue via `PUT …/issues/{id}/tags/{key}`. */
   tagIssue(id: number, key: string, value: string): Promise<Issue>;
   /** GET /api/issues (cross-repo board). */
@@ -491,6 +496,15 @@ export const test = base.extend<{ weaver: WeaverFixture }, WorkerFixtures>({
         execFileSync(WEAVER_BINARY, args, {
           env: { ...childEnv, WEAVER_BRANCH: session.branch.id },
           input: content,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+      },
+
+      async removeArtifact(session, name, opts) {
+        const args = ['artifact', 'rm', name];
+        if (opts?.repo) args.push('--repo');
+        execFileSync(WEAVER_BINARY, args, {
+          env: { ...childEnv, WEAVER_BRANCH: session.branch.id },
           stdio: ['pipe', 'pipe', 'pipe'],
         });
       },
