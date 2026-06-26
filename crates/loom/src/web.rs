@@ -427,7 +427,9 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/artifacts", get(list_artifacts))
         .route(
             "/sessions/{id}/artifacts/{name}",
-            get(get_artifact).put(write_artifact),
+            get(get_artifact)
+                .put(write_artifact)
+                .delete(delete_artifact),
         )
         .route(
             "/sessions/{id}/scratch",
@@ -1952,6 +1954,31 @@ async fn write_artifact(
     Ok(Json(
         artifact_view(&st.db, &branch.repo_root, &a, None).await?,
     ))
+}
+
+/// Delete an artifact and its whole revision history. Resolves the name the way
+/// the session sees it (its own branch-scoped row, else the repo-shared one — the
+/// single row the list shows for that name), so deleting from the UI removes
+/// exactly the artifact displayed. Broadcasts `artifact_deleted` for live refresh.
+async fn delete_artifact(
+    State(st): State<AppState>,
+    Path((key, name)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    let (_, branch) = require_session(&st.db, &key).await?;
+    let a = artifact::get(&st.db, &branch.repo_root, &branch.id, &name)
+        .await?
+        .ok_or_else(|| AppError::not_found("artifact"))?;
+    artifact::delete(&st.db, a.id).await?;
+    events::record(
+        &st.db,
+        &st.bus,
+        &branch.id,
+        "artifact_deleted",
+        json!({ "name": a.name, "branch_id": a.branch_id }),
+    )
+    .await
+    .ok();
+    Ok(Json(json!({ "deleted": true, "name": a.name })))
 }
 
 // ---------------------------------------------------------------------------

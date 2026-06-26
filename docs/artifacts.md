@@ -114,8 +114,11 @@ the survey above:
   agent/user edits safe — last write is a new revision, not a lost update.
 - **Kind-typed, markdown-first.** `kind` defaults to `markdown` (GFM +
   mermaid via the existing `MarkdownView`); other kinds render as source
-  until they earn a renderer. Binary kinds (screenshots) are a deliberate
-  v2.
+  until they earn a renderer. Images (screenshots, diagrams) need no blob
+  store: `write` recognises an image file — by extension, or by magic bytes
+  on stdin — and embeds it as a base64 data-URI inside a markdown wrapper,
+  which `MarkdownView` already renders inline (the renderer passes `data:`
+  URIs through untouched; DOMPurify permits them on `<img>`).
 - **URL-addressable.** `weaver artifact write` prints the dashboard URL
   (`/s/<session>/artifacts/<name>`) so the agent can hand it to the user in
   a status message or PR comment — the Amp-thread lesson: the URL is the
@@ -162,15 +165,22 @@ CLI and API, in the house idiom:
 weaver artifact write <name> [<file>]    # stdin with '-'; --title, --kind, --repo
 weaver artifact ls [--repo]              # this branch's + shared; --repo for all
 weaver artifact show <name> [--rev N]    # content; --meta for the envelope
+weaver artifact rm <name> [--repo]       # remove it + its history; --repo = shared
 
-GET  /api/sessions/{id}/artifacts                 # list: branch-scoped + shared
-GET  /api/sessions/{id}/artifacts/{name}?rev=N    # content + projected refs (below)
-PUT  /api/sessions/{id}/artifacts/{name}          # user edit -> new revision
+GET    /api/sessions/{id}/artifacts                 # list: branch-scoped + shared
+GET    /api/sessions/{id}/artifacts/{name}?rev=N    # content + projected refs (below)
+PUT    /api/sessions/{id}/artifacts/{name}          # user edit -> new revision
+DELETE /api/sessions/{id}/artifacts/{name}          # remove it + its history
 ```
 
 Each write records an `artifact_written` event (`{name, rev, title}`) through
-the existing bus, so the SSE stream, the activity feed, and overlookers see
-it with no new plumbing.
+the existing bus, and a delete records `artifact_deleted` (`{name, branch_id}`),
+so the SSE stream, the activity feed, and overlookers see both with no new
+plumbing. `rm`/DELETE resolve the name the way `show` does (branch-scoped first,
+then repo-shared — the single row the listing shows), so removing from the UI
+takes exactly the artifact on screen; `--repo` targets the shared row when a
+branch copy shadows it. Removing an artifact removes every revision — history is
+not individually prunable.
 
 Artifacts are the outbound twin of `scratch/`: scratch is material the user
 hands the agent; artifacts are documents the agent hands the user. Scratch
@@ -322,8 +332,11 @@ Each step shippable alone:
 
 ## Open questions
 
-- **Binary kinds** (screenshots, the Cursor "demo artifact" pattern): needs
-  blob storage and a raw route; v2, the seam (`kind`) is reserved.
+- **Binary kinds** (screenshots, the Cursor "demo artifact" pattern):
+  resolved by embedding — `write` wraps an image as a base64 data-URI markdown
+  doc (cap: 10 MB raw), so it renders inline with no blob store or raw route.
+  A dedicated binary column stays a future option if large media ever warrants
+  it; for kilobyte-to-low-megabyte screenshots, embedding is enough.
 - **Cross-branch reads in the CLI**: `artifact ls --repo` covers discovery;
   is a branch-qualified `show` needed, or do shared artifacts cover fan-out?
 - **Promote** timing, per above.

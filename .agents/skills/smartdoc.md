@@ -9,6 +9,9 @@ An artifact is a document you write *to weaver*, not the repo: a design, a
 report, a diagram, a plan. It is versioned, survives archive, and is rendered by
 loom for the user to read. `weaver artifact write <name> [<file>]` (stdin with
 `-`) prints a dashboard URL — hand it to the user in your status or a PR comment.
+An image file (`.png`, `.jpg`, `.svg`, …) is auto-embedded as a base64 data-URI
+markdown doc so it renders inline — pass the image straight to `write`, no
+hand-rolled data URI. `weaver artifact rm <name>` removes one and its history.
 
 ## When to write one
 

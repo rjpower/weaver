@@ -114,6 +114,11 @@ export const getArtifact = (id: string, name: string, rev?: number) =>
 export const putArtifact = (id: string, name: string, body: ArtifactWriteBody) =>
   put(`/sessions/${id}/artifacts/${encodeURIComponent(name)}`, body) as Promise<ArtifactView>;
 
+/** Delete an artifact and its whole revision history — the row the session sees
+ *  for that name (its branch-scoped one, else the repo-shared). */
+export const deleteArtifact = (id: string, name: string) =>
+  del(`/sessions/${id}/artifacts/${encodeURIComponent(name)}`);
+
 /** Availability of the session's embedded editor (code-server). */
 export const ideInfo = (id: string) => get(`/sessions/${id}/ide-info`) as Promise<IdeInfo>;
 

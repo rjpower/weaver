@@ -10,6 +10,7 @@ path = "src/bin/weaver.rs"
 [dependencies]
 weaver-core = { path = "../weaver-core" }
 anyhow = "1"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"

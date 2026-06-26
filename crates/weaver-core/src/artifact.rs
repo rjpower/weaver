@@ -297,6 +297,25 @@ pub async fn list_for_repo(db: &Db, repo_root: &str) -> Result<Vec<Artifact>> {
     Ok(rows)
 }
 
+/// Delete an artifact and its entire revision history, by envelope id. Removing
+/// an artifact removes the whole document — every snapshot goes with it.
+///
+/// Foreign keys aren't enabled on the pool, so the `artifact_versions` cascade
+/// won't fire — clear the versions explicitly before dropping the envelope.
+pub async fn delete(db: &Db, id: i64) -> Result<()> {
+    let mut tx = db.begin().await?;
+    sqlx::query("DELETE FROM artifact_versions WHERE artifact_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM artifacts WHERE id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,5 +477,29 @@ mod tests {
         // The scoped one is still at rev 1.
         let scoped_now = get(&db, "/r", "b1", "plan").await.unwrap().unwrap();
         assert_eq!(scoped_now.rev, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_envelope_and_every_revision() {
+        let db = db().await;
+        // A shared `plan` and a same-named branch-scoped one, the scoped with
+        // history, so we can prove delete is targeted and takes all revisions.
+        let shared = wr(&db, None, "plan", "Shared", "s", "agent").await;
+        wr(&db, Some("b1"), "plan", "Mine v1", "v1", "agent").await;
+        let scoped = wr(&db, Some("b1"), "plan", "Mine v2", "v2", "user").await;
+        assert_eq!(scoped.rev, 2);
+
+        delete(&db, scoped.id).await.unwrap();
+
+        // The scoped envelope and both its revisions are gone.
+        assert!(get_by_id(&db, scoped.id).await.unwrap().is_none());
+        assert!(version(&db, scoped.id, 1).await.unwrap().is_none());
+        assert!(version(&db, scoped.id, 2).await.unwrap().is_none());
+        assert!(history(&db, scoped.id).await.unwrap().is_empty());
+
+        // The shared `plan` is untouched — `get` from b1 now falls back to it.
+        let resolved = get(&db, "/r", "b1", "plan").await.unwrap().unwrap();
+        assert_eq!(resolved.id, shared.id);
+        assert_eq!(resolved.title, "Shared");
     }
 }
