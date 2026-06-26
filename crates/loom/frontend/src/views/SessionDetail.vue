@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onActivated, onDeactivated, onUnmounted } from 'vue';
-import { useRoute } from 'vue-router';
+import { ref, reactive, computed, watch, onMounted, onActivated, onDeactivated, onUnmounted } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import { get, ideInfo } from '../api';
 import type { Session, WeaverEvent, Issue } from '../types';
 import SessionTerminals from '../components/SessionTerminals.vue';
@@ -10,16 +10,18 @@ import SessionPageHeader from '../components/SessionPageHeader.vue';
 import SessionTabs from '../components/SessionTabs.vue';
 import SessionOverview from '../components/SessionOverview.vue';
 import SessionConversation from '../components/SessionConversation.vue';
+import ArtifactsPanel from '../components/ArtifactsPanel.vue';
 import { useFleet } from '../lib/sessionsStore';
 
 // Named + keyed-by-id in App.vue's <keep-alive> so the page (and its live
-// terminal) stays warm across the Artifacts trip: clicking Artifacts and back
-// returns to the same terminal, scrollback intact, no reconnect — instead of
-// tearing the WebSocket/xterm down and rebuilding it every round-trip.
+// terminal) stays warm: every `/s/:id…` path (the work tabs and the Artifacts
+// deep-links) resolves to this one instance, so moving terminal ⇄ artifacts is a
+// tab flip on a warm page — no remount, no reconnect, no jump.
 defineOptions({ name: 'SessionDetail' });
 
-const props = defineProps<{ id: string }>();
+const props = defineProps<{ id: string; name?: string }>();
 const route = useRoute();
+const router = useRouter();
 
 // Seed from the shared fleet snapshot so the page paints immediately with the
 // row the list already had — no "Loading…" gap while the per-session refetch is
@@ -31,74 +33,128 @@ const issues = ref<Issue[]>([]);
 const backlog = ref<Issue[]>([]);
 const error = ref('');
 
-// Work-area tab. Terminal is the default surface — "show me what it's doing" —
-// and stays mounted under v-show across both tabs (tearing down the
-// WebSocket/xterm/WebGL is the worst thing on a terminal-first page). A
-// `?tab=overview` query deep-links the Overview tab (e.g. the list's open-issue
-// link). Files are no longer a tab — they live in the embedded editor panel.
+// --- Work-area tabs --------------------------------------------------------
+// Terminal/Overview/Conversation are local panes the parent flips under v-show
+// (never v-if for the terminal — tearing down the WebSocket/xterm is the worst
+// thing on a terminal-first page). Artifacts is route-backed (`/s/:id/artifacts`
+// is this same component) so it stays deep-linkable and refresh-stable, and its
+// heavy viewer lazily mounts only once opened.
+type LocalTab = 'terminal' | 'overview' | 'conversation';
+type WorkTab = LocalTab | 'artifacts';
 const initialTab = route.query.tab;
-type WorkTab = 'terminal' | 'overview' | 'conversation';
-const tab = ref<WorkTab>(
+const localTab = ref<LocalTab>(
   initialTab === 'overview' || initialTab === 'conversation' ? initialTab : 'terminal',
 );
 
-// Which tabs have ever been opened. A tab mounts lazily on first visit, then
-// stays mounted (v-show) — so flipping Terminal ↔ Overview ↔ Conversation is
-// instant and the Conversation keeps its loaded transcript instead of
-// re-fetching on every switch. The terminal is always mounted (it must never
-// drop its socket); the others start unmounted so a session-open stays cheap.
-const mounted = reactive<Record<WorkTab, boolean>>({
-  terminal: true,
-  overview: tab.value === 'overview',
-  conversation: tab.value === 'conversation',
+// The artifacts surface is open whenever the path is under `…/artifacts`.
+const artifactsActive = computed(() => route.path.startsWith(`/s/${props.id}/artifacts`));
+
+// Popped out into the rail beside the terminal vs docked as the work-area tab.
+// Transient (defaults docked on a fresh open); only the rail *width* persists.
+const poppedOut = ref(false);
+const artifactsDocked = computed(() => artifactsActive.value && !poppedOut.value);
+const railOpen = computed(() => artifactsActive.value && poppedOut.value);
+
+// The pane the work area shows: the artifacts panel when docked, else the last
+// local tab (so a popped-out artifact leaves the terminal in the work area).
+const workTab = computed<WorkTab>(() => (artifactsDocked.value ? 'artifacts' : localTab.value));
+
+// Lazy-mount panes on first visit, then keep them (v-show) so re-selecting is
+// instant. The terminal is always mounted; the rest start cold so a session-open
+// stays cheap (Monaco/the artifact viewer only load once their tab is opened).
+const mounted = reactive({
+  overview: localTab.value === 'overview',
+  conversation: localTab.value === 'conversation',
+  artifacts: artifactsActive.value,
 });
+watch(
+  artifactsActive,
+  (on) => {
+    if (on) mounted.artifacts = true;
+  },
+  { immediate: true },
+);
+
 function selectTab(t: WorkTab) {
-  // Mark mounted *before* flipping the tab so the target renders on the same
-  // tick (no one-frame flash). `selectTab` is the only path that changes `tab`.
-  mounted[t] = true;
-  tab.value = t;
+  if (t === 'artifacts') {
+    // The Artifacts tab is the docked view: bring the surface into the work
+    // area (docking it if it was popped out), opening it if it was closed.
+    poppedOut.value = false;
+    if (!artifactsActive.value) router.push(`/s/${props.id}/artifacts`);
+    return;
+  }
+  if (t === 'overview' || t === 'conversation') mounted[t] = true;
+  localTab.value = t;
+  // Leaving a docked artifacts surface for a local tab closes it (back to the
+  // plain session URL); when it's popped out the rail stays and we just swap the
+  // work-area pane.
+  if (artifactsDocked.value) router.push(`/s/${props.id}`);
+}
+
+// Pop the artifact out beside the terminal / dock it back into the tab.
+function togglePop() {
+  poppedOut.value = !poppedOut.value;
+}
+// Close the rail entirely — back to the plain session page.
+function closeRail() {
+  poppedOut.value = false;
+  router.push(`/s/${props.id}`);
 }
 
 const issueCount = computed(() => issues.value.length + backlog.value.length);
 
-// --- Embedded editor (code-server) side panel ------------------------------
-// The editor lives in a resizable panel pulled in from the right, beside the
-// live terminal. It is closed by default and mounted only when open, so opening
-// it is what lazily spawns the session's code-server — a plain session-open
-// never does. `ideEnabled` gates the whole affordance on the server setting.
-const ideEnabled = ref(false);
-const ideOpen = ref(false);
-const MIN_IDE_WIDTH = 360;
-function loadIdeWidth(): number {
-  const v = Number(localStorage.getItem('loom.ideWidth'));
-  return Number.isFinite(v) && v >= MIN_IDE_WIDTH ? v : 760;
+// --- Resizable side rails --------------------------------------------------
+// Two panels pull in from the right: the artifact (popped out) and the embedded
+// editor. Each persists its own width and drags from the right edge.
+const MIN_PANEL_WIDTH = 360;
+function loadWidth(key: string, fallback: number): number {
+  const v = Number(localStorage.getItem(key));
+  return Number.isFinite(v) && v >= MIN_PANEL_WIDTH ? v : fallback;
 }
-const ideWidth = ref(loadIdeWidth());
-let dragging = false;
+const artifactWidth = ref(loadWidth('loom.artifactWidth', 620));
+const ideWidth = ref(loadWidth('loom.ideWidth', 760));
 
+// Each rail drags from the right edge and persists its own width; a single
+// discriminator picks which one a divider drives (templates auto-unwrap refs, so
+// the rail is named, not passed by reference).
+type Rail = 'artifact' | 'ide';
+const RAILS: Record<Rail, { width: typeof artifactWidth; key: string }> = {
+  artifact: { width: artifactWidth, key: 'loom.artifactWidth' },
+  ide: { width: ideWidth, key: 'loom.ideWidth' },
+};
+let dragging: Rail | null = null;
 function onDrag(e: MouseEvent) {
   if (!dragging) return;
-  // Width is measured from the right edge — drag left to widen the editor.
+  // Width is measured from the right edge — drag left to widen the panel.
   const fromRight = window.innerWidth - e.clientX;
-  const max = Math.max(MIN_IDE_WIDTH, window.innerWidth - MIN_IDE_WIDTH);
-  ideWidth.value = Math.min(Math.max(fromRight, MIN_IDE_WIDTH), max);
+  const max = Math.max(MIN_PANEL_WIDTH, window.innerWidth - MIN_PANEL_WIDTH);
+  RAILS[dragging].width.value = Math.min(Math.max(fromRight, MIN_PANEL_WIDTH), max);
 }
 function stopDrag() {
   if (!dragging) return;
-  dragging = false;
+  const rail = RAILS[dragging];
+  localStorage.setItem(rail.key, String(Math.round(rail.width.value)));
+  dragging = null;
   document.removeEventListener('mousemove', onDrag);
   document.removeEventListener('mouseup', stopDrag);
   document.body.style.userSelect = '';
-  localStorage.setItem('loom.ideWidth', String(Math.round(ideWidth.value)));
 }
-function startDrag(e: MouseEvent) {
-  dragging = true;
+function startDrag(which: Rail, e: MouseEvent) {
+  dragging = which;
   e.preventDefault();
   document.addEventListener('mousemove', onDrag);
   document.addEventListener('mouseup', stopDrag);
   // Suppress text selection while dragging the divider.
   document.body.style.userSelect = 'none';
 }
+
+// --- Embedded editor (code-server) side panel ------------------------------
+// The editor lives in a resizable panel pulled in from the right, beside the
+// live terminal. Closed by default and mounted only when open, so opening it is
+// what lazily spawns the session's code-server. `ideEnabled` gates the whole
+// affordance on the server setting.
+const ideEnabled = ref(false);
+const ideOpen = ref(false);
 
 let source: EventSource | null = null;
 
@@ -157,8 +213,8 @@ function openStream() {
     });
   }
   // An artifact write joins the feed; pushing it to `events` also nudges the
-  // Overview's pinned-plan watcher to re-fetch the `plan` artifact, and the
-  // Artifacts surface refreshes off the same SSE stream itself.
+  // Overview's pinned-plan watcher to re-fetch the `plan` artifact. The
+  // Artifacts panel refreshes off its own SSE subscription.
   source.addEventListener('artifact_written', (e) => {
     events.value.push(JSON.parse((e as MessageEvent).data) as WeaverEvent);
   });
@@ -195,14 +251,11 @@ onMounted(() => {
     .catch(() => {});
 });
 // The events SSE is paused while the page is off-screen (kept alive). A cached
-// SessionDetail would otherwise hold an EventSource open on the Artifacts trip or
-// while parked on another session — idle streams stacking up against the
-// browser's per-origin HTTP/1.1 connection cap. The terminal WebSocket (a
-// separate connection pool) stays warm regardless — that's the point of keeping
-// the page alive; only this status stream pauses. onMounted owns the first open;
-// onActivated reopens + refetches on a *return* (guarded by `source` so the
-// initial mount never double-opens). The refetch carries no "Loading…" flash —
-// `ws` is already seeded from the store.
+// SessionDetail would otherwise hold an EventSource open while parked on another
+// session — idle streams stacking up against the browser's per-origin HTTP/1.1
+// connection cap. The terminal WebSocket (a separate pool) stays warm
+// regardless. onMounted owns the first open; onActivated reopens + refetches on
+// a *return* (guarded by `source` so the initial mount never double-opens).
 onActivated(() => {
   if (source) return; // initial mount already loaded + opened the stream
   loadAll();
@@ -217,15 +270,20 @@ onUnmounted(() => {
 
 <template>
   <!-- A horizontal split fills the workbench main area: the session page (header
-       + tabs + terminal/overview) on the left, and the embedded editor pulled in
-       from the right. The editor is a resizable, collapsible panel — closed by
-       default so a session-open never spawns a code-server. -->
+       + tabs + work area) on the left, then any panels pulled in from the right
+       — the popped-out artifact and the embedded editor, each resizable. -->
   <div v-if="ws" class="flex min-h-[28rem] flex-1">
-    <!-- Left: the session page. min-w-0 lets it shrink as the editor widens;
+    <!-- Left: the session page. min-w-0 lets it shrink as panels widen;
          AgentTerminal's ResizeObserver re-fits the terminal on the change. -->
     <div class="flex min-w-0 flex-1 flex-col px-5 py-3">
       <SessionPageHeader :ws="ws" @reload="loadAll" />
-      <SessionTabs :tab="tab" :id="props.id" :issue-count="issueCount" @select="selectTab">
+      <SessionTabs
+        :tab="workTab"
+        :id="props.id"
+        :issue-count="issueCount"
+        :artifacts-popped="railOpen"
+        @select="selectTab"
+      >
         <!-- Scratch attachments ride the tab row's spare right side (drop a file
              anywhere on the page) so the terminal keeps the vertical space the
              old below-the-terminal strip used to take. -->
@@ -238,18 +296,18 @@ onUnmounted(() => {
 
       <div class="min-h-0 flex-1">
         <!-- Terminal (default) — the working zone: the live agent, plus on-demand
-             worktree debug shells in an inner tab strip. v-show, NEVER v-if:
-             keeping the agent terminal's host in the DOM means its zero-size
-             guard skips the bogus resize while hidden and its ResizeObserver
-             re-fits on return. -->
-        <section v-show="tab === 'terminal'" class="h-full">
+             worktree debug shells in an inner tab strip. v-show, NEVER v-if. -->
+        <section v-show="workTab === 'terminal'" class="h-full">
           <SessionTerminals :id="props.id" />
         </section>
 
-        <!-- Overview — read-only context (goal, issues, activity). Scrolls
-             within the work area so the header/tabs stay anchored. Mounted on
+        <!-- Overview — read-only context (goal, issues, activity). Mounted on
              first visit, then kept (v-show) so re-selecting it is instant. -->
-        <div v-if="mounted.overview" v-show="tab === 'overview'" class="h-full overflow-auto pb-1">
+        <div
+          v-if="mounted.overview"
+          v-show="workTab === 'overview'"
+          class="h-full overflow-auto pb-1"
+        >
           <SessionOverview
             :ws="ws"
             :events="events"
@@ -259,15 +317,53 @@ onUnmounted(() => {
           />
         </div>
 
-        <!-- Conversation — the agent's chat with the model (live, or the
-             archived capture). Lazily mounted on first visit and then kept
-             (v-show), so flipping back is instant and the loaded transcript
-             survives; its Refresh button re-pulls on demand. -->
-        <div v-if="mounted.conversation" v-show="tab === 'conversation'" class="h-full">
+        <!-- Conversation — the agent's chat with the model. Lazily mounted, then
+             kept (v-show) so flipping back is instant. -->
+        <div v-if="mounted.conversation" v-show="workTab === 'conversation'" class="h-full">
           <SessionConversation :session="ws" />
+        </div>
+
+        <!-- Artifacts (docked) — fills the work area as a tab. Lazily mounted on
+             first open, then kept (hidden via v-show) so flipping terminal ⇄
+             artifacts is instant. Unmounts only when popped out, where the rail
+             copy below takes over. -->
+        <div v-if="mounted.artifacts && !railOpen" v-show="artifactsDocked" class="h-full">
+          <ArtifactsPanel
+            :id="props.id"
+            :name="props.name"
+            :active="artifactsActive"
+            @toggle-pop="togglePop"
+          />
         </div>
       </div>
     </div>
+
+    <!-- Artifact rail (popped out): a draggable divider + the panel at its
+         persisted width, beside the terminal. A second, compact mount of the
+         same view — opening it restores the artifact from the URL, so the docked
+         tab can stay warm for the instant terminal ⇄ artifacts flip. -->
+    <template v-if="railOpen">
+      <div
+        class="w-1 shrink-0 cursor-col-resize bg-line hover:bg-accent"
+        title="Drag to resize the artifact panel"
+        @mousedown="(e) => startDrag('artifact', e)"
+      ></div>
+      <section
+        class="flex shrink-0 flex-col border-l border-line"
+        :style="{ width: artifactWidth + 'px' }"
+      >
+        <ArtifactsPanel
+          :id="props.id"
+          :name="props.name"
+          :active="railOpen"
+          compact
+          popped
+          class="min-h-0 flex-1"
+          @toggle-pop="togglePop"
+          @close="closeRail"
+        />
+      </section>
+    </template>
 
     <!-- Editor side panel (only when enabled in settings). -->
     <template v-if="ideEnabled">
@@ -276,7 +372,7 @@ onUnmounted(() => {
         <div
           class="w-1 shrink-0 cursor-col-resize bg-line hover:bg-accent"
           title="Drag to resize the editor"
-          @mousedown="startDrag"
+          @mousedown="(e) => startDrag('ide', e)"
         ></div>
         <section
           class="relative flex shrink-0 flex-col border-l border-line"

@@ -240,7 +240,8 @@ enum ArtifactCmd {
     /// An image file (`.png`, `.jpg`, `.gif`, `.webp`, `.svg`, …; raster formats
     /// are also recognised from stdin by their magic bytes) is embedded as a
     /// base64 data-URI in a markdown wrapper, so it renders inline in loom — no
-    /// need to hand-roll the data URI.
+    /// need to hand-roll the data URI. A `.html`/`.htm` file is stored as the
+    /// `html` kind, which loom renders in a sandboxed iframe.
     Write {
         /// The artifact name (its identity within the scope), e.g. `plan`.
         name: String,
@@ -249,8 +250,10 @@ enum ArtifactCmd {
         /// A human title for the artifact (envelope metadata).
         #[arg(long, default_value = "")]
         title: String,
-        /// The content kind; defaults to `markdown`. Ignored for image files,
-        /// which are always wrapped as markdown.
+        /// The content kind: `markdown` (the default; GFM + mermaid) or `html`
+        /// (rendered in a sandboxed iframe). A `.html`/`.htm` file picks `html`
+        /// on its own. Ignored for image files, which are always wrapped as
+        /// markdown; any other value is stored verbatim and shown as source.
         #[arg(long, default_value = "markdown")]
         kind: String,
         /// Publish repo-shared (visible to every branch) instead of scoping it
@@ -429,6 +432,17 @@ fn image_mime_from_ext(name: &str) -> Option<&'static str> {
         "ico" => "image/x-icon",
         _ => return None,
     })
+}
+
+/// True when `filename` looks like a standalone HTML document (`.html`/`.htm`),
+/// so a plain `weaver artifact write report report.html` lands as the `html`
+/// kind loom renders in a sandboxed iframe — no `--kind html` needed. Only
+/// promotes from the default `markdown`; an explicit `--kind` always wins.
+fn is_html_ext(filename: Option<&str>) -> bool {
+    filename
+        .and_then(|n| n.rsplit_once('.'))
+        .map(|(_, e)| e.eq_ignore_ascii_case("html") || e.eq_ignore_ascii_case("htm"))
+        .unwrap_or(false)
 }
 
 /// Sniff a raster image's MIME type from its leading magic bytes — for content
@@ -1228,7 +1242,9 @@ async fn cmd_artifact(cmd: ArtifactCmd) -> Result<()> {
             };
             // An image is auto-wrapped as a base64 data-URI markdown doc (kind
             // forced to markdown so loom renders it inline); everything else is
-            // stored as text under the requested kind.
+            // stored as text under the requested kind. A `.html`/`.htm` file
+            // promotes the default `markdown` to `html` (loom sandboxes it in an
+            // iframe); an explicit `--kind` always wins.
             let (kind, content): (String, String) =
                 match embed_image_markdown(alt, file.as_deref(), &raw)? {
                     Some(md) => ("markdown".to_string(), md),
@@ -1239,7 +1255,13 @@ async fn cmd_artifact(cmd: ArtifactCmd) -> Result<()> {
                                  only text and image files are supported"
                             )
                         })?;
-                        (kind.trim().to_string(), text)
+                        let kind = kind.trim();
+                        let kind = if kind == "markdown" && is_html_ext(file.as_deref()) {
+                            "html".to_string()
+                        } else {
+                            kind.to_string()
+                        };
+                        (kind, text)
                     }
                 };
             // `--repo` writes the repo-shared scope (branch_id = NULL); otherwise
@@ -1626,6 +1648,16 @@ mod tests {
         // Not images: plain docs and extension-less names.
         assert_eq!(image_mime_from_ext("design.md"), None);
         assert_eq!(image_mime_from_ext("plan"), None);
+    }
+
+    #[test]
+    fn html_extensions_are_recognised_case_insensitively() {
+        assert!(is_html_ext(Some("report.html")));
+        assert!(is_html_ext(Some("./out/Dashboard.HTM")));
+        // Not HTML: other docs, extension-less names, and stdin (no filename).
+        assert!(!is_html_ext(Some("plan.md")));
+        assert!(!is_html_ext(Some("notes")));
+        assert!(!is_html_ext(None));
     }
 
     #[test]

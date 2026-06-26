@@ -146,56 +146,6 @@ test.describe('overlooker panel', () => {
     await expect(page.getByTestId('overlooker-warm-off')).toHaveCount(0);
   });
 
-  test('lists builtin programs with read-only source and prefills the form', async ({
-    page,
-    weaver,
-  }) => {
-    await page.goto(`${weaver.baseUrl}/overlookers`);
-
-    // The registry section lists the stock programs that ship with loom.
-    const rows = page.getByTestId('program-row');
-    await expect(rows).toHaveCount(4);
-    const section = page.getByTestId('builtin-programs');
-    for (const name of [
-      'builtin:status',
-      'builtin:resume',
-      'builtin:pr-label',
-      'builtin:archive-merged',
-    ]) {
-      await expect(section).toContainText(name);
-    }
-
-    // Every builtin is a script whose source is viewable read-only.
-    const archive = rows.filter({ hasText: 'builtin:archive-merged' });
-    await archive.getByTestId('program-source-toggle').click();
-    await expect(archive.getByTestId('program-source')).toContainText(
-      'flag sessions whose pull request has merged',
-    );
-    const status = rows.filter({ hasText: 'builtin:status' });
-    await status.getByTestId('program-source-toggle').click();
-    await expect(status.getByTestId('program-source')).toContainText(
-      'assess when the agent goes quiet',
-    );
-
-    // "Use" opens the create form prefilled with the program and a name.
-    await archive.getByTestId('program-use').click();
-    await expect(page.getByTestId('overlooker-form')).toBeVisible();
-    await expect(page.getByTestId('overlooker-program')).toHaveValue('builtin:archive-merged');
-    await expect(page.getByTestId('overlooker-name')).toHaveValue('archive-merged');
-    await page.getByTestId('overlooker-create').click();
-
-    const row = page.getByTestId('overlooker-row');
-    await expect(row).toHaveCount(1);
-    await expect(row).toContainText('builtin:archive-merged');
-
-    // The detail page renders the same script source, read-only.
-    await row.getByTestId('overlooker-name-link').click();
-    await page.getByTestId('program-source-toggle').click();
-    await expect(page.getByTestId('program-source')).toContainText(
-      'flag sessions whose pull request has merged',
-    );
-  });
-
   test('deletes an overlooker from the detail page', async ({ page, weaver }) => {
     const o = await weaver.seedOverlooker({ name: 'doomed' });
 

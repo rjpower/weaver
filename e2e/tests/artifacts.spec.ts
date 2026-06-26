@@ -76,7 +76,7 @@ test.describe('artifacts surface', () => {
     // Selecting an older revision re-fetches it read-only; Edit is disabled.
     await rev.selectOption('1');
     await expect(page.getByText('Viewing an older revision')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Edit' })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Edit', exact: true })).toBeDisabled();
 
     // An out-of-band CLI write (rev 3) is re-broadcast over SSE; the viewer,
     // back on latest, refreshes itself. Return to latest first.
@@ -93,7 +93,7 @@ test.describe('artifacts surface', () => {
     await expect(page.locator('.markdown-body h1')).toContainText('Notes');
 
     // Edit flips the viewer to Monaco; type an addition and save.
-    await page.getByRole('button', { name: 'Edit' }).click();
+    await page.getByRole('button', { name: 'Edit', exact: true }).click();
     await expect(page.locator('.monaco-editor')).toBeVisible();
     await page.locator('.monaco-editor').click();
     await page.keyboard.type('\n\nA user revision.');
@@ -138,6 +138,81 @@ test.describe('artifacts surface', () => {
     // re-broadcast over SSE and the list updates without a reload.
     await weaver.removeArtifact(session, 'doomed');
     await expect(page.locator('[data-artifact="doomed"]')).toHaveCount(0, { timeout: 15_000 });
+  });
+
+  test('an html artifact renders in a sandboxed iframe, with a source view', async ({
+    page,
+    weaver,
+  }) => {
+    const session = await weaver.seedSession({ goal: 'html report', name: 'artifacts-html' });
+    const html =
+      '<!doctype html><html><body><h1 id="hi">Live report</h1>' +
+      '<script>document.documentElement.dataset.ran = "1";</script></body></html>';
+    await weaver.writeArtifact(session, 'report', html, { title: 'Report', kind: 'html' });
+
+    await page.goto(`${weaver.baseUrl}/s/${session.id}/artifacts/report`);
+
+    // Preview is a sandboxed iframe: scripts run, but with no same-origin grant
+    // it cannot reach loom's cookies/API as the signed-in user.
+    const frame = page.getByTestId('artifact-html');
+    await expect(frame).toBeVisible();
+    const sandbox = (await frame.getAttribute('sandbox')) ?? '';
+    expect(sandbox).toContain('allow-scripts');
+    expect(sandbox).not.toContain('allow-same-origin');
+    // It's a real document — the markup rendered and its script executed.
+    const inner = page.frameLocator('[data-testid="artifact-html"]');
+    await expect(inner.locator('#hi')).toHaveText('Live report');
+    await expect(inner.locator('html')).toHaveAttribute('data-ran', '1');
+
+    // The Source toggle swaps the live frame for the raw HTML in Monaco.
+    await page.getByRole('button', { name: 'Source' }).click();
+    await expect(page.locator('.monaco-editor')).toBeVisible();
+    await expect(page.getByTestId('artifact-html')).toHaveCount(0);
+  });
+
+  test('pops the artifact out beside the terminal, then docks it', async ({ page, weaver }) => {
+    const session = await weaver.seedSession({ goal: 'side by side', name: 'artifacts-pop' });
+    await weaver.writeArtifact(session, 'notes', '# Notes\n\nbody\n', { title: 'Notes' });
+
+    await page.goto(`${weaver.baseUrl}/s/${session.id}/artifacts/notes`);
+    await expect(page.locator('.markdown-body h1')).toContainText('Notes');
+    // Docked: the artifact fills the work area, so the terminal is hidden.
+    await expect(page.locator('[data-term-tab="agent"]')).toBeHidden();
+
+    // Pop out → a rail appears beside the terminal: both visible at once.
+    await page.getByTestId('artifact-pop').click();
+    await expect(page.getByTestId('artifact-rail-close')).toBeVisible();
+    await expect(page.locator('[data-term-tab="agent"]')).toBeVisible(); // terminal back
+    await expect(page.locator('.markdown-body h1')).toContainText('Notes'); // artifact in the rail
+
+    // Dock back → the rail closes and the artifact returns to the work-area tab.
+    await page.getByTestId('artifact-pop').click();
+    await expect(page.getByTestId('artifact-rail-close')).toHaveCount(0);
+    await expect(page.locator('[data-term-tab="agent"]')).toBeHidden();
+    await expect(page.locator('.markdown-body h1')).toContainText('Notes');
+  });
+
+  test('Artifacts is an in-page tab — terminal ⇄ artifacts stays on the session page', async ({
+    page,
+    weaver,
+  }) => {
+    const session = await weaver.seedSession({ goal: 'tabbing', name: 'artifacts-tab' });
+    await weaver.writeArtifact(session, 'plan', '# Plan\n\nthe plan\n', { title: 'Plan' });
+
+    await page.goto(`${weaver.baseUrl}/s/${session.id}`);
+    await expect(page.locator('[data-term-tab="agent"]')).toBeVisible();
+
+    // Clicking Artifacts flips the tab in place (the tab bar stays); the panel
+    // renders and the URL deep-links, with no full-page navigation away.
+    await page.locator('[data-tab="artifacts"]').click();
+    await expect(page).toHaveURL(new RegExp(`/s/${session.id}/artifacts`));
+    await expect(page.locator('.markdown-body h1')).toContainText('Plan');
+    await expect(page.locator('[data-tab="terminal"]')).toBeVisible(); // same page, tab bar intact
+
+    // Back to Terminal — the warm terminal returns, URL back to the session.
+    await page.locator('[data-tab="terminal"]').click();
+    await expect(page).toHaveURL(`${weaver.baseUrl}/s/${session.id}`);
+    await expect(page.locator('[data-term-tab="agent"]')).toBeVisible();
   });
 
   test('an image file is embedded as a base64 data-URI and renders inline', async ({

@@ -1,47 +1,53 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue';
+import { ref, computed, watch, onMounted, onActivated, onDeactivated, onUnmounted, nextTick } from 'vue';
 import { useRouter } from 'vue-router';
 import type * as Monaco from 'monaco-editor';
-import { get, getArtifacts, getArtifact, putArtifact, deleteArtifact } from '../api';
-import type { Session, ArtifactMeta, ArtifactView } from '../types';
+import { getArtifacts, getArtifact, putArtifact, deleteArtifact } from '../api';
+import type { ArtifactMeta, ArtifactView } from '../types';
 import { theme } from '../theme';
 import { loadMonaco, monacoTheme, languageForPath } from '../monaco';
-import SessionTabs from '../components/SessionTabs.vue';
-import SessionPageHeader from '../components/SessionPageHeader.vue';
-import MarkdownView from '../components/MarkdownView.vue';
+import MarkdownView from './MarkdownView.vue';
+import HtmlArtifactView from './HtmlArtifactView.vue';
 
-// The Artifacts surface: the agent's out-of-repo documents (designs, reports,
-// the `plan`), each named, scoped (branch vs repo-shared), and versioned by
-// immutable snapshot. A list on the left, a viewer on the right with a version
-// picker and the file browser's proven preview ⇄ Monaco edit toggle — saving an
-// edit appends a new revision (`author: user`) via `putArtifact`. Deep-linkable
-// at `/s/:id/artifacts/:name`; `artifact_written` over SSE refreshes the list
-// and the open viewer. Markdown artifacts render through `MarkdownView` (GFM +
-// mermaid + the smartdoc projection: `#N` refs become live status chips).
-const props = defineProps<{ id: string; name?: string }>();
+// The artifacts surface, as a self-contained panel: a list of the agent's
+// out-of-repo documents (designs, reports, the `plan`) on the left, a viewer on
+// the right with a version picker and the file browser's proven preview ⇄ Monaco
+// edit toggle — saving an edit appends a new revision (`author: user`). Markdown
+// renders through `MarkdownView` (GFM + mermaid + the smartdoc `#N` chips); an
+// `html` artifact renders as a live document in a sandboxed iframe.
+//
+// The host (SessionDetail) places this either as a full-width work-area tab or,
+// when popped out, in a resizable rail beside the live terminal — `compact`
+// collapses the list into a dropdown so the viewer keeps its width in the rail.
+// Deep-linkable at `/s/:id/artifacts/:name`; `artifact_written` over SSE
+// refreshes the list and the open viewer.
+const props = defineProps<{
+  id: string;
+  /** Deep-linked artifact name to open (from the route). */
+  name?: string;
+  /** Narrow-rail layout: the list becomes a dropdown above the viewer. */
+  compact?: boolean;
+  /** Whether the panel is currently docked-out in the rail (drives the toggle). */
+  popped?: boolean;
+  /** Whether the surface is the one on screen. Kept mounted but hidden (so a
+   *  re-open is instant), the panel must not own the route or re-render the
+   *  viewer while it is off-screen — `active = false` makes opens silent and
+   *  defers a live refresh until it is shown again. Absent ⇒ treated as active
+   *  (standalone use). */
+  active?: boolean;
+}>();
+const emit = defineEmits<{ togglePop: []; close: [] }>();
+
 const router = useRouter();
 
-// Selecting a work-area tab returns to the session page, carrying which tab so
-// Overview lands on Overview (Terminal is the default).
-function selectTab(t: 'terminal' | 'overview' | 'conversation') {
-  router.push(t === 'terminal' ? `/s/${props.id}` : `/s/${props.id}?tab=${t}`);
-}
-
-const session = ref<Session | null>(null);
 const list = ref<ArtifactMeta[]>([]);
 const listError = ref('');
 const selected = ref<string>('');
 
-// A header write (rename / acknowledge / archive / adopt) happened — re-fetch
-// the session so the shared header reflects it, and refresh the list.
-async function reloadSession() {
-  try {
-    session.value = (await get(`/sessions/${props.id}`)) as Session;
-  } catch {
-    // Best-effort — the list is the point of this view.
-  }
-  await loadList();
-}
+// True once we're the visible surface. Default-on so the panel works standalone.
+const isActive = computed(() => props.active !== false);
+// An SSE write landed while we were hidden — refresh the open view on return.
+const pendingRefresh = ref(false);
 
 async function loadList() {
   try {
@@ -62,13 +68,19 @@ const editing = ref(false);
 const saving = ref(false);
 const removing = ref(false);
 
-// Markdown gets the rendered Preview; other kinds show source in Monaco.
-const isMarkdown = computed(() => (view.value?.meta.kind ?? 'markdown') === 'markdown');
-// The pseudo-path that drives Monaco's language + the markdown image base. The
+const kind = computed(() => view.value?.meta.kind ?? 'markdown');
+const isMarkdown = computed(() => kind.value === 'markdown');
+const isHtml = computed(() => kind.value === 'html');
+// Markdown and HTML both have a rendered Preview ⇄ Source toggle; every other
+// kind is shown as read-only source only.
+const isRenderable = computed(() => isMarkdown.value || isHtml.value);
+// The pseudo-path drives Monaco's language and the markdown image base. The
 // artifact name carries no extension, so stamp one on from the kind.
 const pseudoPath = computed(() => {
   const name = view.value?.meta.name ?? selected.value;
-  return isMarkdown.value ? `${name}.md` : name;
+  if (isMarkdown.value) return `${name}.md`;
+  if (isHtml.value) return `${name}.html`;
+  return name;
 });
 
 type ViewMode = 'preview' | 'source';
@@ -106,19 +118,24 @@ async function mountEditor(content: string, readOnly: boolean) {
   monaco.editor.setTheme(monacoTheme(theme.value === 'dark'));
 }
 
-// Load an artifact (optionally a specific revision) into the viewer.
-async function openArtifact(name: string, rev?: number) {
+// Load an artifact (optionally a specific revision) into the viewer. `keepMode`
+// refreshes content without resetting the preview/source choice — for a live
+// re-fetch (an SSE write to the open artifact), where snapping back to Preview
+// would yank the reader out of a Source view they were reading.
+async function openArtifact(name: string, rev?: number, opts?: { keepMode?: boolean }) {
   selected.value = name;
   viewRev.value = rev ?? null;
   editing.value = false;
   loading.value = true;
   viewError.value = '';
-  // Keep the URL in step so the view is deep-linkable / refresh-stable.
+  // Keep the URL in step so the view is deep-linkable / refresh-stable — but
+  // only while we're the surface on screen, so a hidden panel (the user moved
+  // back to the terminal) never yanks the route back to artifacts.
   const target = `/s/${props.id}/artifacts/${encodeURIComponent(name)}`;
-  if (router.currentRoute.value.path !== target) router.replace(target);
+  if (isActive.value && router.currentRoute.value.path !== target) router.replace(target);
   try {
     view.value = await getArtifact(props.id, name, rev);
-    viewMode.value = isMarkdown.value ? 'preview' : 'source';
+    if (!opts?.keepMode) viewMode.value = isRenderable.value ? 'preview' : 'source';
     await renderViewer();
   } catch (e) {
     viewError.value = (e as Error).message;
@@ -137,7 +154,7 @@ async function renderViewer() {
     await nextTick();
     await mountEditor(view.value.content, true);
   } else if (!editing.value) {
-    // Preview is the MarkdownView component — drop any Monaco model.
+    // Preview is a render component (markdown / html) — drop any Monaco model.
     teardownEditor();
   }
 }
@@ -154,6 +171,12 @@ function setMode(m: ViewMode) {
 function selectRev(e: Event) {
   const v = (e.target as HTMLSelectElement).value;
   openArtifact(selected.value, v ? Number(v) : undefined);
+}
+
+// The compact list dropdown: switch artifacts from a <select>.
+function selectFromDropdown(e: Event) {
+  const v = (e.target as HTMLSelectElement).value;
+  if (v) openArtifact(v);
 }
 
 const onLatest = computed(
@@ -187,7 +210,7 @@ async function save() {
     view.value = await putArtifact(props.id, selected.value, { content });
     viewRev.value = null;
     editing.value = false;
-    viewMode.value = isMarkdown.value ? 'preview' : 'source';
+    viewMode.value = isRenderable.value ? 'preview' : 'source';
     await loadList();
     await renderViewer();
   } catch (e) {
@@ -244,15 +267,27 @@ function scopeBadge(a: ArtifactMeta): { label: string; title: string } {
 // --- SSE-driven refresh ----------------------------------------------------
 
 let source: EventSource | null = null;
+function closeStream() {
+  source?.close();
+  source = null;
+}
 function openStream() {
+  closeStream();
   source = new EventSource(`/api/sessions/${props.id}/events`);
   source.addEventListener('artifact_written', (e) => {
-    const d = JSON.parse((e as MessageEvent).data).data as { name?: string };
+    const d = JSON.parse((e as MessageEvent).data).data as { name?: string; rev?: number };
     loadList().catch(() => {});
     // If the artifact that just changed is the one we're viewing (and we're not
-    // mid-edit), refresh the viewer to its new latest.
+    // mid-edit), refresh the viewer to its new latest — but only while visible;
+    // hidden, we defer the re-render until the panel is shown again.
     if (d?.name && d.name === selected.value && !editing.value) {
-      openArtifact(selected.value).catch(() => {});
+      // Ignore a replayed/own event we already reflect (the stream replays
+      // recent writes on connect): re-opening would needlessly reset the view —
+      // and snap a reader out of Source back to Preview. Only a genuinely newer
+      // revision refreshes, and it keeps the current preview/source choice.
+      if (d.rev != null && onLatest.value && view.value && d.rev <= view.value.meta.rev) return;
+      if (isActive.value) openArtifact(selected.value, undefined, { keepMode: true }).catch(() => {});
+      else pendingRefresh.value = true;
     }
   });
   source.addEventListener('artifact_deleted', (e) => {
@@ -272,7 +307,7 @@ watch(theme, () => {
   if (editor) loadMonaco().then((m) => m.editor.setTheme(monacoTheme(theme.value === 'dark')));
 });
 
-// A deep-link name change (router navigation within the view) re-opens.
+// A deep-link name change (route navigation from the host) re-opens.
 watch(
   () => props.name,
   (name) => {
@@ -280,39 +315,59 @@ watch(
   },
 );
 
-onMounted(async () => {
-  try {
-    session.value = (await get(`/sessions/${props.id}`)) as Session;
-  } catch {
-    // Header detail is best-effort; the list is the point.
+// On becoming the visible surface again: restore the URL to the open artifact
+// (so it stays deep-linkable) and apply any refresh that landed while hidden.
+watch(isActive, (now) => {
+  if (!now || !selected.value) return;
+  if (pendingRefresh.value) {
+    pendingRefresh.value = false;
+    openArtifact(selected.value, viewRev.value ?? undefined, { keepMode: true }).catch(() => {});
+  } else {
+    const target = `/s/${props.id}/artifacts/${encodeURIComponent(selected.value)}`;
+    if (router.currentRoute.value.path !== target) router.replace(target);
   }
+});
+
+onMounted(async () => {
   await loadList();
   openStream();
   // Open the deep-linked artifact, else the well-known `plan`, else the first.
   const want =
-    props.name ||
-    (list.value.some((a) => a.name === 'plan') ? 'plan' : list.value[0]?.name);
+    props.name || (list.value.some((a) => a.name === 'plan') ? 'plan' : list.value[0]?.name);
   if (want) openArtifact(want);
 });
 
+// The panel rides inside SessionDetail's <keep-alive>. Pause the status SSE
+// while the page is parked (mirroring SessionDetail) so idle EventSources don't
+// stack against the browser's per-origin cap; onMounted owns the first open, so
+// guard the return-open on `source`.
+onActivated(() => {
+  if (source) return;
+  openStream();
+});
+onDeactivated(closeStream);
+
 onUnmounted(() => {
-  source?.close();
+  closeStream();
   teardownEditor();
 });
 </script>
 
 <template>
-  <div class="flex min-h-[28rem] flex-1 flex-col px-5 py-3">
-    <SessionPageHeader v-if="session" :ws="session" @reload="reloadSession" />
-    <SessionTabs :tab="'artifacts'" :id="props.id" :issue-count="0" @select="selectTab" />
+  <div class="flex h-full min-h-0 flex-col rounded border border-line bg-surface overflow-hidden">
+    <p v-if="listError" class="border-b border-line px-3 py-1.5 text-xs text-block">
+      {{ listError }}
+    </p>
 
-    <p v-if="listError" class="mb-3 text-sm text-block">{{ listError }}</p>
-
-    <!-- Two-pane body: artifact list + viewer. -->
-    <div class="flex min-h-0 flex-1 gap-3 rounded border border-line bg-surface overflow-hidden">
-      <!-- List -->
-      <div class="flex w-72 shrink-0 flex-col border-r border-line">
-        <div class="border-b border-line px-2 py-1.5 text-[11px] font-medium uppercase tracking-wide text-faint">
+    <div class="flex min-h-0 flex-1" :class="compact ? 'flex-col' : ''">
+      <!-- List — a sidebar at full width, a dropdown in the narrow rail. -->
+      <div
+        v-if="!compact"
+        class="flex w-72 shrink-0 flex-col border-r border-line"
+      >
+        <div
+          class="border-b border-line px-2 py-1.5 text-[11px] font-medium uppercase tracking-wide text-faint"
+        >
           Artifacts <span class="text-faint">({{ list.length }})</span>
         </div>
         <div class="min-h-0 flex-1 overflow-auto py-1 text-sm">
@@ -326,10 +381,15 @@ onUnmounted(() => {
             @click="openArtifact(a.name)"
           >
             <span class="flex items-center gap-1.5">
-              <span class="min-w-0 truncate font-mono text-xs" :class="selected === a.name ? 'text-fg' : 'text-muted'">
+              <span
+                class="min-w-0 truncate font-mono text-xs"
+                :class="selected === a.name ? 'text-fg' : 'text-muted'"
+              >
                 {{ a.name }}
               </span>
-              <span class="pill ml-auto shrink-0" :title="scopeBadge(a).title">{{ scopeBadge(a).label }}</span>
+              <span class="pill ml-auto shrink-0" :title="scopeBadge(a).title">{{
+                scopeBadge(a).label
+              }}</span>
               <span class="shrink-0 font-mono text-2xs text-faint">v{{ a.rev }}</span>
             </span>
             <span v-if="a.title" class="truncate text-xs text-faint">{{ a.title }}</span>
@@ -338,6 +398,24 @@ onUnmounted(() => {
             No artifacts yet. Agents write them with <code>weaver artifact write</code>.
           </p>
         </div>
+      </div>
+
+      <!-- Compact list: a dropdown header for the rail. -->
+      <div
+        v-else
+        class="flex shrink-0 items-center gap-2 border-b border-line px-2 py-1.5 text-xs"
+      >
+        <span class="text-faint">Artifact</span>
+        <select
+          class="min-w-0 flex-1 rounded border border-line bg-surface px-1.5 py-0.5 text-xs text-fg"
+          :value="selected"
+          @change="selectFromDropdown"
+        >
+          <option v-if="!list.length" value="">No artifacts yet</option>
+          <option v-for="a in list" :key="a.id" :value="a.name">
+            {{ a.name }}{{ a.branch_id == null ? ' · shared' : '' }} · v{{ a.rev }}
+          </option>
+        </select>
       </div>
 
       <!-- Viewer -->
@@ -365,11 +443,13 @@ onUnmounted(() => {
                 </option>
               </select>
             </label>
+          </template>
 
-            <div class="ml-auto flex items-center gap-2">
-              <!-- Preview ⇄ Source toggle (markdown only; hidden while editing). -->
+          <div class="ml-auto flex items-center gap-2">
+            <template v-if="view">
+              <!-- Preview ⇄ Source toggle (markdown/html; hidden while editing). -->
               <div
-                v-if="isMarkdown && !editing"
+                v-if="isRenderable && !editing"
                 class="flex items-center overflow-hidden rounded border border-line"
               >
                 <button
@@ -384,7 +464,11 @@ onUnmounted(() => {
               </div>
 
               <template v-if="!editing">
-                <button class="btn-secondary px-2.5 py-1 text-xs" :disabled="!onLatest" @click="edit">
+                <button
+                  class="btn-secondary px-2.5 py-1 text-xs"
+                  :disabled="!onLatest"
+                  @click="edit"
+                >
                   Edit
                 </button>
                 <button
@@ -400,22 +484,54 @@ onUnmounted(() => {
                 <button class="btn-primary px-2.5 py-1 text-xs" :disabled="saving" @click="save">
                   {{ saving ? 'Saving…' : 'Save' }}
                 </button>
-                <button class="btn-secondary px-2.5 py-1 text-xs" :disabled="saving" @click="cancelEdit">
+                <button
+                  class="btn-secondary px-2.5 py-1 text-xs"
+                  :disabled="saving"
+                  @click="cancelEdit"
+                >
                   Cancel
                 </button>
               </template>
-            </div>
-          </template>
+            </template>
+
+            <!-- Pop out beside the terminal / dock back into the tab. -->
+            <button
+              class="rounded border border-line px-1.5 py-1 text-muted hover:bg-subtle hover:text-fg"
+              data-testid="artifact-pop"
+              :title="popped ? 'Dock back into the tab' : 'Pop out beside the terminal'"
+              @click="emit('togglePop')"
+            >
+              {{ popped ? '⤡ Dock' : '⤢ Pop out' }}
+            </button>
+            <!-- Close the rail entirely (popped only) — back to the plain page. -->
+            <button
+              v-if="popped"
+              class="rounded border border-line px-1.5 py-1 text-muted hover:bg-subtle hover:text-fg"
+              data-testid="artifact-rail-close"
+              title="Close the artifact panel"
+              aria-label="Close artifact panel"
+              @click="emit('close')"
+            >
+              ✕
+            </button>
+          </div>
         </div>
 
-        <p v-if="!onLatest && !editing" class="border-b border-line bg-subtle/40 px-3 py-1 text-xs text-faint">
+        <p
+          v-if="!onLatest && !editing"
+          class="border-b border-line bg-subtle/40 px-3 py-1 text-xs text-faint"
+        >
           Viewing an older revision — Edit always starts from the latest.
         </p>
 
         <!-- Content -->
         <div class="relative min-h-0 flex-1 bg-code">
           <!-- Monaco host: always mounted (v-show) so its ref survives mode flips. -->
-          <div v-show="(viewMode === 'source' || editing) && view" ref="host" class="h-full w-full"></div>
+          <div
+            v-show="(viewMode === 'source' || editing) && view"
+            ref="host"
+            class="h-full w-full"
+          ></div>
 
           <MarkdownView
             v-if="view && isMarkdown && viewMode === 'preview' && !editing"
@@ -426,13 +542,28 @@ onUnmounted(() => {
             class="h-full w-full"
           />
 
+          <HtmlArtifactView
+            v-if="view && isHtml && viewMode === 'preview' && !editing"
+            :content="view.content"
+            class="h-full w-full"
+          />
+
           <div
             v-if="!view && !loading"
             class="flex h-full w-full flex-col items-center justify-center gap-2 text-sm text-faint"
           >
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-              stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
-              class="opacity-60">
+            <svg
+              width="28"
+              height="28"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.25"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+              class="opacity-60"
+            >
               <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
               <path d="M14 2v4a2 2 0 0 0 2 2h4" />
             </svg>

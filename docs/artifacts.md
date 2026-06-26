@@ -114,11 +114,21 @@ the survey above:
   agent/user edits safe — last write is a new revision, not a lost update.
 - **Kind-typed, markdown-first.** `kind` defaults to `markdown` (GFM +
   mermaid via the existing `MarkdownView`); other kinds render as source
-  until they earn a renderer. Images (screenshots, diagrams) need no blob
-  store: `write` recognises an image file — by extension, or by magic bytes
-  on stdin — and embeds it as a base64 data-URI inside a markdown wrapper,
-  which `MarkdownView` already renders inline (the renderer passes `data:`
-  URIs through untouched; DOMPurify permits them on `<img>`).
+  until they earn a renderer. Two more render natively:
+  - **`html`** — a self-contained HTML document (a report, a chart, a small
+    interactive demo) shown as a live page in a sandboxed `<iframe>`. The frame
+    is `srcdoc` with `allow-scripts` but **not** `allow-same-origin`, so its
+    scripts run in a unique opaque origin and cannot read loom's cookies or call
+    the API as the signed-in user — a hostile artifact is sealed off from the
+    session. A `.html`/`.htm` file picks the kind on its own (like image
+    sniffing); `--kind html` is the explicit form. Preview ⇄ Source toggles
+    between the rendered page and the raw HTML; "↗ Open" loads it full-screen in
+    a new tab (its own `blob:` origin, still isolated).
+  - **Images** (screenshots, diagrams) need no blob store: `write` recognises an
+    image file — by extension, or by magic bytes on stdin — and embeds it as a
+    base64 data-URI inside a markdown wrapper, which `MarkdownView` already
+    renders inline (the renderer passes `data:` URIs through untouched; DOMPurify
+    permits them on `<img>`).
 - **URL-addressable.** `weaver artifact write` prints the dashboard URL
   (`/s/<session>/artifacts/<name>`) so the agent can hand it to the user in
   a status message or PR comment — the Amp-thread lesson: the URL is the
@@ -281,10 +291,15 @@ update the issues; when issues change shape, update the doc's references.*
 
 ### Loom UI
 
-- **Session detail** gains an Artifacts surface: list + viewer
-  (`MarkdownView`), version picker, the file browser's proven
-  preview ⇄ Monaco toggle for user edits (each save = new revision,
-  `author: user`). Deep link `/s/:id/artifacts/:name`.
+- **Session detail** gains an Artifacts surface (`ArtifactsPanel`): list +
+  viewer (`MarkdownView` / `HtmlArtifactView` / Monaco source), version picker,
+  the file browser's proven preview ⇄ Monaco toggle for user edits (each save =
+  new revision, `author: user`). It is a tab *within* the session page — a
+  kept-alive panel served from `SessionDetail` (the `/s/:id/artifacts/:name`
+  deep link resolves to the same instance), so moving terminal ⇄ artifacts is an
+  instant flip on the warm page, not a route swap. The panel can **pop out** into
+  a resizable rail beside the live terminal (mirroring the embedded-editor
+  panel), so the user reads an artifact and watches the agent at once.
 - **Overview** pins the well-known `plan` artifact where `SessionPlan`
   renders today; the goal renders as projected markdown above it.
   `SessionPlan.vue`'s reconcile modal goes; its render path becomes the
