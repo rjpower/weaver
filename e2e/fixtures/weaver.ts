@@ -131,7 +131,7 @@ export interface WeaverFixture {
     session: Session,
     name: string,
     content: string | Buffer,
-    opts?: { title?: string; repo?: boolean },
+    opts?: { title?: string; repo?: boolean; kind?: string },
   ): Promise<void>;
   /** Remove an artifact via `weaver artifact rm` — drops it and its whole
    *  history. `--repo` targets the repo-shared row when a branch copy shadows it. */
@@ -492,6 +492,7 @@ export const test = base.extend<{ weaver: WeaverFixture }, WorkerFixtures>({
         // it repo-shared). The first write creates the envelope.
         const args = ['artifact', 'write', name, '-'];
         if (opts?.title) args.push('--title', opts.title);
+        if (opts?.kind) args.push('--kind', opts.kind);
         if (opts?.repo) args.push('--repo');
         execFileSync(WEAVER_BINARY, args, {
           env: { ...childEnv, WEAVER_BRANCH: session.branch.id },

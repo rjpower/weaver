@@ -27,9 +27,8 @@ watch(authed, (ok) => (ok ? startFleetPoll() : stopFleetPoll()), { immediate: tr
 // Views kept alive across navigation so returning is instant — no remount, no
 // refetch flash, no entrance-animation replay. The list views return exactly as
 // left (scroll, filter, the open create form); the session detail page returns
-// to its warm terminal (scrollback intact, no reconnect) after the Artifacts
-// round-trip. Artifacts/Chat are NOT cached — Monaco is heavy and shouldn't
-// stay resident, and Chat is cheap to remount.
+// to its warm terminal (scrollback intact, no reconnect). Chat is NOT cached —
+// it is cheap to remount.
 const CACHED_VIEWS = ['SessionList', 'Issues', 'Overlookers', 'SessionDetail'];
 
 // Cache key per cached instance. List views are singletons (keyed by their
@@ -48,8 +47,11 @@ const CACHED_VIEWS = ['SessionList', 'Issues', 'Overlookers', 'SessionDetail'];
 // to bound the detail terminals.
 const KEEP_ALIVE_MAX = 3;
 function cacheKey(route: { path: string; params: Record<string, string | string[]> }): string {
+  // Every `/s/:id…` path (the work tabs and the Artifacts deep-links) is the
+  // same SessionDetail instance, so they share one cache key — switching to
+  // artifacts and back is a tab flip on the warm page, never a remount.
   const id = route.params.id;
-  if (typeof id === 'string' && route.path === `/s/${id}`) return `s:${id}`;
+  if (typeof id === 'string' && route.path.startsWith(`/s/${id}`)) return `s:${id}`;
   return route.path;
 }
 </script>

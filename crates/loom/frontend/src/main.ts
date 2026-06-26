@@ -11,7 +11,6 @@ import { createRouter, createWebHistory } from 'vue-router';
 import App from './App.vue';
 import SessionList from './views/SessionList.vue';
 import SessionDetail from './views/SessionDetail.vue';
-import Artifacts from './views/Artifacts.vue';
 import Settings from './views/Settings.vue';
 import Issues from './views/Issues.vue';
 import Overlookers from './views/Overlookers.vue';
@@ -32,8 +31,11 @@ const router = createRouter({
     // The old Files browser is gone — the embedded editor (a side panel on the
     // detail page) is the file surface now. Redirect stale links there.
     { path: '/s/:id/files', redirect: (to) => `/s/${to.params.id}` },
-    { path: '/s/:id/artifacts', component: Artifacts, props: true },
-    { path: '/s/:id/artifacts/:name', component: Artifacts, props: true },
+    // Artifacts is a tab *within* the session page (a kept-alive panel that can
+    // pop out beside the terminal), not a page of its own — so these resolve to
+    // the same SessionDetail instance and stay deep-linkable.
+    { path: '/s/:id/artifacts', component: SessionDetail, props: true },
+    { path: '/s/:id/artifacts/:name', component: SessionDetail, props: true },
     { path: '/issues', component: Issues },
     { path: '/chat', component: Chat },
     { path: '/overlookers', component: Overlookers },

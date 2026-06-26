@@ -1,29 +1,34 @@
 <script setup lang="ts">
-// Work-area sub-nav. Terminal/Overview are component-local tabs (the terminal
-// must never unmount, so the parent flips a ref and v-shows it); Artifacts is a
-// real route (Monaco is heavy and mustn't load on session-open). Neutral
-// underline indicator — no loud fills; only the active tab gets text-fg + an
-// accent underline.
+// Work-area sub-nav. Every tab is a local flip the parent (SessionDetail) acts
+// on: Terminal/Overview/Conversation v-show their kept-alive panes; Artifacts
+// drives the route (and the lazy artifacts panel) and can be popped out into a
+// rail beside the terminal. Neutral underline indicator — no loud fills; only
+// the active tab gets text-fg + an accent underline.
 //
 // Terminal is the working zone (the live agent); Overview is the read-only
 // context (goal, claimed issues, activity) — the issue count rides on the
-// Overview tab as a quiet pill rather than owning a tab of its own. Artifacts is
-// the agent's out-of-repo documents (designs, reports, the plan). The worktree
-// files live in the embedded editor (the side panel), not a tab.
+// Overview tab as a quiet pill. Artifacts is the agent's out-of-repo documents
+// (designs, reports, the plan). The worktree files live in the embedded editor
+// (the side panel), not a tab.
 type Tab = 'terminal' | 'overview' | 'conversation' | 'artifacts';
 
-// The Artifacts tab is a real navigation; the rest are local.
-type LocalTab = Exclude<Tab, 'artifacts'>;
+defineProps<{
+  tab: Tab;
+  id: string;
+  issueCount: number;
+  /** Artifacts is open in the rail (popped out) rather than the work area. */
+  artifactsPopped?: boolean;
+}>();
+defineEmits<{ select: [Tab] }>();
 
-defineProps<{ tab: Tab; id: string; issueCount: number }>();
-defineEmits<{ select: [LocalTab] }>();
-
-const LOCAL_TABS: { key: LocalTab; label: string }[] = [
+const TABS: { key: Tab; label: string }[] = [
   { key: 'terminal', label: 'Terminal' },
   { key: 'overview', label: 'Overview' },
   // The agent's chat with the model — live, and (via the archive capture) still
   // here to review after the terminal is gone.
   { key: 'conversation', label: 'Conversation' },
+  // The agent's out-of-repo documents; lazily mounts its (heavy) viewer.
+  { key: 'artifacts', label: 'Artifacts' },
 ];
 </script>
 
@@ -32,29 +37,24 @@ const LOCAL_TABS: { key: LocalTab; label: string }[] = [
        with the title above. -->
   <nav class="mb-2 flex items-center gap-1 border-b border-line pl-0.5 text-sm">
     <button
-      v-for="t in LOCAL_TABS"
+      v-for="t in TABS"
       :key="t.key"
       type="button"
       :data-tab="t.key"
       class="-mb-px border-b-2 px-2.5 py-1.5"
-      :class="tab === t.key
-        ? 'border-accent text-fg font-medium'
-        : 'border-transparent text-muted hover:text-fg'"
+      :class="
+        tab === t.key || (t.key === 'artifacts' && artifactsPopped)
+          ? 'border-accent text-fg font-medium'
+          : 'border-transparent text-muted hover:text-fg'
+      "
       @click="$emit('select', t.key)"
     >
       {{ t.label }}
       <span v-if="t.key === 'overview' && issueCount" class="pill ml-1">{{ issueCount }}</span>
+      <!-- When popped out, the Artifacts surface lives in the rail, not here —
+           a small glyph marks it open without claiming the work area. -->
+      <span v-if="t.key === 'artifacts' && artifactsPopped" class="ml-1 text-faint" title="Open in the side panel">⤢</span>
     </button>
-    <router-link
-      :to="`/s/${id}/artifacts`"
-      data-tab="artifacts"
-      class="-mb-px border-b-2 px-2.5 py-1.5"
-      :class="tab === 'artifacts'
-        ? 'border-accent text-fg font-medium'
-        : 'border-transparent text-muted hover:text-fg'"
-    >
-      Artifacts
-    </router-link>
     <!-- The tab row's right side is otherwise dead space — hosts compact,
          always-relevant extras (the scratch attach strip on the detail page). -->
     <div class="ml-auto flex min-w-0 items-center">
