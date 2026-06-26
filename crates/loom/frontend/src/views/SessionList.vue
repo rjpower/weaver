@@ -10,7 +10,7 @@ import TagPill from '../components/TagPill.vue';
 import GithubStatus from '../components/GithubStatus.vue';
 import ScratchPicker from '../components/ScratchPicker.vue';
 import { timeAgo } from '../lib/time';
-import { effectiveAttention, idleTag, lifecycleDot, messageOf, quietTags, signalChips } from '../lib/sessionState';
+import { effectiveAttention, idleTag, lifecycleDot, messageOf, priorityRank, quietTags, signalChips } from '../lib/sessionState';
 import { useFleet } from '../lib/sessionsStore';
 import { del } from '../api';
 
@@ -120,17 +120,18 @@ const treeRows = computed<TreeRow[]>(() => {
       roots.push(s);
     }
   }
-  // Attention rank for a single session: blocked is louder than attention is
-  // louder than ok. Used to float urgent threads to the top. Uses the resolved
-  // signal (agent's own report or a non-stale overlooker mark) so a triaged
-  // thread floats too — matching visibleSessions/counts above.
-  const rankOf = (s: Session): number => {
-    const lvl = effectiveAttention(s).level;
-    return lvl === 'blocked' ? 2 : lvl === 'attention' ? 1 : 0;
-  };
-  // Memoized max attention rank across a session's whole subtree (itself + all
-  // descendants), so a thread surfaces at the urgency of its loudest member.
-  // The cycle guard mirrors walk()'s: a parent link loop can't spin us forever.
+  // Render rank for a single session: blocked is louder than attention is louder
+  // than the calm default, and a parked row (waiting on an external reviewer —
+  // nothing for the user to do) sinks below it. Used to float urgent threads to
+  // the top and sink parked ones to the bottom. Uses the resolved signal (agent's
+  // own report or a non-stale overlooker mark) so a triaged thread floats too —
+  // matching visibleSessions/counts above.
+  const rankOf = (s: Session): number => priorityRank(s);
+  // Memoized max render rank across a session's whole subtree (itself + all
+  // descendants), so a thread surfaces at the urgency of its loudest member — and
+  // a parked parent with live (rank-0) children stays at the calm default rather
+  // than sinking the whole thread. The cycle guard mirrors walk()'s: a parent
+  // link loop can't spin us forever.
   const rankCache = new Map<string, number>();
   const ranking = new Set<string>();
   const subtreeRank = (s: Session): number => {

@@ -225,7 +225,13 @@ top-level (`id`, `status`, `work_dir`, `term_session`, `agent_kind`, `model`,
 `(key, value)` annotation on a branch; the well-known keys are `attention` (the
 agent's self-report) and `triage` (an overlooker's assessment), and any other
 key is a free-form, quiet pill. Absence of a key is the calm/default state —
-there is no stored `ok` value; the list is empty for an unmarked branch.
+there is no stored `ok` value; the list is empty for an unmarked branch. The
+signal is **value-driven**, with a ladder on either side of calm: a value on the
+attention ladder (`attention`/`blocked`) raises the branch on the dashboard
+whatever its key, while a value on the *parked* ladder (`review` — the review
+watch's `awaiting: review` mark) sinks it *below* the calm default in the fleet
+sort, the quiet "waiting on an external actor, nothing for the user to do" end of
+the spectrum (`weaver_core::tags::{ATTENTION_VALUES, PARKED_VALUES}`).
 
 `SessionView::parent_id` is the branch id of the session that **launched** this
 one — the parent in loom's session tree — or `null` for a top-level session. It
@@ -523,10 +529,14 @@ A round runs the **program** the overlooker names:
   `builtin:status` (stamp a `triage` mark on each in-scope session, judging
   via the configured `prompt` through the daemon's one-shot agent when
   available, else mirroring the agent's own `attention` tag),
-  `builtin:pr-label` (flag sessions whose open PR lacks the loom label) and
-  `builtin:archive-merged` (flag live sessions whose PR has merged). The last
-  two are **read-only**: they record `would:` actions and mutate nothing — the
-  actual archive is still `github.archive_on_merge`, above. The Overlooker
+  `builtin:review-wait` (park a session whose open, non-draft PR awaits an
+  external review — `review_decision` `REVIEW_REQUIRED` — under a quiet
+  `awaiting: review` mark that sinks it below the calm default in the fleet
+  sort, and clear it once review lands, the PR merges, or it un-drafts; needs
+  `mark`), `builtin:pr-label` (flag sessions whose open PR lacks the loom label)
+  and `builtin:archive-merged` (flag live sessions whose PR has merged). The
+  last two are **read-only**: they record `would:` actions and mutate nothing —
+  the actual archive is still `github.archive_on_merge`, above. The Overlooker
   panel and `loom overlooker programs` list the registry; script sources
   render read-only (they ship with the binary).
 - **A custom program file** — an absolute path, conventionally

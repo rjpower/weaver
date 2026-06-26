@@ -9,6 +9,21 @@ export type Attention = 'ok' | 'attention' | 'blocked';
 // pill. Mirrors weaver-core's `ATTENTION_VALUES`.
 const SEVERITY: Record<string, number> = { attention: 1, blocked: 2 };
 
+// The quiet mirror of SEVERITY: values that PARK a row *below* the calm default
+// in the fleet sort. A parked session is waiting on an external actor (a human
+// PR reviewer, …) and needs nothing from the user, so the dashboard sinks it
+// under the live-but-calm rows a scanning user should look at first. Like
+// loudness, parking is value-driven — any key holding such a value parks, so a
+// watch picks its own axis key (e.g. `awaiting`) and the value carries the
+// meaning. Quiet by design (never a badge); the two ladders are disjoint.
+// Mirrors weaver-core's `PARKED_VALUES`.
+const PARKED: Record<string, number> = { review: -1 };
+
+// Sort rank below the calm default for a parked value, or 0 if it doesn't park.
+function parkOf(value: string | undefined): number {
+  return (value && PARKED[value]) || 0;
+}
+
 // The soothing, quiet `idle` mark loom stamps when an agent goes quiet (a
 // finished turn or a `waiting` lull): the calm "resting, no one needed" state.
 // It carries the quiet value `idle`, so it is never loud — an idle agent no
@@ -120,6 +135,29 @@ export function effectiveAttention(s: Session): EffectiveAttention {
   const top = [...pool].sort(louder)[0];
 
   return { ...markOf(s, top), stale };
+}
+
+// Whether a session is *parked*: calm (no loud signal) yet carrying a tag whose
+// value is on the PARKED ladder — work waiting on an external actor (a human PR
+// reviewer, …) that needs nothing from the user. A loud signal always wins: a
+// session that needs a human is never parked, however else it's tagged. Archived
+// sessions are never parked (they read through their own terminal badge).
+export function isParked(s: Session): boolean {
+  if (s.status === 'archived') return false;
+  if (loudTags(s).length > 0) return false;
+  return (s.branch.tags ?? []).some((t) => parkOf(t.value) < 0);
+}
+
+// The fleet-sort rank of a single session: the loud ladder raises a row (blocked
+// 2 > attention 1) via the resolved attention signal; a parked row sinks below
+// the calm default (-1); everything else is the calm default (0). SessionList
+// floats a thread to the max rank across its subtree, so a parked parent with
+// live children stays put — only a wholly-parked thread sinks to the bottom.
+export function priorityRank(s: Session): number {
+  const lvl = effectiveAttention(s).level;
+  if (lvl === 'blocked') return 2;
+  if (lvl === 'attention') return 1;
+  return isParked(s) ? -1 : 0;
 }
 
 // One loud tag surfaced as an individually-dismissable chip. Unlike

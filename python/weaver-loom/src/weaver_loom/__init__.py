@@ -79,6 +79,15 @@ LOUD_VALUES = ("attention", "blocked")
 IDLE_KEY = "idle"
 IDLE_VALUE = "idle"
 
+#: The quiet values that **park** a session *below* the calm default in the
+#: dashboard's fleet sort — the opposite end of the ladder from
+#: :data:`LOUD_VALUES`. A parked session is waiting on an external actor (a human
+#: PR reviewer, …) and needs nothing from the user, so a scanning user skips past
+#: it. The value names what is awaited (``review``, …); a watch picks its own axis
+#: key and the value carries the meaning. Quiet by design — never a badge.
+#: Mirrors weaver-core's ``PARKED_VALUES``.
+PARKED_VALUES = ("review",)
+
 
 def parse_judgement(text):
     """Parse an agent judgement into ``(level, note)``, or ``None``.

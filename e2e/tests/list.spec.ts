@@ -136,6 +136,42 @@ test.describe('session list view', () => {
     expect(updated.branch.tags.find((t) => t.key === 'priority')).toBeUndefined();
   });
 
+  test('a session awaiting external review is parked below the calm default', async ({
+    page,
+    weaver,
+  }) => {
+    // Three sessions, created oldest→newest: a parked one (its PR awaits an
+    // external reviewer), a plainly-calm one, and one the agent raised. The
+    // review watch parks the first by stamping the quiet `awaiting: review` mark.
+    const parked = await weaver.seedSession({ goal: 'Awaiting review', name: 'parked-low' });
+    const calm = await weaver.seedSession({ goal: 'Quietly working', name: 'calm-mid' });
+    const attn = await weaver.seedSession({ goal: 'Needs a decision', name: 'top-attn' });
+    await weaver.setTag(parked, 'awaiting', 'review', {
+      note: 'PR #7 review required — waiting on an external reviewer',
+      by: 'review-wait',
+    });
+    await weaver.setStatus(attn, 'attention', 'which approach?');
+
+    await page.goto(weaver.baseUrl);
+
+    // Sort order top→bottom: the raised row floats up, the parked row sinks below
+    // the calm default — so a scanning user meets what needs them first and the
+    // "nothing to do, waiting on a reviewer" row last.
+    const ids = await page
+      .getByTestId('session-card')
+      .evaluateAll((els) => els.map((e) => e.getAttribute('data-session-id')));
+    expect(ids).toEqual([attn.id, calm.id, parked.id]);
+
+    // The parked row carries the quiet `awaiting: review` pill (no loud chip) and
+    // does not count toward "needs attention" — the user has no action there.
+    const card = page.locator(`[data-session-id="${parked.id}"]`);
+    const pill = card.getByTestId('tag-pill');
+    await expect(pill).toContainText('awaiting');
+    await expect(pill).toContainText('review');
+    await expect(card.getByTestId('signal-chip')).toHaveCount(0);
+    await expect(page.getByTestId('filter-attention')).toContainText('1');
+  });
+
   test('clicking a card navigates to the detail view', async ({ page, weaver }) => {
     const s = await weaver.seedSession({ goal: 'Navigate to me', name: 'nav-task' });
 
