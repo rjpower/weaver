@@ -199,6 +199,7 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `PUT DELETE /api/issues/{id}/tags/{key}` | set (upsert) / clear a free-form issue label — quiet `(key, value)` pills, no loud `attention`/`triage` ladder |
 | `GET POST /api/repos/issues?repo_root=…` | repo-wide board (`scope=repo\|backlog`) / create a backlog item |
 | `GET /api/repos/recent` / `GET /api/repos/branches?cwd=…` | recent repos / branches in a repo |
+| `GET /api/agents` | first-class agent types and their advertised model/effort selectors — backs the create-session form and server-side validation |
 | `GET PATCH /api/settings` | settings registry |
 | `GET /api/auth/me` | caller identity + sign-in methods (public; never 401s) |
 | `POST /api/auth/login` / `POST /api/auth/logout` | username/password login / drop the session (public) |
@@ -334,9 +335,11 @@ agent's own `attention` self-report stays the *server-side* signal — what
 outside marks surface on the dashboard without spuriously waking sub-agent
 tracking.
 
-**Lifecycle** is driven by Claude Code hooks. `loom session launch` merges a `hooks`
-block into the worktree's `.claude/settings.local.json` (see
-`loom::agent::install_hooks` and `weaver_core::agent::hooks_json`):
+**Lifecycle** is driven by the selected agent protocol. Claude Code currently
+provides lifecycle hooks, so its protocol merges a `hooks` block into the
+worktree's `.claude/settings.local.json` (see `loom::agent::install_hooks` and
+`weaver_core::agent::hooks_json`); hookless protocols such as Codex and `shell`
+start `running` immediately:
 
 | Claude hook event | shells out to |
 |---|---|

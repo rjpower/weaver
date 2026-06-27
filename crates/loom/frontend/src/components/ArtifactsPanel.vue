@@ -1,18 +1,15 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onActivated, onDeactivated, onUnmounted, nextTick } from 'vue';
 import { useRouter } from 'vue-router';
-import type * as Monaco from 'monaco-editor';
 import { getArtifacts, getArtifact, putArtifact, deleteArtifact } from '../api';
 import type { ArtifactMeta, ArtifactView } from '../types';
-import { theme } from '../theme';
-import { loadMonaco, monacoTheme, languageForPath } from '../monaco';
 import MarkdownView from './MarkdownView.vue';
 import HtmlArtifactView from './HtmlArtifactView.vue';
 
 // The artifacts surface, as a self-contained panel: a list of the agent's
 // out-of-repo documents (designs, reports, the `plan`) on the left, a viewer on
-// the right with a version picker and the file browser's proven preview ⇄ Monaco
-// edit toggle — saving an edit appends a new revision (`author: user`). Markdown
+// the right with a version picker and a preview/source edit toggle — saving an
+// edit appends a new revision (`author: user`). Markdown
 // renders through `MarkdownView` (GFM + mermaid + the smartdoc `#N` chips); an
 // `html` artifact renders as a live document in a sandboxed iframe.
 //
@@ -74,8 +71,8 @@ const isHtml = computed(() => kind.value === 'html');
 // Markdown and HTML both have a rendered Preview ⇄ Source toggle; every other
 // kind is shown as read-only source only.
 const isRenderable = computed(() => isMarkdown.value || isHtml.value);
-// The pseudo-path drives Monaco's language and the markdown image base. The
-// artifact name carries no extension, so stamp one on from the kind.
+// The pseudo-path drives the markdown image base. The artifact name carries no
+// extension, so stamp one on from the kind.
 const pseudoPath = computed(() => {
   const name = view.value?.meta.name ?? selected.value;
   if (isMarkdown.value) return `${name}.md`;
@@ -85,38 +82,8 @@ const pseudoPath = computed(() => {
 
 type ViewMode = 'preview' | 'source';
 const viewMode = ref<ViewMode>('preview');
-
-const host = ref<HTMLElement | null>(null);
-let editor: Monaco.editor.IStandaloneCodeEditor | null = null;
-let model: Monaco.editor.ITextModel | null = null;
-
-function teardownEditor() {
-  editor?.dispose();
-  editor = null;
-  model?.dispose();
-  model = null;
-}
-
-async function mountEditor(content: string, readOnly: boolean) {
-  const monaco = await loadMonaco();
-  model?.dispose();
-  model = monaco.editor.createModel(content, languageForPath(monaco, pseudoPath.value));
-  if (!editor) {
-    editor = monaco.editor.create(host.value!, {
-      readOnly,
-      automaticLayout: true,
-      theme: monacoTheme(theme.value === 'dark'),
-      fontSize: 13,
-      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-      minimap: { enabled: false },
-      scrollBeyondLastLine: false,
-      wordWrap: 'on',
-    });
-  }
-  editor.updateOptions({ readOnly });
-  editor.setModel(model);
-  monaco.editor.setTheme(monacoTheme(theme.value === 'dark'));
-}
+const draftContent = ref('');
+const sourceInput = ref<HTMLTextAreaElement | null>(null);
 
 // Load an artifact (optionally a specific revision) into the viewer. `keepMode`
 // refreshes content without resetting the preview/source choice — for a live
@@ -135,34 +102,20 @@ async function openArtifact(name: string, rev?: number, opts?: { keepMode?: bool
   if (isActive.value && router.currentRoute.value.path !== target) router.replace(target);
   try {
     view.value = await getArtifact(props.id, name, rev);
+    draftContent.value = view.value.content;
     if (!opts?.keepMode) viewMode.value = isRenderable.value ? 'preview' : 'source';
-    await renderViewer();
   } catch (e) {
     viewError.value = (e as Error).message;
     view.value = null;
-    teardownEditor();
+    draftContent.value = '';
   } finally {
     loading.value = false;
-  }
-}
-
-// Show the current view in the chosen mode (Monaco for source / edit, the
-// component for preview).
-async function renderViewer() {
-  if (!view.value) return;
-  if (viewMode.value === 'source' && !editing.value) {
-    await nextTick();
-    await mountEditor(view.value.content, true);
-  } else if (!editing.value) {
-    // Preview is a render component (markdown / html) — drop any Monaco model.
-    teardownEditor();
   }
 }
 
 function setMode(m: ViewMode) {
   if (viewMode.value === m || editing.value) return;
   viewMode.value = m;
-  renderViewer();
 }
 
 // The version picker: selecting a revision re-fetches at that rev. The latest
@@ -183,36 +136,36 @@ const onLatest = computed(
   () => !view.value || viewRev.value == null || viewRev.value === view.value.meta.rev,
 );
 
-// --- Edit (Monaco) ---------------------------------------------------------
+// --- Edit ------------------------------------------------------------------
 
 async function edit() {
   if (!view.value) return;
+  draftContent.value = view.value.content;
   editing.value = true;
   viewMode.value = 'source';
   await nextTick();
-  await mountEditor(view.value.content, false);
-  editor?.focus();
+  sourceInput.value?.focus();
 }
 
 function cancelEdit() {
   editing.value = false;
-  renderViewer();
+  draftContent.value = view.value?.content ?? '';
 }
 
 async function save() {
-  if (!view.value || !editor) return;
-  const content = editor.getValue();
+  if (!view.value) return;
+  const content = draftContent.value;
   saving.value = true;
   viewError.value = '';
   try {
     // Append a new revision (author: user); the response is the refreshed view
     // at the new latest rev.
     view.value = await putArtifact(props.id, selected.value, { content });
+    draftContent.value = view.value.content;
     viewRev.value = null;
     editing.value = false;
     viewMode.value = isRenderable.value ? 'preview' : 'source';
     await loadList();
-    await renderViewer();
   } catch (e) {
     viewError.value = (e as Error).message;
   } finally {
@@ -240,7 +193,7 @@ async function remove() {
   try {
     await deleteArtifact(props.id, name);
     view.value = null;
-    teardownEditor();
+    draftContent.value = '';
     await loadList();
     const next = list.value[0]?.name;
     if (next) {
@@ -297,15 +250,11 @@ function openStream() {
     // viewer back to the empty state. Our own delete already advanced the view.
     if (d?.name && d.name === selected.value) {
       view.value = null;
-      teardownEditor();
+      draftContent.value = '';
       selected.value = '';
     }
   });
 }
-
-watch(theme, () => {
-  if (editor) loadMonaco().then((m) => m.editor.setTheme(monacoTheme(theme.value === 'dark')));
-});
 
 // A deep-link name change (route navigation from the host) re-opens.
 watch(
@@ -349,7 +298,6 @@ onDeactivated(closeStream);
 
 onUnmounted(() => {
   closeStream();
-  teardownEditor();
 });
 </script>
 
@@ -526,12 +474,20 @@ onUnmounted(() => {
 
         <!-- Content -->
         <div class="relative min-h-0 flex-1 bg-code">
-          <!-- Monaco host: always mounted (v-show) so its ref survives mode flips. -->
-          <div
-            v-show="(viewMode === 'source' || editing) && view"
-            ref="host"
-            class="h-full w-full"
-          ></div>
+          <textarea
+            v-if="view && editing"
+            ref="sourceInput"
+            v-model="draftContent"
+            class="h-full w-full resize-none border-0 bg-code p-4 font-mono text-[13px] leading-5 text-fg outline-none"
+            spellcheck="false"
+            autocomplete="off"
+            autocapitalize="off"
+          ></textarea>
+
+          <pre
+            v-else-if="view && viewMode === 'source'"
+            class="h-full w-full overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-[13px] leading-5 text-fg"
+          ><code>{{ view.content }}</code></pre>
 
           <MarkdownView
             v-if="view && isMarkdown && viewMode === 'preview' && !editing"

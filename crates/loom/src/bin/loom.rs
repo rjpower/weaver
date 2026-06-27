@@ -423,12 +423,12 @@ struct LaunchOpts {
     /// exclusive with `--name`.
     #[arg(long)]
     branch: Option<String>,
-    /// Model tier: haiku, sonnet, opus, or fable. Omit to inherit the
-    /// configured `agent.claude_args`.
+    /// Model selector accepted by the selected agent. Omit to use the selected
+    /// agent's default.
     #[arg(long)]
     model: Option<String>,
-    /// Reasoning effort: low, medium, high, xhigh, or max. Omit to inherit the
-    /// configured `agent.claude_args`.
+    /// Reasoning effort: low, medium, high, xhigh, or max. Omit to use the
+    /// selected agent's default.
     #[arg(long)]
     effort: Option<String>,
 }

@@ -256,6 +256,14 @@ async fn require_branch(db: &Db, key: &str) -> ApiResult<Branch> {
     Err(AppError::not_found("branch"))
 }
 
+async fn list_agents(State(st): State<AppState>) -> ApiResult<Json<Value>> {
+    let default_agent = configured_agent(&st.db, "agent.default", config::DEFAULT_AGENT).await;
+    Ok(Json(json!({
+        "agents": agent::agent_metadata(),
+        "default_agent": default_agent,
+    })))
+}
+
 // ---------------------------------------------------------------------------
 // Caching middleware
 // ---------------------------------------------------------------------------
@@ -479,6 +487,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::put(set_issue_tag).delete(clear_issue_tag),
         )
         // Misc
+        .route("/agents", get(list_agents))
         .route("/repos/recent", get(recent_repos))
         .route("/repos/branches", get(repo_branches))
         .route(
@@ -638,9 +647,40 @@ async fn create_session(
 /// separate from the binary that runs.
 async fn launch_runtime(db: &Db, agent_kind: &str) -> String {
     if agent_kind == agent::CONCIERGE_KIND {
-        config::get_or(db, "concierge.runtime", config::DEFAULT_CONCIERGE_RUNTIME).await
+        configured_agent(db, "concierge.runtime", config::DEFAULT_CONCIERGE_RUNTIME).await
     } else {
         agent_kind.to_string()
+    }
+}
+
+async fn configured_agent(db: &Db, key: &str, default: &str) -> String {
+    let value = config::get_or(db, key, default).await;
+    let value = value.trim();
+    if agent::agent_type(value).is_some() {
+        value.to_string()
+    } else {
+        default.to_string()
+    }
+}
+
+async fn configured_selector(db: &Db, key: &str, runtime: &str, model: bool) -> String {
+    let value = config::get_or(db, key, "").await;
+    let value = value.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+    let Some(agent_type) = agent::agent_type(runtime) else {
+        return String::new();
+    };
+    let valid = if model {
+        agent_type.validate(value, "").is_ok()
+    } else {
+        agent_type.validate("", value).is_ok()
+    };
+    if valid {
+        value.to_string()
+    } else {
+        String::new()
     }
 }
 
@@ -649,7 +689,7 @@ async fn launch_runtime(db: &Db, agent_kind: &str) -> String {
 /// a hookless runtime (shell, codex, a bare command) never gets that hook, so it
 /// is `running` from the start rather than stuck `launching`.
 fn initial_status(runtime: &str) -> &'static str {
-    if agent::is_claude_runtime(runtime) {
+    if agent::starts_from_hook(runtime) {
         "launching"
     } else {
         "running"
@@ -669,38 +709,44 @@ async fn create_session_core(st: AppState, req: CreateReq) -> ApiResult<SessionV
     let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
 
     let agent = match req.agent {
-        Some(a) => a,
-        None => config::get_or(&st.db, "agent.default", config::DEFAULT_AGENT).await,
+        Some(a) => a.trim().to_string(),
+        None => configured_agent(&st.db, "agent.default", config::DEFAULT_AGENT).await,
     };
     // The concierge is the fleet Chat agent, not a workstream: it gets the
     // fleet-ops primer as its opening prompt and no tracking issue (it has no
     // deliverable to track), and is hidden from the fleet list by its kind.
     let is_concierge = agent == agent::CONCIERGE_KIND;
+    let runtime = launch_runtime(&st.db, &agent).await;
 
-    // Normalize and validate the model / effort selections. Blank means
-    // "inherit the configured default"; anything non-blank must be known.
-    let model = req
-        .model
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string();
-    if !model.is_empty() && !agent::MODELS.contains(&model.as_str()) {
+    // Normalize and validate the model / effort selections through the resolved
+    // agent type. Blank means the agent's own default.
+    let configured_model_key = if is_concierge {
+        "concierge.model"
+    } else {
+        "agent.model"
+    };
+    let configured_effort_key = if is_concierge {
+        "concierge.effort"
+    } else {
+        "agent.effort"
+    };
+    let model = match req.model.as_deref().map(str::trim) {
+        Some(model) if !model.is_empty() => model.to_string(),
+        Some(_) => String::new(),
+        None => configured_selector(&st.db, configured_model_key, &runtime, true).await,
+    };
+    let effort = match req.effort.as_deref().map(str::trim) {
+        Some(effort) if !effort.is_empty() => effort.to_string(),
+        Some(_) => String::new(),
+        None => configured_selector(&st.db, configured_effort_key, &runtime, false).await,
+    };
+    if let Some(agent_type) = agent::agent_type(&runtime) {
+        agent_type
+            .validate(&model, &effort)
+            .map_err(AppError::bad_request)?;
+    } else if !model.is_empty() || !effort.is_empty() {
         return Err(AppError::bad_request(format!(
-            "unknown model '{model}' — expected one of {}",
-            agent::MODELS.join(", ")
-        )));
-    }
-    let effort = req
-        .effort
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string();
-    if !effort.is_empty() && !agent::EFFORTS.contains(&effort.as_str()) {
-        return Err(AppError::bad_request(format!(
-            "unknown effort '{effort}' — expected one of {}",
-            agent::EFFORTS.join(", ")
+            "custom agent '{runtime}' does not accept model or effort selectors"
         )));
     }
 
@@ -953,12 +999,7 @@ async fn create_session_core(st: AppState, req: CreateReq) -> ApiResult<SessionV
     };
 
     let term_session = format!("weaver-{session_id}");
-    let base_args = config::get_or(&st.db, "agent.claude_args", "").await;
-    let claude_args = agent::combine_args(&base_args, &model, &effort);
     let extra_env = agent_env::pairs(&st.db).await.unwrap_or_default();
-    // The stored kind is the role; the runtime is what we actually launch (the
-    // concierge resolves to its `concierge.runtime` setting).
-    let runtime = launch_runtime(&st.db, &agent).await;
     agent::launch(
         &agent::LaunchSpec {
             branch_id: &branch.id,
@@ -968,7 +1009,8 @@ async fn create_session_core(st: AppState, req: CreateReq) -> ApiResult<SessionV
             goal_file: goal_file.as_deref(),
             primer_file: primer_file.as_deref(),
             server_addr: &st.addr,
-            claude_args: &claude_args,
+            model: &model,
+            effort: &effort,
             extra_env: &extra_env,
         },
         agent::LaunchMode::Fresh,
@@ -1559,7 +1601,7 @@ pub async fn create_warm_session(
     // The warm session runs the configured default agent (the overlooker's
     // judging agent, normally `claude`); its `prompt` param, when set, seeds the
     // first turn.
-    let agent = config::get_or(&st.db, "agent.default", config::DEFAULT_AGENT).await;
+    let agent = configured_agent(&st.db, "agent.default", config::DEFAULT_AGENT).await;
     let goal_file = match overlooker
         .params()
         .get("prompt")
@@ -1575,8 +1617,6 @@ pub async fn create_warm_session(
     };
 
     let term_session = format!("weaver-{session_id}");
-    let base_args = config::get_or(&st.db, "agent.claude_args", "").await;
-    let claude_args = agent::combine_args(&base_args, &overlooker.model, &overlooker.effort);
     let extra_env = agent_env::pairs(&st.db).await.unwrap_or_default();
     // A warm session never carries the concierge role, so its runtime is its kind.
     agent::launch(
@@ -1589,7 +1629,8 @@ pub async fn create_warm_session(
             // A warm overlooker session is never the concierge, so no primer.
             primer_file: None,
             server_addr: &st.addr,
-            claude_args: &claude_args,
+            model: &overlooker.model,
+            effort: &overlooker.effort,
             extra_env: &extra_env,
         },
         agent::LaunchMode::Fresh,
@@ -1651,8 +1692,6 @@ pub async fn adopt(st: &AppState, session: &Session, branch: &Branch) -> Result<
         let f = run_dir.join("goal.txt");
         f.exists().then_some(f)
     };
-    let base_args = config::get_or(&st.db, "agent.claude_args", "").await;
-    let claude_args = agent::combine_args(&base_args, &session.model, &session.effort);
     let extra_env = agent_env::pairs(&st.db).await.unwrap_or_default();
     let runtime = launch_runtime(&st.db, &session.agent_kind).await;
     agent::launch(
@@ -1664,7 +1703,8 @@ pub async fn adopt(st: &AppState, session: &Session, branch: &Branch) -> Result<
             goal_file: goal_file.as_deref(),
             primer_file: primer_file.as_deref(),
             server_addr: &st.addr,
-            claude_args: &claude_args,
+            model: &session.model,
+            effort: &session.effort,
             extra_env: &extra_env,
         },
         agent::LaunchMode::Adopt,
@@ -2737,6 +2777,9 @@ async fn patch_settings(
         }
         changes.push((key, value));
     }
+    if errors.is_empty() {
+        validate_agent_settings_patch(&st.db, &mut changes, &mut errors).await;
+    }
 
     if !errors.is_empty() {
         let message = if errors.len() == 1 {
@@ -2749,6 +2792,137 @@ async fn patch_settings(
     }
     config::apply(&st.db, &changes).await?;
     settings_envelope(&st.db).await
+}
+
+fn change_for<'a>(changes: &'a [config::Change], key: &str) -> Option<&'a Option<String>> {
+    changes
+        .iter()
+        .rev()
+        .find_map(|(k, v)| (k == key).then_some(v))
+}
+
+fn changed(changes: &[config::Change], key: &str) -> bool {
+    change_for(changes, key).is_some()
+}
+
+async fn setting_after(db: &Db, changes: &[config::Change], key: &str, default: &str) -> String {
+    match change_for(changes, key) {
+        Some(Some(value)) => value.trim().to_string(),
+        Some(None) => default.to_string(),
+        None => config::get_or(db, key, default).await.trim().to_string(),
+    }
+}
+
+async fn validate_agent_settings_patch(
+    db: &Db,
+    changes: &mut Vec<config::Change>,
+    errors: &mut serde_json::Map<String, Value>,
+) {
+    validate_agent_settings_group(
+        db,
+        changes,
+        errors,
+        AgentSettingsGroup {
+            agent_key: "agent.default",
+            agent_default: config::DEFAULT_AGENT,
+            model_key: "agent.model",
+            effort_key: "agent.effort",
+            require_concierge: false,
+        },
+    )
+    .await;
+    validate_agent_settings_group(
+        db,
+        changes,
+        errors,
+        AgentSettingsGroup {
+            agent_key: "concierge.runtime",
+            agent_default: config::DEFAULT_CONCIERGE_RUNTIME,
+            model_key: "concierge.model",
+            effort_key: "concierge.effort",
+            require_concierge: true,
+        },
+    )
+    .await;
+}
+
+struct AgentSettingsGroup {
+    agent_key: &'static str,
+    agent_default: &'static str,
+    model_key: &'static str,
+    effort_key: &'static str,
+    require_concierge: bool,
+}
+
+async fn validate_agent_settings_group(
+    db: &Db,
+    changes: &mut Vec<config::Change>,
+    errors: &mut serde_json::Map<String, Value>,
+    group: AgentSettingsGroup,
+) {
+    if !changed(changes, group.agent_key)
+        && !changed(changes, group.model_key)
+        && !changed(changes, group.effort_key)
+    {
+        return;
+    }
+
+    let agent_kind = setting_after(db, changes, group.agent_key, group.agent_default).await;
+    let Some(agent_type) = agent::agent_type(&agent_kind) else {
+        errors.insert(
+            group.agent_key.to_string(),
+            json!(format!("unknown agent '{agent_kind}'")),
+        );
+        return;
+    };
+    let metadata = agent_type.metadata();
+    if group.require_concierge && !metadata.supports_concierge {
+        errors.insert(
+            group.agent_key.to_string(),
+            json!(format!("agent '{agent_kind}' cannot run the concierge")),
+        );
+        return;
+    }
+
+    let model = setting_after(db, changes, group.model_key, "").await;
+    validate_agent_selector_setting(
+        changes,
+        errors,
+        group.agent_key,
+        group.model_key,
+        &model,
+        || agent_type.validate(&model, ""),
+    );
+
+    let effort = setting_after(db, changes, group.effort_key, "").await;
+    validate_agent_selector_setting(
+        changes,
+        errors,
+        group.agent_key,
+        group.effort_key,
+        &effort,
+        || agent_type.validate("", &effort),
+    );
+}
+
+fn validate_agent_selector_setting(
+    changes: &mut Vec<config::Change>,
+    errors: &mut serde_json::Map<String, Value>,
+    agent_key: &str,
+    selector_key: &str,
+    value: &str,
+    validate: impl FnOnce() -> std::result::Result<(), String>,
+) {
+    if value.is_empty() {
+        return;
+    }
+    if let Err(why) = validate() {
+        if changed(changes, agent_key) && !changed(changes, selector_key) {
+            changes.push((selector_key.to_string(), None));
+        } else {
+            errors.insert(selector_key.to_string(), json!(why));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

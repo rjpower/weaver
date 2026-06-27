@@ -61,7 +61,7 @@ const workTab = computed<WorkTab>(() => (artifactsDocked.value ? 'artifacts' : l
 
 // Lazy-mount panes on first visit, then keep them (v-show) so re-selecting is
 // instant. The terminal is always mounted; the rest start cold so a session-open
-// stays cheap (Monaco/the artifact viewer only load once their tab is opened).
+// stays cheap (the artifact viewer only loads once its tab is opened).
 const mounted = reactive({
   overview: localTab.value === 'overview',
   conversation: localTab.value === 'conversation',

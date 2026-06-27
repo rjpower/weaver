@@ -73,9 +73,9 @@ export interface Session {
   work_dir: string;
   term_session: string;
   agent_kind: string;
-  /** Model tier ('', 'haiku', 'sonnet', 'opus', 'fable') — spliced in as `--model`. */
+  /** Model selector interpreted by the selected agent protocol. */
   model: string;
-  /** Reasoning effort ('', 'low', 'medium', 'high', 'xhigh', 'max') — `--effort`. */
+  /** Reasoning effort interpreted by the selected agent protocol. */
   effort: string;
   github_repo: string | null;
   last_activity_at: string;
@@ -90,6 +90,21 @@ export interface Session {
    *  the launcher follows). Only set on the create response. */
   tracking_issue: number | null;
   branch: Branch;
+}
+
+export interface AgentChoice {
+  id: string;
+  label: string;
+}
+
+export interface AgentMetadata {
+  kind: string;
+  label: string;
+  models: AgentChoice[];
+  efforts: AgentChoice[];
+  accepts_raw_model: boolean;
+  supports_hooks: boolean;
+  supports_concierge: boolean;
 }
 
 /** An issue belongs to a repo (`repo_root`). `claimed_branch` is the branch
@@ -169,7 +184,7 @@ export interface ArtifactRefs {
  *  picker, and the projected reference map. */
 export interface ArtifactView {
   meta: ArtifactMeta;
-  /** Raw content of the selected revision — rendered read-first, edited in Monaco. */
+  /** Raw content of the selected revision — rendered read-first, editable as source. */
   content: string;
   /** Every revision, newest first, for the version picker. */
   versions: ArtifactVersion[];

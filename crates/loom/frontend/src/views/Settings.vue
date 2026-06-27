@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
-import { get, patch } from '../api';
-import type { SettingView } from '../types';
+import { ref, computed, onMounted, watch } from 'vue';
+import { get, patch, listAgents } from '../api';
+import type { AgentMetadata, SettingView } from '../types';
 import ToggleSwitch from '../components/ToggleSwitch.vue';
 import TokensPanel from '../components/TokensPanel.vue';
 import AccountPanel from '../components/AccountPanel.vue';
@@ -24,7 +24,11 @@ interface SettingsEnvelope {
   settings: SettingView[];
 }
 
+type SelectOption = { value: string; label: string };
+type AgentSettingGroup = 'session' | 'concierge';
+
 const settings = ref<SettingView[]>([]);
+const agents = ref<AgentMetadata[]>([]);
 // Per-key editable draft, keyed by setting key.
 const drafts = ref<Record<string, string>>({});
 const error = ref('');
@@ -45,9 +49,91 @@ const groups = computed(() => {
   return out;
 });
 
+const agentGroups: Record<AgentSettingGroup, { agent: string; model: string; effort: string }> = {
+  session: { agent: 'agent.default', model: 'agent.model', effort: 'agent.effort' },
+  concierge: {
+    agent: 'concierge.runtime',
+    model: 'concierge.model',
+    effort: 'concierge.effort',
+  },
+};
+
+function agentGroupFor(key: string): AgentSettingGroup | null {
+  for (const [group, keys] of Object.entries(agentGroups) as [
+    AgentSettingGroup,
+    { agent: string; model: string; effort: string },
+  ][]) {
+    if (Object.values(keys).includes(key)) return group;
+  }
+  return null;
+}
+
+function isAgentRegistrySetting(s: SettingView): boolean {
+  return agentGroupFor(s.key) !== null;
+}
+
+function agentsForGroup(group: AgentSettingGroup): AgentMetadata[] {
+  return group === 'concierge'
+    ? agents.value.filter((agent) => agent.supports_concierge)
+    : agents.value;
+}
+
+function selectedAgent(group: AgentSettingGroup): AgentMetadata | undefined {
+  const keys = agentGroups[group];
+  const kind = drafts.value[keys.agent];
+  return agentsForGroup(group).find((agent) => agent.kind === kind);
+}
+
+function registryOptions(s: SettingView): SelectOption[] {
+  const group = agentGroupFor(s.key);
+  if (!group) return [];
+  const keys = agentGroups[group];
+  if (s.key === keys.agent) {
+    return agentsForGroup(group).map((agent) => ({ value: agent.kind, label: agent.label }));
+  }
+
+  const agent = selectedAgent(group);
+  const choices = s.key === keys.model ? agent?.models ?? [] : agent?.efforts ?? [];
+  return [
+    { value: '', label: 'Default' },
+    ...choices.map((choice) => ({ value: choice.id, label: choice.label })),
+  ];
+}
+
+function sanitizeAgentDraft(group: AgentSettingGroup) {
+  const keys = agentGroups[group];
+  const availableAgents = agentsForGroup(group);
+  if (!availableAgents.length) return;
+  if (!availableAgents.some((agent) => agent.kind === drafts.value[keys.agent])) {
+    drafts.value[keys.agent] = availableAgents[0].kind;
+  }
+  const agent = selectedAgent(group);
+  if (!agent) return;
+  if (
+    drafts.value[keys.model] &&
+    !agent.models.some((choice) => choice.id === drafts.value[keys.model])
+  ) {
+    drafts.value[keys.model] = '';
+  }
+  if (
+    drafts.value[keys.effort] &&
+    !agent.efforts.some((choice) => choice.id === drafts.value[keys.effort])
+  ) {
+    drafts.value[keys.effort] = '';
+  }
+}
+
+function sanitizeAgentDrafts() {
+  sanitizeAgentDraft('session');
+  sanitizeAgentDraft('concierge');
+}
+
 async function load() {
   try {
-    const res = (await get('/settings')) as SettingsEnvelope;
+    const [res, agentRes] = await Promise.all([
+      get('/settings') as Promise<SettingsEnvelope>,
+      listAgents(),
+    ]);
     // Validate the shape before touching reactive state. A stale server — one
     // built before the settings endpoint existed — answers `{}`; assigning its
     // missing `settings` to the ref would crash the render (the `groups`
@@ -56,7 +142,9 @@ async function load() {
       throw new Error('Unexpected /api/settings response — the server may be out of date.');
     }
     settings.value = res.settings;
+    agents.value = agentRes.agents;
     drafts.value = Object.fromEntries(res.settings.map((s) => [s.key, s.value]));
+    sanitizeAgentDrafts();
     error.value = '';
   } catch (e) {
     settings.value = [];
@@ -83,22 +171,42 @@ async function act(key: string, fn: () => Promise<void>) {
 
 // Adopt a PATCH reply: refresh the canonical values, and resync only the
 // changed key's draft so other in-progress edits are left untouched.
-function adopt(res: SettingsEnvelope, changedKey: string) {
+function adopt(res: SettingsEnvelope, changedKeys: string[]) {
   settings.value = res.settings;
-  const changed = res.settings.find((s) => s.key === changedKey);
-  if (changed) drafts.value[changedKey] = changed.value;
+  for (const changedKey of changedKeys) {
+    const changed = res.settings.find((s) => s.key === changedKey);
+    if (changed) drafts.value[changedKey] = changed.value;
+  }
+  sanitizeAgentDrafts();
+}
+
+function patchBody(s: SettingView, value: string | null): Record<string, string | null> {
+  const group = agentGroupFor(s.key);
+  if (!group) return { [s.key]: value };
+  const keys = agentGroups[group];
+  return {
+    [keys.agent]: s.key === keys.agent ? value : drafts.value[keys.agent] ?? '',
+    [keys.model]: s.key === keys.model ? value : drafts.value[keys.model] ?? '',
+    [keys.effort]: s.key === keys.effort ? value : drafts.value[keys.effort] ?? '',
+  };
 }
 
 // PATCH a single key — a value to set it, null to reset it to its default.
 const apply = (s: SettingView, value: string | null, verb: string) =>
   act(s.key, async () => {
-    const res = (await patch('/settings', { [s.key]: value })) as SettingsEnvelope;
-    adopt(res, s.key);
+    const body = patchBody(s, value);
+    const res = (await patch('/settings', body)) as SettingsEnvelope;
+    adopt(res, Object.keys(body));
     notice.value = `${verb} ${s.label}.`;
   });
 
 const save = (s: SettingView) => apply(s, drafts.value[s.key] ?? '', 'Saved');
 const reset = (s: SettingView) => apply(s, null, 'Reset');
+
+watch(
+  () => [drafts.value['agent.default'], drafts.value['concierge.runtime'], agents.value.length],
+  sanitizeAgentDrafts,
+);
 
 onMounted(load);
 </script>
@@ -169,6 +277,17 @@ onMounted(load);
                 drafts[s.key] === 'true' ? 'Enabled' : 'Disabled'
               }}</span>
             </div>
+            <select
+              v-else-if="isAgentRegistrySetting(s)"
+              :id="s.key"
+              v-model="drafts[s.key]"
+              :disabled="registryOptions(s).length <= 1 && s.key !== 'agent.default' && s.key !== 'concierge.runtime'"
+              class="flex-1 rounded bg-input px-2 py-1 text-sm outline-none focus:ring-1 ring-accent"
+            >
+              <option v-for="opt in registryOptions(s)" :key="opt.value" :value="opt.value">
+                {{ opt.label }}
+              </option>
+            </select>
             <select
               v-else-if="s.kind === 'enum'"
               :id="s.key"

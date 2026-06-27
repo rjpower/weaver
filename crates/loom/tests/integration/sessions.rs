@@ -245,6 +245,36 @@ async fn concierge_runtime_codex_launches_hookless() {
         .unwrap();
 }
 
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_validate_agent_model_effort_against_registry() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    let err = client
+        .patch(
+            "/api/settings",
+            json!({ "agent.default": "codex", "agent.model": "haiku" }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("unknown model 'haiku' for codex"),
+        "unexpected error: {err}"
+    );
+
+    let err = client
+        .patch("/api/settings", json!({ "concierge.runtime": "shell" }))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("agent 'shell' cannot run the concierge"),
+        "unexpected error: {err}"
+    );
+}
+
 /// The fleet listing hides archived sessions by default (so the agent's `loom
 /// session ls` sees only live work), includes them on `?archived=true`, and
 /// narrows by substring on `?q=` — over the title, branch, and goal. A rename

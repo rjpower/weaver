@@ -14,9 +14,13 @@ use sqlx::Row;
 use crate::db::{now_iso, Db};
 
 pub const DEFAULT_AGENT: &str = "claude";
+pub const DEFAULT_AGENT_MODEL: &str = "";
+pub const DEFAULT_AGENT_EFFORT: &str = "";
 /// The agent that backs the fleet Chat concierge when `concierge.runtime` is
 /// unset. Claude is the default because only it fires weaver's lifecycle hooks.
 pub const DEFAULT_CONCIERGE_RUNTIME: &str = "claude";
+pub const DEFAULT_CONCIERGE_MODEL: &str = "";
+pub const DEFAULT_CONCIERGE_EFFORT: &str = "";
 /// Whether the server adopts orphaned sessions on startup. Off by default:
 /// the operator opts in via `weaver config set server.auto_adopt true`.
 pub const DEFAULT_AUTO_ADOPT: bool = false;
@@ -88,23 +92,29 @@ pub const REGISTRY: &[SettingSpec] = &[
         key: "agent.default",
         label: "Default agent",
         description: "Agent launched in each new session's terminal when `loom \
-            launch` is given no `--agent`. Use `claude` for the Claude Code \
-            TUI, `shell` for a plain shell, or any other command (it receives \
-            the goal file's path as its argument).",
+            launch` is given no `--agent`.",
         kind: SettingKind::String,
         default: DEFAULT_AGENT,
         group: "Agents",
         options: &[],
     },
     SettingSpec {
-        key: "agent.claude_args",
-        label: "Claude agent arguments",
-        description: "Extra arguments inserted into the Claude Code launch \
-            command, e.g. `--model claude-opus-4-7` to pin a model class. \
-            Applies only to claude-backed sessions; ignored by `shell` and \
-            custom agents.",
+        key: "agent.model",
+        label: "Default model",
+        description: "Model selector used for new sessions when launch/create \
+            requests do not specify one.",
         kind: SettingKind::String,
-        default: "",
+        default: DEFAULT_AGENT_MODEL,
+        group: "Agents",
+        options: &[],
+    },
+    SettingSpec {
+        key: "agent.effort",
+        label: "Default effort",
+        description: "Reasoning effort used for new sessions when launch/create \
+            requests do not specify one.",
+        kind: SettingKind::String,
+        default: DEFAULT_AGENT_EFFORT,
         group: "Agents",
         options: &[],
     },
@@ -117,10 +127,30 @@ pub const REGISTRY: &[SettingSpec] = &[
             fire weaver's lifecycle hooks, so the concierge shows no live \
             working/idle status and the Chat view won't auto-refresh on each \
             reply (use the Refresh button).",
-        kind: SettingKind::Enum,
+        kind: SettingKind::String,
         default: DEFAULT_CONCIERGE_RUNTIME,
         group: "Agents",
-        options: &["claude", "codex"],
+        options: &[],
+    },
+    SettingSpec {
+        key: "concierge.model",
+        label: "Concierge model",
+        description: "Model selector used when Chat starts or resets the fleet \
+            concierge.",
+        kind: SettingKind::String,
+        default: DEFAULT_CONCIERGE_MODEL,
+        group: "Agents",
+        options: &[],
+    },
+    SettingSpec {
+        key: "concierge.effort",
+        label: "Concierge effort",
+        description: "Reasoning effort used when Chat starts or resets the \
+            fleet concierge.",
+        kind: SettingKind::String,
+        default: DEFAULT_CONCIERGE_EFFORT,
+        group: "Agents",
+        options: &[],
     },
     SettingSpec {
         key: "server.auto_adopt",
@@ -595,18 +625,21 @@ mod tests {
         let db = crate::db::connect_in_memory().await.unwrap();
         apply(
             &db,
-            &[("agent.claude_args".into(), Some("--model x".into()))],
+            &[(
+                "unknown.legacy".into(),
+                Some("kept but unregistered".into()),
+            )],
         )
         .await
         .unwrap();
         assert_eq!(
-            get(&db, "agent.claude_args").await.as_deref(),
-            Some("--model x")
+            get(&db, "unknown.legacy").await.as_deref(),
+            Some("kept but unregistered")
         );
         // A `None` change clears the row so the default applies again.
-        apply(&db, &[("agent.claude_args".into(), None)])
+        apply(&db, &[("unknown.legacy".into(), None)])
             .await
             .unwrap();
-        assert_eq!(get(&db, "agent.claude_args").await, None);
+        assert_eq!(get(&db, "unknown.legacy").await, None);
     }
 }

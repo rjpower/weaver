@@ -1,47 +1,313 @@
-//! Launching coding agents into per-session terminals and installing status hooks, plus
-//! the **one-shot headless agent** (`POST /api/agent/oneshot`) — a fresh,
-//! env-stripped `claude -p` run for a judgement call.
+//! Launching coding agents into per-session terminals, plus the **one-shot
+//! headless agent** (`POST /api/agent/oneshot`) — a fresh, env-stripped agent
+//! run for a judgement call.
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use serde_json::{json, Value};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use crate::backend;
 use weaver_core::agent::hooks_json;
 
-/// Accepted per-session reasoning effort levels, increasing. Orthogonal to the
-/// model: any model can run at any effort.
-pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct AgentChoice {
+    pub id: &'static str,
+    pub label: &'static str,
+}
 
-/// Accepted per-session model tiers.
-pub const MODELS: &[&str] = &["haiku", "sonnet", "opus", "fable"];
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentMetadata {
+    pub kind: &'static str,
+    pub label: &'static str,
+    pub models: &'static [AgentChoice],
+    pub efforts: &'static [AgentChoice],
+    pub accepts_raw_model: bool,
+    pub supports_hooks: bool,
+    pub supports_concierge: bool,
+}
 
-/// `--effort <level>` for a known level, else empty (inherit the configured
-/// `agent.claude_args`).
-pub fn effort_args(effort: &str) -> String {
-    match effort.trim() {
-        "" => String::new(),
-        e => format!("--effort {e}"),
+pub struct AgentInstance {
+    pub term_session: String,
+}
+
+pub type AgentFuture<'a> = Pin<Box<dyn Future<Output = Result<AgentInstance>> + Send + 'a>>;
+
+pub trait AgentType: Sync {
+    fn metadata(&self) -> AgentMetadata;
+
+    fn validate(&self, model: &str, effort: &str) -> Result<(), String> {
+        let metadata = self.metadata();
+        validate_model(&metadata, model)?;
+        validate_effort(&metadata, effort)
     }
+
+    fn create<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a>;
+    fn adopt<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a>;
+}
+
+pub struct ClaudeAgentType;
+pub struct CodexAgentType;
+pub struct ShellAgentType;
+pub struct CustomCommandAgentType {
+    command: String,
+}
+
+impl CustomCommandAgentType {
+    pub fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+        }
+    }
+}
+
+const MODEL_CHOICES: &[AgentChoice] = &[
+    AgentChoice {
+        id: "haiku",
+        label: "Haiku",
+    },
+    AgentChoice {
+        id: "sonnet",
+        label: "Sonnet",
+    },
+    AgentChoice {
+        id: "opus",
+        label: "Opus",
+    },
+    AgentChoice {
+        id: "fable",
+        label: "Fable",
+    },
+];
+
+const CODEX_MODEL_CHOICES: &[AgentChoice] = &[
+    AgentChoice {
+        id: "gpt-5.5",
+        label: "GPT-5.5",
+    },
+    AgentChoice {
+        id: "gpt-5.4",
+        label: "GPT-5.4",
+    },
+    AgentChoice {
+        id: "gpt-5.4-mini",
+        label: "GPT-5.4 Mini",
+    },
+    AgentChoice {
+        id: "gpt-5.3-codex-spark",
+        label: "GPT-5.3 Codex Spark",
+    },
+];
+
+const EFFORT_CHOICES: &[AgentChoice] = &[
+    AgentChoice {
+        id: "low",
+        label: "Low",
+    },
+    AgentChoice {
+        id: "medium",
+        label: "Medium",
+    },
+    AgentChoice {
+        id: "high",
+        label: "High",
+    },
+    AgentChoice {
+        id: "xhigh",
+        label: "X-High",
+    },
+    AgentChoice {
+        id: "max",
+        label: "Max",
+    },
+];
+
+const CODEX_EFFORT_CHOICES: &[AgentChoice] = &[
+    AgentChoice {
+        id: "low",
+        label: "Low",
+    },
+    AgentChoice {
+        id: "medium",
+        label: "Medium",
+    },
+    AgentChoice {
+        id: "high",
+        label: "High",
+    },
+    AgentChoice {
+        id: "xhigh",
+        label: "X-High",
+    },
+];
+
+static CLAUDE_AGENT_TYPE: ClaudeAgentType = ClaudeAgentType;
+static CODEX_AGENT_TYPE: CodexAgentType = CodexAgentType;
+static SHELL_AGENT_TYPE: ShellAgentType = ShellAgentType;
+
+pub fn agent_type(kind: &str) -> Option<&'static dyn AgentType> {
+    match kind {
+        "claude" => Some(&CLAUDE_AGENT_TYPE),
+        "codex" => Some(&CODEX_AGENT_TYPE),
+        "shell" | "none" => Some(&SHELL_AGENT_TYPE),
+        _ => None,
+    }
+}
+
+pub fn agent_metadata() -> Vec<AgentMetadata> {
+    [
+        &CLAUDE_AGENT_TYPE as &dyn AgentType,
+        &CODEX_AGENT_TYPE as &dyn AgentType,
+        &SHELL_AGENT_TYPE as &dyn AgentType,
+    ]
+    .into_iter()
+    .map(AgentType::metadata)
+    .collect()
+}
+
+pub fn accepts_model(runtime: &str, model: &str) -> bool {
+    agent_type(runtime)
+        .map(|agent| validate_model(&agent.metadata(), model).is_ok())
+        .unwrap_or(false)
+}
+
+pub fn accepts_effort(runtime: &str, effort: &str) -> bool {
+    agent_type(runtime)
+        .map(|agent| validate_effort(&agent.metadata(), effort).is_ok())
+        .unwrap_or(false)
+}
+
+pub fn starts_from_hook(runtime: &str) -> bool {
+    agent_type(runtime)
+        .map(|agent| agent.metadata().supports_hooks)
+        .unwrap_or(false)
+}
+
+fn validate_model(metadata: &AgentMetadata, model: &str) -> Result<(), String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Ok(());
+    }
+    if metadata.models.iter().any(|choice| choice.id == model) {
+        Ok(())
+    } else {
+        Err(format!("unknown model '{model}' for {}", metadata.kind))
+    }
+}
+
+fn validate_effort(metadata: &AgentMetadata, effort: &str) -> Result<(), String> {
+    let effort = effort.trim();
+    if effort.is_empty() {
+        return Ok(());
+    }
+    if metadata.efforts.iter().any(|choice| choice.id == effort) {
+        Ok(())
+    } else {
+        Err(format!("unknown effort '{effort}' for {}", metadata.kind))
+    }
+}
+
+fn model_flag(model: &str) -> Option<&str> {
+    let model = model.trim();
+    (!model.is_empty()).then_some(model)
+}
+
+fn effort_flag(effort: &str) -> Option<&str> {
+    let effort = effort.trim();
+    (!effort.is_empty()).then_some(effort)
+}
+
+fn claude_model_arg(model: &str) -> Option<String> {
+    model_flag(model).map(|m| format!("--model {m}"))
+}
+
+fn claude_effort_arg(effort: &str) -> Option<String> {
+    effort_flag(effort).map(|e| format!("--effort {e}"))
+}
+
+fn codex_model_arg(model: &str) -> Option<String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    Some(format!("--model {model}"))
+}
+
+fn codex_effort_arg(effort: &str) -> Option<String> {
+    effort_flag(effort).map(|e| format!("-c model_reasoning_effort=\\\"{e}\\\""))
+}
+
+fn join_args(args: impl IntoIterator<Item = Option<String>>) -> String {
+    args.into_iter().flatten().collect::<Vec<_>>().join(" ")
+}
+
+/// `--effort <level>` for a known level, else empty.
+pub fn effort_args(effort: &str) -> String {
+    claude_effort_arg(effort).unwrap_or_default()
 }
 
 /// `--model <tier>` for a chosen model, else empty.
 pub fn model_args(model: &str) -> String {
-    match model.trim() {
-        "" => String::new(),
-        m => format!("--model {m}"),
+    claude_model_arg(model).unwrap_or_default()
+}
+
+/// Combine per-session model and effort selections for the Claude protocol.
+pub fn combine_args(model: &str, effort: &str) -> String {
+    join_args([claude_model_arg(model), claude_effort_arg(effort)])
+}
+
+fn claude_command(ctx: &AgentLaunchContext<'_>, mode: LaunchMode) -> String {
+    let args = join_args([claude_model_arg(ctx.model), claude_effort_arg(ctx.effort)]);
+    let args = if args.is_empty() {
+        String::new()
+    } else {
+        format!(" {args}")
+    };
+    match (mode, ctx.primer_file) {
+        (LaunchMode::Adopt, Some(p)) => {
+            format!(
+                "claude --continue{args} --append-system-prompt-file {}",
+                sh_single_quote_path(p)
+            )
+        }
+        (LaunchMode::Fresh, Some(p)) => {
+            format!(
+                "claude{args} --append-system-prompt-file {}",
+                sh_single_quote_path(p)
+            )
+        }
+        (LaunchMode::Adopt, None) => format!("claude --continue{args}"),
+        (LaunchMode::Fresh, None) => match ctx.goal_file {
+            Some(f) => format!("claude{args} \"$(cat {})\"", sh_single_quote_path(f)),
+            None => format!("claude{args}"),
+        },
     }
 }
 
-/// Combine the configured base `agent.claude_args` with the per-session model
-/// and effort selections. Each non-empty part is appended in turn, so a session
-/// layers its model/effort on top of the global flags.
-pub fn combine_args(base: &str, model: &str, effort: &str) -> String {
-    [base.trim(), &model_args(model), &effort_args(effort)]
-        .into_iter()
-        .filter(|p| !p.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+fn codex_command(ctx: &AgentLaunchContext<'_>) -> String {
+    let args = join_args([codex_model_arg(ctx.model), codex_effort_arg(ctx.effort)]);
+    let args = if args.is_empty() {
+        String::new()
+    } else {
+        format!(" {args}")
+    };
+    match ctx.goal_file.or(ctx.primer_file) {
+        Some(f) => format!("codex{args} \"$(cat {})\"", sh_single_quote_path(f)),
+        None => format!("codex{args}"),
+    }
+}
+
+fn shell_command(_ctx: &AgentLaunchContext<'_>) -> String {
+    String::new()
+}
+
+fn custom_command(command: &str, ctx: &AgentLaunchContext<'_>) -> String {
+    match ctx.goal_file.or(ctx.primer_file) {
+        Some(f) => format!("{command} {}", sh_single_quote_path(f)),
+        None => command.to_string(),
+    }
 }
 
 /// Whether a session's terminal is being created for the first time or
@@ -52,6 +318,149 @@ pub enum LaunchMode {
     Fresh,
     /// Re-launch into an existing worktree: resume rather than restart.
     Adopt,
+}
+
+pub struct AgentLaunchContext<'a> {
+    /// The branch id — the agent uses this to resolve "its" branch via
+    /// `$WEAVER_BRANCH`.
+    pub branch_id: &'a str,
+    pub work_dir: &'a Path,
+    pub term_session: &'a str,
+    /// The positional opening prompt catted in as the operator's first message.
+    pub goal_file: Option<&'a Path>,
+    /// Optional system context file for runtimes that support it.
+    pub primer_file: Option<&'a Path>,
+    pub server_addr: &'a str,
+    pub model: &'a str,
+    pub effort: &'a str,
+    /// Operator-managed environment variables exported into the session.
+    pub extra_env: &'a [(String, String)],
+}
+
+impl AgentType for ClaudeAgentType {
+    fn metadata(&self) -> AgentMetadata {
+        AgentMetadata {
+            kind: "claude",
+            label: "Claude",
+            models: MODEL_CHOICES,
+            efforts: EFFORT_CHOICES,
+            accepts_raw_model: false,
+            supports_hooks: true,
+            supports_concierge: true,
+        }
+    }
+
+    fn create<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a> {
+        Box::pin(async move {
+            prepare_claude(&ctx).await;
+            start_terminal(
+                &ctx,
+                self.metadata().kind,
+                &claude_command(&ctx, LaunchMode::Fresh),
+            )
+            .await
+        })
+    }
+
+    fn adopt<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a> {
+        Box::pin(async move {
+            prepare_claude(&ctx).await;
+            start_terminal(
+                &ctx,
+                self.metadata().kind,
+                &claude_command(&ctx, LaunchMode::Adopt),
+            )
+            .await
+        })
+    }
+}
+
+impl AgentType for CodexAgentType {
+    fn metadata(&self) -> AgentMetadata {
+        AgentMetadata {
+            kind: "codex",
+            label: "Codex",
+            models: CODEX_MODEL_CHOICES,
+            efforts: CODEX_EFFORT_CHOICES,
+            accepts_raw_model: false,
+            supports_hooks: false,
+            supports_concierge: true,
+        }
+    }
+
+    fn create<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a> {
+        Box::pin(
+            async move { start_terminal(&ctx, self.metadata().kind, &codex_command(&ctx)).await },
+        )
+    }
+
+    fn adopt<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a> {
+        Box::pin(
+            async move { start_terminal(&ctx, self.metadata().kind, &codex_command(&ctx)).await },
+        )
+    }
+}
+
+impl AgentType for ShellAgentType {
+    fn metadata(&self) -> AgentMetadata {
+        AgentMetadata {
+            kind: "shell",
+            label: "Shell",
+            models: &[],
+            efforts: &[],
+            accepts_raw_model: false,
+            supports_hooks: false,
+            supports_concierge: false,
+        }
+    }
+
+    fn create<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a> {
+        Box::pin(
+            async move { start_terminal(&ctx, self.metadata().kind, &shell_command(&ctx)).await },
+        )
+    }
+
+    fn adopt<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a> {
+        Box::pin(
+            async move { start_terminal(&ctx, self.metadata().kind, &shell_command(&ctx)).await },
+        )
+    }
+}
+
+impl AgentType for CustomCommandAgentType {
+    fn metadata(&self) -> AgentMetadata {
+        AgentMetadata {
+            kind: "custom",
+            label: "Custom",
+            models: &[],
+            efforts: &[],
+            accepts_raw_model: false,
+            supports_hooks: false,
+            supports_concierge: false,
+        }
+    }
+
+    fn create<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a> {
+        Box::pin(async move {
+            start_terminal(
+                &ctx,
+                self.command.as_str(),
+                &custom_command(&self.command, &ctx),
+            )
+            .await
+        })
+    }
+
+    fn adopt<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a> {
+        Box::pin(async move {
+            start_terminal(
+                &ctx,
+                self.command.as_str(),
+                &custom_command(&self.command, &ctx),
+            )
+            .await
+        })
+    }
 }
 
 /// Build the shell command that launches one session's agent. `runtime` is the
@@ -69,52 +478,25 @@ fn inner_command(
     goal_file: Option<&Path>,
     primer_file: Option<&Path>,
     mode: LaunchMode,
-    claude_args: &str,
+    model: &str,
+    effort: &str,
 ) -> String {
-    let args = match claude_args.trim() {
-        "" => String::new(),
-        a => format!(" {a}"),
+    let ctx = AgentLaunchContext {
+        branch_id: "",
+        work_dir: Path::new("."),
+        term_session: "",
+        goal_file,
+        primer_file,
+        server_addr: "",
+        model,
+        effort,
+        extra_env: &[],
     };
     match runtime {
-        "shell" | "none" => String::new(),
-        "claude" => match (mode, primer_file) {
-            // Primed-but-idle: the primer rides in as system context, not a
-            // positional prompt, so claude waits for the operator's first message
-            // instead of taking a turn on launch. Re-appended on adopt because the
-            // system prompt is reconstructed per launch — `--continue` resumes the
-            // conversation, but the appended context is not persisted with it.
-            (LaunchMode::Adopt, Some(p)) => {
-                format!(
-                    "claude --continue{args} --append-system-prompt-file '{}'",
-                    p.display()
-                )
-            }
-            (LaunchMode::Fresh, Some(p)) => {
-                format!("claude{args} --append-system-prompt-file '{}'", p.display())
-            }
-            (LaunchMode::Adopt, None) => format!("claude --continue{args}"),
-            (LaunchMode::Fresh, None) => match goal_file {
-                Some(f) => format!("claude{args} \"$(cat '{}')\"", f.display()),
-                None => format!("claude{args}"),
-            },
-        },
-        // Codex takes its opening prompt as a positional arg, like claude. It has
-        // no scoped "continue this worktree's session" flag, so on adopt we
-        // re-launch fresh (re-reading the prompt) rather than resuming. It also has
-        // no `--append-system-prompt-file` equivalent and no WEAVER.md hook, so a
-        // codex concierge's primer is still seeded *positionally* (falling back to
-        // `primer_file`) and it will take a turn on boot. Making codex boot idle is
-        // a documented follow-up.
-        "codex" => match goal_file.or(primer_file) {
-            Some(f) => format!("codex \"$(cat '{}')\"", f.display()),
-            None => "codex".to_string(),
-        },
-        // A bare command likewise only takes a positional prompt, so fall back to
-        // the primer if that is all this session carries.
-        other => match goal_file.or(primer_file) {
-            Some(f) => format!("{other} '{}'", f.display()),
-            None => other.to_string(),
-        },
+        "claude" => claude_command(&ctx, mode),
+        "codex" => codex_command(&ctx),
+        "shell" | "none" => shell_command(&ctx),
+        other => custom_command(other, &ctx),
     }
 }
 
@@ -124,14 +506,6 @@ fn inner_command(
 /// *role*; the runtime it actually launches (claude|codex) is the separate
 /// `concierge.runtime` setting, resolved before launch.
 pub const CONCIERGE_KIND: &str = "concierge";
-
-/// Whether a resolved `runtime` runs the Claude runtime — the `claude` command
-/// plus the weaver lifecycle hooks and first-run launch gates. Only Claude fires
-/// the hooks today, so this also decides whether a session starts `launching`
-/// (a hook will promote it) or `running` (no hooks — it is live on launch).
-pub fn is_claude_runtime(runtime: &str) -> bool {
-    runtime == "claude"
-}
 
 /// The builtin concierge primer — how the fleet concierge explores and acts on
 /// the fleet. Catted in at build time like [`weaver_core::agent::builtin_weaver_md`],
@@ -152,15 +526,11 @@ fn sh_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-pub fn launch_script(
-    runtime: &str,
-    goal_file: Option<&Path>,
-    primer_file: Option<&Path>,
-    env: &[(&str, &str)],
-    weaver_dir: Option<&Path>,
-    mode: LaunchMode,
-    claude_args: &str,
-) -> String {
+fn sh_single_quote_path(path: &Path) -> String {
+    sh_single_quote(&path.display().to_string())
+}
+
+fn wrap_launch_script(inner: &str, env: &[(&str, &str)], weaver_dir: Option<&Path>) -> String {
     let mut script = String::new();
     if let Some(dir) = weaver_dir {
         script.push_str(&format!("export PATH=\"{}:$PATH\"; ", dir.display()));
@@ -168,13 +538,35 @@ pub fn launch_script(
     for (k, v) in env {
         script.push_str(&format!("export {k}={}; ", sh_single_quote(v)));
     }
-    let inner = inner_command(runtime, goal_file, primer_file, mode, claude_args);
     if !inner.is_empty() {
-        script.push_str(&inner);
+        script.push_str(inner);
         script.push_str("; ");
     }
     script.push_str("exec \"${SHELL:-/bin/sh}\"");
     script
+}
+
+pub struct LaunchScriptSpec<'a> {
+    pub runtime: &'a str,
+    pub goal_file: Option<&'a Path>,
+    pub primer_file: Option<&'a Path>,
+    pub env: &'a [(&'a str, &'a str)],
+    pub weaver_dir: Option<&'a Path>,
+    pub mode: LaunchMode,
+    pub model: &'a str,
+    pub effort: &'a str,
+}
+
+pub fn launch_script(spec: LaunchScriptSpec<'_>) -> String {
+    let inner = inner_command(
+        spec.runtime,
+        spec.goal_file,
+        spec.primer_file,
+        spec.mode,
+        spec.model,
+        spec.effort,
+    );
+    wrap_launch_script(&inner, spec.env, spec.weaver_dir)
 }
 
 /// Everything [`launch`] needs to bring up a session's terminal.
@@ -198,7 +590,8 @@ pub struct LaunchSpec<'a> {
     /// at most one is set.
     pub primer_file: Option<&'a Path>,
     pub server_addr: &'a str,
-    pub claude_args: &'a str,
+    pub model: &'a str,
+    pub effort: &'a str,
     /// Operator-managed environment variables ([`crate::agent_env`]) exported
     /// into the session on top of loom's own `WEAVER_*` / `LOOM_TOKEN`. The
     /// caller reads these from the database; an empty slice adds nothing.
@@ -207,41 +600,65 @@ pub struct LaunchSpec<'a> {
 
 /// Bring up the session's terminal running the agent.
 pub async fn launch(spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<()> {
+    let ctx = AgentLaunchContext {
+        branch_id: spec.branch_id,
+        work_dir: spec.work_dir,
+        term_session: spec.term_session,
+        goal_file: spec.goal_file,
+        primer_file: spec.primer_file,
+        server_addr: spec.server_addr,
+        model: spec.model,
+        effort: spec.effort,
+        extra_env: spec.extra_env,
+    };
+    let _instance = match agent_type(spec.runtime) {
+        Some(agent_type) => match mode {
+            LaunchMode::Fresh => agent_type.create(ctx).await,
+            LaunchMode::Adopt => agent_type.adopt(ctx).await,
+        },
+        None => {
+            let custom = CustomCommandAgentType::new(spec.runtime);
+            match mode {
+                LaunchMode::Fresh => custom.create(ctx).await,
+                LaunchMode::Adopt => custom.adopt(ctx).await,
+            }
+        }
+    }?;
+    Ok(())
+}
+
+async fn prepare_claude(ctx: &AgentLaunchContext<'_>) {
     let loom_exe = std::env::current_exe().ok();
     let weaver_dir = loom_exe.as_deref().and_then(Path::parent);
     let weaver_bin = weaver_dir
         .map(|d| d.join("weaver").display().to_string())
         .unwrap_or_else(|| "weaver".to_string());
 
-    // Only the Claude runtime wires weaver's lifecycle hooks and needs its
-    // first-run gates pre-cleared. Codex (and any bare command) gets neither — it
-    // runs, but reports no working/idle status through weaver yet.
-    if is_claude_runtime(spec.runtime) {
-        // Both steps are best-effort — a failure shouldn't abort the launch — but
-        // log it, since a silent failure here resurfaces only as a stalled agent.
-        if let Err(e) = install_hooks(spec.work_dir, &weaver_bin).await {
-            tracing::warn!(work_dir = %spec.work_dir.display(), error = %e,
-                "install_hooks failed; launching agent without weaver hooks");
-        }
-        // A fresh container HOME hasn't cleared Claude Code's first-run gates
-        // (theme picker, workspace trust, API-key + bypass-mode prompts), so an
-        // unattended `claude` would stall — or quit — before reading the goal.
-        // Pre-seed that state so it runs. Pass the resolved args so the
-        // bypass-mode gate is only seeded when we actually launch in that mode.
-        if let Err(e) = seed_claude_launch_gates(spec.work_dir, spec.claude_args).await {
-            tracing::warn!(work_dir = %spec.work_dir.display(), error = %e,
-                "seeding claude launch gates failed; agent may stall on first-run prompts");
-        }
+    if let Err(e) = install_hooks(ctx.work_dir, &weaver_bin).await {
+        tracing::warn!(work_dir = %ctx.work_dir.display(), error = %e,
+            "agent hook setup failed; launching without lifecycle hooks");
     }
+    if let Err(e) = seed_claude_launch_gates(ctx.work_dir, ctx.model, ctx.effort).await {
+        tracing::warn!(work_dir = %ctx.work_dir.display(), error = %e,
+            "agent launch-gate setup failed; agent may stall on first-run prompts");
+    }
+}
 
-    let api_url = format!("http://{}", spec.server_addr);
+async fn start_terminal(
+    ctx: &AgentLaunchContext<'_>,
+    runtime: &str,
+    inner: &str,
+) -> Result<AgentInstance> {
+    let loom_exe = std::env::current_exe().ok();
+    let weaver_dir = loom_exe.as_deref().and_then(Path::parent);
+    let api_url = format!("http://{}", ctx.server_addr);
     // Hand the agent the machine-local token so its in-worktree `loom session …`
     // calls authenticate even when loopback trust is off. Absent file ⇒ omit it
     // (loopback trust then covers the local case).
     let local_token = read_local_token();
     let mut env = vec![
         ("WEAVER_API", api_url.as_str()),
-        ("WEAVER_BRANCH", spec.branch_id),
+        ("WEAVER_BRANCH", ctx.branch_id),
     ];
     if let Some(token) = local_token.as_deref() {
         env.push(("LOOM_TOKEN", token));
@@ -250,36 +667,28 @@ pub async fn launch(spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<()> {
     // That's safe because `agent_env::validate_name` reserves loom's own
     // WEAVER_*/LOOM_ prefixes, so a stored var can never shadow the environment
     // loom needs — everything else the agent's tools read is theirs to set.
-    for (k, v) in spec.extra_env {
+    for (k, v) in ctx.extra_env {
         env.push((k.as_str(), v.as_str()));
     }
-    let script = launch_script(
-        spec.runtime,
-        spec.goal_file,
-        spec.primer_file,
-        &env,
-        weaver_dir,
-        mode,
-        spec.claude_args,
-    );
+    let script = wrap_launch_script(inner, &env, weaver_dir);
     tracing::debug!(
-        branch = spec.branch_id,
-        runtime = spec.runtime,
-        session = spec.term_session,
-        ?mode,
+        branch = ctx.branch_id,
+        runtime,
+        session = ctx.term_session,
         "launching agent session"
     );
-    backend::new_session(spec.term_session, spec.work_dir, &script)
+    backend::new_session(ctx.term_session, ctx.work_dir, &script)
         .await
-        .with_context(|| format!("terminal: launching session {}", spec.term_session))?;
+        .with_context(|| format!("terminal: launching session {}", ctx.term_session))?;
     tracing::info!(
-        branch = spec.branch_id,
-        runtime = spec.runtime,
-        session = spec.term_session,
-        ?mode,
+        branch = ctx.branch_id,
+        runtime,
+        session = ctx.term_session,
         "agent launched"
     );
-    Ok(())
+    Ok(AgentInstance {
+        term_session: ctx.term_session.to_string(),
+    })
 }
 
 /// The machine-local bearer token (trimmed), if the daemon has minted it. Read
@@ -330,7 +739,7 @@ pub async fn install_hooks(work_dir: &Path, weaver_bin: &str) -> Result<()> {
 ///   Permissions mode" confirmation, **which defaults to *exit***. Seeded only
 ///   when this launch actually runs with a bypass flag, since the dialog only
 ///   appears then.
-pub async fn seed_claude_launch_gates(work_dir: &Path, claude_args: &str) -> Result<()> {
+pub async fn seed_claude_launch_gates(work_dir: &Path, model: &str, effort: &str) -> Result<()> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         tracing::debug!("HOME unset; skipping claude launch-gate seed");
         return Ok(());
@@ -355,8 +764,9 @@ pub async fn seed_claude_launch_gates(work_dir: &Path, claude_args: &str) -> Res
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
 
-    let bypass = claude_args.contains("--dangerously-skip-permissions")
-        || claude_args.contains("bypassPermissions");
+    let launch_args = combine_args(model, effort);
+    let bypass = launch_args.contains("--dangerously-skip-permissions")
+        || launch_args.contains("bypassPermissions");
     // Approve the ambient ANTHROPIC_API_KEY by its last 20 chars (how claude keys
     // these), when one is set and long enough to slice.
     let api_key_tail = std::env::var("ANTHROPIC_API_KEY")
@@ -565,9 +975,30 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    fn launch_script(
+        runtime: &str,
+        goal_file: Option<&Path>,
+        primer_file: Option<&Path>,
+        env: &[(&str, &str)],
+        mode: LaunchMode,
+        model: &str,
+        effort: &str,
+    ) -> String {
+        super::launch_script(LaunchScriptSpec {
+            runtime,
+            goal_file,
+            primer_file,
+            env,
+            weaver_dir: None,
+            mode,
+            model,
+            effort,
+        })
+    }
+
     #[test]
     fn shell_script_just_execs_a_shell() {
-        let script = launch_script("shell", None, None, &[], None, LaunchMode::Fresh, "");
+        let script = launch_script("shell", None, None, &[], LaunchMode::Fresh, "", "");
         assert_eq!(script, "exec \"${SHELL:-/bin/sh}\"");
     }
 
@@ -578,8 +1009,8 @@ mod tests {
             Some(Path::new("/x/goal.txt")),
             None,
             &[("WEAVER_API", "http://h:1")],
-            None,
             LaunchMode::Fresh,
+            "",
             "",
         );
         assert!(script.contains("export WEAVER_API='http://h:1'; "));
@@ -597,8 +1028,8 @@ mod tests {
             None,
             Some(Path::new("/x/primer.txt")),
             &[],
-            None,
             LaunchMode::Fresh,
+            "",
             "",
         );
         assert_eq!(
@@ -615,8 +1046,8 @@ mod tests {
             None,
             Some(Path::new("/x/primer.txt")),
             &[],
-            None,
             LaunchMode::Adopt,
+            "",
             "",
         );
         assert_eq!(
@@ -631,10 +1062,10 @@ mod tests {
     fn concierge_kind_is_a_role_not_a_runtime() {
         // The `concierge` string marks a role; it is not a runtime, so it must be
         // resolved (to claude|codex) before launch and never reach the command
-        // builder. `is_claude_runtime` only matches the actual Claude runtime.
-        assert!(is_claude_runtime("claude"));
-        assert!(!is_claude_runtime(CONCIERGE_KIND));
-        assert!(!is_claude_runtime("codex"));
+        // builder. Hook-starting is a runtime capability, not a role property.
+        assert!(starts_from_hook("claude"));
+        assert!(!starts_from_hook(CONCIERGE_KIND));
+        assert!(!starts_from_hook("codex"));
         // The primer the concierge is seeded with is the real fleet-ops doc.
         assert!(concierge_primer().contains("fleet concierge"));
     }
@@ -648,8 +1079,8 @@ mod tests {
             Some(Path::new("/x/goal.txt")),
             None,
             &[],
-            None,
             LaunchMode::Fresh,
+            "",
             "",
         );
         assert!(
@@ -662,8 +1093,8 @@ mod tests {
             Some(Path::new("/x/goal.txt")),
             None,
             &[],
-            None,
             LaunchMode::Adopt,
+            "",
             "",
         );
         assert!(
@@ -683,8 +1114,8 @@ mod tests {
             None,
             Some(Path::new("/x/primer.txt")),
             &[],
-            None,
             LaunchMode::Fresh,
+            "",
             "",
         );
         assert!(
@@ -702,8 +1133,8 @@ mod tests {
             None,
             None,
             &[("MSG", "it's \"quoted\"")],
-            None,
             LaunchMode::Fresh,
+            "",
             "",
         );
         assert!(
@@ -722,19 +1153,28 @@ mod tests {
     }
 
     #[test]
-    fn combine_args_layers_model_and_effort_onto_base() {
-        assert_eq!(
-            combine_args("", "opus", "high"),
-            "--model opus --effort high"
+    fn combine_args_layers_model_and_effort() {
+        assert_eq!(combine_args("opus", "high"), "--model opus --effort high");
+        assert_eq!(combine_args("", "max"), "--effort max");
+        assert_eq!(combine_args("haiku", ""), "--model haiku");
+        assert_eq!(combine_args("", ""), "");
+    }
+
+    #[test]
+    fn codex_protocol_maps_tiers_and_effort_to_codex_flags() {
+        let script = launch_script(
+            "codex",
+            Some(Path::new("/x/goal.txt")),
+            None,
+            &[],
+            LaunchMode::Fresh,
+            "gpt-5.5",
+            "xhigh",
         );
-        assert_eq!(combine_args("--verbose", "", ""), "--verbose");
-        assert_eq!(combine_args("", "", "max"), "--effort max");
-        assert_eq!(combine_args("", "haiku", ""), "--model haiku");
-        assert_eq!(
-            combine_args("--verbose", "sonnet", "low"),
-            "--verbose --model sonnet --effort low"
+        assert!(
+            script.contains("codex --model gpt-5.5 -c model_reasoning_effort=\\\"xhigh\\\""),
+            "got: {script}"
         );
-        assert_eq!(combine_args("", "", ""), "");
     }
 
     #[test]
@@ -744,8 +1184,8 @@ mod tests {
             Some(Path::new("/x/goal.txt")),
             None,
             &[],
-            None,
             LaunchMode::Adopt,
+            "",
             "",
         );
         assert_eq!(script, "claude --continue; exec \"${SHELL:-/bin/sh}\"");

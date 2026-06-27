@@ -61,7 +61,22 @@ export const del = (path: string) => request(path, { method: 'DELETE' });
 
 // --- Issues ----------------------------------------------------------------
 
-import type { Issue, Session, ArtifactMeta, ArtifactView, ArtifactWriteBody, IdeInfo } from './types';
+import type {
+  Issue,
+  Session,
+  ArtifactMeta,
+  ArtifactView,
+  ArtifactWriteBody,
+  IdeInfo,
+  AgentMetadata,
+} from './types';
+
+interface AgentsEnvelope {
+  agents: AgentMetadata[];
+  default_agent: string;
+}
+
+export const listAgents = () => get('/agents') as Promise<AgentsEnvelope>;
 
 /** Every issue across every repo — the Issues pane's cross-repo board. Pass
  *  `all` to include closed issues. */

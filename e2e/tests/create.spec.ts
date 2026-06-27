@@ -79,6 +79,50 @@ test.describe('creating a session via the UI form', () => {
     expect(files.map((f) => f.name).sort()).toEqual(['shot.png', 'trace.log']);
   });
 
+  test('agent selection drives model and effort choices', async ({ page, weaver }) => {
+    await page.goto(weaver.baseUrl);
+    await page.getByRole('button', { name: 'New session' }).click();
+
+    const form = page.locator('form');
+    const agent = form.getByLabel('Agent');
+    const model = form.getByLabel('Model');
+    const effort = form.getByLabel('Effort');
+
+    await expect(agent.locator('option')).toContainText(['Claude', 'Codex', 'Shell']);
+
+    await agent.selectOption('claude');
+    await expect(model.locator('option')).toContainText(['Default', 'Haiku', 'Sonnet', 'Opus', 'Fable']);
+    await expect(effort.locator('option')).toContainText([
+      'Default',
+      'Low',
+      'Medium',
+      'High',
+      'X-High',
+      'Max',
+    ]);
+
+    await agent.selectOption('codex');
+    await expect(model.locator('option')).toContainText([
+      'Default',
+      'GPT-5.5',
+      'GPT-5.4',
+      'GPT-5.4 Mini',
+      'GPT-5.3 Codex Spark',
+    ]);
+    await expect(model.locator('option', { hasText: 'Haiku' })).toHaveCount(0);
+    await expect(model.locator('option', { hasText: 'Sonnet' })).toHaveCount(0);
+    await expect(model.locator('option', { hasText: 'Opus' })).toHaveCount(0);
+    await expect(model.locator('option', { hasText: 'Fable' })).toHaveCount(0);
+    await expect(effort.locator('option')).toContainText([
+      'Default',
+      'Low',
+      'Medium',
+      'High',
+      'X-High',
+    ]);
+    await expect(effort.locator('option', { hasText: 'Max' })).toHaveCount(0);
+  });
+
   test('Cancel hides the form again', async ({ page, weaver }) => {
     await page.goto(weaver.baseUrl);
     await page.getByRole('button', { name: 'New session' }).click();

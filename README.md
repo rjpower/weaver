@@ -158,12 +158,13 @@ tracking issue is attributed to it (`source_branch`), so its sub-trees show up
 under "Delegated by this branch" in `weaver issue ls` — agents can fan work out
 into parallel sub-sessions and poll or block on them the same way a human does.
 
-`loom session launch --model <haiku|sonnet|opus|fable> --effort <low|medium|high|xhigh|max>`
-(both also selectors in the web create form) pin the session's Claude model
-tier and reasoning effort. They are orthogonal — any model runs at any effort —
-and spliced into the launch as `--model` / `--effort`. Both are stored per
-session, so adopting a recovered session resumes with the same settings. Omit
-either to inherit `agent.claude_args`.
+`loom session launch --model <model> --effort <effort>` (both also selectors in
+the web create form) pins the session's model selector and reasoning effort.
+The selected agent type advertises its available models/efforts and translates
+them into its own launch flags (`claude` and `codex` are built in; `shell`
+ignores them). Both are stored per session, so adopting a recovered session
+resumes with the same settings. Omit either to use the configured default, or
+the runtime's own default when no configured default is set.
 
 ## Status & attention
 
@@ -329,16 +330,18 @@ Edit them in the **Settings** pane of the web UI, or from the CLI:
 ```sh
 weaver config ls
 weaver config get agent.default
-weaver config set agent.claude_args "--model claude-opus-4-7"
-weaver config rm agent.claude_args
+weaver config set agent.default codex
+weaver config rm agent.default
 ```
 
 Notable settings:
 
 - `agent.default` — agent kind launched for a new session when `loom session
-  launch` is given no `--agent` (`claude`, `shell`, or a custom command).
-- `agent.claude_args` — extra arguments spliced into the Claude TUI launch,
-  e.g. `--model claude-opus-4-7`.
+  launch` is given no `--agent` (`claude`, `codex`, or `shell`).
+- `agent.model` / `agent.effort` — default model and reasoning effort for new
+  sessions. The Settings UI populates these from the selected agent type.
+- `concierge.runtime` / `concierge.model` / `concierge.effort` — agent, model,
+  and reasoning effort used when the Chat concierge starts or resets.
 - `server.auto_adopt` — adopt every recoverable session on daemon startup.
 - `github.poll` — poll GitHub (via `gh`) for each session's PR, review, and
   check status (on by default; a no-op without `gh` or a GitHub remote).

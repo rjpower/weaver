@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { get, post } from '../api';
-import type { Session, RecentRepo, RepoBranch } from '../types';
+import { get, post, listAgents } from '../api';
+import type { Session, RecentRepo, RepoBranch, AgentMetadata } from '../types';
 import StatusBadge from '../components/StatusBadge.vue';
 import SignalChip from '../components/SignalChip.vue';
 import IdleChip from '../components/IdleChip.vue';
@@ -181,6 +181,7 @@ const repo = ref('');
 const repoFocused = ref(false);
 const title = ref('');
 const goal = ref('');
+const agent = ref('');
 const model = ref('');
 const effort = ref('');
 const name = ref('');
@@ -192,6 +193,12 @@ const creating = ref(false);
 // Reference files staged in the form; base64-encoded into the create request
 // so they land in the new worktree's scratch/ before the agent launches.
 const scratchFiles = ref<File[]>([]);
+const agents = ref<AgentMetadata[]>([]);
+
+const selectedAgent = computed<AgentMetadata | undefined>(() => {
+  const selected = agent.value || agents.value[0]?.kind || '';
+  return agents.value.find((a) => a.kind === selected);
+});
 
 // Read a File as base64 (JSON can't carry raw binary). Chunked so large files
 // don't blow the argument limit of String.fromCharCode(...).
@@ -254,6 +261,12 @@ watch([title, goal], ([t, g]) => {
   if (!nameEdited.value) name.value = slugify(t || g);
 });
 
+watch(selectedAgent, (meta) => {
+  if (!meta) return;
+  if (model.value && !meta.models.some((m) => m.id === model.value)) model.value = '';
+  if (effort.value && !meta.efforts.some((e) => e.id === effort.value)) effort.value = '';
+});
+
 async function loadBranches() {
   const path = repo.value.trim();
   branches.value = [];
@@ -297,6 +310,20 @@ async function loadRecentRepos() {
   }
 }
 
+async function loadAgents() {
+  try {
+    const res = await listAgents();
+    agents.value = res.agents;
+    if (!agent.value) {
+      agent.value = agents.value.some((a) => a.kind === res.default_agent)
+        ? res.default_agent
+        : agents.value[0]?.kind || '';
+    }
+  } catch (e) {
+    error.value = (e as Error).message;
+  }
+}
+
 // Clear the form back to its initial state and hide it. Shared by the create()
 // success path and the Cancel button so the two can't drift apart. The repo path
 // is intentionally left as-is (kept out of create()'s reset) — it's the most
@@ -304,6 +331,7 @@ async function loadRecentRepos() {
 function resetForm() {
   title.value = '';
   goal.value = '';
+  agent.value = agents.value[0]?.kind || '';
   model.value = '';
   effort.value = '';
   name.value = '';
@@ -326,6 +354,7 @@ async function create() {
       cwd: repo.value,
       title: title.value || undefined,
       goal: goal.value,
+      agent: agent.value || undefined,
       model: model.value || undefined,
       effort: effort.value || undefined,
     };
@@ -358,6 +387,7 @@ async function create() {
 // The recent-repos list only feeds the create form; fetch it once on first
 // mount (kept alive, so this never re-runs) and after each create.
 loadRecentRepos();
+loadAgents();
 </script>
 
 <template>
@@ -520,42 +550,56 @@ loadRecentRepos();
         </div>
       </section>
 
-      <!-- Agent: which Claude tier and how hard it reasons. -->
+      <!-- Agent: which model selector and how hard it reasons. -->
       <section class="space-y-3 border-t border-line pt-3">
         <h2 class="text-2xs font-semibold uppercase tracking-wider text-muted">Agent</h2>
-        <div class="grid grid-cols-2 gap-3">
+        <div class="grid grid-cols-3 gap-3">
           <div>
-            <label class="block text-xs text-muted mb-1">Model</label>
+            <label for="session-agent" class="block text-xs text-muted mb-1">Agent</label>
             <select
+              id="session-agent"
+              v-model="agent"
+              autocomplete="loom-agent"
+              class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
+            >
+              <option v-for="option in agents" :key="option.kind" :value="option.kind">
+                {{ option.label }}
+              </option>
+            </select>
+          </div>
+          <div>
+            <label for="session-model" class="block text-xs text-muted mb-1">Model</label>
+            <select
+              id="session-model"
               v-model="model"
               autocomplete="loom-model"
+              :disabled="!selectedAgent?.models.length"
               class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
             >
               <option value="">Default</option>
-              <option value="haiku">Haiku</option>
-              <option value="sonnet">Sonnet</option>
-              <option value="opus">Opus</option>
-              <option value="fable">Fable</option>
+              <option v-for="option in selectedAgent?.models ?? []" :key="option.id" :value="option.id">
+                {{ option.label }}
+              </option>
             </select>
           </div>
           <div>
-            <label class="block text-xs text-muted mb-1">Effort</label>
+            <label for="session-effort" class="block text-xs text-muted mb-1">Effort</label>
             <select
+              id="session-effort"
               v-model="effort"
               autocomplete="loom-effort"
+              :disabled="!selectedAgent?.efforts.length"
               class="w-full rounded bg-input px-2 py-1.5 text-sm outline-none focus:ring-1 ring-accent"
             >
               <option value="">Default</option>
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
-              <option value="xhigh">X-High</option>
-              <option value="max">Max</option>
+              <option v-for="option in selectedAgent?.efforts ?? []" :key="option.id" :value="option.id">
+                {{ option.label }}
+              </option>
             </select>
           </div>
-          <p class="col-span-2 -mt-1 text-xs text-faint">
-            Model tier and reasoning effort for the Claude agent. Leave as Default
-            to inherit the configured launch args.
+          <p class="col-span-3 -mt-1 text-xs text-faint">
+            Model selector and reasoning effort for the selected agent. Leave as
+            Default to use the agent runtime defaults.
           </p>
         </div>
       </section>

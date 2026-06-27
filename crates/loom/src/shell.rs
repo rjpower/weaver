@@ -73,7 +73,16 @@ async fn shell_script(st: &AppState, branch_id: Option<&str>) -> String {
 
     let loom_exe = std::env::current_exe().ok();
     let weaver_dir = loom_exe.as_deref().and_then(Path::parent);
-    agent::launch_script("shell", None, None, &env, weaver_dir, LaunchMode::Adopt, "")
+    agent::launch_script(agent::LaunchScriptSpec {
+        runtime: "shell",
+        goal_file: None,
+        primer_file: None,
+        env: &env,
+        weaver_dir,
+        mode: LaunchMode::Adopt,
+        model: "",
+        effort: "",
+    })
 }
 
 /// Ensure the scratch-shell supervisor is up, spawning it if not. Idempotent: a

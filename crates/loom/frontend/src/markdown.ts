@@ -3,9 +3,8 @@
 //
 // Everything heavy (markdown-it + plugins, highlight.js, DOMPurify, and
 // especially mermaid) is pulled in via dynamic import the first time a markdown
-// file is previewed, keeping it out of the main app chunk exactly as `monaco.ts`
-// does for the editor. This module is framework-agnostic; `MarkdownView.vue`
-// drives it.
+// file is previewed, keeping it out of the main app chunk. This module is
+// framework-agnostic; `MarkdownView.vue` drives it.
 
 import type MarkdownIt from 'markdown-it';
 // markdown-it v14's Token isn't re-exported from the package root; it's the

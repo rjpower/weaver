@@ -438,12 +438,12 @@ pub struct CreateReq {
     /// a human/dashboard launch leaves it unset.
     #[serde(default)]
     pub parent_branch: Option<String>,
-    /// Model tier ('haiku' | 'sonnet' | 'opus' | 'fable'); blank/absent
-    /// inherits the configured `agent.claude_args`.
+    /// Model selector accepted by the selected agent type; blank/absent uses
+    /// the agent runtime's default.
     #[serde(default)]
     pub model: Option<String>,
     /// Reasoning effort ('low' | 'medium' | 'high' | 'xhigh' | 'max');
-    /// blank/absent inherits the configured `agent.claude_args`.
+    /// blank/absent uses the agent runtime's default.
     #[serde(default)]
     pub effort: Option<String>,
     /// Reference files to drop into the new worktree's `scratch/` directory
