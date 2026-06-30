@@ -53,6 +53,10 @@ function close() {
           <dt class="w-16 shrink-0 text-faint">github</dt>
           <dd class="min-w-0 break-all font-mono text-muted">{{ ws.github_repo }}</dd>
         </div>
+        <div v-if="ws.created_by" class="flex gap-2">
+          <dt class="w-16 shrink-0 text-faint">created by</dt>
+          <dd class="min-w-0 break-all font-mono text-muted">{{ ws.created_by }}</dd>
+        </div>
       </dl>
       <!-- Lifecycle actions (Adopt / Archive / Remove), supplied by the header.
            Kept here so destructive, low-frequency operations live one click

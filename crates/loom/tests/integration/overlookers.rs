@@ -1272,6 +1272,7 @@ async fn insert_managed_session(
             github_repo: None,
             parent_branch_id: None,
             managed_by: Some(overlooker_id.to_string()),
+            created_by: None,
         },
     )
     .await

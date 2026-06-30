@@ -846,6 +846,15 @@ loadAgents();
         <!-- Ref: machine identity, mono, pushed far-right and receding. -->
         <div class="shrink-0 text-right">
           <span class="block truncate font-mono text-2xs text-faint">{{ s.branch.branch }}</span>
+          <!-- Attribution: who/what launched this session — a subtle provenance
+               label on the shared board. Absent for older rows. -->
+          <span
+            v-if="s.created_by"
+            class="block truncate text-2xs text-faint"
+            :title="`Launched by ${s.created_by}`"
+          >
+            by <span class="font-mono">{{ s.created_by }}</span>
+          </span>
           <!-- PR snapshot (if any) — a quiet link straight to the GitHub PR. -->
           <GithubStatus v-if="s.branch.github" :gh="s.branch.github" compact class="mt-0.5 justify-end" />
           <router-link
