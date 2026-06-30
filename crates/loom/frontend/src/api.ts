@@ -69,7 +69,18 @@ import type {
   ArtifactWriteBody,
   IdeInfo,
   AgentMetadata,
+  ManagedRepo,
 } from './types';
+
+// --- Managed repos ---------------------------------------------------------
+
+/** Every registered managed repo — the clone allowlist (`GET /api/repos`). */
+export const listRepos = () => get('/repos') as Promise<ManagedRepo[]>;
+
+/** Register a repo (a GitHub `owner/name` slug or clone URL) in the managed
+ *  store / allowlist (`POST /api/repos`). Returns the stored mapping. */
+export const registerRepo = (repo: string) =>
+  post('/repos', { repo }) as Promise<ManagedRepo>;
 
 interface AgentsEnvelope {
   agents: AgentMetadata[];

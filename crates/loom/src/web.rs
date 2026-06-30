@@ -489,6 +489,8 @@ pub fn router(state: AppState) -> Router {
         )
         // Misc
         .route("/agents", get(list_agents))
+        // The managed repo store + clone allowlist (register/list).
+        .route("/repos", get(list_repos).post(register_repo))
         .route("/repos/recent", get(recent_repos))
         .route("/repos/branches", get(repo_branches))
         .route(
@@ -715,10 +717,24 @@ async fn create_session_core(
     req: CreateReq,
     created_by: Option<String>,
 ) -> ApiResult<SessionView> {
-    let cwd = PathBuf::from(&req.cwd);
-    let repo_root = git::repo_root(&cwd)
-        .await
-        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    // Resolve the repo root. An explicit managed `repo` (a slug/URL) is
+    // allowlist-checked and cloned-if-absent into the managed store, then used
+    // directly; otherwise fork from `cwd`'s repo (the default). The traversal /
+    // allowlist gate lives in `repo::resolve_clone`.
+    let repo_root = match req.repo.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(input) => repo::resolve_clone(&st.db, input)
+            .await
+            .map_err(|e| match e {
+                repo::ResolveError::BadRequest(m) => AppError::bad_request(m),
+                repo::ResolveError::Clone(m) => AppError::new(StatusCode::BAD_GATEWAY, m),
+            })?,
+        None => {
+            let cwd = PathBuf::from(&req.cwd);
+            git::repo_root(&cwd)
+                .await
+                .map_err(|e| AppError::bad_request(e.to_string()))?
+        }
+    };
     // Canonicalize so repo identity matches the `weaver` CLI's resolver — issues
     // are keyed on this path and the two binaries must agree on it.
     let repo_root = repo_root.canonicalize().unwrap_or(repo_root);
@@ -2702,6 +2718,35 @@ async fn recent_repos(
 ) -> ApiResult<Json<Vec<repo::RecentRepo>>> {
     let limit = q.limit.unwrap_or(10).clamp(1, 50);
     Ok(Json(repo::recent(&st.db, limit).await?))
+}
+
+/// `GET /api/repos` — the registered managed repos (the clone allowlist).
+async fn list_repos(State(st): State<AppState>) -> ApiResult<Json<Vec<repo::ManagedRepo>>> {
+    Ok(Json(repo::list_registered(&st.db).await?))
+}
+
+/// Body for `POST /api/repos`: a repo reference — a GitHub `owner/name` slug or a
+/// clone URL — to add to the managed store / allowlist.
+#[derive(Debug, Deserialize)]
+struct RegisterRepoReq {
+    repo: String,
+}
+
+/// `POST /api/repos` — register a repo in the managed store. The reference is
+/// parsed to a clean `owner/name` slug (traversal rejected → 400); the clone URL
+/// is the canonical GitHub HTTPS remote for a bare slug, or the URL as given.
+/// The clone itself is lazy — it happens on first use (session create),
+/// idempotently — so registering is just adding to the allowlist.
+async fn register_repo(
+    State(st): State<AppState>,
+    Json(req): Json<RegisterRepoReq>,
+) -> ApiResult<Json<repo::ManagedRepo>> {
+    let slug = repo::parse_slug(&req.repo).map_err(AppError::bad_request)?;
+    let remote_url = repo::remote_url_for(&req.repo, &slug);
+    let path = slug.path(&repo::repos_dir());
+    let managed =
+        repo::register(&st.db, &slug.slug(), &remote_url, &path.to_string_lossy()).await?;
+    Ok(Json(managed))
 }
 
 #[derive(Debug, Deserialize)]

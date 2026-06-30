@@ -47,6 +47,19 @@ CREATE TABLE IF NOT EXISTS recent_repos (
     last_used_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- Managed repositories: GitHub repos loom has cloned (or may clone) into the
+-- container-owned repo root (WEAVER_REPOS_DIR), laid out <owner>/<name>. The
+-- slug -> (remote_url, path) mapping doubles as the clone allowlist: only a repo
+-- registered here may be resolved and cloned for a session, the boundary the
+-- GitHub trigger relies on. Distinct from `recent_repos`, which only records
+-- bind-mounted local paths a session has used.
+CREATE TABLE IF NOT EXISTS repos (
+    slug       TEXT PRIMARY KEY,
+    remote_url TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 -- The latest GitHub snapshot for a branch: the pull request loom found for it
 -- (via the `gh` CLI) plus its review/check rollup. One row per branch, replaced
 -- on each poll; it is optional context, gone the moment the branch row is.

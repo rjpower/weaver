@@ -212,6 +212,19 @@ export interface RecentRepo {
   active_branches: number;
 }
 
+/** A repository registered in the managed repo store (`/api/repos`). The
+ *  slug→(remote, path) mapping doubles as the clone allowlist: only a registered
+ *  repo may be cloned for a session. Mirrors loom's `repo::ManagedRepo`. */
+export interface ManagedRepo {
+  /** Canonical GitHub `owner/name`. */
+  slug: string;
+  /** The clone source URL. */
+  remote_url: string;
+  /** The managed on-disk clone path. */
+  path: string;
+  created_at: string;
+}
+
 /** Branch listing returned by `/api/repos/branches?cwd=...` — distinct from
  *  the tracked-branch model: this enumerates git branches in a repo on disk. */
 export interface RepoBranch {

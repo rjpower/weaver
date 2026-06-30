@@ -17,6 +17,7 @@ mod env;
 mod ide;
 mod overlookers;
 mod pane;
+mod repos;
 mod scratch;
 mod sessions;
 mod shell;
