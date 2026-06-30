@@ -60,6 +60,15 @@ CREATE TABLE IF NOT EXISTS repos (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- Processed GitHub webhook deliveries, keyed on the `X-GitHub-Delivery` GUID.
+-- The receiver records each delivery before acting on it and treats a repeat as
+-- a no-op, so a replayed (or GitHub-retried) delivery never launches a second
+-- session. Append-only; rows are cheap and can be pruned by age later.
+CREATE TABLE IF NOT EXISTS processed_deliveries (
+    delivery_id TEXT PRIMARY KEY,
+    received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 -- The latest GitHub snapshot for a branch: the pull request loom found for it
 -- (via the `gh` CLI) plus its review/check rollup. One row per branch, replaced
 -- on each poll; it is optional context, gone the moment the branch row is.

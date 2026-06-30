@@ -1383,6 +1383,7 @@ mod tests {
             bus: events::EventBus::new(),
             addr: "127.0.0.1:0".to_string(),
             ide: std::sync::Arc::new(crate::ide::IdeManager::new(crate::ide::ide_home())),
+            trigger: crate::github_trigger::GithubTrigger::production(),
         };
         let o = ov::create(
             &state.db,
@@ -1596,6 +1597,7 @@ rnd.finish("counted to %d" % n)
             bus: events::EventBus::new(),
             addr: "127.0.0.1:0".to_string(),
             ide: std::sync::Arc::new(crate::ide::IdeManager::new(crate::ide::ide_home())),
+            trigger: crate::github_trigger::GithubTrigger::production(),
         };
         // A reactive overlooker (no cron) — the scheduled half of the timer skips
         // it; only the wake half should fire it.

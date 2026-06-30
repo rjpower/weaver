@@ -40,6 +40,7 @@ async fn engine_state(ts: &TestServer) -> AppState {
         bus: EventBus::new(),
         addr: ts.addr.to_string(),
         ide: std::sync::Arc::new(loom::ide::IdeManager::new(loom::ide::ide_home())),
+        trigger: loom::github_trigger::GithubTrigger::production(),
     }
 }
 

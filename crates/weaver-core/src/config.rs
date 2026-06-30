@@ -30,6 +30,9 @@ pub const DEFAULT_GITHUB_POLL: bool = true;
 /// Whether loom archives a session automatically once its pull request merges.
 /// On by default — a merged branch's worktree has served its purpose.
 pub const DEFAULT_GITHUB_ARCHIVE_ON_MERGE: bool = true;
+/// The phrase an `issue_comment` must begin with to trigger a loom session via
+/// the GitHub webhook. Fixed (not free-text) in v1 to shrink the abuse surface.
+pub const DEFAULT_GITHUB_TRIGGER_PHRASE: &str = "@loom work on this";
 /// The palette the browser terminal (xterm.js) renders with. `dark` keeps the
 /// classic black background; `light` swaps in a light, readable palette.
 pub const DEFAULT_TERMINAL_THEME: &str = "dark";
@@ -186,6 +189,20 @@ pub const REGISTRY: &[SettingSpec] = &[
             GitHub polling.",
         kind: SettingKind::Bool,
         default: "true",
+        group: "GitHub",
+        options: &[],
+    },
+    SettingSpec {
+        key: "github.trigger_phrase",
+        label: "GitHub trigger phrase",
+        description: "The exact phrase an issue comment must begin with for the \
+            GitHub webhook to launch a session against that repo (e.g. \
+            `@loom work on this`). Matched case-insensitively against the start \
+            of the comment; kept fixed rather than free-text to limit the abuse \
+            surface. The webhook is only active once `LOOM_GITHUB_WEBHOOK_SECRET` \
+            is configured.",
+        kind: SettingKind::String,
+        default: DEFAULT_GITHUB_TRIGGER_PHRASE,
         group: "GitHub",
         options: &[],
     },

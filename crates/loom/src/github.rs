@@ -757,6 +757,7 @@ mod tests {
             bus: events::EventBus::new(),
             addr: "127.0.0.1:0".to_string(),
             ide: std::sync::Arc::new(crate::ide::IdeManager::new(crate::ide::ide_home())),
+            trigger: crate::github_trigger::GithubTrigger::production(),
         };
         Fixture {
             _repo: repo,
