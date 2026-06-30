@@ -80,6 +80,7 @@ pub async fn run(addr: &str) -> Result<()> {
         bus: EventBus::new(),
         addr: actual.to_string(),
         ide: std::sync::Arc::new(crate::ide::IdeManager::new(crate::ide::ide_home())),
+        trigger: crate::github_trigger::GithubTrigger::production(),
     };
 
     let server_state = ServerState {
