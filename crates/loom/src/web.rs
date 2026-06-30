@@ -2765,10 +2765,14 @@ async fn register_repo(
 /// [`crate::github_trigger`].
 ///
 /// Status discipline: a missing/invalid signature is a hard **401** (a real
-/// misconfiguration GitHub should surface as a failed delivery). Everything past
-/// that returns **200** — a non-trigger comment, a replay, an unauthorized
-/// commenter, a non-allowlisted repo, or a rate-limited repo are all quiet
-/// no-ops, so GitHub does not retry a delivery we deliberately ignored.
+/// misconfiguration GitHub should surface as a failed delivery). Two further
+/// non-2xx cases past that are deliberate, not no-ops: a delivery with no
+/// `X-GitHub-Delivery` GUID is malformed (**400** — without it idempotency is
+/// impossible), and a failure to record the delivery is transient (**5xx**, so
+/// GitHub *should* retry). Every *business-logic* outcome — a non-trigger
+/// comment, a replay, an unauthorized commenter, a non-allowlisted repo, a
+/// rate-limited repo — returns **200**, so GitHub does not retry a delivery we
+/// deliberately ignored.
 async fn github_webhook(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     // 1. Authenticate the delivery: HMAC-SHA256 over the RAW body bytes (never a
     //    re-serialized parse). An empty secret means the webhook is unconfigured,
@@ -2786,12 +2790,14 @@ async fn github_webhook(State(st): State<AppState>, headers: HeaderMap, body: By
         return (StatusCode::UNAUTHORIZED, "invalid signature").into_response();
     }
 
-    // The body is now trusted (GitHub-signed). Past here, problems are 200
-    // no-ops; `ok()` is the acknowledge-and-ignore reply.
+    // The body is now trusted (GitHub-signed). Every *business-logic* outcome
+    // past here is a 200 no-op via `ok()`; the only non-2xx exceptions below are
+    // a malformed delivery (no GUID → 400) and a transient store error (→ 5xx).
     let ok = || (StatusCode::OK, "ok").into_response();
 
-    // 2. Idempotency: dedupe on the delivery GUID. A delivery without one can't
-    //    be deduped (a malformed request); a repeat is a no-op.
+    // 2. Idempotency: dedupe on the delivery GUID. A genuine GitHub delivery
+    //    always carries one; its absence is a malformed request we reject (400),
+    //    since without it idempotency is impossible. A repeat GUID is a no-op.
     let Some(delivery) = headers
         .get("x-github-delivery")
         .and_then(|v| v.to_str().ok())
