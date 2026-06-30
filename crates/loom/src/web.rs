@@ -2132,16 +2132,41 @@ fn thread_dto(t: &discussion::Thread) -> ThreadDto {
     }
 }
 
+/// Resolve `{name}` to an artifact visible from the session (branch-scoped then
+/// repo-shared, the way `get_artifact` does), returning the session's branch
+/// alongside it. Shared by every thread endpoint.
+async fn session_artifact(st: &AppState, key: &str, name: &str) -> ApiResult<(Branch, Artifact)> {
+    let (_, branch) = require_session(&st.db, key).await?;
+    let a = artifact::get(&st.db, &branch.repo_root, &branch.id, name)
+        .await?
+        .ok_or_else(|| AppError::not_found("artifact"))?;
+    Ok((branch, a))
+}
+
+/// Resolve a thread by id, confirming it belongs to the named artifact the
+/// session can see — so a thread id can't be probed across artifacts or
+/// sessions.
+async fn session_thread(
+    st: &AppState,
+    key: &str,
+    name: &str,
+    tid: i64,
+) -> ApiResult<(Branch, Artifact, discussion::Thread)> {
+    let (branch, a) = session_artifact(st, key, name).await?;
+    let thread = discussion::get_thread(&st.db, tid)
+        .await?
+        .filter(|t| t.artifact_id == a.id)
+        .ok_or_else(|| AppError::not_found("thread"))?;
+    Ok((branch, a, thread))
+}
+
 /// `GET /sessions/{id}/artifacts/{name}/threads` — every thread on an
 /// artifact, open and resolved, each with its comments.
 async fn list_threads(
     State(st): State<AppState>,
     Path((key, name)): Path<(String, String)>,
 ) -> ApiResult<Json<Vec<ThreadDto>>> {
-    let (_, branch) = require_session(&st.db, &key).await?;
-    let a = artifact::get(&st.db, &branch.repo_root, &branch.id, &name)
-        .await?
-        .ok_or_else(|| AppError::not_found("artifact"))?;
+    let (_, a) = session_artifact(&st, &key, &name).await?;
     let threads = discussion::list_for_artifact(&st.db, a.id, true).await?;
     Ok(Json(threads.iter().map(thread_dto).collect()))
 }
@@ -2153,10 +2178,7 @@ async fn create_thread(
     Path((key, name)): Path<(String, String)>,
     Json(body): Json<NewThreadBody>,
 ) -> ApiResult<Json<ThreadDto>> {
-    let (_, branch) = require_session(&st.db, &key).await?;
-    let a = artifact::get(&st.db, &branch.repo_root, &branch.id, &name)
-        .await?
-        .ok_or_else(|| AppError::not_found("artifact"))?;
+    let (branch, a) = session_artifact(&st, &key, &name).await?;
     let thread = discussion::create_thread(
         &st.db,
         &discussion::NewThread {
@@ -2189,17 +2211,7 @@ async fn add_comment(
     Path((key, name, tid)): Path<(String, String, i64)>,
     Json(body): Json<NewCommentBody>,
 ) -> ApiResult<Json<CommentDto>> {
-    let (_, branch) = require_session(&st.db, &key).await?;
-    // Confirm the thread belongs to an artifact the session can see, the same
-    // way the artifact endpoints resolve `{name}` (branch-scoped then
-    // repo-shared) — not just any thread id.
-    let a = artifact::get(&st.db, &branch.repo_root, &branch.id, &name)
-        .await?
-        .ok_or_else(|| AppError::not_found("artifact"))?;
-    let thread = discussion::get_thread(&st.db, tid)
-        .await?
-        .filter(|t| t.artifact_id == a.id)
-        .ok_or_else(|| AppError::not_found("thread"))?;
+    let (branch, _a, thread) = session_thread(&st, &key, &name, tid).await?;
     let comment = discussion::add_comment(&st.db, thread.id, "user", &body.body).await?;
     events::record(
         &st.db,
@@ -2224,14 +2236,7 @@ async fn resolve_thread(
     State(st): State<AppState>,
     Path((key, name, tid)): Path<(String, String, i64)>,
 ) -> ApiResult<Json<Value>> {
-    let (_, branch) = require_session(&st.db, &key).await?;
-    let a = artifact::get(&st.db, &branch.repo_root, &branch.id, &name)
-        .await?
-        .ok_or_else(|| AppError::not_found("artifact"))?;
-    let thread = discussion::get_thread(&st.db, tid)
-        .await?
-        .filter(|t| t.artifact_id == a.id)
-        .ok_or_else(|| AppError::not_found("thread"))?;
+    let (branch, _a, thread) = session_thread(&st, &key, &name, tid).await?;
     discussion::resolve(&st.db, thread.id).await?;
     events::record(
         &st.db,

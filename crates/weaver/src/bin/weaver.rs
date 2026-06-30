@@ -633,9 +633,7 @@ async fn render_summary(db: &db::Db, b: &branch::Branch) -> Result<String> {
     // doesn't grow an empty header.
     let mut open_threads: Vec<(&str, discussion::Thread)> = Vec::new();
     for a in &artifacts {
-        let threads = discussion::list_for_artifact(db, a.id, false)
-            .await
-            .unwrap_or_default();
+        let threads = discussion::list_for_artifact(db, a.id, false).await?;
         open_threads.extend(threads.into_iter().map(|t| (a.name.as_str(), t)));
     }
     if !open_threads.is_empty() {
