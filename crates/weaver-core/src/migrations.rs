@@ -67,6 +67,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "overlooker_state",
         include_str!("../migrations/0010_overlooker_state.sql"),
     ),
+    (
+        11,
+        "discussion",
+        include_str!("../migrations/0011_discussion.sql"),
+    ),
 ];
 
 /// Apply every pending migration, bringing the database up to the latest schema.
