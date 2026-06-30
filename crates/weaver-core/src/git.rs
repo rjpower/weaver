@@ -63,6 +63,45 @@ pub async fn repo_root(dir: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(first))
 }
 
+/// Clone `url` into `dest`, or fetch into it when `dest` is already a clone —
+/// idempotent, so two session launches racing to acquire the same managed repo
+/// converge instead of one erroring on a populated directory. Authentication
+/// rides the ambient git credential helper (the deploy image wires `GH_TOKEN`);
+/// no credentials are passed or stored here.
+pub async fn clone(url: &str, dest: &Path) -> Result<()> {
+    // An existing clone (its `.git` is present) is refreshed, not re-cloned.
+    if dest.join(".git").exists() {
+        git(dest, &["fetch", "--all", "--prune"]).await?;
+        tracing::info!(dest = %dest.display(), "fetched existing clone");
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating repo parent {}", parent.display()))?;
+    }
+    // `git clone` has no working tree to `-C` into yet, so it is spawned directly
+    // rather than through the `git()` helper.
+    let dest_str = dest.to_string_lossy();
+    let out = Command::new("git")
+        .args(["clone", url, &dest_str])
+        .output()
+        .await
+        .context("failed to spawn git clone")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        tracing::warn!(
+            url,
+            dest = %dest.display(),
+            stderr = %truncate(stderr.trim(), 500),
+            "git clone failed"
+        );
+        bail!("git clone failed: {}", stderr.trim());
+    }
+    tracing::info!(url, dest = %dest.display(), "cloned repo");
+    Ok(())
+}
+
 /// Ensure `pattern` is present in the repository's `.git/info/exclude`, so
 /// that (for example) the in-repo `.worktrees/` directory is not reported as
 /// untracked content. This is local-only and never touches a tracked file.
@@ -582,6 +621,61 @@ mod tests {
         let clean = changed_files(dir, &since).await.unwrap();
         assert_eq!(clean.len(), 1);
         assert_eq!(clean[0].path, "mine.txt");
+    }
+
+    /// `clone` acquires a repo into a fresh dest, then is idempotent: a second
+    /// call fetches into the existing clone (picking up new commits) instead of
+    /// failing on the populated directory. Uses a local bare repo as the remote —
+    /// no network.
+    #[tokio::test]
+    async fn clone_then_fetch_is_idempotent() {
+        // A working source repo with one commit.
+        let src = tempfile::tempdir().unwrap();
+        let sdir = src.path();
+        run(sdir, &["init", "-q", "-b", "main"]).await;
+        run(sdir, &["config", "user.email", "t@t.t"]).await;
+        run(sdir, &["config", "user.name", "t"]).await;
+        std::fs::write(sdir.join("a.txt"), "a\n").unwrap();
+        run(sdir, &["add", "-A"]).await;
+        commit(sdir, "init").await;
+
+        // A bare clone of it acts as the clonable remote.
+        let bare = tempfile::tempdir().unwrap();
+        let bare_path = bare.path().join("origin.git");
+        let out = Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                &sdir.to_string_lossy(),
+                &bare_path.to_string_lossy(),
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success(), "bare clone of the source failed");
+        let bare_url = bare_path.to_string_lossy().to_string();
+
+        // First call clones into a nested <root>/owner/name path (parent created).
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("acme").join("widgets");
+        clone(&bare_url, &dest).await.unwrap();
+        assert!(dest.join(".git").exists(), "clone made a working clone");
+        assert!(dest.join("a.txt").exists(), "clone checked out content");
+
+        // Advance the remote with a second commit.
+        std::fs::write(sdir.join("b.txt"), "b\n").unwrap();
+        run(sdir, &["add", "-A"]).await;
+        let second = commit(sdir, "second").await;
+        run(sdir, &["push", "-q", &bare_url, "main"]).await;
+
+        // Idempotent: the second call fetches rather than erroring, and the new
+        // commit is now reachable via origin.
+        clone(&bare_url, &dest).await.unwrap();
+        assert!(
+            commit_exists(&dest, &second).await,
+            "fetch pulled the new remote commit into the existing clone"
+        );
     }
 
     /// With no `origin` remote, the launch base degrades to the local current

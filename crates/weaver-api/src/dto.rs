@@ -418,7 +418,17 @@ pub struct ScratchUpload {
 /// Body for `POST /api/sessions`: launch a new session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateReq {
+    /// The repo to fork the session's worktree from, as a local path. Ignored
+    /// when `repo` (a managed repo) is set; otherwise required.
+    #[serde(default)]
     pub cwd: String,
+    /// An optional **managed** repository to launch against: a GitHub `owner/name`
+    /// slug or URL. When set, loom resolves it against the registered repo
+    /// allowlist, clones it into the managed repo store if absent (else fetches),
+    /// and uses that checkout as the repo root — `cwd` is then ignored. Unset (the
+    /// default) keeps the historical behaviour: fork from `cwd`'s repo.
+    #[serde(default)]
+    pub repo: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
