@@ -126,6 +126,11 @@ pub struct SessionView {
     /// Branch id of the session that **launched** this one — the parent in the
     /// dashboard's session tree — or `null` for a top-level session.
     pub parent_id: Option<String>,
+    /// The principal (username) that launched this session — attribution for the
+    /// shared team board. `null` for engine-created sessions (the concierge, warm
+    /// overlooker sessions) and rows that predate the column. A tracking/UX field,
+    /// not a security boundary: the fleet stays co-owned by everyone authenticated.
+    pub created_by: Option<String>,
     /// The tracking issue opened for this session's task at launch (the handle
     /// handed back to whoever launched it). Only populated on the create
     /// response; `None` on the list/get/patch paths, which don't recompute it.

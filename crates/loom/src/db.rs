@@ -31,6 +31,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- from the fleet listing and the survey scope, and its restart adoption is
     -- governed by `overlooker.adopt_warm`, independent of `server.auto_adopt`.
     managed_by         TEXT,
+    -- The principal (username) that launched this session — attribution for the
+    -- shared team board. NULL for engine-created sessions (warm overlooker
+    -- sessions) and rows that predate the column. A tracking/UX field, never a
+    -- security boundary: the fleet stays co-owned, this just records who/what
+    -- launched each session.
+    created_by         TEXT,
     created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_active_branch
@@ -173,6 +179,13 @@ async fn migrate_loom(pool: &Db) -> Result<()> {
     // ordinary fleet session. Sessions predating the column stay NULL (they are
     // all ordinary fleet sessions, as they were before warm sessions existed).
     add_column_if_missing(pool, "sessions", "managed_by", "TEXT").await?;
+    // The principal (username) that launched this session — attribution for the
+    // shared team board. NULL for engine-created sessions and rows predating the
+    // column. (The `sessions` table is created here in `migrate_loom`, after the
+    // weaver-core numbered migrations have already run, so a `sessions` column is
+    // added here rather than as a numbered migration in weaver-core/migrations —
+    // matching `model`/`effort`/`parent_branch_id`/`managed_by` above.)
+    add_column_if_missing(pool, "sessions", "created_by", "TEXT").await?;
     seed_owner(pool).await?;
     Ok(())
 }

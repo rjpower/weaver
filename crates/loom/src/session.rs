@@ -35,6 +35,12 @@ pub struct Session {
     /// restart adoption is governed by `overlooker.adopt_warm` rather than
     /// `server.auto_adopt`.
     pub managed_by: Option<String>,
+    /// The principal (username) that launched this session — attribution for the
+    /// shared team board. `None` for engine-created sessions (warm overlooker
+    /// sessions) and rows that predate the column. Stamped once at creation from
+    /// the resolving [`crate::auth::Principal`]; a tracking/UX field, never a
+    /// security boundary.
+    pub created_by: Option<String>,
 }
 
 /// Session **lifecycle** states — the mechanical, orchestrator-owned axis: is
@@ -78,6 +84,9 @@ pub struct NewSession {
     /// The owning overlooker id for an engine-managed (warm) session, or `None`
     /// for an ordinary fleet session. See [`Session::managed_by`].
     pub managed_by: Option<String>,
+    /// The principal (username) that launched this session, or `None` for an
+    /// engine-created (warm) session. See [`Session::created_by`].
+    pub created_by: Option<String>,
 }
 
 pub async fn insert(db: &Db, s: &NewSession) -> Result<Session> {
@@ -85,8 +94,8 @@ pub async fn insert(db: &Db, s: &NewSession) -> Result<Session> {
     sqlx::query(
         "INSERT INTO sessions
          (id, branch_id, work_dir, term_session, agent_kind, model, effort, status,
-          github_repo, parent_branch_id, managed_by, last_activity_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          github_repo, parent_branch_id, managed_by, created_by, last_activity_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&s.id)
     .bind(&s.branch_id)
@@ -99,6 +108,7 @@ pub async fn insert(db: &Db, s: &NewSession) -> Result<Session> {
     .bind(&s.github_repo)
     .bind(&s.parent_branch_id)
     .bind(&s.managed_by)
+    .bind(&s.created_by)
     .bind(&now)
     .bind(&now)
     .execute(db)
@@ -276,6 +286,7 @@ mod tests {
             github_repo: None,
             parent_branch_id: None,
             managed_by: managed_by.map(str::to_string),
+            created_by: None,
         }
     }
 

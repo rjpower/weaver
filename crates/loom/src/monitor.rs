@@ -366,6 +366,7 @@ mod tests {
             created_at: created_at.to_string(),
             parent_branch_id: None,
             managed_by: None,
+            created_by: None,
         }
     }
 

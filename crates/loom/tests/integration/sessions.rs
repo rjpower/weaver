@@ -525,6 +525,54 @@ async fn adopt_recreates_killed_session() {
     client.delete(&format!("/api/sessions/{id}")).await.unwrap();
 }
 
+/// A session records the principal that launched it (`created_by`) — attribution
+/// for the shared board. The value is read from the resolving `Principal` (here
+/// the loopback owner the harness authenticates as), stored on the row at create
+/// time, and survives a re-list (and a get-by-id) unchanged.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_records_its_creating_principal() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    // Who the harness authenticates as — the resolved principal for these calls.
+    // Asserting against this (rather than a hardcoded name) proves attribution is
+    // read from the Principal, not pinned to one user.
+    let me = client.get("/api/auth/me").await.unwrap();
+    let who = me["username"].as_str().unwrap().to_string();
+    assert!(!who.is_empty(), "the loopback caller resolves to a user");
+
+    let ws = client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "attributed work", "cwd": ts.cwd(), "agent": "shell" }),
+        )
+        .await
+        .unwrap();
+    let id = ws["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        ws["created_by"].as_str(),
+        Some(who.as_str()),
+        "the create response attributes the session to the launching principal"
+    );
+
+    // Stored, not recomputed: the attribution is still there on a plain list…
+    let list = client.get("/api/sessions").await.unwrap();
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == id.as_str())
+        .expect("session in list");
+    assert_eq!(row["created_by"].as_str(), Some(who.as_str()));
+
+    // …and on a get-by-id.
+    let got = client.get(&format!("/api/sessions/{id}")).await.unwrap();
+    assert_eq!(got["created_by"].as_str(), Some(who.as_str()));
+
+    client.delete(&format!("/api/sessions/{id}")).await.unwrap();
+}
+
 /// A delegated launch records its launcher as the session's tree parent
 /// (`parent_id`); a top-level launch has none. The link is stored on the session
 /// row at create time, so it survives a re-list unchanged.

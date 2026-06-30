@@ -747,6 +747,7 @@ mod tests {
                 github_repo: None,
                 parent_branch_id: None,
                 managed_by: None,
+                created_by: None,
             },
         )
         .await

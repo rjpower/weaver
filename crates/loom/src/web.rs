@@ -226,6 +226,7 @@ async fn session_view(db: &Db, session: &Session, branch: &Branch) -> ApiResult<
         created_at: session.created_at.clone(),
         updated_at: branch.updated_at.clone(),
         parent_id: session.parent_branch_id.clone(),
+        created_by: session.created_by.clone(),
         tracking_issue: None,
         branch: bv,
     })
@@ -636,9 +637,16 @@ async fn get_session(
 
 async fn create_session(
     State(st): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Json(req): Json<CreateReq>,
 ) -> ApiResult<Json<SessionView>> {
-    Ok(Json(create_session_core(st, req).await?))
+    // Attribute the session to whoever the auth middleware resolved: a human
+    // (cookie/token) → their username; a loopback/local-token call → the owner;
+    // a future webhook → its bot principal. Read from the `Principal`, never
+    // hardcoded and never client-supplied.
+    Ok(Json(
+        create_session_core(st, req, Some(principal.username)).await?,
+    ))
 }
 
 /// Resolve the **runtime** a session of `agent_kind` launches with. Every kind is
@@ -699,7 +707,14 @@ fn initial_status(runtime: &str) -> &'static str {
 /// The session-creation core, shared by `POST /api/sessions` and the Chat
 /// surface's concierge get-or-create ([`get_chat`]). Returns the view directly so
 /// the caller can shape its own response.
-async fn create_session_core(st: AppState, req: CreateReq) -> ApiResult<SessionView> {
+///
+/// `created_by` is the launching principal's username (attribution for the shared
+/// board), or `None` for a system launch with no user behind it (the concierge).
+async fn create_session_core(
+    st: AppState,
+    req: CreateReq,
+    created_by: Option<String>,
+) -> ApiResult<SessionView> {
     let cwd = PathBuf::from(&req.cwd);
     let repo_root = git::repo_root(&cwd)
         .await
@@ -1035,6 +1050,7 @@ async fn create_session_core(st: AppState, req: CreateReq) -> ApiResult<SessionV
             github_repo: github_repo.clone(),
             parent_branch_id: parent.as_ref().map(|b| b.id.clone()),
             managed_by: None,
+            created_by,
         },
     )
     .await?;
@@ -1135,7 +1151,9 @@ async fn create_concierge(st: AppState) -> ApiResult<SessionView> {
         title: Some("Fleet concierge".to_string()),
         ..Default::default()
     };
-    create_session_core(st, req).await
+    // The concierge is a system singleton, not a user's workstream (and is hidden
+    // from the fleet board), so it carries no creator attribution.
+    create_session_core(st, req, None).await
 }
 
 /// `POST /api/chat/reset` — start a clean conversation with the concierge. The
@@ -1653,6 +1671,8 @@ pub async fn create_warm_session(
             github_repo: None,
             parent_branch_id: None,
             managed_by: Some(overlooker.id.clone()),
+            // Engine-created infrastructure, no user behind it.
+            created_by: None,
         },
     )
     .await?;
