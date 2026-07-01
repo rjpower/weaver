@@ -6,7 +6,6 @@ a TLS front-door in front of it is the choice this directory captures.
 | Path | Front-door | Use it when |
 |---|---|---|
 | **[`standalone/`](standalone/)** | **bundled** (Caddy, automatic HTTPS) | You want one self-contained, internet-facing host. **Start here.** |
-| repo-root `docker-compose.yml` | external (a Caddy you already run) | You already operate a shared reverse proxy on a `web` network (the maintainer "halcyon" setup). |
 | [`gcp/`](gcp/) | bundled (runs `standalone/` unmodified) | You want scripted provisioning of a single GCE VM to run the standalone stack on, instead of bringing your own host. |
 | cloud / cluster | — | Future work — see [below](#future-cloud--cluster). |
 
@@ -64,6 +63,21 @@ docker compose logs -f caddy   # watch the certificate get issued
 ```
 
 Then open `https://<LOOM_DOMAIN>` and [log in](#first-run-login).
+
+Or let [`run.py`](standalone/run.py) do the render + `up` in one step — the
+local/self-hosted counterpart to [`gcp/bootstrap.py`](gcp/bootstrap.py):
+
+```sh
+deploy/standalone/run.py            # render .env from loom.toml, then compose up
+deploy/standalone/run.py --local    # same, but LOOM_DOMAIN=localhost for a
+                                     # self-signed try-out on your own machine
+```
+
+`--local` exercises the real three-service stack over `https://localhost` (Caddy
+signs with its own internal CA — the browser warns, expected). Sign-in still
+goes through GitHub (loopback trust doesn't apply behind Caddy), so the App's
+OAuth callback list must include `https://localhost/api/auth/github/callback` —
+`loom setup github-app --base-url https://localhost` sets that up.
 
 To validate the config without starting anything:
 

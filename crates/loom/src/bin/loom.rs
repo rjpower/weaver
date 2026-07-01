@@ -11,6 +11,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde_json::{json, Value};
 
 use loom::client::{self, Client};
+use weaver_core::db::Db;
 
 #[derive(Parser)]
 #[command(
@@ -100,8 +101,10 @@ enum Cmd {
     /// `loom setup` with no subcommand runs the **interactive walkthrough**: it
     /// establishes a bootstrap operator (so the daemon can start and someone can
     /// sign in), then optionally the GitHub App and the agent secrets — one
-    /// command to get a fresh instance ready. The subcommands below run an
-    /// individual step directly.
+    /// command to get a fresh instance ready. Re-running it is safe: each step
+    /// pre-fills its default from the existing config, so it updates in place
+    /// rather than starting over. The subcommands below run an individual step
+    /// directly.
     ///
     /// `loom setup github-app` registers the GitHub App loom uses (the
     /// webhook receiver + REST identity from `docs/github-trigger.md`, which
@@ -109,7 +112,9 @@ enum Cmd {
     /// flow**: it opens a local page that auto-submits to GitHub, you confirm
     /// once, and loom exchanges the redirect for the full credential set —
     /// app id, private key, webhook secret, OAuth client — writing them
-    /// straight into loom's settings. No `.env` editing, no restart.
+    /// straight into loom's settings. No `.env` editing, no restart. When an App
+    /// is already configured it instead offers to update its permissions or
+    /// re-install it (opening the right GitHub page), or to replace it.
     ///
     ///     loom setup github-app --base-url https://loom.team.dev
     ///
@@ -806,12 +811,25 @@ async fn cmd_setup_init() -> Result<()> {
         .await
         .context("opening loom's database")?;
 
+    // Pre-fill each step's default from any existing config, so re-running the
+    // wizard updates in place instead of restarting from scratch. The operator
+    // login falls back to the seeded primary user when loom.toml has none yet.
+    let existing_cfg = loom::loom_config::load(&config_path).ok();
+    let prefill_owner = existing_cfg
+        .as_ref()
+        .and_then(|c| c.owner_github.clone())
+        .or(loom::auth::primary_user(&db).await.ok().flatten());
+    let prefill_base_url = existing_cfg
+        .as_ref()
+        .and_then(|c| c.domain.as_deref())
+        .and_then(base_url_from_domain);
+
     // Step 1 — bootstrap operator (required). Without one, no one can sign in
     // and the daemon refuses to start, so this step cannot be skipped.
     println!("Step 1/4 · Bootstrap operator (required)");
     println!("  The GitHub login allowed to sign in first and approve everyone else.");
     let owner = loop {
-        let login = prompt_line("GitHub login", None)?;
+        let login = prompt_line("GitHub login", prefill_owner.as_deref())?;
         if loom::owners::valid_login(&login) {
             break login;
         }
@@ -842,9 +860,14 @@ async fn cmd_setup_init() -> Result<()> {
     // Step 2 — public URL.
     println!("Step 2/4 · Public URL");
     println!("  Where loom is reachable; localhost for a local try-out.");
-    let base_url = prompt_line("Base URL", Some("http://localhost:7878"))?
-        .trim_end_matches('/')
-        .to_string();
+    let base_url = prompt_line(
+        "Base URL",
+        prefill_base_url
+            .as_deref()
+            .or(Some("http://localhost:7878")),
+    )?
+    .trim_end_matches('/')
+    .to_string();
     let domain = host_from_base_url(&base_url).to_string();
     loom::loom_config::upsert(&config_path, &[("LOOM_DOMAIN", domain.as_str())])
         .context("writing the domain into loom.toml")?;
@@ -853,8 +876,20 @@ async fn cmd_setup_init() -> Result<()> {
     // Step 3 — GitHub App (optional; opens a browser). Delegates to the same
     // wizard the subcommand uses, passing the operator so it stays consistent.
     println!("Step 3/4 · GitHub App (recommended — opens your browser)");
-    println!("  Creates the App loom acts through (webhook, sign-in, per-repo tokens).");
-    if prompt_yes_no("Set up the GitHub App now?", true)? {
+    // An App already on file turns this step into an update/re-install (the
+    // create-vs-update choice itself is offered inside `cmd_setup_github_app`).
+    let app_exists = existing_app(&db).await.is_some();
+    if app_exists {
+        println!("  A GitHub App is already configured — you can update or re-install it.");
+    } else {
+        println!("  Creates the App loom acts through (webhook, sign-in, per-repo tokens).");
+    }
+    let step3_prompt = if app_exists {
+        "Review / update the GitHub App now?"
+    } else {
+        "Set up the GitHub App now?"
+    };
+    if prompt_yes_no(step3_prompt, true)? {
         let app_opts = GithubAppOpts {
             base_url: base_url.clone(),
             name: None,
@@ -871,6 +906,8 @@ async fn cmd_setup_init() -> Result<()> {
             println!("  ! GitHub App setup didn't complete: {e}");
             println!("  Retry later with `loom setup github-app --base-url {base_url}`.");
         }
+    } else if app_exists {
+        println!("  Left the existing App as-is.");
     } else {
         println!("  Skipped — set it up later with `loom setup github-app`.");
     }
@@ -938,6 +975,139 @@ fn prompt_yes_no(label: &str, default_yes: bool) -> Result<bool> {
     })
 }
 
+/// Prompt for one of `options` by number, returning the chosen 0-based index.
+/// A blank answer takes `default` (also 0-based); an out-of-range answer
+/// re-prompts.
+fn prompt_choice(prompt: &str, options: &[&str], default: usize) -> Result<usize> {
+    use std::io::Write;
+    println!("  {prompt}");
+    for (i, opt) in options.iter().enumerate() {
+        let marker = if i == default { "  (default)" } else { "" };
+        println!("    {}) {opt}{marker}", i + 1);
+    }
+    loop {
+        print!("  Choice [{}]: ", default + 1);
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("reading a menu choice")?;
+        let s = input.trim();
+        if s.is_empty() {
+            return Ok(default);
+        }
+        match s.parse::<usize>() {
+            Ok(n) if (1..=options.len()).contains(&n) => return Ok(n - 1),
+            _ => println!("  Enter a number from 1 to {}.", options.len()),
+        }
+    }
+}
+
+/// Open `url` in the operator's browser (best-effort via `xdg-open`), always
+/// printing it first so a headless or SSH-tunnelled run can open it by hand.
+fn open_browser(url: &str, intro: &str) {
+    println!("{intro}");
+    println!("  {url}");
+    let _ = std::process::Command::new("xdg-open").arg(url).status();
+}
+
+/// The GitHub App already recorded in loom's settings, if any. `slug`/`org` may
+/// be absent for an App created before setup began recording them
+/// ([`loom::github_app::APP_SLUG_KEY`]).
+struct ExistingApp {
+    id: String,
+    slug: Option<String>,
+    org: Option<String>,
+}
+
+/// Read the configured App from the settings table. `None` when no App id is
+/// stored (a fresh instance, or one that only ever used the ambient `GH_TOKEN`).
+async fn existing_app(db: &Db) -> Option<ExistingApp> {
+    let nonempty = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let id = nonempty(loom::config::get(db, loom::github_app::APP_ID_KEY).await)?;
+    Some(ExistingApp {
+        id,
+        slug: nonempty(loom::config::get(db, loom::github_app::APP_SLUG_KEY).await),
+        org: nonempty(loom::config::get(db, loom::github_app::APP_OWNER_KEY).await),
+    })
+}
+
+/// Present the update / re-install menu for an already-configured App. Returns
+/// `true` when the operator chose to create a brand-new App (the caller should
+/// fall through to the manifest flow, replacing the old one); `false` when the
+/// existing App was handled here (a page opened, or left untouched).
+async fn offer_existing_app(app: &ExistingApp) -> Result<bool> {
+    println!(
+        "  A GitHub App is already configured (id {}{}).",
+        app.id,
+        app.slug
+            .as_deref()
+            .map(|s| format!(", {s}"))
+            .unwrap_or_default()
+    );
+    let choice = prompt_choice(
+        "What would you like to do?",
+        &[
+            "Update its permissions/settings on GitHub (opens the App's settings page)",
+            "Install or re-install it on repositories (opens the install page)",
+            "Create a new App to replace it",
+            "Leave it as-is",
+        ],
+        3,
+    )?;
+    match choice {
+        // Update permissions/settings. loom can't change GitHub App permissions
+        // itself — the owner edits them in the UI, then each installation
+        // re-approves — so this deep-links to the right page and says what to do.
+        0 => match &app.slug {
+            Some(slug) => {
+                let url = loom::github_manifest::settings_url(slug, app.org.as_deref());
+                open_browser(
+                    &url,
+                    "  Opening the App's settings. If nothing opens, visit:",
+                );
+                println!(
+                    "  Adjust Repository permissions as needed (e.g. Pull requests: Read & \
+                     write), Save, then accept the updated permissions on each installation."
+                );
+            }
+            None => println!(
+                "  This App's slug isn't on record (it predates slug capture). Open your App \
+                 settings manually at https://github.com/settings/apps and edit it there."
+            ),
+        },
+        // Install / re-install / adjust repo access. The install page also
+        // surfaces any pending permission re-approval.
+        1 => match &app.slug {
+            Some(slug) => {
+                let url = loom::github_manifest::install_url(slug);
+                open_browser(&url, "  Opening the install page. If nothing opens, visit:");
+            }
+            None => println!(
+                "  This App's slug isn't on record; find it at \
+                 https://github.com/settings/apps and use its Install button."
+            ),
+        },
+        2 => return Ok(true),
+        _ => println!("  Left the existing App unchanged."),
+    }
+    Ok(false)
+}
+
+/// Reconstruct a base URL from a stored `LOOM_DOMAIN` for pre-filling the
+/// wizard: `localhost` (with no port on record) maps back to the local default,
+/// any real domain to `https://<domain>`. `None` for an empty domain.
+fn base_url_from_domain(domain: &str) -> Option<String> {
+    let d = domain.trim();
+    if d.is_empty() {
+        None
+    } else if d == "localhost" || d.starts_with("localhost:") || d.starts_with("127.0.0.1") {
+        Some("http://localhost:7878".to_string())
+    } else {
+        Some(format!("https://{d}"))
+    }
+}
+
 /// `loom setup github-app` — the manifest-flow wizard. Talks to GitHub and to
 /// loom's sqlite database directly (the same daemon-less path `weaver` uses);
 /// it does not need the loom daemon to be running.
@@ -951,15 +1121,54 @@ async fn cmd_setup_github_app(opts: GithubAppOpts) -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_app_name(&base_url));
 
-    // `--org` needs an explicit owner: the manifest flow's own confirming
-    // account (`conv.owner.login`, used below when this is `None`) is the org
-    // itself for an org install, which isn't a usable `LOOM_OWNER_GITHUB` — a
-    // fresh database with no owner seeded locks everyone out (see
-    // `db::seed_owner`). Checked before opening the callback listener so a
-    // non-interactive, misconfigured run fails fast rather than after the
-    // operator has already gone through the browser confirmation.
+    let db = loom::db::connect(&weaver_core::db::default_db_path())
+        .await
+        .context("opening loom's database")?;
+
+    // If an App is already configured, offer to update / re-install it rather
+    // than silently registering a second one. Only fall through to the manifest
+    // create flow when the operator explicitly chooses to replace it (or when
+    // running non-interactively, preserving the historical create behavior).
+    if let Some(app) = existing_app(&db).await {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() {
+            if !offer_existing_app(&app).await? {
+                return Ok(());
+            }
+            println!();
+            println!("Creating a new App to replace the existing one…");
+        } else {
+            eprintln!(
+                "note: a GitHub App (id {}) is already configured; creating another.",
+                app.id
+            );
+        }
+    }
+
+    // Which account owns the App: an explicit `--org`, else ask interactively
+    // (defaulting to the personal account). A non-interactive run with no `--org`
+    // stays personal, preserving the historical default for scripted setups.
+    let org: Option<String> = match &opts.org {
+        Some(o) => Some(o.clone()),
+        None => {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                prompt_org()?
+            } else {
+                None
+            }
+        }
+    };
+
+    // An org-owned App needs an explicit individual owner: the manifest flow's
+    // own confirming account (`conv.owner.login`, used below when this is `None`)
+    // is the org itself for an org install, which isn't a usable
+    // `LOOM_OWNER_GITHUB` — a fresh database with no owner seeded locks everyone
+    // out (see `db::seed_owner`). Resolved before opening the callback listener
+    // so a misconfigured run fails fast rather than after the operator has
+    // already gone through the browser confirmation.
     let org_owner: Option<String> = match (
-        &opts.org,
+        &org,
         opts.owner
             .as_deref()
             .map(str::trim)
@@ -996,7 +1205,7 @@ async fn cmd_setup_github_app(opts: GithubAppOpts) -> Result<()> {
         redirect_url: &redirect_url,
     });
     let state = loom::auth::random_state();
-    let target = loom::github_manifest::create_url(opts.org.as_deref(), &state);
+    let target = loom::github_manifest::create_url(org.as_deref(), &state);
     let html = loom::github_manifest::submission_html(&manifest, &target);
     // Served at `/` by the same listener that catches the `/callback` redirect
     // — no `file://` URL, so this works unmodified through an SSH tunnel or a
@@ -1007,7 +1216,7 @@ async fn cmd_setup_github_app(opts: GithubAppOpts) -> Result<()> {
     println!("App name:  {name}");
     println!(
         "Owner:     {}",
-        opts.org.as_deref().unwrap_or("your personal account")
+        org.as_deref().unwrap_or("your personal account")
     );
     println!("Webhook:   {base_url}/api/github/webhook");
     println!("Login:     {base_url}/api/auth/github/callback");
@@ -1050,9 +1259,6 @@ async fn cmd_setup_github_app(opts: GithubAppOpts) -> Result<()> {
     );
     println!("  {}", conv.html_url);
 
-    let db = loom::db::connect(&weaver_core::db::default_db_path())
-        .await
-        .context("opening loom's database to store the App credentials")?;
     loom::config::apply(
         &db,
         &[
@@ -1076,6 +1282,16 @@ async fn cmd_setup_github_app(opts: GithubAppOpts) -> Result<()> {
                 loom::auth::GH_CLIENT_SECRET_KEY.to_string(),
                 Some(conv.client_secret.clone()),
             ),
+            // Recorded (not runtime credentials) so a later `loom setup` can
+            // deep-link to this App's GitHub settings/install pages to update it.
+            (
+                loom::github_app::APP_SLUG_KEY.to_string(),
+                Some(conv.slug.clone()),
+            ),
+            (
+                loom::github_app::APP_OWNER_KEY.to_string(),
+                Some(org.clone().unwrap_or_default()),
+            ),
         ],
     )
     .await
@@ -1088,27 +1304,32 @@ async fn cmd_setup_github_app(opts: GithubAppOpts) -> Result<()> {
 
     let domain = host_from_base_url(&base_url);
     let app_id = conv.id.to_string();
-    // For a personal install the confirming account (`conv.owner.login`) *is*
-    // the right owner; for `--org` it's the org's own login, so `org_owner`
-    // (required, resolved above) is used instead.
+    // The individual who can sign in first (`LOOM_OWNER_GITHUB`): for a personal
+    // install the confirming account (`conv.owner.login`); for an org install
+    // `org_owner` (the org itself can't sign in, so an individual is required).
     let owner_login = org_owner.as_deref().unwrap_or(conv.owner.login.as_str());
+    // The account whose App installations the inbound trigger honors: for an org
+    // install that's the *org* (its repos are org-owned, so trusting the
+    // individual wouldn't cover them); for a personal install it's the same
+    // personal account that signs in.
+    let trusted_owner = org.as_deref().unwrap_or(owner_login);
 
-    // Trust that account as a trusted owner, so its App installations are honored
-    // by the inbound trigger. This is what keeps a *public* App safe: only owners
-    // on this allowlist are auto-trusted, never a stranger who installs the App on
-    // their own repo. Written live to the running daemon here, and to loom.toml
+    // Trust that account, so its App installations are honored by the inbound
+    // trigger. This is what keeps a *public* App safe: only owners on this
+    // allowlist are auto-trusted, never a stranger who installs the App on their
+    // own repo. Written live to the running daemon here, and to loom.toml
     // (`LOOM_ALLOWED_OWNERS`) below for a fresh DB. Add more in the UI later.
-    loom::owners::add(&db, owner_login)
+    loom::owners::add(&db, trusted_owner)
         .await
         .context("trusting the App owner in the trusted-owner allowlist")?;
     println!(
-        "Trusted GitHub owner '{owner_login}' for the inbound trigger — add more in \
+        "Trusted GitHub owner '{trusted_owner}' for the inbound trigger — add more in \
          Settings → Authorized GitHub owners."
     );
 
     // Merge (don't overwrite) the allowlist, so re-running setup never silently
     // drops owners an operator already added to loom.toml.
-    let allowed_owners = merged_allowed_owners(&opts.config.config, owner_login);
+    let allowed_owners = merged_allowed_owners(&opts.config.config, trusted_owner);
     let updates: Vec<(&str, &str)> = vec![
         ("LOOM_GITHUB_APP_ID", app_id.as_str()),
         ("LOOM_GITHUB_APP_PRIVATE_KEY", conv.pem.as_str()),
@@ -1192,18 +1413,30 @@ async fn cmd_setup_secrets(opts: SecretsOpts) -> Result<()> {
              secrets you paste) — run it directly, not piped or in CI"
         );
     }
-    println!("Paste-once secrets for the agents loom launches (leave blank to skip).");
-    let anthropic = prompt_secret("ANTHROPIC_API_KEY")?;
-    let gh_token = prompt_secret("GH_TOKEN")?;
-
-    if anthropic.is_none() && gh_token.is_none() {
-        println!("nothing entered — nothing to do");
-        return Ok(());
-    }
-
     let db = loom::db::connect(&weaver_core::db::default_db_path())
         .await
         .context("opening loom's database")?;
+    // Which secrets are already stored, so the prompts can say a blank answer
+    // keeps the existing value rather than clearing it.
+    let existing_names: std::collections::HashSet<String> = loom::agent_env::pairs(&db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+
+    println!("Paste-once secrets for the agents loom launches (leave blank to skip).");
+    let anthropic = prompt_secret(
+        "ANTHROPIC_API_KEY",
+        existing_names.contains("ANTHROPIC_API_KEY"),
+    )?;
+    let gh_token = prompt_secret("GH_TOKEN", existing_names.contains("GH_TOKEN"))?;
+
+    if anthropic.is_none() && gh_token.is_none() {
+        println!("nothing entered — existing values kept unchanged");
+        return Ok(());
+    }
+
     let mut stored = Vec::new();
     if let Some(v) = &anthropic {
         loom::agent_env::set(&db, "ANTHROPIC_API_KEY", v).await?;
@@ -1242,6 +1475,33 @@ async fn cmd_setup_secrets(opts: SecretsOpts) -> Result<()> {
     Ok(())
 }
 
+/// Ask whether the GitHub App should be owned by an organization instead of the
+/// operator's personal account, returning the org login (or `None` for a
+/// personal App). An org-owned App is created under the org's own developer
+/// settings; the individual `LOOM_OWNER_GITHUB` is still resolved separately
+/// (see [`prompt_owner`]).
+fn prompt_org() -> Result<Option<String>> {
+    let choice = prompt_choice(
+        "Who should own the GitHub App?",
+        &[
+            "Your personal account",
+            "An organization (its members share the App)",
+        ],
+        0,
+    )?;
+    if choice == 0 {
+        return Ok(None);
+    }
+    let org = loop {
+        let login = prompt_line("Organization login", None)?;
+        if loom::owners::valid_login(&login) {
+            break login;
+        }
+        println!("  '{login}' isn't a valid GitHub org login (letters, digits, and hyphens only).");
+    };
+    Ok(Some(org))
+}
+
 /// Prompt (plain, not hidden — a GitHub login isn't a secret) for the
 /// individual owner login an `--org` install needs, since the org itself
 /// can't be `LOOM_OWNER_GITHUB`.
@@ -1264,9 +1524,15 @@ fn prompt_owner(org: &str) -> Result<String> {
 }
 
 /// Prompt for a secret without echoing it to the terminal. An empty answer
-/// means "skip" (leave the current value, if any, alone).
-fn prompt_secret(name: &str) -> Result<Option<String>> {
-    let value = rpassword::prompt_password(format!("{name}: "))
+/// means "skip" (leave the current value, if any, alone). `already_set` annotates
+/// the prompt so the operator knows a blank answer keeps the stored value.
+fn prompt_secret(name: &str, already_set: bool) -> Result<Option<String>> {
+    let hint = if already_set {
+        " (already set — blank keeps it)"
+    } else {
+        ""
+    };
+    let value = rpassword::prompt_password(format!("{name}{hint}: "))
         .with_context(|| format!("reading {name}"))?;
     let value = value.trim();
     Ok((!value.is_empty()).then(|| value.to_string()))
@@ -2669,6 +2935,27 @@ mod tests {
             host_from_base_url("https://loom.example.com/"),
             "loom.example.com"
         );
+    }
+
+    #[test]
+    fn base_url_from_domain_reconstructs_the_wizard_default() {
+        // A real domain → https; the stored LOOM_DOMAIN has no scheme.
+        assert_eq!(
+            base_url_from_domain("loom.team.dev").as_deref(),
+            Some("https://loom.team.dev")
+        );
+        // localhost lost its port on the way to LOOM_DOMAIN → the local default.
+        assert_eq!(
+            base_url_from_domain("localhost").as_deref(),
+            Some("http://localhost:7878")
+        );
+        assert_eq!(
+            base_url_from_domain("127.0.0.1").as_deref(),
+            Some("http://localhost:7878")
+        );
+        // Nothing stored → no pre-fill (caller falls back to its own default).
+        assert_eq!(base_url_from_domain(""), None);
+        assert_eq!(base_url_from_domain("   "), None);
     }
 
     #[test]

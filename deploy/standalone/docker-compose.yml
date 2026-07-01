@@ -1,9 +1,8 @@
 # Self-contained, internet-facing loom deploy (Model 1, single shared container).
 #
-# Unlike the repo-root docker-compose.yml — which attaches to an EXTERNAL `web`
-# network and assumes a Caddy front-door already exists on the host — this stack
-# OWNS its front-door: a bundled Caddy terminates TLS for $LOOM_DOMAIN and is the
-# only service that publishes ports. loom itself is never bound on the host.
+# This stack OWNS its front-door: a bundled Caddy terminates TLS for $LOOM_DOMAIN
+# and is the only service that publishes ports. loom itself is never bound on the
+# host — the only way in is through Caddy.
 #
 # Full guide, env reference, and first-run steps: ../README.md
 name: loom
@@ -17,11 +16,15 @@ services:
   # the same three values. (See ../README.md "Security posture".)
   loom-init:
     image: ${LOOM_IMAGE:-loom:latest}
-    build: &loom_build
+    build:
       context: ../..
       args:
         HOST_UID: ${HOST_UID:-1000}
         HOST_GID: ${HOST_GID:-1000}
+        # Debug by default (fast to build); set CARGO_PROFILE=release for a
+        # production deploy. The image build caches the cargo target across
+        # rebuilds (BuildKit cache mounts — see the Dockerfile).
+        CARGO_PROFILE: ${CARGO_PROFILE:-debug}
     env_file: .env
     restart: "no"
     volumes:
@@ -38,7 +41,10 @@ services:
 
   loom:
     image: ${LOOM_IMAGE:-loom:latest}
-    build: *loom_build
+    # No build: of its own — loom runs the very image loom-init builds (identical
+    # Dockerfile + args, same tag). Declaring the build once keeps `up --build`
+    # from building *and* exporting the (large) image twice; loom-init runs first
+    # (below), so the image exists by the time this service starts.
     restart: unless-stopped
     env_file: .env
     depends_on:

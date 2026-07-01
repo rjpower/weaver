@@ -114,6 +114,25 @@ pub fn create_url(org: Option<&str>, state: &str) -> String {
     }
 }
 
+/// The GitHub page to edit an existing App's settings and permissions. A
+/// personal App lives under the owner's own developer settings; an org-owned App
+/// (`org` set) under the organization's. This is where an operator updates
+/// permissions loom can't change itself (GitHub App permissions are owner-edited
+/// in the UI, then re-approved per installation).
+pub fn settings_url(slug: &str, org: Option<&str>) -> String {
+    match org.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(org) => format!("https://github.com/organizations/{org}/settings/apps/{slug}"),
+        None => format!("https://github.com/settings/apps/{slug}"),
+    }
+}
+
+/// The page to install the App (or adjust which repositories it can access, and
+/// re-approve updated permissions) — the public App install page, valid for both
+/// personal and org-owned Apps.
+pub fn install_url(slug: &str) -> String {
+    format!("https://github.com/apps/{slug}/installations/new")
+}
+
 /// A local HTML page that auto-submits `manifest` to `target_url` the instant
 /// it loads, so the operator's browser lands straight on GitHub's own "Create
 /// GitHub App" confirmation screen. GitHub's manifest flow is POST-only (the
@@ -363,6 +382,37 @@ mod tests {
         assert_eq!(
             url,
             "https://github.com/organizations/acme-corp/settings/apps/new?state=a%20b"
+        );
+    }
+
+    // -- settings_url / install_url -----------------------------------------
+
+    #[test]
+    fn settings_url_personal_when_no_org() {
+        assert_eq!(
+            settings_url("loom-acme", None),
+            "https://github.com/settings/apps/loom-acme"
+        );
+        // A stored-but-empty owner (personal App) is treated as no org.
+        assert_eq!(
+            settings_url("loom-acme", Some("")),
+            "https://github.com/settings/apps/loom-acme"
+        );
+    }
+
+    #[test]
+    fn settings_url_org_form_when_org_owned() {
+        assert_eq!(
+            settings_url("loom-acme", Some("acme-corp")),
+            "https://github.com/organizations/acme-corp/settings/apps/loom-acme"
+        );
+    }
+
+    #[test]
+    fn install_url_uses_the_public_app_page() {
+        assert_eq!(
+            install_url("loom-acme"),
+            "https://github.com/apps/loom-acme/installations/new"
         );
     }
 

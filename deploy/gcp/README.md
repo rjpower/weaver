@@ -80,13 +80,17 @@ PROJECT=my-project LOOM_DOMAIN=loom.example.com ./bootstrap.py
 ```
 
 While `bootstrap.py` is waiting, go set the `A` record it printed at your DNS
-provider. Once it resolves, the script proceeds to create the VM. GCE runs
+provider. Once it resolves, the script creates the VM. GCE runs
 `startup-script.sh` as the instance's `startup-script` metadata: it installs
-Docker, installs the `gcloud` CLI, fetches the `LOOM_DOTENV` blob from Secret
+Docker, git, and the `gcloud` CLI, fetches the `LOOM_DOTENV` blob from Secret
 Manager and writes it to `deploy/standalone/.env`, clones the repo, and runs
 `docker compose up -d --build` from `deploy/standalone` — unmodified.
 
-Watch it boot:
+`bootstrap.py` then drives the deploy to completion for you: it waits for SSH,
+streams the startup-script's `journalctl` output until it finishes (or fails),
+and polls `https://<LOOM_DOMAIN>/` once the stack is up — so a single run ends
+either at "loom is live" or a specific failure. You don't need to tail the boot
+yourself, but to watch a later reboot:
 
 ```sh
 gcloud --project=my-project compute ssh loom --zone=us-central1-a \
@@ -94,16 +98,28 @@ gcloud --project=my-project compute ssh loom --zone=us-central1-a \
 ```
 
 Both scripts are check-before-create, so re-running either after an
-interruption is safe. Re-run `secrets.py` any time `loom.toml` changes to
-push the update, then re-trigger the startup script (see
-["Operations"](#operations)) to pick it up. `bootstrap.py` will not recreate
-or resize an existing instance — delete it first if you need to change its
-machine type or disks.
+interruption is safe. Re-running `bootstrap.py` against an existing VM updates
+its `startup-script` + placement metadata in place and re-triggers the boot to
+apply it (and pushes `LOOM_DOTENV` via `secrets.py` first if that secret is
+still missing) — so a fixed startup script or a new `--git-ref` rolls out with a
+bare re-run. It will *not* recreate or resize an existing instance, though;
+delete it first to change its machine type or disks. Re-run `secrets.py`
+yourself any time `loom.toml` changes, then re-run `bootstrap.py` (or re-trigger
+the startup script, see ["Operations"](#operations)) to pick it up.
 
 Run `./bootstrap.py --help` and `./secrets.py --help` for the full list of
 options and their defaults — every `bootstrap.py` option also has a
 same-named env var (`PROJECT`, `LOOM_DOMAIN`, `MACHINE_TYPE`, ...), so the
 env-var invocations above and `--flag` invocations are interchangeable.
+
+After a successful run `bootstrap.py` writes the knobs it used to a gitignored
+`deploy/gcp/deploy.toml` (project, domain, region, machine type, disk sizes,
+...), and reads them back as defaults next time — so a bare `./bootstrap.py`
+re-deploys with the last settings, and you only pass a flag to *change* one.
+Precedence is flag > env var > `deploy.toml` > built-in default; `push-image.py`
+reads the same file for its `--project`/`--region`. This is deploy/infra state,
+deliberately separate from `loom.toml` (the app config that `render-env` bakes
+into the container's env and Secret Manager).
 `secrets.py --granular` pushes each secret field to its own Secret Manager
 secret instead of the one `LOOM_DOTENV` blob, for independent rotation — see
 `./secrets.py --help`; the shipped `startup-script.sh` expects the blob.
@@ -134,7 +150,7 @@ VM deletes them along with it** — you'd lose the database and have to
 re-issue a certificate (subject to Let's Encrypt's rate limits).
 
 `bootstrap.py` mitigates this by default: it creates a separate persistent
-disk (`DATA_DISK_SIZE`, default 50GB) and `startup-script.sh` points Docker's
+disk (`DATA_DISK_SIZE`, default 500GB) and `startup-script.sh` points Docker's
 entire data-root at it (`/etc/docker/daemon.json`), so every named volume
 lands on that disk without any change to `docker-compose.yml`. That disk
 still gets deleted if you delete the VM *and* the disk together — it is
@@ -142,6 +158,19 @@ durability against VM recreation, not against `terraform destroy`-style
 teardown. To keep state across a full teardown, detach the disk first
 (`gcloud compute instances detach-disk`) or snapshot it
 (`gcloud compute disks snapshot`) before deleting the instance.
+
+**Resizing the data disk.** Re-running `bootstrap.py` with a larger
+`--data-disk-size` does *not* touch an existing disk — it's created only when
+absent, so a re-run just logs "already exists" and moves on. To grow it in
+place, resize the disk (GCP grows live; you can't shrink) and reboot:
+
+```sh
+gcloud compute disks resize loom-data --size=500GB --zone=<zone>
+gcloud compute instances reset loom --zone=<zone>
+```
+
+`startup-script.sh` runs `resize2fs` on every boot, so the ext4 filesystem
+expands to fill the enlarged disk automatically — no manual filesystem step.
 
 Set `DATA_DISK_SIZE=0` to skip this and put everything on the boot disk
 instead — simpler, but the loss-on-VM-delete risk above applies to the whole
@@ -154,30 +183,30 @@ The default (`IMAGE_MODE=build`) has the VM build the image itself with
 Rust+Node build, so this is slow and the default machine type
 (`e2-standard-4`, 100GB boot disk) is sized to avoid OOMing during it.
 
-For faster boots and re-deploys, build once and push to Artifact Registry,
-then point the VM at the prebuilt image:
+For faster boots and re-deploys, build the image once on your workstation and
+push it to Artifact Registry, then point the VM at the prebuilt image.
+`push-image.py` does the whole push side — enables the AR API, creates the
+`loom` repo, wires `docker` auth, and builds+pushes for `linux/amd64`:
 
 ```sh
-gcloud artifacts repositories create loom --repository-format=docker \
-  --location=us-central1 --project=my-project
-
-gcloud auth configure-docker us-central1-docker.pkg.dev
-
-docker build -t us-central1-docker.pkg.dev/my-project/loom/loom:latest .
-docker push us-central1-docker.pkg.dev/my-project/loom/loom:latest
+PROJECT=my-project ./push-image.py
 ```
 
-Then run `bootstrap.py` with:
+It pushes to `<region>-docker.pkg.dev/<project>/loom/loom:latest` — the exact
+path `bootstrap.py --image-mode=pull` derives by default, so you don't repeat
+it:
 
 ```sh
-IMAGE_MODE=pull \
-AR_IMAGE=us-central1-docker.pkg.dev/my-project/loom/loom:latest \
-PROJECT=my-project LOOM_DOMAIN=loom.example.com ./bootstrap.py
+IMAGE_MODE=pull PROJECT=my-project LOOM_DOMAIN=loom.example.com ./bootstrap.py
 ```
+
+(`AR_IMAGE`/`--ar-image` is only needed to pull some *other* image.) It builds
+`release` for `linux/amd64`; on a non-amd64 workstation that needs an emulating
+`docker-container` buildx builder (`docker buildx create --use`).
 
 `startup-script.sh` then does `gcloud auth configure-docker` (using the VM's
 own service account) and `docker compose pull` instead of `--build`. To roll
-out a new build to an existing VM, push a new image tag and either
+out a new build to an existing VM, `./push-image.py` again, then either
 `docker compose pull && docker compose up -d` over SSH, or reset the instance
 to re-run the startup script.
 
