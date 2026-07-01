@@ -174,6 +174,8 @@ const treeRows = computed<TreeRow[]>(() => {
   return rows;
 });
 const error = ref('');
+const MISSING_GITHUB_TOKEN_ERROR = 'No GitHub token configured.';
+const tokenConfigWarning = computed(() => error.value.startsWith(MISSING_GITHUB_TOKEN_ERROR));
 const showForm = ref(false);
 
 // A quiet pill's × clears that tag, then refreshes the row. The tag write
@@ -270,7 +272,22 @@ async function handleCreated() {
       @created="handleCreated"
     />
 
-    <p v-if="error" class="mb-4 text-sm text-block">{{ error }}</p>
+    <div v-if="error" class="mb-4 text-sm text-block">
+      <template v-if="tokenConfigWarning">
+        {{ MISSING_GITHUB_TOKEN_ERROR }}
+        <RouterLink
+          class="text-accent underline"
+          :to="{ path: '/settings', query: { tab: 'account' } }"
+        >Add your GitHub token</RouterLink>
+        or configure
+        <RouterLink
+          class="text-accent underline"
+          :to="{ path: '/settings', query: { tab: 'env' } }"
+        >GH_TOKEN</RouterLink>
+        before creating an agent session.
+      </template>
+      <template v-else>{{ error }}</template>
+    </div>
 
     <div
       v-if="!sessions.length"

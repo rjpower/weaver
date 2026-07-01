@@ -30,6 +30,8 @@ use super::scratch::{scratch_note, write_initial_scratch};
 use super::{author_or_manual, require_branch, require_session, session_view};
 use super::{ApiResult, AppError, AppState};
 
+const MISSING_GITHUB_TOKEN_MESSAGE: &str = "No GitHub token configured. Add your personal GitHub token in Settings > Account, or configure GH_TOKEN in Settings > Environment.";
+
 pub(super) async fn list_agents(State(st): State<AppState>) -> ApiResult<Json<Value>> {
     let default_agent = configured_agent(&st.db, "agent.default", config::DEFAULT_AGENT).await;
     Ok(Json(json!({
@@ -268,15 +270,16 @@ async fn launch_env(
 /// Precedence mirrors the commit-identity handling: only for a launch that
 /// carries a `created_by` principal (webhook/warm/adopt keep the shared ambient
 /// token), and only if no higher env layer (`repo_env` / `agent_env` / the repo
-/// file) already set `GH_TOKEN` — an explicit value wins. Best-effort: a lookup
-/// failure is logged, never fatal, so a token-store hiccup can't block a launch.
+/// file) already set a non-empty `GH_TOKEN` — an explicit usable value wins.
+/// Best-effort: a lookup failure is logged, never fatal, so a token-store hiccup
+/// can't block a launch.
 async fn apply_user_github_token(
     db: &Db,
     env: &mut Vec<(String, String)>,
     created_by: Option<&str>,
 ) {
     let Some(username) = created_by else { return };
-    if env.iter().any(|(k, _)| k == "GH_TOKEN") {
+    if env_has_nonempty(env, "GH_TOKEN") {
         return;
     }
     match crate::user_token::get(db, username).await {
@@ -284,6 +287,58 @@ async fn apply_user_github_token(
         Ok(None) => {}
         Err(e) => tracing::warn!(%username, "failed to load user github token: {e}"),
     }
+}
+
+fn env_has_key(env: &[(String, String)], name: &str) -> bool {
+    env.iter().any(|(k, _)| k == name)
+}
+
+fn env_has_nonempty(env: &[(String, String)], name: &str) -> bool {
+    env.iter().any(|(k, v)| k == name && !v.trim().is_empty())
+}
+
+fn ambient_env_has_nonempty(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
+async fn ensure_github_token_available(
+    db: &Db,
+    env: &[(String, String)],
+    created_by: Option<&str>,
+    runtime: &str,
+) -> ApiResult<()> {
+    // Shell sessions are explicitly allowed as empty/manual terminals; they do
+    // not need GitHub credentials to be useful.
+    if matches!(runtime, "shell" | "none") {
+        return Ok(());
+    }
+    let Some(username) = created_by else {
+        return Ok(());
+    };
+    // Webhook launches carry an attribution string, not a real approved user.
+    // Their GitHub credentials come from the app/ambient path rather than a
+    // per-user token row.
+    if crate::auth::get_user(db, username).await?.is_none() {
+        return Ok(());
+    }
+    if env_has_nonempty(env, "GH_TOKEN")
+        || (!env_has_key(env, "GH_TOKEN") && ambient_env_has_nonempty("GH_TOKEN"))
+    {
+        return Ok(());
+    }
+    if crate::user_token::get(db, username)
+        .await?
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty())
+    {
+        return Ok(());
+    }
+    Err(AppError::new(
+        StatusCode::PRECONDITION_REQUIRED,
+        MISSING_GITHUB_TOKEN_MESSAGE,
+    ))
 }
 
 /// The configured wall-clock budget for a repo setup run.
@@ -454,6 +509,16 @@ pub(crate) async fn create_session_core(
     // deliverable to track), and is hidden from the fleet list by its kind.
     let is_concierge = agent == agent::CONCIERGE_KIND;
     let runtime = launch_runtime(&st.db, &agent).await;
+    // The resolved launch environment: global agent_env < per-repo repo_env < the
+    // repo file's [env]. It is needed before provisioning so a real agent launch
+    // can stop cleanly when neither the user nor the deployment provides GH_TOKEN.
+    let mut extra_env = launch_env(&st.db, &repo_root, &repo_cfg).await;
+    // Run the launching user's git/gh as themselves: overlay their personal
+    // GitHub token as GH_TOKEN (design §6.3, "Level B"). See
+    // `apply_user_github_token` for the precedence rules. This happens before
+    // the preflight below so the guard and the eventual launch inspect the same
+    // environment vector.
+    apply_user_github_token(&st.db, &mut extra_env, created_by.as_deref()).await;
 
     // Normalize and validate the model / effort selections through the resolved
     // agent type. Blank means the agent's own default.
@@ -504,6 +569,7 @@ pub(crate) async fn create_session_core(
             "custom agent '{runtime}' does not accept model or effort selectors"
         )));
     }
+    ensure_github_token_available(&st.db, &extra_env, created_by.as_deref(), &runtime).await?;
 
     // Build title/goal/description; an optional GitHub issue seeds all three.
     let mut goal = req.goal.unwrap_or_default().trim().to_string();
@@ -754,9 +820,6 @@ pub(crate) async fn create_session_core(
     };
 
     let term_session = format!("weaver-{session_id}");
-    // The resolved launch environment: global agent_env < per-repo repo_env < the
-    // repo file's [env]. The same env is handed to the setup script and the agent.
-    let mut extra_env = launch_env(&st.db, &repo_root, &repo_cfg).await;
 
     // Attribute the agent's commits to the launching user (design §6.3, Level A):
     // export their GitHub identity as the git author/committer. Inserted only if
@@ -782,11 +845,6 @@ pub(crate) async fn create_session_core(
             Err(e) => tracing::warn!(%username, "failed to resolve commit identity: {e}"),
         }
     }
-
-    // Run the launching user's git/gh as themselves: overlay their personal
-    // GitHub token as GH_TOKEN (design §6.3, "Level B"). See
-    // `apply_user_github_token` for the precedence rules.
-    apply_user_github_token(&st.db, &mut extra_env, created_by.as_deref()).await;
 
     // Per-repo setup: run the repo's committed `[setup]` script in the worktree
     // before the agent starts — but ONLY for an allowlisted (registered) repo,
@@ -1953,6 +2011,34 @@ mod tests {
             .unwrap();
     }
 
+    struct EnvVarGuard {
+        name: &'static str,
+        value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(name: &'static str) -> Self {
+            let value = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, value }
+        }
+
+        fn set(name: &'static str, new_value: &str) -> Self {
+            let value = std::env::var_os(name);
+            std::env::set_var(name, new_value);
+            Self { name, value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.value {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn user_github_token_injected_as_gh_token() {
         let db = crate::db::connect_in_memory().await.unwrap();
@@ -1987,6 +2073,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_gh_token_layer_does_not_block_user_token() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        seed_user(&db, "alice").await;
+        crate::user_token::set(&db, "alice", "ghp_alice")
+            .await
+            .unwrap();
+
+        let mut env = vec![("GH_TOKEN".to_string(), "  ".to_string())];
+        apply_user_github_token(&db, &mut env, Some("alice")).await;
+        let gh: Vec<&(String, String)> = env.iter().filter(|(k, _)| k == "GH_TOKEN").collect();
+        assert_eq!(
+            gh.len(),
+            2,
+            "the user token is appended after the empty layer"
+        );
+        assert_eq!(
+            gh[1].1, "ghp_alice",
+            "the appended token wins at export time"
+        );
+    }
+
+    #[tokio::test]
     async fn gh_token_untouched_without_token_or_principal() {
         let db = crate::db::connect_in_memory().await.unwrap();
         seed_user(&db, "alice").await;
@@ -2004,6 +2112,81 @@ mod tests {
         let mut env2 = vec![("FOO".to_string(), "bar".to_string())];
         apply_user_github_token(&db, &mut env2, None).await;
         assert!(!env2.iter().any(|(k, _)| k == "GH_TOKEN"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn real_agent_requires_github_token_for_known_user() {
+        let _env = EnvVarGuard::unset("GH_TOKEN");
+        let db = crate::db::connect_in_memory().await.unwrap();
+        seed_user(&db, "alice").await;
+
+        let err = ensure_github_token_available(
+            &db,
+            &[("FOO".to_string(), "bar".to_string())],
+            Some("alice"),
+            "codex",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(err.message(), MISSING_GITHUB_TOKEN_MESSAGE);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn real_agent_accepts_user_or_default_github_token() {
+        let _env = EnvVarGuard::unset("GH_TOKEN");
+        let db = crate::db::connect_in_memory().await.unwrap();
+        seed_user(&db, "alice").await;
+
+        crate::user_token::set(&db, "alice", "ghp_alice")
+            .await
+            .unwrap();
+        ensure_github_token_available(&db, &[], Some("alice"), "claude")
+            .await
+            .unwrap();
+
+        crate::user_token::remove(&db, "alice").await.unwrap();
+        ensure_github_token_available(
+            &db,
+            &[("GH_TOKEN".to_string(), "ghp_shared".to_string())],
+            Some("alice"),
+            "codex",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn empty_configured_gh_token_does_not_fall_back_to_ambient() {
+        let _env = EnvVarGuard::set("GH_TOKEN", "ghp_ambient");
+        let db = crate::db::connect_in_memory().await.unwrap();
+        seed_user(&db, "alice").await;
+
+        let err = ensure_github_token_available(
+            &db,
+            &[("GH_TOKEN".to_string(), " ".to_string())],
+            Some("alice"),
+            "codex",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn shell_and_webhook_launches_do_not_require_user_github_token() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        seed_user(&db, "alice").await;
+
+        ensure_github_token_available(&db, &[], Some("alice"), "shell")
+            .await
+            .unwrap();
+        ensure_github_token_available(&db, &[], Some("github-webhook (octo)"), "codex")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

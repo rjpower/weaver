@@ -8,6 +8,28 @@ use loom::backend;
 
 use crate::fixtures::{sh, HomeGuard, TestServer};
 
+struct EnvVarGuard {
+    name: &'static str,
+    value: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn unset(name: &'static str) -> Self {
+        let value = std::env::var_os(name);
+        std::env::remove_var(name);
+        Self { name, value }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.value {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
 /// Creating a session provisions a worktree + terminal session and records the repo;
 /// deleting it tears the terminal session down and releases the repo's active count.
 #[serial]
@@ -83,6 +105,43 @@ async fn create_lists_and_tears_down() {
     assert_eq!(recent.len(), 1, "recent repo should outlive its sessions");
     assert_eq!(recent[0]["repo_root"], repo_root);
     assert_eq!(recent[0]["active_branches"], 0);
+}
+
+/// A real agent launch needs either the launching user's GitHub token or a
+/// default GH_TOKEN source. Without one, reject before provisioning anything.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_agent_without_github_token_is_rejected_before_provisioning() {
+    let _env = EnvVarGuard::unset("GH_TOKEN");
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    let err = client
+        .post(
+            "/api/sessions",
+            json!({
+                "goal": "needs credentials",
+                "cwd": ts.cwd(),
+                "agent": "codex",
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("server returned 428") && err.contains("No GitHub token configured"),
+        "unexpected error: {err}"
+    );
+
+    let list = client.get("/api/sessions").await.unwrap();
+    assert!(
+        list.as_array().unwrap().is_empty(),
+        "rejected launch should not create a session row: {list}"
+    );
+    assert!(
+        !ts.repo_path().join(".worktrees").exists(),
+        "rejected launch should not create a worktree directory"
+    );
 }
 
 /// With an `origin` remote present, a launch that doesn't pin `--base` forks the

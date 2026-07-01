@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import { get, patch, listAgents } from '../api';
 import type { AgentMetadata, SettingView } from '../types';
 import ToggleSwitch from '../components/ToggleSwitch.vue';
@@ -9,6 +10,10 @@ import EnvPanel from '../components/EnvPanel.vue';
 import AgentProfileEditor from '../components/AgentProfileEditor.vue';
 import SettingFieldRow from '../components/SettingFieldRow.vue';
 
+const route = useRoute();
+const router = useRouter();
+
+// The server's canonical reply for both GET and PATCH /api/settings.
 interface SettingsEnvelope {
   settings: SettingView[];
 }
@@ -120,7 +125,11 @@ const agentProfiles: {
   },
 ];
 
-const category = ref<Category>('agents');
+function categoryFromQuery(q: unknown): Category {
+  return categories.some((item) => item.id === q) ? (q as Category) : 'agents';
+}
+
+const category = ref<Category>(categoryFromQuery(route.query.tab));
 const settings = ref<SettingView[]>([]);
 const agents = ref<AgentMetadata[]>([]);
 const drafts = ref<Record<string, string>>({});
@@ -131,6 +140,18 @@ const busy = ref('');
 const currentCategory = computed(
   () => categories.find((item) => item.id === category.value) ?? categories[0],
 );
+
+watch(
+  () => route.query.tab,
+  (q) => (category.value = categoryFromQuery(q)),
+);
+
+function setCategory(next: Category) {
+  category.value = next;
+  router.replace({
+    query: { ...route.query, tab: next === 'agents' ? undefined : next },
+  });
+}
 
 const groupedSettings = computed(() => {
   const out = new Map<string, SettingView[]>();
@@ -350,7 +371,7 @@ onMounted(load);
                 ? 'bg-input font-medium text-fg'
                 : 'text-muted hover:bg-subtle hover:text-fg'
             "
-            @click="category = item.id"
+            @click="setCategory(item.id)"
           >
             <span
               class="h-1.5 w-1.5 rounded-full"
