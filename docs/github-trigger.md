@@ -121,17 +121,19 @@ loom setup github-app --base-url https://loom.team.dev
 
 It opens a local page that auto-submits the App configuration to GitHub, waits
 for your one confirmation click, exchanges the redirect for the full credential
-set (App id, private key, webhook secret, OAuth client id/secret), and writes
-them straight into loom's settings — live on the running daemon, no restart.
-The App's `callback_urls` are set to loom's GitHub login callback too, so the
-same App's OAuth client also covers "Sign in with GitHub" (see
+set (App id, private key, webhook secret, OAuth client id/secret), writes them
+into the typed `loom.toml` (along with `LOOM_DOMAIN` and, unless `--org` is
+set, `LOOM_OWNER_GITHUB`), and — when it can reach the running daemon's
+database — live-applies them too, no restart needed for that part. The App's
+`callback_urls` are set to loom's GitHub login callback too, so the same App's
+OAuth client also covers "Sign in with GitHub" (see
 [deploy/README.md "First-run login"](../deploy/README.md#first-run-login)) —
 one registration, not two. See `loom setup github-app --help` for `--org` (App
 under an organization instead of your account), `--port` (pin a port when
-tunnelling into a remote host), and `--env-file` (also write the
-`LOOM_GITHUB_*` variables, plus `LOOM_DOMAIN` and — unless `--org` is set —
-`LOOM_OWNER_GITHUB`, into a deploy `.env`, for a fresh deploy or a restart; see
-[deploy/README.md "First-run login"](../deploy/README.md#first-run-login)).
+tunnelling into a remote host), and `--config` (where to write `loom.toml`;
+defaults to `./loom.toml` or `$LOOM_CONFIG`). `loom config render-env` turns
+`loom.toml` into a deploy `.env` — see
+[deploy/README.md "First-run login"](../deploy/README.md#first-run-login).
 
 To register by hand instead, under **Settings → Developer settings → GitHub
 Apps → New GitHub App**:

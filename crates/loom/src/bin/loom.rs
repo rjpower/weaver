@@ -118,6 +118,21 @@ enum Cmd {
         cmd: SetupCmd,
     },
 
+    /// The typed `loom.toml` `loom setup` writes, and everything derived from
+    /// it.
+    ///
+    /// `loom.toml` is the single authored source of truth for every
+    /// credential/setting — the shared contract a deploy (e.g. the GCP
+    /// scripts under `deploy/gcp`) builds against:
+    ///
+    ///     loom config render-env                # -> deploy/standalone/.env
+    ///     loom config secret-names               # the secret fields' ENV_NAMEs
+    ///     loom config push-secrets --backend gcp --project my-project
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+
     /// Launch a new session — shortcut for `loom session launch`.
     Launch(LaunchOpts),
     /// List active sessions — shortcut for `loom session ls`.
@@ -373,24 +388,65 @@ struct GithubAppOpts {
     /// page's URL.
     #[arg(long)]
     no_open: bool,
-    /// Also upsert the `LOOM_GITHUB_*` variables — plus `LOOM_DOMAIN` (from
-    /// `--base-url`) and, unless `--org` is set, `LOOM_OWNER_GITHUB` (the
-    /// App's owner) — into this env file (e.g. `deploy/standalone/.env`), so
-    /// it becomes a complete, self-sufficient handoff for `docker compose up`
-    /// or a fresh deploy. Belt-and-suspenders for the credentials themselves —
-    /// the running daemon already picks those up live from the database, no
-    /// restart needed.
-    #[arg(long)]
-    env_file: Option<std::path::PathBuf>,
+    #[command(flatten)]
+    config: ConfigPathOpts,
 }
 
 #[derive(Args)]
 struct SecretsOpts {
-    /// Also upsert `ANTHROPIC_API_KEY` / `GH_TOKEN` into this env file, for
-    /// the daemon's own ambient use (cloning private repos, and the `gh`
-    /// fallback when no GitHub App is configured) — requires a restart.
+    #[command(flatten)]
+    config: ConfigPathOpts,
+}
+
+/// Shared `--config` flag: the authored `loom.toml`, the single source of
+/// truth every `loom setup` wizard fills in and `loom config` reads from.
+#[derive(Args)]
+struct ConfigPathOpts {
+    /// Path to `loom.toml`. Defaults to `./loom.toml`, or `$LOOM_CONFIG`.
+    #[arg(long, env = loom::loom_config::CONFIG_ENV_VAR, default_value = loom::loom_config::DEFAULT_PATH)]
+    config: std::path::PathBuf,
+}
+
+/// Subcommands under `loom config` — the typed `loom.toml` and everything
+/// rendered/pushed from it. The contract a deploy (e.g. `deploy/gcp`) builds
+/// against — see [`Cmd::Config`]. `render-env` and `push-secrets` resolve
+/// every field from `loom.toml` *or* a same-named env var (env wins) — set
+/// one to override a single invocation without editing the file.
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Render `loom.toml` as a dotenv file (e.g. `deploy/standalone/.env`).
+    RenderEnv(RenderEnvOpts),
+    /// Print each secret field's `ENV_NAME`, one per line.
+    SecretNames(ConfigPathOpts),
+    /// Push each secret field's value to a secret-manager backend. Never
+    /// echoes a value.
+    PushSecrets(PushSecretsOpts),
+}
+
+#[derive(Args)]
+struct RenderEnvOpts {
+    #[command(flatten)]
+    config: ConfigPathOpts,
+    /// Where to write the rendered dotenv file. `-` writes to stdout instead.
+    #[arg(long, default_value = "deploy/standalone/.env")]
+    out: String,
+}
+
+#[derive(Args)]
+struct PushSecretsOpts {
+    #[command(flatten)]
+    config: ConfigPathOpts,
+    /// Secret-manager backend to push to.
+    #[arg(long, value_enum)]
+    backend: SecretBackend,
+    /// The GCP project id to push into.
     #[arg(long)]
-    env_file: Option<std::path::PathBuf>,
+    project: String,
+}
+
+#[derive(Clone, clap::ValueEnum)]
+enum SecretBackend {
+    Gcp,
 }
 
 #[derive(Subcommand)]
@@ -530,6 +586,7 @@ async fn run() -> Result<()> {
         Cmd::Overlooker { cmd } => run_overlooker(cmd).await,
         Cmd::Token { cmd } => run_token(cmd).await,
         Cmd::Setup { cmd } => run_setup(cmd).await,
+        Cmd::Config { cmd } => run_config(cmd).await,
         Cmd::Launch(opts) => cmd_launch(opts.into()).await,
         Cmd::Ps => cmd_ps(false, None).await,
         Cmd::Attach { branch } => cmd_attach(branch).await,
@@ -795,36 +852,34 @@ async fn cmd_setup_github_app(opts: GithubAppOpts) -> Result<()> {
          settings — live on the running daemon, no restart needed."
     );
 
-    if let Some(path) = &opts.env_file {
-        let domain = host_from_base_url(&base_url);
-        let app_id = conv.id.to_string();
-        let existing = std::fs::read_to_string(path).unwrap_or_default();
-        let mut updates: Vec<(&str, &str)> = vec![
-            ("LOOM_GITHUB_APP_ID", app_id.as_str()),
-            ("LOOM_GITHUB_APP_PRIVATE_KEY", conv.pem.as_str()),
-            ("LOOM_GITHUB_WEBHOOK_SECRET", conv.webhook_secret.as_str()),
-            ("LOOM_GITHUB_CLIENT_ID", conv.client_id.as_str()),
-            ("LOOM_GITHUB_CLIENT_SECRET", conv.client_secret.as_str()),
-            ("LOOM_DOMAIN", domain),
-        ];
-        if opts.org.is_none() {
-            updates.push(("LOOM_OWNER_GITHUB", conv.owner.login.as_str()));
-        }
-        let updated = loom::envfile::upsert(&existing, &updates);
-        write_env_file(path, &updated)?;
+    let domain = host_from_base_url(&base_url);
+    let app_id = conv.id.to_string();
+    let mut updates: Vec<(&str, &str)> = vec![
+        ("LOOM_GITHUB_APP_ID", app_id.as_str()),
+        ("LOOM_GITHUB_APP_PRIVATE_KEY", conv.pem.as_str()),
+        ("LOOM_GITHUB_WEBHOOK_SECRET", conv.webhook_secret.as_str()),
+        ("LOOM_GITHUB_CLIENT_ID", conv.client_id.as_str()),
+        ("LOOM_GITHUB_CLIENT_SECRET", conv.client_secret.as_str()),
+        ("LOOM_DOMAIN", domain),
+    ];
+    if opts.org.is_none() {
+        updates.push(("LOOM_OWNER_GITHUB", conv.owner.login.as_str()));
+    }
+    loom::loom_config::upsert(&opts.config.config, &updates)
+        .context("writing the App credentials into loom.toml")?;
+    println!(
+        "Also wrote them, plus LOOM_DOMAIN, to {} — run `loom config render-env` to produce a \
+         deploy `.env` from it.",
+        opts.config.config.display()
+    );
+    if opts.org.is_some() {
         println!(
-            "Also wrote them, plus LOOM_DOMAIN, to {} (for a fresh deploy).",
-            path.display()
+            "Not writing LOOM_OWNER_GITHUB — the App is owned by the {} organization, but that \
+             setting needs the individual GitHub login for the first approved sign-in, which an \
+             org login isn't — set it yourself in {}.",
+            conv.owner.login,
+            opts.config.config.display()
         );
-        if opts.org.is_some() {
-            println!(
-                "Not writing LOOM_OWNER_GITHUB — the App is owned by the {} organization, but \
-                 that setting needs the individual GitHub login for the first approved \
-                 sign-in, which an org login isn't — set it yourself in {}.",
-                conv.owner.login,
-                path.display()
-            );
-        }
     }
 
     println!();
@@ -906,23 +961,20 @@ async fn cmd_setup_secrets(opts: SecretsOpts) -> Result<()> {
          them as real environment variables before the daemon starts for that to apply."
     );
 
-    if let Some(path) = &opts.env_file {
-        let mut updates: Vec<(&str, &str)> = Vec::new();
-        if let Some(v) = &anthropic {
-            updates.push(("ANTHROPIC_API_KEY", v.as_str()));
-        }
-        if let Some(v) = &gh_token {
-            updates.push(("GH_TOKEN", v.as_str()));
-        }
-        let existing = std::fs::read_to_string(path).unwrap_or_default();
-        let updated = loom::envfile::upsert(&existing, &updates);
-        write_env_file(path, &updated)?;
-        println!(
-            "Also wrote them to {} — restart the daemon (e.g. `docker compose up -d`) to \
-             apply the ambient-process use.",
-            path.display()
-        );
+    let mut updates: Vec<(&str, &str)> = Vec::new();
+    if let Some(v) = &anthropic {
+        updates.push(("ANTHROPIC_API_KEY", v.as_str()));
     }
+    if let Some(v) = &gh_token {
+        updates.push(("GH_TOKEN", v.as_str()));
+    }
+    loom::loom_config::upsert(&opts.config.config, &updates)
+        .context("writing the paste-once secrets into loom.toml")?;
+    println!(
+        "Also wrote them to {} — run `loom config render-env` then restart the daemon (e.g. \
+         `docker compose up -d`) to apply the ambient-process use.",
+        opts.config.config.display()
+    );
     Ok(())
 }
 
@@ -935,19 +987,148 @@ fn prompt_secret(name: &str) -> Result<Option<String>> {
     Ok((!value.is_empty()).then(|| value.to_string()))
 }
 
-/// Write `contents` to `path`, creating parent directories and restricting
-/// permissions to the owner (the file holds live secrets).
-fn write_env_file(path: &std::path::Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+// ---------------------------------------------------------------------------
+// `loom config` — the typed loom.toml, and everything derived from it. The
+// shared contract a deploy (e.g. deploy/gcp) builds against; see `Cmd::Config`.
+// ---------------------------------------------------------------------------
+
+async fn run_config(cmd: ConfigCmd) -> Result<()> {
+    match cmd {
+        ConfigCmd::RenderEnv(opts) => cmd_config_render_env(opts),
+        ConfigCmd::SecretNames(opts) => cmd_config_secret_names(opts),
+        ConfigCmd::PushSecrets(opts) => cmd_config_push_secrets(opts).await,
     }
-    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 600 {}", path.display()))?;
+}
+
+/// `loom config render-env` — resolve `loom.toml` (plus any ambient env
+/// override) and write it out as a dotenv file, the only place the
+/// field→`ENV_NAME` mapping is applied.
+fn cmd_config_render_env(opts: RenderEnvOpts) -> Result<()> {
+    let config = loom::loom_config::resolve(&opts.config.config)
+        .with_context(|| format!("loading {}", opts.config.config.display()))?;
+    let rendered = loom::loom_config::render_env(&config);
+    if opts.out == "-" {
+        print!("{rendered}");
+    } else {
+        let out = std::path::Path::new(&opts.out);
+        loom::envfile::write_private(out, &rendered)
+            .with_context(|| format!("writing {}", out.display()))?;
+        eprintln!(
+            "wrote {} from {}",
+            out.display(),
+            opts.config.config.display()
+        );
+    }
+    Ok(())
+}
+
+/// `loom config secret-names` — the secret fields' `ENV_NAME`s, one per line.
+/// Static (drawn from the schema, not from which fields happen to be set) —
+/// what a Secret Manager provisioning step names its secrets after.
+fn cmd_config_secret_names(opts: ConfigPathOpts) -> Result<()> {
+    // Resolved (not just iterated statically) so a malformed loom.toml surfaces
+    // here rather than only later, in render-env or push-secrets.
+    loom::loom_config::resolve(&opts.config)
+        .with_context(|| format!("loading {}", opts.config.display()))?;
+    for field in loom::loom_config::FIELDS.iter().filter(|f| f.secret) {
+        println!("{}", field.env_name);
+    }
+    Ok(())
+}
+
+/// `loom config push-secrets` — push every set secret field to a Secret
+/// Manager backend, secret id == `ENV_NAME`. Values travel over the
+/// subprocess's stdin, never a command-line argument or a log line.
+async fn cmd_config_push_secrets(opts: PushSecretsOpts) -> Result<()> {
+    let config = loom::loom_config::resolve(&opts.config.config)
+        .with_context(|| format!("loading {}", opts.config.config.display()))?;
+    let mut pushed = Vec::new();
+    let mut skipped = Vec::new();
+    for field in loom::loom_config::FIELDS.iter().filter(|f| f.secret) {
+        let Some(value) = field.get(&config) else {
+            skipped.push(field.env_name);
+            continue;
+        };
+        match opts.backend {
+            SecretBackend::Gcp => gcp_push_secret(&opts.project, field.env_name, value).await,
+        }
+        .with_context(|| format!("pushing {} to Secret Manager", field.env_name))?;
+        pushed.push(field.env_name);
+    }
+    if !pushed.is_empty() {
+        println!("pushed: {}", pushed.join(", "));
+    }
+    if !skipped.is_empty() {
+        println!("skipped (not set in loom.toml): {}", skipped.join(", "));
+    }
+    Ok(())
+}
+
+/// Create-or-update one GCP Secret Manager secret via the `gcloud` CLI,
+/// feeding `value` over stdin so it never appears in an argument list or a
+/// process listing.
+async fn gcp_push_secret(project: &str, name: &str, value: &str) -> Result<()> {
+    let exists = tokio::process::Command::new("gcloud")
+        .args(["secrets", "describe", name, "--project", project])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .context("failed to spawn gcloud (is the Google Cloud SDK installed?)")?
+        .success();
+    let args: &[&str] = if exists {
+        &[
+            "secrets",
+            "versions",
+            "add",
+            name,
+            "--project",
+            project,
+            "--data-file=-",
+        ]
+    } else {
+        &[
+            "secrets",
+            "create",
+            name,
+            "--project",
+            project,
+            "--replication-policy=automatic",
+            "--data-file=-",
+        ]
+    };
+    run_gcloud_with_stdin(args, value).await
+}
+
+/// Run `gcloud <args>`, writing `stdin_data` to its stdin and closing it —
+/// the way to pass a secret value without it ever appearing in the argument
+/// list (visible in `ps`) or an error message.
+async fn run_gcloud_with_stdin(args: &[&str], stdin_data: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new("gcloud")
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn gcloud (is the Google Cloud SDK installed?)")?;
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(stdin_data.as_bytes())
+        .await
+        .context("writing the secret value to gcloud's stdin")?;
+    let out = child
+        .wait_with_output()
+        .await
+        .context("waiting for gcloud")?;
+    if !out.status.success() {
+        bail!(
+            "gcloud {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }

@@ -1,0 +1,46 @@
+# loom.toml — the authored source of truth for every credential/setting a
+# loom deploy needs. Copy to `loom.toml` (repo root) and fill in by hand, or
+# let `loom setup github-app` / `loom setup secrets` fill it in for you —
+# either way, NEVER commit the real one (the repo .gitignore already excludes
+# it; this `.example` has no real secrets, so it's safe to commit).
+#
+# `loom.toml` is not read directly by anything else — run
+# `loom config render-env` to turn it into `deploy/standalone/.env`, the file
+# docker compose (and a GCP deploy's Secret Manager push) actually consumes.
+# Re-run it after any edit here; the generated `.env` is not meant to be
+# hand-edited.
+
+# The public domain whose DNS A/AAAA record points at the deploy host. Caddy
+# obtains a Let's Encrypt certificate for it automatically. `localhost` for a
+# local try-out (Caddy then uses its own internal CA — the browser warns;
+# expected).
+domain = "loom.example.com"
+
+# GitHub login seeded as the first approved user on a fresh database. This is
+# the only account that can log in until it approves others.
+owner_github = "your-github-login"
+
+# The GitHub App loom acts through (webhook receiver, REST identity, and
+# "Sign in with GitHub"). `loom setup github-app` fills these four in for
+# you — hand-typing the private key PEM is impractical, so leave them unset
+# here and run the wizard instead unless you registered the App by hand.
+# github_app_id = ""
+# github_app_private_key = ""
+# github_webhook_secret = ""
+# github_client_id = ""
+# github_client_secret = ""
+
+# Paste-once agent secrets — `loom setup secrets` prompts for these (hidden
+# input) instead of you typing them in cleartext here.
+# anthropic_api_key = ""
+# gh_token = ""
+
+# Deploy-mechanism knobs — every one has a sensible compose-level default, so
+# leave them commented out unless you need to override one. (You can also
+# override any of these, or anything above, for a single invocation by
+# exporting the same-named env var instead of editing this file — see
+# `loom config render-env --help`.)
+# tls_email = "you@example.com"    # LOOM_TLS_EMAIL: ACME contact for cert-expiry notices
+# host_uid = "1000"                # HOST_UID: uid the image runs as
+# host_gid = "1000"                # HOST_GID: gid the image runs as
+# image = "loom:latest"            # LOOM_IMAGE: override the image tag

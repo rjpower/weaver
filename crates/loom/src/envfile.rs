@@ -1,19 +1,24 @@
-//! Upsert `KEY=value` lines into a dotenv-style file (e.g.
-//! `deploy/standalone/.env`), preserving everything else — comments, blank
-//! lines, unrelated keys, and their order.
+//! Upsert `KEY=value` lines into dotenv-style text, preserving everything
+//! else — comments, blank lines, unrelated keys, and their order.
 //!
-//! Used by `loom setup` to hand credentials to the *deploy* env file, for the
-//! ambient-process-level uses (daemon-level `GH_TOKEN` for cloning, the App
-//! id/private key/webhook secret/OAuth client as a fallback if the settings-table
-//! write is ever lost) that only take effect on the next process start — the
-//! live-effective path is a direct settings/`agent_env` write
-//! ([`crate::github_manifest`], [`crate::agent_env`]), and this is the
-//! belt-and-suspenders record for a restart or a fresh deploy.
+//! This is the rendering engine behind `loom config render-env`
+//! ([`crate::loom_config::render_env`]): the typed `loom.toml` is the
+//! authored source of truth, and this module turns it into the
+//! `deploy/standalone/.env` docker compose reads, for the ambient-process-level
+//! uses (daemon-level `GH_TOKEN` for cloning, the App id/private key/webhook
+//! secret/OAuth client as a fallback if the settings-table write is ever lost)
+//! that only take effect on the next process start — the live-effective path
+//! is a direct settings/`agent_env` write ([`crate::github_manifest`],
+//! [`crate::agent_env`]).
 //!
 //! Multi-line values (an RSA private key PEM) are written double-quoted with
 //! embedded newlines escaped to a literal `\n` — the form docker compose's
 //! `env_file` parser (compose-go's dotenv, based on `joho/godotenv`) expands
 //! back to real newlines inside double quotes.
+
+use std::path::Path;
+
+use anyhow::{Context, Result};
 
 /// Upsert every `(key, value)` pair into `contents`. An existing uncommented
 /// `KEY=...` line is replaced in place (keeping its position); a key with no
@@ -49,6 +54,26 @@ pub fn upsert(contents: &str, updates: &[(&str, &str)]) -> String {
     let mut out = lines.join("\n");
     out.push('\n');
     out
+}
+
+/// Write `contents` to `path` as a secrets-bearing file: create parent
+/// directories as needed and restrict permissions to the owner (0600 on
+/// unix). Shared by `loom.toml` ([`crate::loom_config::save`]) and the
+/// generated `.env` (`loom config render-env`'s `--out`) — both can hold
+/// plaintext credentials.
+pub fn write_private(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 600 {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// The `KEY` of an uncommented `KEY=...` line, or `None` for a comment, a blank

@@ -61,6 +61,9 @@ serde_json = "1"
 # a fast digest is right — the slow KDF above is only for low-entropy passwords).
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "derive"] }
+# The authored `loom.toml` (crate::loom_config) — parsed *and* serialized, unlike
+# weaver-core's read-only `.weaver/config.toml` loader.
+toml = { version = "1", default-features = false, features = ["parse", "display", "serde"] }
 # The overlooker engine materializes embedded builtin scripts to a scratch file
 # before running them; the tests reuse it for fixtures.
 tempfile = "3"

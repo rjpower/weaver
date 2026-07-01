@@ -20,6 +20,7 @@ pub mod github_app;
 pub mod github_manifest;
 pub mod github_trigger;
 pub mod ide;
+pub mod loom_config;
 pub mod monitor;
 pub mod overlooker;
 pub mod repo;
