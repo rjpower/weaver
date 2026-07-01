@@ -91,9 +91,16 @@ pub(super) async fn add_owner(
     State(st): State<AppState>,
     Json(req): Json<AddOwnerReq>,
 ) -> ApiResult<Json<owners::Owner>> {
-    let owner = owners::add(&st.db, &req.login)
-        .await
-        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    // A malformed login is a client error (400); a storage failure from `add`
+    // then surfaces as 500 via `?`, so operators can tell a bad request apart
+    // from a server problem.
+    if !owners::valid_login(&req.login) {
+        return Err(AppError::bad_request(format!(
+            "'{}' is not a valid GitHub login",
+            req.login.trim()
+        )));
+    }
+    let owner = owners::add(&st.db, &req.login).await?;
     Ok(Json(owner))
 }
 

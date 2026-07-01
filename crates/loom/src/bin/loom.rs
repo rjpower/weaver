@@ -928,6 +928,9 @@ async fn cmd_setup_github_app(opts: GithubAppOpts) -> Result<()> {
          Settings → Authorized GitHub owners."
     );
 
+    // Merge (don't overwrite) the allowlist, so re-running setup never silently
+    // drops owners an operator already added to loom.toml.
+    let allowed_owners = merged_allowed_owners(&opts.config.config, owner_login);
     let updates: Vec<(&str, &str)> = vec![
         ("LOOM_GITHUB_APP_ID", app_id.as_str()),
         ("LOOM_GITHUB_APP_PRIVATE_KEY", conv.pem.as_str()),
@@ -936,7 +939,7 @@ async fn cmd_setup_github_app(opts: GithubAppOpts) -> Result<()> {
         ("LOOM_GITHUB_CLIENT_SECRET", conv.client_secret.as_str()),
         ("LOOM_DOMAIN", domain),
         ("LOOM_OWNER_GITHUB", owner_login),
-        ("LOOM_ALLOWED_OWNERS", owner_login),
+        ("LOOM_ALLOWED_OWNERS", allowed_owners.as_str()),
     ];
     loom::loom_config::upsert(&opts.config.config, &updates)
         .context("writing the App credentials into loom.toml")?;
@@ -955,6 +958,25 @@ async fn cmd_setup_github_app(opts: GithubAppOpts) -> Result<()> {
     );
     println!("  2. Sign in at {base_url} with GitHub — the App's OAuth client now handles login.");
     Ok(())
+}
+
+/// The `LOOM_ALLOWED_OWNERS` value to write after adding `owner`: the owners
+/// already authored in `config_path` (if any) with `owner` appended when absent
+/// (case-insensitive). This makes writing the allowlist a **merge**, not an
+/// overwrite, so re-running setup never silently drops previously trusted
+/// owners. Returns a comma-separated list.
+fn merged_allowed_owners(config_path: &std::path::Path, owner: &str) -> String {
+    let existing = loom::loom_config::load(config_path)
+        .ok()
+        .and_then(|c| c.allowed_owners);
+    let mut owners: Vec<String> = existing
+        .as_deref()
+        .map(|s| loom::owners::split_logins(s).map(str::to_string).collect())
+        .unwrap_or_default();
+    if !owners.iter().any(|o| o.eq_ignore_ascii_case(owner)) {
+        owners.push(owner.to_string());
+    }
+    owners.join(", ")
 }
 
 /// The bare host from a `--base-url` like `https://loom.team.dev` or
@@ -2478,6 +2500,19 @@ mod tests {
             "loom-loom-team-dev"
         );
         assert_eq!(default_app_name("http://localhost:7878"), "loom-localhost");
+    }
+
+    #[test]
+    fn merged_allowed_owners_appends_without_dropping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loom.toml");
+        // No file yet → just the new owner.
+        assert_eq!(merged_allowed_owners(&path, "acme"), "acme");
+        // With an existing list, a new owner is appended and the rest kept.
+        loom::loom_config::upsert(&path, &[("LOOM_ALLOWED_OWNERS", "org-a, org-b")]).unwrap();
+        assert_eq!(merged_allowed_owners(&path, "acme"), "org-a, org-b, acme");
+        // An already-present owner (any case) is not duplicated.
+        assert_eq!(merged_allowed_owners(&path, "ORG-A"), "org-a, org-b");
     }
 
     /// clap's own consistency check over the full command tree — catches a
