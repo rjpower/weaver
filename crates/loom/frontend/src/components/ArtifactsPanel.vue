@@ -3,15 +3,15 @@ import { ref, computed, watch, onMounted, onActivated, onDeactivated, onUnmounte
 import { useRouter } from 'vue-router';
 import { getArtifacts, getArtifact, putArtifact, deleteArtifact } from '../api';
 import type { ArtifactMeta, ArtifactView } from '../types';
-import MarkdownView from './MarkdownView.vue';
+import ArtifactDocument from './ArtifactDocument.vue';
 import HtmlArtifactView from './HtmlArtifactView.vue';
-import ArtifactComments from './ArtifactComments.vue';
 
 // The artifacts surface, as a self-contained panel: a list of the agent's
 // out-of-repo documents (designs, reports, the `plan`) on the left, a viewer on
 // the right with a version picker and a preview/source edit toggle — saving an
 // edit appends a new revision (`author: user`). Markdown
-// renders through `MarkdownView` (GFM + mermaid + the smartdoc `#N` chips); an
+// renders through `ArtifactDocument` (GFM + mermaid + smartdoc chips + the inline
+// comment layer); an
 // `html` artifact renders as a live document in a sandboxed iframe.
 //
 // The host (SessionDetail) places this either as a full-width work-area tab or,
@@ -87,27 +87,15 @@ const draftContent = ref('');
 const sourceInput = ref<HTMLTextAreaElement | null>(null);
 
 // --- Inline comments ---------------------------------------------------------
-// The rendered <article> from MarkdownView's `defineExpose({ body })`, and a
-// nonce bumped on every `@rendered` — ArtifactComments watches both to relocate
-// its anchors against the fresh DOM (source edit, ref update, theme flip) and
-// re-place the inline thread cards it teleports into the flow.
-const commentsRef = ref<InstanceType<typeof ArtifactComments> | null>(null);
-const commentBodyEl = ref<HTMLElement | null>(null);
-const renderNonce = ref(0);
-function onMarkdownRendered(el: HTMLElement | null) {
-  commentBodyEl.value = el;
-  renderNonce.value++;
-}
-// Same gate MarkdownView/ArtifactComments mount under. Reset the stashed body
-// element when it flips off (Source, editing, a non-markdown artifact) so a
-// later remount never briefly hands ArtifactComments a stale, detached node
-// from the last preview mount before the fresh `@rendered` arrives.
+// The collaborative markdown surface (ArtifactDocument) renders the artifact and
+// owns its inline comment layer. We hold a ref only to forward the shared
+// session SSE (`comment_added` / `comment_resolved`) into it. `showComments`
+// gates the markdown-preview surface: Source, editing, and non-markdown kinds
+// have no comment layer.
+const commentsRef = ref<InstanceType<typeof ArtifactDocument> | null>(null);
 const showComments = computed(
   () => !!view.value && isMarkdown.value && viewMode.value === 'preview' && !editing.value,
 );
-watch(showComments, (shown) => {
-  if (!shown) commentBodyEl.value = null;
-});
 
 // Load an artifact (optionally a specific revision) into the viewer. `keepMode`
 // refreshes content without resetting the preview/source choice — for a live
@@ -278,7 +266,7 @@ function openStream() {
       selected.value = '';
     }
   });
-  // Inline comments: forward to ArtifactComments rather than opening a second
+  // Inline comments: forward to ArtifactDocument rather than opening a second
   // EventSource (the browser caps how many an origin can hold open).
   source.addEventListener('comment_added', (e) => {
     const d = JSON.parse((e as MessageEvent).data).data as { artifact?: string; thread?: number };
@@ -512,6 +500,7 @@ onUnmounted(() => {
             v-if="view && editing"
             ref="sourceInput"
             v-model="draftContent"
+            data-testid="artifact-source-editor"
             class="h-full w-full resize-none border-0 bg-code p-4 font-mono text-[13px] leading-5 text-fg outline-none"
             spellcheck="false"
             autocomplete="off"
@@ -523,24 +512,17 @@ onUnmounted(() => {
             class="h-full w-full overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-[13px] leading-5 text-fg"
           ><code>{{ view.content }}</code></pre>
 
-          <MarkdownView
-            v-if="showComments"
+          <ArtifactDocument
+            v-if="showComments && view"
+            ref="commentsRef"
+            :key="selected"
             :id="props.id"
             :path="pseudoPath"
             :source="view.content"
             :refs="view.refs.issues"
-            class="h-full w-full"
-            @rendered="onMarkdownRendered"
-          />
-
-          <ArtifactComments
-            v-if="showComments"
-            ref="commentsRef"
-            :session-id="props.id"
             :artifact-name="selected"
             :rev="view.meta.rev"
-            :body-el="commentBodyEl"
-            :render-nonce="renderNonce"
+            class="h-full w-full"
           />
 
           <HtmlArtifactView

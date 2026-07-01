@@ -34,7 +34,7 @@ export interface RenderContext {
 
 /** True for links we must leave untouched: absolute URLs, protocol-relative,
  *  root-absolute, fragments, and anything with a scheme (mailto:, data:, …). */
-function isExternal(url: string): boolean {
+export function isExternal(url: string): boolean {
   return (
     /^[a-z][a-z0-9+.-]*:/i.test(url) || // scheme:  http:  data:  mailto:
     url.startsWith('//') ||
@@ -45,7 +45,7 @@ function isExternal(url: string): boolean {
 
 /** Resolve `rel` against directory `dir` (both `/`-separated, repo-relative),
  *  collapsing `.`/`..` segments. Returns a clean repo-relative path. */
-function resolvePath(dir: string, rel: string): string {
+export function resolvePath(dir: string, rel: string): string {
   const stack = dir ? dir.split('/') : [];
   for (const part of rel.split('/')) {
     if (part === '' || part === '.') continue;
@@ -58,7 +58,7 @@ function resolvePath(dir: string, rel: string): string {
 /** Map a markdown `src`/`href` to a viewable URL. Relative paths point at the
  *  raw-bytes endpoint so images in the worktree render inline; external links
  *  pass through unchanged. */
-function resolveUrl(ctx: RenderContext, url: string): string {
+export function resolveUrl(ctx: RenderContext, url: string): string {
   if (!url || isExternal(url)) return url;
   const dir = ctx.filePath.includes('/')
     ? ctx.filePath.slice(0, ctx.filePath.lastIndexOf('/'))
@@ -294,126 +294,54 @@ function slugify(s: string): string {
 // Public API
 // ---------------------------------------------------------------------------
 
-/** Render markdown source to sanitised HTML, resolving relative images against
- *  the file's location. Mermaid code blocks come back as `<pre class="mermaid">`
- *  placeholders — call {@link renderMermaid} on the mounted element to draw them. */
-export async function renderMarkdown(src: string, ctx: RenderContext): Promise<string> {
-  const [md, purifyMod] = await Promise.all([getMarkdownIt(), import('dompurify')]);
-  const DOMPurify = purifyMod.default;
-
-  // Open off-page links in a new tab and neutralise the opener. In-page `#`
-  // anchors are left alone — MarkdownView intercepts them to scroll the preview
-  // (a real navigation would clobber the hash router). smartdoc chips/links
-  // (carrying `data-issue` / `data-artifact`) are internal SPA routes —
-  // MarkdownView intercepts them too, so they stay same-tab.
-  DOMPurify.addHook('afterSanitizeAttributes', (node) => {
-    if (node.tagName !== 'A') return;
-    const href = node.getAttribute('href');
-    const internal = node.hasAttribute('data-issue') || node.hasAttribute('data-artifact');
-    if (href && !href.startsWith('#') && !internal) {
-      node.setAttribute('target', '_blank');
-      node.setAttribute('rel', 'noopener noreferrer');
-    }
-  });
-  try {
-    const html = md.render(src, { ctx });
-    // Defaults already allow the tags/attrs we emit (`pre`, `code`, `span`,
-    // `input[type=checkbox]`, `class`, `id`); `target` plus the smartdoc
-    // `data-*` hooks are added so the new-tab hook and the SPA-link interception
-    // stick.
-    return DOMPurify.sanitize(html, { ADD_ATTR: ['target', 'data-issue', 'data-status', 'data-artifact'] });
-  } finally {
-    DOMPurify.removeHook('afterSanitizeAttributes');
-  }
+/** Parse markdown source into markdown-it's token stream, with every projection
+ *  plugin applied (task lists, heading anchors, the smartdoc `#N`/`artifact:`
+ *  refs). The vnode renderer (`markdown-render.ts`) walks these tokens into a
+ *  real Vue tree — no intermediate HTML string, so the rendered document is
+ *  Vue-owned (the comment layer interleaves as real vnodes, not teleported into
+ *  an innerHTML blob). `ctx` rides on `env.ctx`, where the smartdoc core rule
+ *  reads the refs map. */
+export async function parseMarkdown(src: string, ctx: RenderContext): Promise<Token[]> {
+  const md = await getMarkdownIt();
+  return md.parse(src, { ctx });
 }
 
-let mermaidSeq = 0;
+/** Sanitises the raw-HTML islands the vnode renderer emits: markdown that embeds
+ *  literal HTML (`html: true`), plus the chips/checkboxes the smartdoc, anchor,
+ *  and task-list plugins produce as `html_inline`. Same policy as the old
+ *  whole-document sanitise — external links open in a new tab with the opener
+ *  neutralised, and the smartdoc `data-*` / `target` attributes survive. The link
+ *  hook is added and removed around each call so it never bleeds into another
+ *  DOMPurify user (e.g. MermaidBlock's SVG sanitise). */
+export type Sanitizer = (html: string) => string;
 
-// Mermaid's stock `default`/`dark` themes paint nodes lavender-purple, which
-// clashes with loom's neutral-slate + single-blue palette. Drive mermaid's
-// `base` theme with loom's own tokens instead so diagrams read as part of the
-// same UI in both palettes. Hexes mirror the slate/blue values in styles.css.
-function mermaidThemeVariables(dark: boolean): Record<string, string> {
-  return dark
-    ? {
-        background: '#1e293b', // surface (slate-800)
-        primaryColor: '#0f172a', // canvas (slate-900) — node fill
-        primaryBorderColor: '#475569', // slate-600
-        primaryTextColor: '#f1f5f9', // slate-100
-        lineColor: '#64748b', // slate-500 — edges
-        secondaryColor: '#334155', // slate-700
-        tertiaryColor: '#0f172a',
+let sanitizerPromise: Promise<Sanitizer> | null = null;
+export function loadSanitizer(): Promise<Sanitizer> {
+  if (sanitizerPromise) return sanitizerPromise;
+  sanitizerPromise = (async () => {
+    const DOMPurify = (await import('dompurify')).default;
+    const linkHook = (node: Element) => {
+      if (node.tagName !== 'A') return;
+      const href = node.getAttribute('href');
+      const internal = node.hasAttribute('data-issue') || node.hasAttribute('data-artifact');
+      if (href && !href.startsWith('#') && !internal) {
+        node.setAttribute('target', '_blank');
+        node.setAttribute('rel', 'noopener noreferrer');
       }
-    : {
-        background: '#ffffff',
-        primaryColor: '#f1f5f9', // slate-100 — node fill
-        primaryBorderColor: '#cbd5e1', // slate-300
-        primaryTextColor: '#0f172a', // slate-900
-        lineColor: '#94a3b8', // slate-400 — edges
-        secondaryColor: '#e2e8f0', // slate-200
-        tertiaryColor: '#f8fafc',
-      };
-}
-
-/** Turn every `<pre class="mermaid">` placeholder under `root` into a rendered
- *  SVG diagram. Mermaid runs with `securityLevel: 'strict'` (it sanitises its
- *  own SVG); a diagram that fails to parse is left as its source text with an
- *  error note rather than blowing up the whole preview. */
-export async function renderMermaid(root: HTMLElement, dark: boolean): Promise<void> {
-  const blocks = Array.from(root.querySelectorAll<HTMLElement>('pre.mermaid'));
-  if (blocks.length === 0) return;
-  const [mermaid, purifyMod] = await Promise.all([
-    import('mermaid').then((m) => m.default),
-    import('dompurify'),
-  ]);
-  const DOMPurify = purifyMod.default;
-  // initialize is idempotent-ish but theme can change with the app theme, so
-  // re-apply it each pass.
-  mermaid.initialize({
-    startOnLoad: false,
-    securityLevel: 'strict',
-    theme: 'base',
-    themeVariables: mermaidThemeVariables(dark),
-    fontFamily: 'inherit',
-    // Throw on a bad diagram instead of drawing mermaid's "bomb" error graphic.
-    // The default renders that graphic into a temp node mermaid appends to
-    // `document.body` and only removes on success — so a failed parse leaks the
-    // bomb into the page body, where it survives route changes and shows up at
-    // the bottom of every view. Suppressing it makes `render` reject cleanly
-    // (mermaid removes its temp node), and the catch below shows our own inline
-    // error note instead.
-    suppressErrorRendering: true,
-  });
-
-  for (const block of blocks) {
-    const code = block.textContent ?? '';
-    const id = `weaver-mermaid-${mermaidSeq++}`;
-    try {
-      const { svg } = await mermaid.render(id, code);
-      const wrap = document.createElement('div');
-      wrap.className = 'mermaid-diagram';
-      // Mermaid already sanitises under `securityLevel: 'strict'`, but the SVG
-      // is derived from DOM text, so pass it through DOMPurify before innerHTML
-      // for defence-in-depth (and to keep the flow provably XSS-safe).
-      //
-      // Mermaid draws node/cluster labels as HTML inside `<foreignObject>`. That
-      // only survives sanitising if DOMPurify is told `foreignobject` is an HTML
-      // integration point (otherwise its XHTML children are dropped as stray SVG
-      // and every label renders blank). These options mirror mermaid's own
-      // internal sanitise call, so we keep its structure verbatim while still
-      // stripping scripts/handlers.
-      wrap.innerHTML = DOMPurify.sanitize(svg, {
-        ADD_TAGS: ['foreignobject'],
-        ADD_ATTR: ['dominant-baseline'],
-        HTML_INTEGRATION_POINTS: { foreignobject: true },
-      });
-      block.replaceWith(wrap);
-    } catch (e) {
-      const err = document.createElement('div');
-      err.className = 'mermaid-error';
-      err.textContent = `Could not render mermaid diagram: ${(e as Error).message}`;
-      block.before(err);
-      // Leave the source block in place so the content isn't lost.
-    }
-  }
+    };
+    return (html: string) => {
+      DOMPurify.addHook('afterSanitizeAttributes', linkHook);
+      try {
+        // Defaults already allow the tags/attrs the plugins emit (`a`, `span`,
+        // `input[type=checkbox]`, `label`, `class`, `id`); `target` plus the
+        // smartdoc `data-*` hooks keep the new-tab and SPA-link interception.
+        return DOMPurify.sanitize(html, {
+          ADD_ATTR: ['target', 'data-issue', 'data-status', 'data-artifact'],
+        });
+      } finally {
+        DOMPurify.removeHook('afterSanitizeAttributes');
+      }
+    };
+  })();
+  return sanitizerPromise;
 }

@@ -9,7 +9,7 @@
 Give every session a **real VS Code in the browser**, rooted at that session's
 worktree, sitting **beside the live terminal** — pull it in from the right,
 side-by-side with the agent. It replaces the bespoke "Files" tab: instead of
-loom's hand-rolled tree + Monaco viewer, the operator gets the full editor —
+loom's hand-rolled tree + file viewer, the operator gets the full editor —
 file tree, multi-file edit, search, git gutters, extensions, an integrated
 terminal — pointed at the same files the agent is working.
 
@@ -182,7 +182,7 @@ the editor panel just reports "not installed".
 `GET /sessions/{id}/tree`, `GET/PUT /sessions/{id}/file` routes + handlers (their
 only consumers are the file browser and the unused `writeFile`). **Kept:**
 `GET /sessions/{id}/raw` (markdown inline images), `/diff`, `/log`, `MarkdownView`,
-Monaco (Artifacts), Artifacts.
+Artifacts (rendered preview + raw-source view).
 
 ## 9. Open questions / future work
 

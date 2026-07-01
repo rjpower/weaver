@@ -303,9 +303,10 @@ update the issues; when issues change shape, update the doc's references.*
 ### Loom UI
 
 - **Session detail** gains an Artifacts surface (`ArtifactsPanel`): list +
-  viewer (`MarkdownView` / `HtmlArtifactView` / Monaco source), version picker,
-  the file browser's proven preview ⇄ Monaco toggle for user edits (each save =
-  new revision, `author: user`). It is a tab *within* the session page — a
+  viewer (`ArtifactDocument` for markdown, `HtmlArtifactView` for html, a
+  raw-source pane for everything else), version picker, a preview ⇄ source toggle
+  with a plain-text source editor for user edits (each save = new revision,
+  `author: user`). It is a tab *within* the session page — a
   kept-alive panel served from `SessionDetail` (the `/s/:id/artifacts/:name`
   deep link resolves to the same instance), so moving terminal ⇄ artifacts is an
   instant flip on the warm page, not a route swap. The panel can **pop out** into
@@ -326,7 +327,7 @@ update the issues; when issues change shape, update the doc's references.*
 2. The agent drafts, then `weaver artifact write plan design.md --title
    "Search rewrite"` → prints `http://…/s/ab12cd34/artifacts/plan`; sets
    `attention "plan ready — see artifact"`.
-3. The user reads it rendered (mermaid and all), edits in Monaco (rev 2) or
+3. The user reads it rendered (mermaid and all), edits the source (rev 2) or
    replies; the agent revises (rev 3).
 4. On blessing, the agent files the breakdown — `weaver issue add --repo
    "Index layer"` … — and rewrites the plan's task section to `- #41 …`,

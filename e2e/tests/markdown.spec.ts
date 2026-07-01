@@ -85,10 +85,11 @@ test.describe('rich markdown rendering', () => {
     // stripped it, leaving every box blank), so assert the label text is there.
     await expect(mermaidSvg.locator('.nodeLabel').first()).toHaveText('A');
 
-    // Source flips to the Monaco editor showing the raw markdown…
+    // Source flips to the raw markdown (a read-only source pane), hiding the
+    // rendered view — the literal `# Design Doc`/fence text shows verbatim.
     await page.getByRole('button', { name: 'Source', exact: true }).click();
-    await expect(page.locator('.monaco-editor')).toBeVisible();
     await expect(body).toBeHidden();
+    await expect(page.locator('pre', { hasText: '# Design Doc' })).toBeVisible();
 
     // …and Preview flips back to the rendered view.
     await page.getByRole('button', { name: 'Preview', exact: true }).click();

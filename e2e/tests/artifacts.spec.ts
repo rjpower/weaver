@@ -92,11 +92,11 @@ test.describe('artifacts surface', () => {
     await page.goto(`${weaver.baseUrl}/s/${session.id}/artifacts/notes`);
     await expect(page.locator('.markdown-body h1')).toContainText('Notes');
 
-    // Edit flips the viewer to Monaco; type an addition and save.
+    // Edit flips the viewer to a raw-source textarea; append a line and save.
     await page.getByRole('button', { name: 'Edit', exact: true }).click();
-    await expect(page.locator('.monaco-editor')).toBeVisible();
-    await page.locator('.monaco-editor').click();
-    await page.keyboard.type('\n\nA user revision.');
+    const editor = page.getByTestId('artifact-source-editor');
+    await expect(editor).toBeVisible();
+    await editor.fill((await editor.inputValue()) + '\n\nA user revision.');
     await page.getByRole('button', { name: 'Save' }).click();
 
     // The save appended rev 2 (author: user); the picker and list reflect it.
@@ -109,7 +109,10 @@ test.describe('artifacts surface', () => {
   });
 
   test('deleting an artifact removes it and falls back to the next', async ({ page, weaver }) => {
-    const session = await weaver.seedSession({ goal: 'cleanup', name: 'artifacts-delete' });
+    const session = await weaver.seedSession({
+      goal: '# Session goal\n\nClean up the docs.',
+      name: 'artifacts-delete',
+    });
     await weaver.writeArtifact(session, 'keep', '# Keep me\n', { title: 'Keep' });
     await weaver.writeArtifact(session, 'scratch', '# Throwaway\n', { title: 'Scratch' });
 
@@ -120,10 +123,13 @@ test.describe('artifacts surface', () => {
     page.once('dialog', (d) => d.accept());
     await page.getByTestId('artifact-delete').click();
 
-    // The row is gone and the viewer falls back to the remaining `keep`.
+    // The row is gone and the viewer falls back to the first remaining artifact.
+    // Every session carries an always-present `goal` artifact (the goal is a
+    // first-class artifact), which sorts ahead of user docs — so the fallback
+    // lands on it, and its markdown renders in the viewer.
     await expect(page.locator('[data-artifact="scratch"]')).toHaveCount(0);
     await expect(page.locator('[data-artifact="keep"]')).toBeVisible();
-    await expect(page.locator('.markdown-body h1')).toContainText('Keep me');
+    await expect(page.locator('.markdown-body h1')).toContainText('Session goal');
   });
 
   test('a CLI `artifact rm` removes it and the list updates over SSE', async ({ page, weaver }) => {
@@ -164,9 +170,9 @@ test.describe('artifacts surface', () => {
     await expect(inner.locator('#hi')).toHaveText('Live report');
     await expect(inner.locator('html')).toHaveAttribute('data-ran', '1');
 
-    // The Source toggle swaps the live frame for the raw HTML in Monaco.
+    // The Source toggle swaps the live iframe for the raw HTML source.
     await page.getByRole('button', { name: 'Source' }).click();
-    await expect(page.locator('.monaco-editor')).toBeVisible();
+    await expect(page.locator('pre', { hasText: 'Live report' })).toBeVisible();
     await expect(page.getByTestId('artifact-html')).toHaveCount(0);
   });
 
