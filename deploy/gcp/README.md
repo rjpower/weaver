@@ -80,13 +80,17 @@ PROJECT=my-project LOOM_DOMAIN=loom.example.com ./bootstrap.py
 ```
 
 While `bootstrap.py` is waiting, go set the `A` record it printed at your DNS
-provider. Once it resolves, the script proceeds to create the VM. GCE runs
+provider. Once it resolves, the script creates the VM. GCE runs
 `startup-script.sh` as the instance's `startup-script` metadata: it installs
-Docker, installs the `gcloud` CLI, fetches the `LOOM_DOTENV` blob from Secret
+Docker, git, and the `gcloud` CLI, fetches the `LOOM_DOTENV` blob from Secret
 Manager and writes it to `deploy/standalone/.env`, clones the repo, and runs
 `docker compose up -d --build` from `deploy/standalone` — unmodified.
 
-Watch it boot:
+`bootstrap.py` then drives the deploy to completion for you: it waits for SSH,
+streams the startup-script's `journalctl` output until it finishes (or fails),
+and polls `https://<LOOM_DOMAIN>/` once the stack is up — so a single run ends
+either at "loom is live" or a specific failure. You don't need to tail the boot
+yourself, but to watch a later reboot:
 
 ```sh
 gcloud --project=my-project compute ssh loom --zone=us-central1-a \
@@ -94,11 +98,14 @@ gcloud --project=my-project compute ssh loom --zone=us-central1-a \
 ```
 
 Both scripts are check-before-create, so re-running either after an
-interruption is safe. Re-run `secrets.py` any time `loom.toml` changes to
-push the update, then re-trigger the startup script (see
-["Operations"](#operations)) to pick it up. `bootstrap.py` will not recreate
-or resize an existing instance — delete it first if you need to change its
-machine type or disks.
+interruption is safe. Re-running `bootstrap.py` against an existing VM updates
+its `startup-script` + placement metadata in place and re-triggers the boot to
+apply it (and pushes `LOOM_DOTENV` via `secrets.py` first if that secret is
+still missing) — so a fixed startup script or a new `--git-ref` rolls out with a
+bare re-run. It will *not* recreate or resize an existing instance, though;
+delete it first to change its machine type or disks. Re-run `secrets.py`
+yourself any time `loom.toml` changes, then re-run `bootstrap.py` (or re-trigger
+the startup script, see ["Operations"](#operations)) to pick it up.
 
 Run `./bootstrap.py --help` and `./secrets.py --help` for the full list of
 options and their defaults — every `bootstrap.py` option also has a

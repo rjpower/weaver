@@ -13,17 +13,24 @@ cluster". It does not provision a cluster, Cloud Run, or per-session
 isolation.
 
 Every gcloud call here is check-before-create, so re-running after a partial
-failure (or to change a knob) is safe.
+failure (or to change a knob) is safe. Re-running against an existing VM
+updates its startup-script + placement metadata in place and re-triggers the
+startup script (machine type and disks are left alone — delete the VM to
+change those).
 
-Secrets (GH_TOKEN, ANTHROPIC_API_KEY, ...) are NOT handled here — run
-./secrets.py first (or after; order doesn't matter, see ../README.md).
+It also ensures the LOOM_DOTENV secret exists (pushing it via ./secrets.py if
+missing) and, after creating or updating the VM, re-triggers the startup script
+and streams it to completion so a single run finishes the deploy. Re-run
+./secrets.py yourself whenever loom.toml changes to refresh the pushed config.
 """
 
+import shutil
 import socket
 import subprocess
 import sys
 import time
 import tomllib
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -330,23 +337,37 @@ def ensure_instance(
     data_disk_size: int,
     data_disk_name: str,
     data_disk_device: str,
-) -> None:
-    log(f"ensuring instance {instance_name}")
-    if gcloud_exists(
-        project, "compute", "instances", "describe", instance_name, f"--zone={zone}"
-    ):
-        log(f"instance {instance_name} already exists — leaving it as-is")
-        log(
-            "(delete it first if you want bootstrap.py to recreate it with new settings)"
-        )
-        return
-
+) -> bool:
+    """Create the VM, or update an existing one's startup-script + placement
+    metadata in place. Returns True if it was freshly created (its boot-time
+    startup run is the one to watch), False if it already existed (the caller
+    re-triggers the startup script). Machine type and disks are never changed on
+    an existing instance — delete it first for those."""
     script_dir = Path(__file__).resolve().parent
+    startup_script = script_dir / "startup-script.sh"
 
     metadata = f"loom-domain={loom_domain},repo-url={repo_url},git-ref={git_ref},image-mode={image_mode}"
     if ar_image:
         metadata += f",ar-image={ar_image}"
 
+    if gcloud_exists(
+        project, "compute", "instances", "describe", instance_name, f"--zone={zone}"
+    ):
+        log(f"instance {instance_name} exists — updating startup-script + metadata in place")
+        gcloud(
+            project,
+            "compute",
+            "instances",
+            "add-metadata",
+            instance_name,
+            f"--zone={zone}",
+            f"--metadata={metadata}",
+            f"--metadata-from-file=startup-script={startup_script}",
+        )
+        log("(machine type and disks are left as-is — delete the VM to change those)")
+        return False
+
+    log(f"creating instance {instance_name}")
     args = [
         "compute",
         "instances",
@@ -363,7 +384,7 @@ def ensure_instance(
         "--scopes=cloud-platform",
         f"--address={ip_name}",
         f"--metadata={metadata}",
-        f"--metadata-from-file=startup-script={script_dir / 'startup-script.sh'}",
+        f"--metadata-from-file=startup-script={startup_script}",
     ]
     if data_disk_size > 0:
         args.append(
@@ -371,6 +392,170 @@ def ensure_instance(
         )
 
     gcloud(project, *args)
+    return True
+
+
+LOOM_DOTENV_SECRET = "LOOM_DOTENV"
+STARTUP_UNIT = "google-startup-scripts"
+STARTUP_BANNER = "loom startup-script:"  # first line every run logs
+STARTUP_DONE = "loom startup-script done"
+STARTUP_FAIL = ("failed with error", "Failed with result")
+
+
+def ensure_secrets(project: str) -> None:
+    """Make sure the LOOM_DOTENV blob the startup script fetches exists. If it's
+    already there, leave it (re-run ./secrets.py to refresh after loom.toml
+    changes). If missing, push it now via ./secrets.py so a first run is
+    self-contained."""
+    if gcloud_exists(project, "secrets", "describe", LOOM_DOTENV_SECRET):
+        log(f"secret {LOOM_DOTENV_SECRET} present — leaving as-is (re-run ./secrets.py to refresh)")
+        return
+    log(f"secret {LOOM_DOTENV_SECRET} missing — pushing it via ./secrets.py")
+    if shutil.which("uv") is None:
+        die("need `uv` to run ./secrets.py; install uv or run ./secrets.py yourself first")
+    secrets_py = Path(__file__).resolve().parent / "secrets.py"
+    result = subprocess.run(
+        ["uv", "run", "--script", str(secrets_py), "--project", project]
+    )
+    if result.returncode != 0:
+        die(
+            "`./secrets.py` failed — it needs `loom` + a populated loom.toml on this "
+            "workstation. Fix that and re-run, or push LOOM_DOTENV yourself. See ./README.md."
+        )
+
+
+def ssh_run(
+    project: str, zone: str, instance: str, remote_cmd: str, *, timeout: int = 120
+) -> subprocess.CompletedProcess:
+    """Run one command on the VM over SSH, capturing output. --quiet accepts the
+    key-gen / OS-Login prompts non-interactively."""
+    return subprocess.run(
+        [
+            "gcloud",
+            f"--project={project}",
+            "compute",
+            "ssh",
+            instance,
+            f"--zone={zone}",
+            "--quiet",
+            f"--command={remote_cmd}",
+        ],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=timeout,
+    )
+
+
+def wait_for_ssh(project: str, zone: str, instance: str, timeout: int = 300) -> None:
+    log("waiting for SSH (the first connect propagates keys, ~1 min)")
+    waited = 0
+    while waited < timeout:
+        try:
+            if ssh_run(project, zone, instance, "true", timeout=60).returncode == 0:
+                log("SSH is up")
+                return
+        except subprocess.TimeoutExpired:
+            pass
+        time.sleep(10)
+        waited += 10
+    die(
+        "SSH never became reachable — check the VM is RUNNING and the SSH "
+        "firewall rule allows your current IP"
+    )
+
+
+def count_startup_banners(project: str, zone: str, instance: str) -> int:
+    """How many times the startup-script has logged its opening banner so far —
+    i.e. how many runs are already in the journal. The monitor waits for this to
+    grow before judging, so a re-trigger never reads a previous run's result."""
+    r = ssh_run(
+        project,
+        zone,
+        instance,
+        f"sudo journalctl -u {STARTUP_UNIT} --no-pager -o cat 2>/dev/null "
+        f"| grep -c '{STARTUP_BANNER}' || true",
+    )
+    try:
+        return int(r.stdout.strip() or 0)
+    except ValueError:
+        return 0
+
+
+def trigger_startup(project: str, zone: str, instance: str) -> None:
+    log("re-triggering the startup-script (detached, via systemd)")
+    r = ssh_run(
+        project,
+        zone,
+        instance,
+        f"sudo systemctl restart --no-block {STARTUP_UNIT}.service",
+    )
+    if r.returncode != 0:
+        die(f"failed to re-trigger startup-script:\n{r.stderr}")
+
+
+def monitor_startup(
+    project: str, zone: str, instance: str, prior_banners: int, timeout: int = 2400
+) -> bool:
+    """Watch the startup-script journal until the *current* run — the one past
+    `prior_banners` opening banners — prints its done marker or fails. Anchoring
+    on the banner count (not a raw line offset) means a re-trigger's monitor
+    never trips over an earlier run's failure line still sitting in the journal,
+    and it waits for the new run to actually start before judging it. Returns
+    whether it succeeded."""
+    log("watching startup-script (journalctl) — the build path can take many minutes")
+    printed = None
+    waited = 0
+    while waited < timeout:
+        r = ssh_run(
+            project,
+            zone,
+            instance,
+            f"sudo journalctl -u {STARTUP_UNIT} --no-pager -o cat 2>/dev/null",
+        )
+        lines = r.stdout.splitlines() if r.stdout else []
+        banners = [i for i, line in enumerate(lines) if STARTUP_BANNER in line]
+        if len(banners) <= prior_banners:
+            # The (re-)triggered run hasn't logged its banner yet — keep waiting
+            # so we never read the previous run's outcome.
+            time.sleep(15)
+            waited += 15
+            continue
+        boundary = banners[prior_banners]  # first line of the current run
+        if printed is None:
+            printed = boundary
+        for line in lines[printed:]:
+            click.echo(f"  {line}", err=True)
+        printed = max(printed, len(lines))
+        window = "\n".join(lines[boundary:])
+        if STARTUP_DONE in window:
+            log("startup-script finished ✔")
+            return True
+        if any(marker in window for marker in STARTUP_FAIL):
+            warn("startup-script FAILED — see the lines above")
+            return False
+        time.sleep(15)
+        waited += 15
+    warn(f"startup-script did not finish within {timeout}s")
+    return False
+
+
+def wait_for_https(domain: str, timeout: int = 300) -> bool:
+    log(f"checking https://{domain}/ is serving (TLS cert issuance can lag a minute)")
+    waited = 0
+    while waited < timeout:
+        try:
+            with urllib.request.urlopen(f"https://{domain}/", timeout=10) as resp:
+                log(f"https://{domain}/ responded {resp.status}")
+                return True
+        except urllib.error.HTTPError as e:
+            log(f"https://{domain}/ responded {e.code} — the server is up")
+            return True
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(15)
+        waited += 15
+    return False
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
@@ -500,7 +685,8 @@ def main(
     ip = ensure_static_ip(project, region, ip_name)
     wait_for_dns(loom_domain, ip, dns_wait_seconds, skip_dns_wait)
     ensure_data_disk(project, zone, data_disk_name, data_disk_size)
-    ensure_instance(
+    ensure_secrets(project)
+    created = ensure_instance(
         project,
         zone,
         instance_name,
@@ -537,14 +723,41 @@ def main(
         }
     )
 
-    click.echo("", err=True)
-    log(f"done. VM: {instance_name}  IP: {ip}  domain: {loom_domain}")
     log(f"remembered these settings in {DEPLOY_TOML.name} — a bare re-run reuses them")
-    log("next: run ./secrets.py if you haven't yet, then watch the boot:")
-    log(f"  gcloud --project={project} compute ssh {instance_name} --zone={zone} \\")
-    log("    --command='sudo journalctl -u google-startup-scripts -f'")
+
+    # Drive the deploy to completion: apply the (possibly updated) startup
+    # script and watch it land, rather than leaving the operator to tail logs.
+    wait_for_ssh(project, zone, instance_name)
+    if created:
+        prior_banners = 0  # fresh VM: its boot-time run is the first
+    else:
+        # Existing VM: count the runs already in the journal, then re-trigger and
+        # watch only for the new one, so a prior failure isn't mistaken for it.
+        prior_banners = count_startup_banners(project, zone, instance_name)
+        trigger_startup(project, zone, instance_name)
+
+    ok = monitor_startup(project, zone, instance_name, prior_banners)
+    click.echo("", err=True)
+    if not ok:
+        die(
+            "deploy did not finish — inspect the VM:\n"
+            f"  gcloud --project={project} compute ssh {instance_name} --zone={zone} "
+            f"--command='sudo journalctl -u {STARTUP_UNIT} --no-pager | tail -60'"
+        )
+
+    log(f"startup-script succeeded. VM: {instance_name}  IP: {ip}  domain: {loom_domain}")
+    if wait_for_https(loom_domain):
+        log(f"loom is live: https://{loom_domain}/")
+    else:
+        warn(
+            f"stack is up but https://{loom_domain}/ isn't answering yet — the TLS "
+            "certificate may still be issuing. Watch it:\n"
+            f"  gcloud --project={project} compute ssh {instance_name} --zone={zone} "
+            "--command='cd /opt/loom/deploy/standalone && sudo docker compose logs -f caddy'"
+        )
     log(
-        "see ./README.md for the manual-once checklist (OAuth app, first login, webhook)."
+        "manual-once (if not done): first OAuth login + install the App on your "
+        "repos — see ./README.md."
     )
 
 
