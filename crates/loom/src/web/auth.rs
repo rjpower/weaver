@@ -285,11 +285,17 @@ pub(super) async fn github_callback(
         .ok_or_else(|| AppError::bad_request("cannot determine the callback URL"))?;
     let redirect_uri = format!("{base}{GITHUB_CALLBACK_PATH}");
     let token = auth::exchange_code(&cfg, &code, &redirect_uri).await?;
-    let login = auth::fetch_github_login(&token).await?;
-    let Some(user) = auth::user_by_github(&st.db, &login).await? else {
+    let gh = auth::fetch_github_user(&token).await?;
+    let Some(user) = auth::user_by_github(&st.db, &gh.login).await? else {
         // Authenticated with GitHub, but not on the allowlist.
         return Ok(login_error_redirect("not-approved"));
     };
+    // Record the profile for commit attribution (best-effort — a failure here
+    // must not block a valid sign-in).
+    if let Err(e) = auth::update_github_profile(&st.db, &gh.login, gh.id, gh.name.as_deref()).await
+    {
+        tracing::warn!(login = %gh.login, "failed to record GitHub profile: {e}");
+    }
     let cookie = auth::create_session(&st.db, &user.username).await?;
     Ok(redirect_with_cookies(
         "/",

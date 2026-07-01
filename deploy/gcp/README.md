@@ -134,7 +134,7 @@ VM deletes them along with it** — you'd lose the database and have to
 re-issue a certificate (subject to Let's Encrypt's rate limits).
 
 `bootstrap.py` mitigates this by default: it creates a separate persistent
-disk (`DATA_DISK_SIZE`, default 50GB) and `startup-script.sh` points Docker's
+disk (`DATA_DISK_SIZE`, default 500GB) and `startup-script.sh` points Docker's
 entire data-root at it (`/etc/docker/daemon.json`), so every named volume
 lands on that disk without any change to `docker-compose.yml`. That disk
 still gets deleted if you delete the VM *and* the disk together — it is
@@ -142,6 +142,19 @@ durability against VM recreation, not against `terraform destroy`-style
 teardown. To keep state across a full teardown, detach the disk first
 (`gcloud compute instances detach-disk`) or snapshot it
 (`gcloud compute disks snapshot`) before deleting the instance.
+
+**Resizing the data disk.** Re-running `bootstrap.py` with a larger
+`--data-disk-size` does *not* touch an existing disk — it's created only when
+absent, so a re-run just logs "already exists" and moves on. To grow it in
+place, resize the disk (GCP grows live; you can't shrink) and reboot:
+
+```sh
+gcloud compute disks resize loom-data --size=500GB --zone=<zone>
+gcloud compute instances reset loom --zone=<zone>
+```
+
+`startup-script.sh` runs `resize2fs` on every boot, so the ext4 filesystem
+expands to fill the enlarged disk automatically — no manual filesystem step.
 
 Set `DATA_DISK_SIZE=0` to skip this and put everything on the boot disk
 instead — simpler, but the loss-on-VM-delete risk above applies to the whole

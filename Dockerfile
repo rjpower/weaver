@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # loom — the weaver orchestrator — packaged for a reverse-proxy deploy.
 
 # ---- build: loom + tapestry + weaver, plus the embedded Vue bundle ----
@@ -7,8 +8,36 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-# loom's build.rs runs `npm install` + rspack, emitting crates/loom/static/dist.
-RUN cargo build --release -p loom -p tapestry -p weaver
+
+# `debug` (default) is far faster to compile — fine for local/standalone
+# try-outs; pass `release` for a production image (`CARGO_PROFILE=release`).
+ARG CARGO_PROFILE=debug
+
+# BuildKit cache mounts persist the cargo registry/git and the target dir across
+# builds *without* baking them into the image, so an incremental rebuild only
+# recompiles what actually changed instead of the whole dependency tree — the
+# difference between a multi-minute and a few-second `docker compose up --build`.
+# The compiled artifacts live inside the (ephemeral) target mount, which doesn't
+# survive into the image layer, so they're copied out to /out (a real layer).
+#
+# The Vue bundle is built explicitly rather than left to loom's build.rs: with
+# the target cached, cargo may skip build.rs (unchanged fingerprint), and
+# static/dist is excluded from the build context (.dockerignore) — so an
+# incremental build would otherwise have no bundle for the runtime stage to copy.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    --mount=type=cache,target=/root/.npm \
+    set -eux; \
+    ( cd crates/loom/frontend && npm ci && npm run build ); \
+    if [ "$CARGO_PROFILE" = release ]; then \
+        cargo build --release -p loom -p tapestry -p weaver; TARGET_DIR=release; \
+    else \
+        cargo build -p loom -p tapestry -p weaver; TARGET_DIR=debug; \
+    fi; \
+    mkdir -p /out; \
+    cp "target/$TARGET_DIR/loom" "target/$TARGET_DIR/tapestry" "target/$TARGET_DIR/weaver" /out/; \
+    cp -r crates/loom/static/dist /out/dist
 
 # ---- runtime: loom + the toolchain its agents shell out to ----
 FROM rust:1-bookworm
@@ -104,12 +133,12 @@ EOF
 
 # loom resolves the tapestry PTY supervisor as a sibling of its own binary
 # (current_exe dir + /tapestry), so the two must land in the same directory.
-COPY --from=build /src/target/release/loom     /usr/local/bin/loom
-COPY --from=build /src/target/release/tapestry /usr/local/bin/tapestry
+COPY --from=build /out/loom     /usr/local/bin/loom
+COPY --from=build /out/tapestry /usr/local/bin/tapestry
 # `weaver` is the agent-facing CLI — kept on PATH for `docker exec weaver
 # weaver config set …` (settings live in the shared sqlite db).
-COPY --from=build /src/target/release/weaver   /usr/local/bin/weaver
-COPY --from=build /src/crates/loom/static/dist /app/static/dist
+COPY --from=build /out/weaver   /usr/local/bin/weaver
+COPY --from=build /out/dist     /app/static/dist
 
 # static_dir() defaults to a build-time CARGO_MANIFEST_DIR path that doesn't
 # exist here, so point it at the copied bundle explicitly. WEAVER_HOME is left to

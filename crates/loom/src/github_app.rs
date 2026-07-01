@@ -41,6 +41,14 @@ pub const APP_ID_KEY: &str = "github.app_id";
 /// Settings key (env-overridable) holding the App's RSA private key PEM. Like
 /// the OAuth client secret, this is **never** returned by `GET /api/settings`.
 pub const APP_PRIVATE_KEY_KEY: &str = "github.app_private_key";
+/// Settings key holding the App's URL slug (from the manifest conversion). Not
+/// used at runtime — recorded so `loom setup` can deep-link to the App's GitHub
+/// settings/install pages when updating an already-configured App.
+pub const APP_SLUG_KEY: &str = "github.app_slug";
+/// Settings key holding the org login that owns the App, when it's an org-owned
+/// App (empty for a personal App). Together with [`APP_SLUG_KEY`] it picks the
+/// right (org vs personal) GitHub settings URL for the update flow.
+pub const APP_OWNER_KEY: &str = "github.app_owner";
 
 /// The production GitHub REST base. Overridable per-instance only for tests.
 const DEFAULT_API_BASE: &str = "https://api.github.com";

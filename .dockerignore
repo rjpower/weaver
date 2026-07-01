@@ -1,9 +1,14 @@
-# The image build does its own clean `cargo build --release` and `npm install`
-# inside the build stage, so none of these host artifacts belong in the build
-# context — shipping them just bloats the daemon upload (host target/ alone is
-# >1GB) and can shadow a clean build.
+# The image build does its own clean cargo + npm build inside the build stage,
+# so none of these host artifacts belong in the build context — shipping them
+# just bloats the daemon upload (host target/ alone is >1GB, .worktrees/ holds
+# whole extra checkouts) and can shadow a clean build.
 target/
+**/target/
 .git/
+.worktrees/
 **/node_modules/
 crates/loom/static/dist/
+# Never ship a rendered env into the build context — it holds secrets, and none
+# of the deploy .env files (repo root or deploy/standalone/.env) are build inputs.
 .env
+**/.env

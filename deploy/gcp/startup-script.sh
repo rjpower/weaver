@@ -83,6 +83,11 @@ if [ -e "$DATA_DISK_DEVICE" ]; then
   if ! mountpoint -q "$DATA_MOUNT"; then
     mount "$DATA_DISK_DEVICE" "$DATA_MOUNT"
   fi
+  # Grow the filesystem to fill the device — a no-op unless the disk was resized
+  # larger (`gcloud compute disks resize`) since the last boot. This makes
+  # enlarging the data disk a resize + reboot, with no manual resize2fs; ext4
+  # grows online, so the mount above stays put.
+  resize2fs "$DATA_DISK_DEVICE" 2>/dev/null || true
   if ! grep -q "^${DATA_DISK_DEVICE} " /etc/fstab; then
     echo "${DATA_DISK_DEVICE} ${DATA_MOUNT} ext4 discard,defaults,nofail 0 2" >>/etc/fstab
   fi

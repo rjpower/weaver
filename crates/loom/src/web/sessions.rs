@@ -732,7 +732,32 @@ pub(crate) async fn create_session_core(
     let term_session = format!("weaver-{session_id}");
     // The resolved launch environment: global agent_env < per-repo repo_env < the
     // repo file's [env]. The same env is handed to the setup script and the agent.
-    let extra_env = launch_env(&st.db, &repo_root, &repo_cfg).await;
+    let mut extra_env = launch_env(&st.db, &repo_root, &repo_cfg).await;
+
+    // Attribute the agent's commits to the launching user (design §6.3, Level A):
+    // export their GitHub identity as the git author/committer. Inserted only if
+    // not already set by a preceding env layer, so an explicit repo/operator
+    // override still wins, and only for an interactive launch that carries a
+    // `created_by` principal (webhook/warm/adopt paths have none and keep the
+    // shared identity).
+    if let Some(username) = created_by.as_deref() {
+        match crate::auth::commit_identity(&st.db, username).await {
+            Ok(Some(id)) => {
+                for (k, v) in [
+                    ("GIT_AUTHOR_NAME", &id.name),
+                    ("GIT_AUTHOR_EMAIL", &id.email),
+                    ("GIT_COMMITTER_NAME", &id.name),
+                    ("GIT_COMMITTER_EMAIL", &id.email),
+                ] {
+                    if !extra_env.iter().any(|(ek, _)| ek == k) {
+                        extra_env.push((k.to_string(), v.clone()));
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(%username, "failed to resolve commit identity: {e}"),
+        }
+    }
 
     // Per-repo setup: run the repo's committed `[setup]` script in the worktree
     // before the agent starts — but ONLY for an allowlisted (registered) repo,

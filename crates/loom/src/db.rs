@@ -96,10 +96,17 @@ CREATE TABLE IF NOT EXISTS branch_github (
 -- (argon2) backs username/password login. Either may be NULL — a GitHub-only
 -- user has no password until they set one, and vice versa.
 CREATE TABLE IF NOT EXISTS users (
-    username      TEXT PRIMARY KEY,
-    github_login  TEXT UNIQUE,
-    password_hash TEXT,
-    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    username       TEXT PRIMARY KEY,
+    github_login   TEXT UNIQUE,
+    password_hash  TEXT,
+    -- Captured at GitHub sign-in for commit attribution (design §6.3, Level A).
+    -- `github_user_id` yields the stable `<id>+<login>@users.noreply.github.com`
+    -- commit email that links a commit to the GitHub account; `display_name` is
+    -- the profile name used for the git author name. Both NULL until the user has
+    -- signed in via GitHub since these columns existed.
+    github_user_id INTEGER,
+    display_name   TEXT,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 -- API tokens (personal access tokens) for automation — the `LOOM_TOKEN` a CI
@@ -237,6 +244,11 @@ async fn migrate_loom(pool: &Db) -> Result<()> {
     // added here rather than as a numbered migration in weaver-core/migrations —
     // matching `model`/`effort`/`parent_branch_id`/`managed_by` above.)
     add_column_if_missing(pool, "sessions", "created_by", "TEXT").await?;
+    // GitHub profile captured at sign-in for commit attribution (see the `users`
+    // schema above). Added here for databases predating the columns; a fresh DB
+    // already has them from the `CREATE TABLE` and these are no-ops.
+    add_column_if_missing(pool, "users", "github_user_id", "INTEGER").await?;
+    add_column_if_missing(pool, "users", "display_name", "TEXT").await?;
     seed_owner(pool).await?;
     seed_owners(pool).await?;
     Ok(())

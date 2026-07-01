@@ -201,6 +201,65 @@ pub async fn user_by_github(db: &Db, login: &str) -> Result<Option<User>> {
     Ok(row.as_ref().map(user_from_row))
 }
 
+/// Record the GitHub profile (numeric id + display name) captured at sign-in,
+/// keyed by the login already matched to a user row. Best-effort attribution
+/// data: it updates the existing allowlist row in place and never creates one,
+/// so a not-approved login (rejected before this is called) leaves no trace.
+pub async fn update_github_profile(
+    db: &Db,
+    login: &str,
+    github_user_id: i64,
+    display_name: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE users SET github_user_id = ?, display_name = ?
+         WHERE github_login IS NOT NULL AND lower(github_login) = lower(?)",
+    )
+    .bind(github_user_id)
+    .bind(display_name)
+    .bind(login)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// The git author/committer identity to attribute a user's commits to.
+#[derive(Debug, Clone)]
+pub struct CommitIdentity {
+    pub name: String,
+    pub email: String,
+}
+
+/// The commit identity for `username`, or `None` if the user has no GitHub
+/// login on file (a password-only operator — nothing to attribute to). The
+/// email is GitHub's stable `<id>+<login>@users.noreply.github.com` form, which
+/// links the commit to the account without exposing a private address; it falls
+/// back to the id-less `<login>@…` shape for a user who hasn't signed in via
+/// GitHub since [`update_github_profile`] began recording the id. The name is
+/// the captured display name, else the login.
+pub async fn commit_identity(db: &Db, username: &str) -> Result<Option<CommitIdentity>> {
+    let Some(row) = sqlx::query(
+        "SELECT github_login, github_user_id, display_name FROM users WHERE username = ?",
+    )
+    .bind(username)
+    .fetch_optional(db)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let Some(login) = row.get::<Option<String>, _>("github_login") else {
+        return Ok(None);
+    };
+    let id = row.get::<Option<i64>, _>("github_user_id");
+    let display = row.get::<Option<String>, _>("display_name");
+    let email = match id {
+        Some(id) => format!("{id}+{login}@users.noreply.github.com"),
+        None => format!("{login}@users.noreply.github.com"),
+    };
+    let name = display.filter(|s| !s.trim().is_empty()).unwrap_or(login);
+    Ok(Some(CommitIdentity { name, email }))
+}
+
 pub async fn list_users(db: &Db) -> Result<Vec<User>> {
     let rows = sqlx::query(
         "SELECT username, github_login, password_hash, created_at FROM users ORDER BY created_at, username",
@@ -726,11 +785,22 @@ pub async fn exchange_code(cfg: &GithubOAuth, code: &str, redirect_uri: &str) ->
     }
 }
 
-/// Fetch the authenticated user's GitHub login for `access_token`.
-pub async fn fetch_github_login(access_token: &str) -> Result<String> {
+/// The authenticated user's GitHub profile, as much as sign-in needs: `login`
+/// for the allowlist check, and `id`/`name` for commit attribution (design
+/// §6.3, Level A). `name` is the free-text profile name and may be absent.
+pub struct GithubUser {
+    pub login: String,
+    pub id: i64,
+    pub name: Option<String>,
+}
+
+/// Fetch the authenticated user's GitHub profile for `access_token`.
+pub async fn fetch_github_user(access_token: &str) -> Result<GithubUser> {
     #[derive(serde::Deserialize)]
     struct GhUser {
         login: String,
+        id: i64,
+        name: Option<String>,
     }
     let resp = reqwest::Client::new()
         .get("https://api.github.com/user")
@@ -754,7 +824,11 @@ pub async fn fetch_github_login(access_token: &str) -> Result<String> {
         ));
     }
     let user: GhUser = resp.json().await.context("decoding GitHub user")?;
-    Ok(user.login)
+    Ok(GithubUser {
+        login: user.login,
+        id: user.id,
+        name: user.name,
+    })
 }
 
 #[cfg(test)]
@@ -831,6 +905,30 @@ mod tests {
         assert_eq!(primary_user(&db).await.unwrap().as_deref(), Some("rjpower"));
         let u = user_by_github(&db, "RJPower").await.unwrap();
         assert_eq!(u.map(|u| u.username), Some("rjpower".to_string()));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn commit_identity_derives_noreply_email() {
+        let db = connect_in_memory_with_owner("rjpower").await;
+
+        // Before any profile is captured: id-less noreply email, login as name.
+        let id = commit_identity(&db, "rjpower").await.unwrap().unwrap();
+        assert_eq!(id.name, "rjpower");
+        assert_eq!(id.email, "rjpower@users.noreply.github.com");
+
+        // After sign-in records the numeric id + display name: the stable
+        // account-linked noreply email, and the display name as the git author.
+        update_github_profile(&db, "RJPower", 4242, Some("Russell Power"))
+            .await
+            .unwrap();
+        let id = commit_identity(&db, "rjpower").await.unwrap().unwrap();
+        assert_eq!(id.name, "Russell Power");
+        assert_eq!(id.email, "4242+rjpower@users.noreply.github.com");
+
+        // A password-only operator has no GitHub identity to attribute to.
+        add_user(&db, "localonly", None, Some("pw")).await.unwrap();
+        assert!(commit_identity(&db, "localonly").await.unwrap().is_none());
     }
 
     #[tokio::test]

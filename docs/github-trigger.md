@@ -152,7 +152,15 @@ database — live-applies them too, no restart needed for that part. The App's
 `callback_urls` are set to loom's GitHub login callback too, so the same App's
 OAuth client also covers "Sign in with GitHub" (see
 [deploy/README.md "First-run login"](../deploy/README.md#first-run-login)) —
-one registration, not two. See `loom setup github-app --help` for `--org` (App
+one registration, not two.
+
+Run it again on an instance that already has an App and it offers to **update**
+it instead of creating a second one: it opens the App's GitHub settings page to
+adjust permissions (which loom can't change itself — you edit them there, then
+re-approve on each installation) or the install page to add repositories, or you
+can choose to replace the App with a fresh one.
+
+See `loom setup github-app --help` for `--org` (App
 under an organization instead of your account), `--port` (pin a port when
 tunnelling into a remote host), and `--config` (where to write `loom.toml`;
 defaults to `./loom.toml` or `$LOOM_CONFIG`). `loom config render-env` turns

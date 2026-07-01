@@ -331,11 +331,12 @@ def ensure_instance(
 @click.option(
     "--data-disk-size",
     envvar="DATA_DISK_SIZE",
-    default=50,
+    default=500,
     show_default=True,
     help="Persistent data-disk size, GB, for loom_home/caddy_data (see "
     "../README.md 'Durable state'). Set to 0 to skip — state then lives "
-    "on the boot disk.",
+    "on the boot disk. Only applied to a *new* disk; grow an existing one with "
+    "`gcloud compute disks resize` + reboot (the VM grows the filesystem on boot).",
 )
 @click.option(
     "--instance-name", envvar="INSTANCE_NAME", default="loom", show_default=True
