@@ -30,6 +30,7 @@ async function refresh() {
 }
 
 async function uploadFiles(list: FileList | File[]) {
+  if (busy.value) return;
   busy.value = true;
   error.value = '';
   try {
@@ -138,9 +139,10 @@ onUnmounted(() => {
          (Enter/Space) both open the file picker. -->
     <button
       type="button"
-      class="flex shrink-0 cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 text-faint hover:bg-subtle hover:text-fg focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+      class="flex shrink-0 cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 text-faint hover:bg-subtle hover:text-fg focus:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:cursor-wait disabled:opacity-60"
       :title="busy ? 'Uploading scratch file(s)…' : 'Attach a file — the agent sees it as scratch/<name> (or drop one anywhere on the page)'"
       :aria-label="busy ? 'Uploading scratch file(s)' : 'Attach a scratch file'"
+      :disabled="busy"
       @click="fileInput?.click()"
     >
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"

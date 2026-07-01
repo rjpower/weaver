@@ -153,7 +153,7 @@ function setting(key: string): SettingView | undefined {
 }
 
 function isDefaultValue(s: SettingView): boolean {
-  return (drafts.value[s.key] ?? '') === s.default;
+  return s.is_default && !dirty(s);
 }
 
 function dirty(s: SettingView): boolean {

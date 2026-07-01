@@ -111,7 +111,7 @@ const add = () =>
         class="grid grid-cols-1 gap-2 border-b border-line px-3 py-2.5 md:grid-cols-[minmax(11rem,14rem)_minmax(0,1fr)_auto]"
       >
         <label class="flex flex-col gap-1 md:min-w-0">
-          <span class="text-2xs text-muted md:hidden">Name</span>
+          <span class="text-2xs text-muted md:sr-only">Name</span>
           <input
             v-model="newName"
             placeholder="e.g. GH_HOST"
@@ -121,7 +121,7 @@ const add = () =>
           />
         </label>
         <label class="flex flex-col gap-1 md:min-w-0">
-          <span class="text-2xs text-muted md:hidden">Value</span>
+          <span class="text-2xs text-muted md:sr-only">Value</span>
           <input
             v-model="newValue"
             placeholder="(value)"
@@ -154,7 +154,7 @@ const add = () =>
       >
         <code class="truncate font-mono text-sm" :title="v.name">{{ v.name }}</code>
         <div class="flex flex-col gap-1 md:min-w-0">
-          <span class="text-2xs text-muted md:hidden">Value</span>
+          <span class="text-2xs text-muted md:sr-only">Value</span>
           <input
             v-model="drafts[v.name]"
             class="rounded bg-input px-2 py-1 font-mono text-sm outline-none focus:ring-1 ring-accent"
