@@ -1,15 +1,6 @@
-//! Upsert `KEY=value` lines into dotenv-style text, preserving everything
-//! else — comments, blank lines, unrelated keys, and their order.
-//!
-//! This is the rendering engine behind `loom config render-env`
-//! ([`crate::loom_config::render_env`]): the typed `loom.toml` is the
-//! authored source of truth, and this module turns it into the
-//! `deploy/standalone/.env` docker compose reads, for the ambient-process-level
-//! uses (daemon-level `GH_TOKEN` for cloning, the App id/private key/webhook
-//! secret/OAuth client as a fallback if the settings-table write is ever lost)
-//! that only take effect on the next process start — the live-effective path
-//! is a direct settings/`agent_env` write ([`crate::github_manifest`],
-//! [`crate::agent_env`]).
+//! Dotenv-shaped text: upsert `KEY=value` lines while preserving everything
+//! else — comments, blank lines, unrelated keys, and their order — and write
+//! a secrets-bearing file with owner-only permissions.
 //!
 //! Multi-line values (an RSA private key PEM) are written double-quoted with
 //! embedded newlines escaped to a literal `\n` — the form docker compose's

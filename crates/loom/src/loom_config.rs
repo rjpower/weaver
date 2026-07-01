@@ -1,19 +1,13 @@
 //! The typed `loom.toml` — the single authored source of truth for every
-//! credential/setting a deploy needs, whether or not it's a secret.
-//!
-//! Before this module, the field↔`ENV_NAME` mapping and the secret/non-secret
-//! marker for each one were spelled twice: once in the Rust setup wizard
-//! (`bin/loom.rs`) and once wherever a deploy script re-derived the same list
-//! (a bash array, a Python constant, ...), and the deploy-mechanism knobs
-//! (`HOST_UID`, `LOOM_TLS_EMAIL`, ...) were carved out as a *separate*,
-//! untyped set of `${VAR:-default}` substitutions in `docker-compose.yml`
-//! with no representation here at all — two systems for what is, from an
-//! operator's chair, one file. [`FIELDS`] now covers every one of them
-//! uniformly, with no special cases: `loom setup` fills a [`LoomConfig`] and
-//! calls [`upsert`] to persist it; `loom config render-env`/`secret-names`/
-//! `push-secrets` (`bin/loom.rs`) all iterate [`FIELDS`] generically instead
-//! of naming an `ENV_NAME` themselves. `deploy/standalone/.env` is no longer
-//! hand-authored — it is *generated* from this file by `render_env`.
+//! credential and deploy-mechanism setting, secret or not (GitHub App
+//! credentials, paste-once agent secrets, and knobs like `LOOM_TLS_EMAIL` or
+//! `HOST_UID` alike). [`FIELDS`] is the one place a field's `ENV_NAME` and
+//! secret/non-secret marker are spelled — `loom setup` fills a [`LoomConfig`]
+//! and calls [`upsert`] to persist it; `loom config
+//! render-env`/`secret-names`/`push-secrets` (`bin/loom.rs`) all iterate
+//! [`FIELDS`] generically instead of naming an `ENV_NAME` themselves.
+//! `deploy/standalone/.env` is generated from this file by [`render_env`],
+//! not hand-authored.
 //!
 //! Every field resolves from **either** `loom.toml` **or** a same-named
 //! environment variable — [`resolve`] layers the process environment over
