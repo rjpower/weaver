@@ -440,16 +440,28 @@ pub(super) async fn remove_user(
     }
 }
 
-// -- GitHub OAuth app config -------------------------------------------------
+// -- GitHub App / sign-in config ---------------------------------------------
+// One GitHub App backs loom: its OAuth client powers sign-in (`configured` /
+// `client_id`), and the same App's id + private key power the `@loom` trigger
+// (`app_configured` / `app_id` / `app_slug`).
 
 async fn github_config_view(st: &AppState) -> ApiResult<GithubConfigView> {
-    let client_id = config::get(&st.db, auth::GH_CLIENT_ID_KEY)
+    // Both the OAuth client id and the App identity are resolved env-or-settings
+    // (via `auth`/`github_app`), so an env-configured deploy reports its live
+    // values instead of blanks read from an empty settings table.
+    let app_id = crate::github_app::app_id(&st.db)
         .await
+        .map(|id| id.to_string())
         .unwrap_or_default();
     Ok(GithubConfigView {
         configured: auth::github_oauth(&st.db).await.is_some(),
-        client_id,
+        client_id: auth::oauth_client_id(&st.db).await,
         callback_path: GITHUB_CALLBACK_PATH.to_string(),
+        app_configured: crate::github_app::is_configured(&st.db).await,
+        app_id,
+        app_slug: crate::github_app::app_slug(&st.db)
+            .await
+            .unwrap_or_default(),
     })
 }
 
@@ -460,7 +472,8 @@ pub(super) async fn get_github_config(
     Ok(Json(github_config_view(&st).await?))
 }
 
-/// `PUT /api/auth/github/config` — set the OAuth app id (and, optionally, secret).
+/// `PUT /api/auth/github/config` — set the sign-in OAuth client id (and,
+/// optionally, its secret).
 pub(super) async fn put_github_config(
     State(st): State<AppState>,
     Json(body): Json<SetGithubConfigReq>,
