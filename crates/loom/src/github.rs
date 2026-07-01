@@ -431,7 +431,7 @@ async fn apply_snapshot(
 
     let recovered = tags::get(&state.db, &branch.id, tags::RECOVERED_KEY)
         .await?
-        .is_some();
+        .is_some_and(|tag| tag.value == tags::RECOVERED_VALUE);
     if archive_on_merge
         && snap.pr_state == "MERGED"
         && !session_mod::is_terminal(&session.status)
@@ -863,6 +863,32 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(open_issue.status, "open");
+    }
+
+    #[tokio::test]
+    async fn malformed_recovered_tag_does_not_suppress_archive_on_merge() {
+        let f = fixture().await;
+        tags::set(
+            &f.state.db,
+            &f.branch.id,
+            tags::RECOVERED_KEY,
+            "false",
+            "manual",
+            "manual",
+        )
+        .await
+        .unwrap();
+
+        apply_snapshot(&f.state, &f.session, &f.branch, &snapshot("MERGED"), true)
+            .await
+            .unwrap();
+
+        let session = session_mod::get(&f.state.db, &f.session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, "archived");
+        assert!(!f.work_dir.exists());
     }
 
     #[tokio::test]
