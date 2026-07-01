@@ -39,9 +39,21 @@ DATA_MOUNT=/mnt/loom-data
 echo "== loom startup-script: domain=${LOOM_DOMAIN} image-mode=${IMAGE_MODE} =="
 
 # ---- Docker + compose plugin ----------------------------------------------
+# Docker's signed apt repo, not `curl | sh` — this is a long-lived
+# internet-facing host, so root shouldn't run an unauthenticated remote
+# script. Same keyring idiom as the google-cloud-cli install below.
 if ! command -v docker >/dev/null 2>&1; then
   echo "== installing Docker =="
-  curl -fsSL https://get.docker.com | sh
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/debian/gpg \
+    -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+  # shellcheck disable=SC1091 # /etc/os-release is a Debian-image-provided file, not repo-tracked
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+    >/etc/apt/sources.list.d/docker.list
+  apt-get update
+  apt-get install -y --no-install-recommends \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 fi
 systemctl enable --now docker
 
@@ -88,10 +100,19 @@ EOF
   fi
 fi
 
-# ---- fetch secrets into deploy/standalone/.env -----------------------------
+# ---- get the repo, at the exact code this boot should run -----------------
+# Re-run on every boot (not just clone-if-missing), so re-triggering the
+# startup script (see ../README.md "Operations") actually picks up a changed
+# GIT_REF/REPO_URL instead of silently keeping whatever was checked out first.
 if [ ! -d "$REPO_DIR/.git" ]; then
   echo "== cloning ${REPO_URL}@${GIT_REF} =="
   git clone --branch "$GIT_REF" --depth 1 "$REPO_URL" "$REPO_DIR"
+else
+  echo "== updating ${REPO_DIR} to ${REPO_URL}@${GIT_REF} =="
+  git -C "$REPO_DIR" remote set-url origin "$REPO_URL"
+  git -C "$REPO_DIR" fetch --depth 1 origin "$GIT_REF"
+  git -C "$REPO_DIR" checkout --force FETCH_HEAD
+  git -C "$REPO_DIR" clean -fd
 fi
 
 ENV_FILE="${REPO_DIR}/deploy/standalone/.env"

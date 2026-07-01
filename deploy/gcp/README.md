@@ -45,6 +45,14 @@ for any other host you chose to run the stack on. (`LOOM_DOMAIN` is *also* a
 `loom.toml` field the app itself reads — the two are naturally the same
 value, kept in sync by you, not by any code path here.)
 
+Every `loom.toml` field is optional (an unset field is simply absent from the
+rendered blob and skipped by `push-secrets` — no failure, no placeholder).
+`anthropic_api_key` in particular is usually one you *don't* set: the more
+common path is skipping it in `loom setup secrets` and logging in to Claude
+interactively once the VM is up, the same as any other host —
+`gcloud --project=my-project compute ssh loom --zone=us-central1-a` in, then
+`cd /opt/loom/deploy/standalone && sudo docker compose exec loom claude`.
+
 ## Run order
 
 The ordering constraint that matters: **the static IP must exist and DNS must
