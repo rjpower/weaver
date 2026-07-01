@@ -23,6 +23,7 @@ import socket
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.request
 from pathlib import Path
 
@@ -64,6 +65,70 @@ def gcloud_exists(project: str, *args: str) -> bool:
         stdin=subprocess.DEVNULL,
     )
     return result.returncode == 0
+
+
+DEPLOY_TOML = Path(__file__).resolve().parent / "deploy.toml"
+
+# The resolved knobs worth remembering between runs — the durable infra choices,
+# not the per-invocation operational flags (operator_ip is auto-detected, the
+# DNS-wait gate is situational).
+REMEMBERED = (
+    "project",
+    "loom_domain",
+    "region",
+    "zone",
+    "machine_type",
+    "disk_size",
+    "data_disk_size",
+    "instance_name",
+    "service_account_name",
+    "network",
+    "repo_url",
+    "git_ref",
+    "image_mode",
+    "ar_image",
+)
+
+
+def load_deploy_toml() -> dict:
+    """Remembered defaults from the last successful run, fed to click as
+    `default_map` — so precedence is CLI flag > env var > deploy.toml > the
+    built-in defaults. A missing file just means no remembered defaults."""
+    if not DEPLOY_TOML.exists():
+        return {}
+    with DEPLOY_TOML.open("rb") as f:
+        return tomllib.load(f)
+
+
+def save_deploy_toml(values: dict) -> None:
+    """Write back the knobs this run resolved, so the next `./bootstrap.py`
+    re-deploys with the same settings and no flags. Not secret (secrets live in
+    Secret Manager via ./secrets.py) but project-specific, hence gitignored."""
+    lines = [
+        "# Written by bootstrap.py after a successful run — the remembered deploy",
+        "# defaults for next time. Edit or delete freely; flags and env vars still win.",
+        "",
+    ]
+    for key in REMEMBERED:
+        v = values.get(key)
+        if v is None or v == "":
+            continue
+        if isinstance(v, bool):
+            lines.append(f"{key} = {str(v).lower()}")
+        elif isinstance(v, int):
+            lines.append(f"{key} = {v}")
+        else:
+            s = str(v).replace("\\", "\\\\").replace('"', '\\"')
+            lines.append(f'{key} = "{s}"')
+    DEPLOY_TOML.write_text("\n".join(lines) + "\n")
+
+
+def default_ar_image(project: str, region: str) -> str:
+    """The Artifact Registry image `push-image.py` pushes to and
+    `--image-mode=pull` reads — derived from project + region (fixed `loom/loom`
+    repo/image) so the path never has to be pasted by hand. Keep in sync with
+    push-image.py's copy."""
+    return f"{region}-docker.pkg.dev/{project}/loom/loom:latest"
 
 
 def enable_apis(project: str, image_mode: str) -> None:
@@ -379,8 +444,9 @@ def ensure_instance(
     "--ar-image",
     envvar="AR_IMAGE",
     default="",
-    help="Required when --image-mode=pull, e.g. "
-    "us-central1-docker.pkg.dev/$PROJECT/loom/loom:latest",
+    help="Image for --image-mode=pull. Defaults to what ./push-image.py pushes "
+    "(<region>-docker.pkg.dev/<project>/loom/loom:latest), so it's usually left "
+    "blank; set it only to pull some other prebuilt image.",
 )
 @click.option(
     "--dns-wait-seconds",
@@ -424,10 +490,9 @@ def main(
     fw_ssh = f"{instance_name}-allow-ssh"
 
     if image_mode == "pull" and not ar_image:
-        die(
-            f"--image-mode=pull requires --ar-image (e.g. "
-            f"us-central1-docker.pkg.dev/{project}/loom/loom:latest)"
-        )
+        ar_image = default_ar_image(project, region)
+        log(f"--image-mode=pull: no --ar-image given, using {ar_image}")
+        log("  (build+push it there first with ./push-image.py)")
 
     enable_apis(project, image_mode)
     ensure_service_account(project, sa_email, service_account_name, image_mode)
@@ -453,8 +518,28 @@ def main(
         data_disk_device,
     )
 
+    save_deploy_toml(
+        {
+            "project": project,
+            "loom_domain": loom_domain,
+            "region": region,
+            "zone": zone,
+            "machine_type": machine_type,
+            "disk_size": disk_size,
+            "data_disk_size": data_disk_size,
+            "instance_name": instance_name,
+            "service_account_name": service_account_name,
+            "network": network,
+            "repo_url": repo_url,
+            "git_ref": git_ref,
+            "image_mode": image_mode,
+            "ar_image": ar_image,
+        }
+    )
+
     click.echo("", err=True)
     log(f"done. VM: {instance_name}  IP: {ip}  domain: {loom_domain}")
+    log(f"remembered these settings in {DEPLOY_TOML.name} — a bare re-run reuses them")
     log("next: run ./secrets.py if you haven't yet, then watch the boot:")
     log(f"  gcloud --project={project} compute ssh {instance_name} --zone={zone} \\")
     log("    --command='sudo journalctl -u google-startup-scripts -f'")
@@ -464,4 +549,6 @@ def main(
 
 
 if __name__ == "__main__":
-    main()
+    # deploy.toml → click default_map: remembered defaults that a flag or env var
+    # still overrides. See load_deploy_toml.
+    main(default_map=load_deploy_toml())

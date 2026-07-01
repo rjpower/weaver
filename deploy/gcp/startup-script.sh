@@ -67,7 +67,18 @@ if ! command -v gcloud >/dev/null 2>&1; then
   echo "deb [signed-by=/etc/apt/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt cloud-sdk main" \
     >/etc/apt/sources.list.d/google-cloud-sdk.list
   apt-get update
-  apt-get install -y --no-install-recommends google-cloud-cli git
+  apt-get install -y --no-install-recommends google-cloud-cli
+fi
+
+# ---- git (to clone the repo) ----------------------------------------------
+# Installed in its own command-guarded block, NOT bundled into the gcloud
+# install above: on a reboot where gcloud is already present that block is
+# skipped, so a git bundled there would never install and the clone below
+# would fail with `git: command not found`.
+if ! command -v git >/dev/null 2>&1; then
+  echo "== installing git =="
+  apt-get update
+  apt-get install -y --no-install-recommends git
 fi
 
 # ---- optional persistent data disk for loom_home / caddy_data -------------

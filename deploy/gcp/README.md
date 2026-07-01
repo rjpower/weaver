@@ -104,6 +104,15 @@ Run `./bootstrap.py --help` and `./secrets.py --help` for the full list of
 options and their defaults — every `bootstrap.py` option also has a
 same-named env var (`PROJECT`, `LOOM_DOMAIN`, `MACHINE_TYPE`, ...), so the
 env-var invocations above and `--flag` invocations are interchangeable.
+
+After a successful run `bootstrap.py` writes the knobs it used to a gitignored
+`deploy/gcp/deploy.toml` (project, domain, region, machine type, disk sizes,
+...), and reads them back as defaults next time — so a bare `./bootstrap.py`
+re-deploys with the last settings, and you only pass a flag to *change* one.
+Precedence is flag > env var > `deploy.toml` > built-in default; `push-image.py`
+reads the same file for its `--project`/`--region`. This is deploy/infra state,
+deliberately separate from `loom.toml` (the app config that `render-env` bakes
+into the container's env and Secret Manager).
 `secrets.py --granular` pushes each secret field to its own Secret Manager
 secret instead of the one `LOOM_DOTENV` blob, for independent rotation — see
 `./secrets.py --help`; the shipped `startup-script.sh` expects the blob.
@@ -167,30 +176,30 @@ The default (`IMAGE_MODE=build`) has the VM build the image itself with
 Rust+Node build, so this is slow and the default machine type
 (`e2-standard-4`, 100GB boot disk) is sized to avoid OOMing during it.
 
-For faster boots and re-deploys, build once and push to Artifact Registry,
-then point the VM at the prebuilt image:
+For faster boots and re-deploys, build the image once on your workstation and
+push it to Artifact Registry, then point the VM at the prebuilt image.
+`push-image.py` does the whole push side — enables the AR API, creates the
+`loom` repo, wires `docker` auth, and builds+pushes for `linux/amd64`:
 
 ```sh
-gcloud artifacts repositories create loom --repository-format=docker \
-  --location=us-central1 --project=my-project
-
-gcloud auth configure-docker us-central1-docker.pkg.dev
-
-docker build -t us-central1-docker.pkg.dev/my-project/loom/loom:latest .
-docker push us-central1-docker.pkg.dev/my-project/loom/loom:latest
+PROJECT=my-project ./push-image.py
 ```
 
-Then run `bootstrap.py` with:
+It pushes to `<region>-docker.pkg.dev/<project>/loom/loom:latest` — the exact
+path `bootstrap.py --image-mode=pull` derives by default, so you don't repeat
+it:
 
 ```sh
-IMAGE_MODE=pull \
-AR_IMAGE=us-central1-docker.pkg.dev/my-project/loom/loom:latest \
-PROJECT=my-project LOOM_DOMAIN=loom.example.com ./bootstrap.py
+IMAGE_MODE=pull PROJECT=my-project LOOM_DOMAIN=loom.example.com ./bootstrap.py
 ```
+
+(`AR_IMAGE`/`--ar-image` is only needed to pull some *other* image.) It builds
+`release` for `linux/amd64`; on a non-amd64 workstation that needs an emulating
+`docker-container` buildx builder (`docker buildx create --use`).
 
 `startup-script.sh` then does `gcloud auth configure-docker` (using the VM's
 own service account) and `docker compose pull` instead of `--build`. To roll
-out a new build to an existing VM, push a new image tag and either
+out a new build to an existing VM, `./push-image.py` again, then either
 `docker compose pull && docker compose up -d` over SSH, or reset the instance
 to re-run the startup script.
 

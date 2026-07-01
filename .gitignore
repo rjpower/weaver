@@ -24,3 +24,7 @@ python/weaver-loom/uv.lock
 # `loom setup`'s authored config — every credential in plaintext TOML. Never
 # commit it; `loom.toml.example` (tracked) documents the shape.
 loom.toml
+
+# bootstrap.py's remembered GCP deploy knobs (project id, region, machine type,
+# ...). Not secret, but project-specific, so it stays out of the repo.
+deploy/gcp/deploy.toml
