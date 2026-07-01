@@ -6,12 +6,12 @@ import { timeAgo } from '../lib/time';
 // One discussion thread rendered inline in the document flow — right under the
 // block its quote anchors to (Google-Wave style, not a margin gutter). Collapsed
 // it's a slim one-line chip; the active one expands in place to the full thread
-// plus a reply composer. Purely props-in / events-out — ArtifactComments owns
+// plus a reply composer. Purely props-in / events-out — ArtifactDocument owns
 // the state and the API calls; this only renders and reports intent.
 //
-// Uses <div> (not <p>) for every text line on purpose: the card is teleported
-// *inside* the rendered `.markdown-body`, whose prose CSS styles `p`/`ul`/`pre`
-// but leaves `div`/`button`/`textarea` alone, so nothing bleeds in.
+// Uses <div> (not <p>) for every text line on purpose: the card renders *inside*
+// the rendered `.markdown-body`, whose prose CSS styles `p`/`ul`/`pre` but leaves
+// `div`/`button`/`textarea` alone, so nothing bleeds in.
 const props = defineProps<{ thread: Thread; active: boolean }>();
 const emit = defineEmits<{
   focus: [tid: number];

@@ -19,7 +19,7 @@ answer; the design it argues for now ships. What landed:
 - **loom** — `GET /api/sessions/{id}/plan`, `POST /api/sessions/{id}/plan/sync`,
   and the `PUT /api/sessions/{id}/file` write primitive; a `SessionPlan`
   component renders the plan on the Overview tab (read-first, projected status,
-  dependency graph) with an Edit-in-Monaco mode and Reconcile.
+  dependency graph) with an Edit-in-source mode and Reconcile.
 
 The rest is the original design argument, kept as the rationale of record.
 
@@ -300,8 +300,8 @@ The dashboard is where "understand and interact with the workflow" actually
 happens, and it is the payoff for storing structure-in-file / state-in-DB. The
 good news after merging #16/#17: **almost the entire renderer already ships.**
 `markdown.ts` + `MarkdownView.vue` give GFM markdown, `mermaid` diagrams
-(client-side, theme-aware), and `- [ ]`/`- [x]` task lists today; Monaco is
-already wired (read-only) in the file browser; the session detail already has a
+(client-side, theme-aware), and `- [ ]`/`- [x]` task lists today; a raw-source
+view is already wired (read-only) in the file browser; the session detail already has a
 **Terminal / Overview / Issues / Files** tab bar. So the plan view is mostly
 *composition*, not new infrastructure.
 
@@ -315,8 +315,8 @@ out. Sessions with no plan keep today's Overview unchanged.
 agent authors, the human reads." The plan is the one principled exception — the
 design loop *is* the user editing it — so the affordance must be explicit, not
 ambient. Reuse the pattern the file browser already proved: a **preview ⇄ source
-toggle**. An **Edit** button swaps the rendered plan for **Monaco in the same
-panel** (editable, not the read-only viewer), with **Save** and **Cancel**; Save
+toggle**. An **Edit** button swaps the rendered plan for **a plain-text source
+editor in the same panel** (editable, not the read-only viewer), with **Save** and **Cancel**; Save
 writes the file and offers *Reconcile* (the plan's task set may have changed).
 This is a mode-flip on one object, not a separate modal or destination — and it
 generalizes: the same file-write path makes the Files tab editable for free.
@@ -334,7 +334,7 @@ generalizes: the same file-write path makes the Files tab editable for free.
   task → `loom session launch --claim`).
 
 The one genuinely new backend piece is a **file-write endpoint** (today
-`/sessions/{id}/raw` and `/file` are read-only; Monaco is `readOnly: true`).
+`/sessions/{id}/raw` and `/file` are read-only; the source view is read-only).
 Everything lands API-first — a plan read endpoint (parsed + tasks joined to
 issue status), a `sync` endpoint, and the file-write endpoint in `web.rs`,
 consumed by the SPA and the `loom` CLI alike; the agent-facing `weaver plan`
@@ -438,7 +438,7 @@ independently useful.
    `attention`. This is the bit that makes the design loop *safe*.
 4. **loom plan view + Edit.** Render the plan on Overview (`MarkdownView`, the
    status-badge overlay, dependency graph, drill-down), plus the file-write
-   endpoint and the preview ⇄ Monaco Edit toggle, and the Reconcile/Launch
+   endpoint and the preview ⇄ source Edit toggle, and the Reconcile/Launch
    actions. The file-write endpoint can land earlier if Files-tab editing is
    wanted sooner.
 
@@ -457,13 +457,13 @@ Each step is independently shippable and independently useful.
   for the link/status join. The file and `issues` already own every fact a table
   would hold. ✅
 - **Dashboard editing:** read-first on the **Overview** tab with an explicit
-  **Edit** button that flips the rendered plan to **Monaco** in-place (Save +
+  **Edit** button that flips the rendered plan to **a source editor** in-place (Save +
   Cancel, then offer Reconcile) — reusing the file browser's proven preview ⇄
   source pattern. Needs one new backend primitive: a file-write endpoint. ✅
 
 Remaining minor sub-question: `.weaver/config.toml` vs flat `.weaver.toml`
 (cosmetic), and optimistic-concurrency handling if the agent rewrites the plan
-while a human has it open in Monaco (a "file changed on disk" guard on Save —
+while a human has it open in the source editor (a "file changed on disk" guard on Save —
 noted, not over-built).
 
 ## Sources

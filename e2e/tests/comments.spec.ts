@@ -150,4 +150,41 @@ test.describe('artifact inline comments', () => {
       }
     }
   });
+
+  // The real in-app path: users don't deep-link to an artifact, they land on a
+  // session and click into the Artifacts tab, which is kept alive across tab
+  // switches. This drives that path — land on the session, open Artifacts, switch
+  // to the terminal and back — and asserts select-to-comment still works end to
+  // end on the (warm, kept-alive) panel, not just on a freshly deep-linked one.
+  test('select-to-comment works through the in-app tab path', async ({ page, weaver }) => {
+    const session = await weaver.seedSession({ goal: 'roundtrip', name: 'comments-warm' });
+    await weaver.writeArtifact(session, 'design', DOC, { title: 'Design notes' });
+
+    // Land on the session (terminal), then click into Artifacts like a user —
+    // this mounts the kept-alive panel rather than deep-linking straight in.
+    await page.goto(`${weaver.baseUrl}/s/${session.id}`);
+    await page.locator('[data-tab="artifacts"]').click();
+    await expect(page.locator('.markdown-body h1')).toContainText('Design notes');
+
+    // First open: the seam works.
+    await selectPhrase(page, 'collaborative editing');
+    await expect(page.getByTestId('comment-select-button')).toBeVisible();
+
+    // Round-trip through the terminal tab and back — the panel stays mounted.
+    await page.locator('[data-tab="terminal"]').click();
+    await page.locator('[data-tab="artifacts"]').click();
+    await expect(page.locator('.markdown-body h1')).toContainText('Design notes');
+
+    // Warm panel: selecting text must still open the seam, and it must still
+    // drive all the way through to a created thread.
+    await selectPhrase(page, 'markdown representation');
+    await expect(page.getByTestId('comment-select-button')).toBeVisible();
+    await page.getByTestId('comment-select-button').click();
+    const composer = page.getByTestId('comment-pending');
+    await composer.locator('textarea').fill('Does the warm panel still comment?');
+    await composer.getByRole('button', { name: 'Comment' }).click();
+    await expect(composer).toBeHidden();
+    const card = page.locator('[data-testid^="comment-card-"]').first();
+    await expect(card).toContainText('Does the warm panel still comment?');
+  });
 });
