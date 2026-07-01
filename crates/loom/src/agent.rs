@@ -258,8 +258,21 @@ pub fn combine_args(model: &str, effort: &str) -> String {
     join_args([claude_model_arg(model), claude_effort_arg(effort)])
 }
 
+/// Permission-bypass ("YOLO") flags, applied per runtime when the `agent.yolo`
+/// setting is on. Claude enters bypass-permissions mode; Codex skips every
+/// approval prompt and its sandbox. Both let a detached, unattended agent run any
+/// command without a human to answer the prompt — at the cost of the usual
+/// guardrails, which is why the setting is off by default.
+const CLAUDE_YOLO_ARGS: &str = "--permission-mode bypassPermissions";
+const CODEX_YOLO_ARGS: &str = "--dangerously-bypass-approvals-and-sandbox";
+
 fn claude_command(ctx: &AgentLaunchContext<'_>, mode: LaunchMode) -> String {
-    let args = join_args([claude_model_arg(ctx.model), claude_effort_arg(ctx.effort)]);
+    let yolo = ctx.yolo.then(|| CLAUDE_YOLO_ARGS.to_string());
+    let args = join_args([
+        yolo,
+        claude_model_arg(ctx.model),
+        claude_effort_arg(ctx.effort),
+    ]);
     let args = if args.is_empty() {
         String::new()
     } else {
@@ -287,7 +300,12 @@ fn claude_command(ctx: &AgentLaunchContext<'_>, mode: LaunchMode) -> String {
 }
 
 fn codex_command(ctx: &AgentLaunchContext<'_>) -> String {
-    let args = join_args([codex_model_arg(ctx.model), codex_effort_arg(ctx.effort)]);
+    let yolo = ctx.yolo.then(|| CODEX_YOLO_ARGS.to_string());
+    let args = join_args([
+        yolo,
+        codex_model_arg(ctx.model),
+        codex_effort_arg(ctx.effort),
+    ]);
     let args = if args.is_empty() {
         String::new()
     } else {
@@ -333,6 +351,9 @@ pub struct AgentLaunchContext<'a> {
     pub server_addr: &'a str,
     pub model: &'a str,
     pub effort: &'a str,
+    /// When set, launch the runtime with its permission-bypass ("YOLO") flags —
+    /// the `agent.yolo` setting, resolved per launch.
+    pub yolo: bool,
     /// Operator-managed environment variables exported into the session.
     pub extra_env: &'a [(String, String)],
 }
@@ -480,6 +501,7 @@ fn inner_command(
     mode: LaunchMode,
     model: &str,
     effort: &str,
+    yolo: bool,
 ) -> String {
     let ctx = AgentLaunchContext {
         branch_id: "",
@@ -490,6 +512,7 @@ fn inner_command(
         server_addr: "",
         model,
         effort,
+        yolo,
         extra_env: &[],
     };
     match runtime {
@@ -555,6 +578,7 @@ pub struct LaunchScriptSpec<'a> {
     pub mode: LaunchMode,
     pub model: &'a str,
     pub effort: &'a str,
+    pub yolo: bool,
 }
 
 pub fn launch_script(spec: LaunchScriptSpec<'_>) -> String {
@@ -565,6 +589,7 @@ pub fn launch_script(spec: LaunchScriptSpec<'_>) -> String {
         spec.mode,
         spec.model,
         spec.effort,
+        spec.yolo,
     );
     wrap_launch_script(&inner, spec.env, spec.weaver_dir)
 }
@@ -592,6 +617,9 @@ pub struct LaunchSpec<'a> {
     pub server_addr: &'a str,
     pub model: &'a str,
     pub effort: &'a str,
+    /// Launch the runtime with its permission-bypass ("YOLO") flags — the
+    /// `agent.yolo` setting, which the caller reads from the database per launch.
+    pub yolo: bool,
     /// Operator-managed environment variables ([`crate::agent_env`]) exported
     /// into the session on top of loom's own `WEAVER_*` / `LOOM_TOKEN`. The
     /// caller reads these from the database; an empty slice adds nothing.
@@ -609,6 +637,7 @@ pub async fn launch(spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<()> {
         server_addr: spec.server_addr,
         model: spec.model,
         effort: spec.effort,
+        yolo: spec.yolo,
         extra_env: spec.extra_env,
     };
     let _instance = match agent_type(spec.runtime) {
@@ -638,7 +667,7 @@ async fn prepare_claude(ctx: &AgentLaunchContext<'_>) {
         tracing::warn!(work_dir = %ctx.work_dir.display(), error = %e,
             "agent hook setup failed; launching without lifecycle hooks");
     }
-    if let Err(e) = seed_claude_launch_gates(ctx.work_dir, ctx.model, ctx.effort).await {
+    if let Err(e) = seed_claude_launch_gates(ctx.work_dir, ctx.yolo).await {
         tracing::warn!(work_dir = %ctx.work_dir.display(), error = %e,
             "agent launch-gate setup failed; agent may stall on first-run prompts");
     }
@@ -737,9 +766,9 @@ pub async fn install_hooks(work_dir: &Path, weaver_bin: &str) -> Result<()> {
 ///   set (i.e. the agent authenticates by API key).
 /// * `bypassPermissionsModeAccepted` — the one-time "you're in Bypass
 ///   Permissions mode" confirmation, **which defaults to *exit***. Seeded only
-///   when this launch actually runs with a bypass flag, since the dialog only
-///   appears then.
-pub async fn seed_claude_launch_gates(work_dir: &Path, model: &str, effort: &str) -> Result<()> {
+///   when `bypass` is set (the launch runs with [`CLAUDE_YOLO_ARGS`]), since the
+///   dialog only appears then.
+pub async fn seed_claude_launch_gates(work_dir: &Path, bypass: bool) -> Result<()> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         tracing::debug!("HOME unset; skipping claude launch-gate seed");
         return Ok(());
@@ -764,9 +793,6 @@ pub async fn seed_claude_launch_gates(work_dir: &Path, model: &str, effort: &str
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
 
-    let launch_args = combine_args(model, effort);
-    let bypass = launch_args.contains("--dangerously-skip-permissions")
-        || launch_args.contains("bypassPermissions");
     // Approve the ambient ANTHROPIC_API_KEY by its last 20 chars (how claude keys
     // these), when one is set and long enough to slice.
     let api_key_tail = std::env::var("ANTHROPIC_API_KEY")
@@ -993,6 +1019,7 @@ mod tests {
             mode,
             model,
             effort,
+            yolo: false,
         })
     }
 
@@ -1122,6 +1149,50 @@ mod tests {
             fresh.contains("codex \"$(cat '/x/primer.txt')\"; "),
             "got: {fresh}"
         );
+    }
+
+    // Build a launch script with YOLO mode on, holding everything else at its
+    // simplest (fresh, no model/effort, no env).
+    fn yolo_script(runtime: &str, goal: &str) -> String {
+        super::launch_script(LaunchScriptSpec {
+            runtime,
+            goal_file: Some(Path::new(goal)),
+            primer_file: None,
+            env: &[],
+            weaver_dir: None,
+            mode: LaunchMode::Fresh,
+            model: "",
+            effort: "",
+            yolo: true,
+        })
+    }
+
+    #[test]
+    fn yolo_injects_per_runtime_bypass_flags() {
+        // Each runtime gets its own bypass flag, and only when yolo is on.
+        let claude = yolo_script("claude", "/x/goal.txt");
+        assert!(
+            claude.contains("claude --permission-mode bypassPermissions \"$(cat '/x/goal.txt')\""),
+            "got: {claude}"
+        );
+        let codex = yolo_script("codex", "/x/goal.txt");
+        assert!(
+            codex.contains(
+                "codex --dangerously-bypass-approvals-and-sandbox \"$(cat '/x/goal.txt')\""
+            ),
+            "got: {codex}"
+        );
+        // Off by default: the plain launch carries neither bypass flag.
+        let plain = launch_script(
+            "claude",
+            Some(Path::new("/x/goal.txt")),
+            None,
+            &[],
+            LaunchMode::Fresh,
+            "",
+            "",
+        );
+        assert!(!plain.contains("bypassPermissions"), "got: {plain}");
     }
 
     #[test]

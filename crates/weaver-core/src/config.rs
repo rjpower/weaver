@@ -122,6 +122,19 @@ pub const REGISTRY: &[SettingSpec] = &[
         options: &[],
     },
     SettingSpec {
+        key: "agent.yolo",
+        label: "YOLO mode",
+        description: "Launch agents with all permission prompts bypassed — Claude \
+            in `bypassPermissions` mode, Codex with approvals and sandbox skipped. \
+            The agent can run any command without asking, which lets an unattended \
+            session make progress with no human to approve prompts. Off by default; \
+            enabling it removes the usual guardrails.",
+        kind: SettingKind::Bool,
+        default: "false",
+        group: "Agents",
+        options: &[],
+    },
+    SettingSpec {
         key: "concierge.runtime",
         label: "Concierge agent",
         description: "Which agent backs the fleet Chat concierge. `claude` runs \

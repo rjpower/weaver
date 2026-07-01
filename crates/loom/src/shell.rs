@@ -82,6 +82,8 @@ async fn shell_script(st: &AppState, branch_id: Option<&str>) -> String {
         mode: LaunchMode::Adopt,
         model: "",
         effort: "",
+        // A debug shell runs no agent, so the permission-bypass flags don't apply.
+        yolo: false,
     })
 }
 
