@@ -970,7 +970,7 @@ async fn create_session_core(
     let branch = branch_mod::upsert(&st.db, &repo_root_str, &branch_name, &base).await?;
     branch_mod::set_title(&st.db, &branch.id, &title).await?;
     if !goal.is_empty() {
-        branch_mod::set_goal(&st.db, &branch.id, &goal).await?;
+        branch_mod::set_goal(&st.db, &branch.id, &goal, "user").await?;
     }
     if !description.is_empty() {
         branch_mod::set_description(&st.db, &branch.id, &description).await?;
@@ -1412,7 +1412,7 @@ async fn patch_session(
         branch_mod::set_title(&st.db, &branch.id, title).await?;
     }
     if let Some(goal) = &req.goal {
-        branch_mod::set_goal(&st.db, &branch.id, goal).await?;
+        branch_mod::set_goal(&st.db, &branch.id, goal, "user").await?;
         tokio::fs::write(db::run_dir(&session.id).join("goal.txt"), goal)
             .await
             .ok();
@@ -1756,7 +1756,17 @@ pub async fn adopt(st: &AppState, session: &Session, branch: &Branch) -> Result<
     };
     let goal_file = {
         let f = run_dir.join("goal.txt");
-        f.exists().then_some(f)
+        if f.exists() {
+            // Refresh from the authoritative goal artifact before the spawned
+            // shell cats this file in as the opening prompt, so a restart picks
+            // up the newest goal rather than reseeding a stale on-disk copy.
+            if let Ok(goal) = branch_mod::current_goal(&st.db, branch).await {
+                tokio::fs::write(&f, &goal).await.ok();
+            }
+            Some(f)
+        } else {
+            None
+        }
     };
     let extra_env = agent_env::pairs(&st.db).await.unwrap_or_default();
     let runtime = launch_runtime(&st.db, &session.agent_kind).await;
@@ -2057,6 +2067,11 @@ async fn write_artifact(
         },
     )
     .await?;
+    // `goal` is the canonical goal artifact — keep the denormalized
+    // `branches.goal` cache column in sync with what was just written.
+    if a.name == "goal" {
+        branch_mod::sync_goal_cache(&st.db, &branch.id).await?;
+    }
     events::record(
         &st.db,
         &st.bus,
@@ -2578,7 +2593,7 @@ async fn patch_branch(
         branch_mod::set_title(&st.db, &branch.id, title).await?;
     }
     if let Some(goal) = &req.goal {
-        branch_mod::set_goal(&st.db, &branch.id, goal).await?;
+        branch_mod::set_goal(&st.db, &branch.id, goal, "user").await?;
     }
     if let Some(description) = &req.description {
         branch_mod::set_description(&st.db, &branch.id, description).await?;

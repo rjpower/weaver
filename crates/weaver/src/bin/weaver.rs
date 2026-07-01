@@ -533,7 +533,7 @@ async fn cmd_goal(cmd: Option<GoalCmd>) -> Result<()> {
     let db = open_db().await?;
     let b = branch::resolve(&db).await?;
     let Some(GoalCmd::Set { text, file }) = cmd else {
-        println!("{}", b.goal);
+        println!("{}", branch::current_goal(&db, &b).await?);
         return Ok(());
     };
     // A `--file` (or `-` text) reads from disk/stdin; otherwise join the args.
@@ -548,7 +548,7 @@ async fn cmd_goal(cmd: Option<GoalCmd>) -> Result<()> {
     if goal.is_empty() {
         bail!("a goal is required — pass text, --file <path>, or pipe via '-'");
     }
-    branch::set_goal(&db, &b.id, &goal).await?;
+    branch::set_goal(&db, &b.id, &goal, "agent").await?;
     if b.title.is_empty() {
         let title = branch::derive_title(&goal);
         branch::set_title(&db, &b.id, &title).await?;
@@ -584,8 +584,9 @@ async fn render_summary(db: &db::Db, b: &branch::Branch) -> Result<String> {
 
     // Each section trails the command that drills into it, so the summary
     // doubles as a map of where to look next.
-    let goal = if !b.goal.is_empty() {
-        b.goal.clone()
+    let resolved_goal = branch::current_goal(db, b).await?;
+    let goal = if !resolved_goal.is_empty() {
+        resolved_goal
     } else if !b.title.is_empty() {
         b.title.clone()
     } else {
@@ -844,9 +845,10 @@ async fn cmd_status(level: Option<String>, message: String) -> Result<()> {
     if !b.title.is_empty() {
         println!("title:       {}", b.title);
     }
+    let goal = branch::current_goal(&db, &b).await?;
     println!(
         "goal:        {}",
-        if b.goal.is_empty() { "(none)" } else { &b.goal }
+        if goal.is_empty() { "(none)" } else { &goal }
     );
     let attention = resolve_attention(&db, &b.id).await?;
     let status = if b.description.is_empty() {
@@ -1363,6 +1365,13 @@ async fn cmd_artifact(cmd: ArtifactCmd) -> Result<()> {
                 },
             )
             .await?;
+            // `goal` is the canonical goal artifact when branch-scoped — keep the
+            // denormalized `branches.goal` cache column in sync.
+            if a.name == "goal" {
+                if let Some(id) = branch_id {
+                    branch::sync_goal_cache(&db, id).await?;
+                }
+            }
             events::record_local(
                 &db,
                 &b.id,
