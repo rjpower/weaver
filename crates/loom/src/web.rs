@@ -703,6 +703,13 @@ async fn configured_selector(db: &Db, key: &str, runtime: &str, model: bool) -> 
     }
 }
 
+/// Whether YOLO mode (`agent.yolo`) is on — launch agents with their
+/// permission-bypass flags. A global setting, resolved fresh per launch. Off by
+/// default.
+async fn yolo_enabled(db: &Db) -> bool {
+    config::get_or(db, "agent.yolo", "false").await.trim() == "true"
+}
+
 /// A freshly launched session's lifecycle status. A Claude runtime starts
 /// `launching` because its `SessionStart`/work hook will promote it to `running`;
 /// a hookless runtime (shell, codex, a bare command) never gets that hook, so it
@@ -1051,6 +1058,7 @@ async fn create_session_core(
             server_addr: &st.addr,
             model: &model,
             effort: &effort,
+            yolo: yolo_enabled(&st.db).await,
             extra_env: &extra_env,
         },
         agent::LaunchMode::Fresh,
@@ -1674,6 +1682,7 @@ pub async fn create_warm_session(
             server_addr: &st.addr,
             model: &overlooker.model,
             effort: &overlooker.effort,
+            yolo: yolo_enabled(&st.db).await,
             extra_env: &extra_env,
         },
         agent::LaunchMode::Fresh,
@@ -1750,6 +1759,7 @@ pub async fn adopt(st: &AppState, session: &Session, branch: &Branch) -> Result<
             server_addr: &st.addr,
             model: &session.model,
             effort: &session.effort,
+            yolo: yolo_enabled(&st.db).await,
             extra_env: &extra_env,
         },
         agent::LaunchMode::Adopt,
