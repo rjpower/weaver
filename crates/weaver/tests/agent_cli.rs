@@ -546,6 +546,75 @@ async fn artifact_write_show_ls_and_revisions() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn artifact_comment_thread_and_resolve_roundtrip() {
+    let env = Env::start().await;
+    env.run_with_stdin(&["artifact", "write", "plan"], "# Plan\n\nDesign here.\n");
+
+    // No thread yet.
+    let threads = env.run(&["artifact", "threads", "plan"]);
+    assert!(
+        threads.contains("no open threads"),
+        "no threads yet: {threads}"
+    );
+
+    // Opening a thread requires --quote.
+    let missing_quote = env.run_raw(&["artifact", "comment", "plan", "looks off"]);
+    assert!(
+        !missing_quote.status.success(),
+        "comment without --quote or --thread should fail"
+    );
+
+    // Open a new thread anchored to a quote, seeded with its first comment.
+    let opened = env.run(&[
+        "artifact",
+        "comment",
+        "plan",
+        "--quote",
+        "Design here.",
+        "this needs more detail",
+    ]);
+    assert!(opened.contains("opened thread"), "opened: {opened}");
+
+    let threads = env.run(&["artifact", "threads", "plan"]);
+    assert!(threads.contains("this needs more detail"), "{threads}");
+    assert!(threads.contains("agent:"), "author is agent: {threads}");
+
+    // Extract the thread id printed by `comment`, then reply and resolve it.
+    let tid: i64 = opened
+        .split_whitespace()
+        .nth(2)
+        .expect("opened thread <id>")
+        .parse()
+        .expect("thread id is numeric");
+
+    let replied = env.run(&[
+        "artifact",
+        "comment",
+        "plan",
+        "--thread",
+        &tid.to_string(),
+        "fixed, take a look",
+    ]);
+    assert!(replied.contains("added comment"), "replied: {replied}");
+
+    let threads = env.run(&["artifact", "threads", "plan"]);
+    assert!(threads.contains("fixed, take a look"), "{threads}");
+
+    env.run(&["artifact", "resolve", "plan", &tid.to_string()]);
+    let threads = env.run(&["artifact", "threads", "plan"]);
+    assert!(
+        threads.contains("no open threads"),
+        "resolved thread should no longer be open: {threads}"
+    );
+    let all = env.run(&["artifact", "threads", "plan", "--all"]);
+    assert!(
+        all.contains("this needs more detail"),
+        "--all still shows the resolved thread: {all}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn goal_set_from_stdin() {
     let env = Env::start().await;
     env.run_with_stdin(&["goal", "set", "-"], "ship it from stdin\n");

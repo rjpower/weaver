@@ -541,7 +541,12 @@ impl Client {
 
     /// Mark a thread resolved
     /// (`POST /api/branches/{key}/artifacts/{name}/threads/{tid}/resolve`).
-    pub async fn resolve_branch_thread(&self, key: &str, name: &str, thread_id: i64) -> Result<Value> {
+    pub async fn resolve_branch_thread(
+        &self,
+        key: &str,
+        name: &str,
+        thread_id: i64,
+    ) -> Result<Value> {
         self.post(
             &format!(
                 "/api/branches/{}/artifacts/{}/threads/{thread_id}/resolve",
