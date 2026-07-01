@@ -48,6 +48,9 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 libc = "0.2"
 percent-encoding = "2"
 rand = "0.9"
+# Hidden (non-echoing) prompts for `loom setup secrets` — paste-once API keys
+# shouldn't land in shell history or a terminal scrollback.
+rpassword = "7"
 # `rustls-tls` is needed for the GitHub OAuth token/user calls over HTTPS — the
 # rest of loom's HTTP is loopback to its own daemon, but the OAuth dance reaches
 # github.com directly.
@@ -58,6 +61,9 @@ serde_json = "1"
 # a fast digest is right — the slow KDF above is only for low-entropy passwords).
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "derive"] }
+# The authored `loom.toml` (crate::loom_config) — parsed *and* serialized, unlike
+# weaver-core's read-only `.weaver/config.toml` loader.
+toml = { version = "1", default-features = false, features = ["parse", "display", "serde"] }
 # The overlooker engine materializes embedded builtin scripts to a scratch file
 # before running them; the tests reuse it for fixtures.
 tempfile = "3"

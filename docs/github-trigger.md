@@ -45,6 +45,12 @@ deliberately ignored.
 
 ## Configure the webhook
 
+This section is the classic, App-less path: a shared secret plus a manually
+added repo/org webhook. If you're setting up the [GitHub App](#the-github-app)
+(the recommended path — `loom setup github-app` does it in one step), skip
+straight there: the App's own webhook delivers events for any repo it's
+installed on, so there's no separate webhook to add.
+
 Set a shared secret in loom's environment (it is held outside the settings
 registry and never returned by `GET /api/settings`, like the OAuth client
 secret):
@@ -106,7 +112,31 @@ the App only changes which credential the two outbound GitHub calls use.
 
 ### Create the App
 
-Under **Settings → Developer settings → GitHub Apps → New GitHub App**:
+The fast path is the guided wizard, which drives GitHub's [manifest
+flow](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest):
+
+```sh
+loom setup github-app --base-url https://loom.team.dev
+```
+
+It opens a local page that auto-submits the App configuration to GitHub, waits
+for your one confirmation click, exchanges the redirect for the full credential
+set (App id, private key, webhook secret, OAuth client id/secret), writes them
+into the typed `loom.toml` (along with `LOOM_DOMAIN` and, unless `--org` is
+set, `LOOM_OWNER_GITHUB`), and — when it can reach the running daemon's
+database — live-applies them too, no restart needed for that part. The App's
+`callback_urls` are set to loom's GitHub login callback too, so the same App's
+OAuth client also covers "Sign in with GitHub" (see
+[deploy/README.md "First-run login"](../deploy/README.md#first-run-login)) —
+one registration, not two. See `loom setup github-app --help` for `--org` (App
+under an organization instead of your account), `--port` (pin a port when
+tunnelling into a remote host), and `--config` (where to write `loom.toml`;
+defaults to `./loom.toml` or `$LOOM_CONFIG`). `loom config render-env` turns
+`loom.toml` into a deploy `.env` — see
+[deploy/README.md "First-run login"](../deploy/README.md#first-run-login).
+
+To register by hand instead, under **Settings → Developer settings → GitHub
+Apps → New GitHub App**:
 
 - **Webhook** — set the **URL** to `{base}/api/github/webhook` (loom's public URL,
   the same `auth.base_url` names) and the **Secret** to the value you put in
@@ -124,6 +154,8 @@ installation is what authorizes a repo to trigger.
 
 ### Configure loom
 
+`loom setup github-app` already does this (see [above](#create-the-app)) — this
+section is for the manual path, or to move the credentials to a different host.
 Provide the App id and private key through the environment (both held outside the
 settings registry, never returned by `GET /api/settings`, like the OAuth client
 secret):
