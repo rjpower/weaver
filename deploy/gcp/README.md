@@ -20,10 +20,25 @@ up the GCE VM underneath it.
   `secrets.py` are `uv run --script` scripts (self-contained, no venv setup;
   `uv` fetches `click` on first run).
 - A domain you control, able to add an `A` record.
-- The credential values from [`../README.md` "Required environment"](../README.md#required-environment)
-  ready to hand to `secrets.py` — at minimum `GH_TOKEN`, `LOOM_OWNER_GITHUB`,
-  and either `ANTHROPIC_API_KEY` or a plan to log in to Claude interactively
-  after boot.
+- `deploy/standalone/.env`, populated by `loom setup github-app` and
+  `loom setup secrets` on your workstation — see
+  [`../README.md` "First-run login"](../README.md#first-run-login). That file
+  is the single credential handoff this deploy consumes; see
+  ["Credential handoff"](#credential-handoff) below.
+
+## Credential handoff
+
+`deploy/standalone/.env` is the single handoff contract between credential
+setup and every way of running the stack — `docker compose up` reads it
+directly; this deploy reads it too, by way of Secret Manager. `secrets.py`
+**consumes** that file; it does not collect credentials itself beyond a
+fallback prompt for operators who skip the wizard (see below).
+
+GCP infra placement — `PROJECT`, `REGION`, `ZONE`, `MACHINE_TYPE`,
+`LOOM_DOMAIN`, ... — is a separate, deploy-specific concern and is **not**
+part of that handoff: it stays `bootstrap.py` flags/env vars and instance
+metadata, the same way it would for any other host you chose to run the
+stack on.
 
 ## Run order
 
@@ -35,10 +50,18 @@ the IP, prints the exact record to set, and then polls for DNS to resolve
 before it creates the VM.
 
 ```sh
-cd deploy/gcp
+# 0. On your workstation (not the VM — these are daemon-less, no running loom
+#    needed yet): collect credentials into the standalone stack's .env, the
+#    handoff file everything downstream reads.
+cd deploy/standalone
+loom setup github-app --base-url https://loom.example.com --env-file .env
+loom setup secrets --env-file .env
 
-# 1. Store the secrets startup-script.sh will fetch on boot. Prompts for each
-#    (or export SECRET_NAME=value beforehand for non-interactive use).
+cd ../gcp
+
+# 1. Push those same secrets into Secret Manager, for startup-script.sh to
+#    fetch on boot. Auto-detects and ingests ../standalone/.env (from step 0)
+#    when no NAMES are given; falls back to prompting for anything missing.
 PROJECT=my-project ./secrets.py
 
 # 2. Provision the static IP, firewall, service account, and VM. Prints the
@@ -67,29 +90,26 @@ change its machine type or disks.
 
 Run `./bootstrap.py --help` and `./secrets.py --help` for the full list of
 configuration options (region, zone, machine type, disk sizes, image source,
-...) and their defaults — every option also has a same-named env var
-(`PROJECT`, `LOOM_DOMAIN`, `MACHINE_TYPE`, ...), so the env-var invocations
-above and `--flag` invocations are interchangeable.
+`--from-env`, ...) and their defaults — every `bootstrap.py` option also has a
+same-named env var (`PROJECT`, `LOOM_DOMAIN`, `MACHINE_TYPE`, ...), so the
+env-var invocations above and `--flag` invocations are interchangeable.
 
 ## Manual-once checklist
 
 These steps aren't scriptable (they happen in GitHub's UI, or need a human in
 a browser) and only need doing once per deploy:
 
-1. **Register a GitHub OAuth app** — callback URL
-   `https://<LOOM_DOMAIN>/api/auth/github/callback`. Put its client
-   ID/secret in Secret Manager via `./secrets.py LOOM_GITHUB_CLIENT_ID
-   LOOM_GITHUB_CLIENT_SECRET`, then either wait for the next boot or
-   re-trigger the startup script (`gcloud compute instances reset` or SSH in
-   and re-run `sudo google_metadata_script_runner startup`) to pick it up.
+1. **Run `loom setup github-app` and `loom setup secrets`** — step 0 of
+   ["Run order"](#run-order) above; see also
+   [`../README.md` "First-run login"](../README.md#first-run-login).
 2. **First login** — open `https://<LOOM_DOMAIN>` and *Continue with GitHub*
    as the `LOOM_OWNER_GITHUB` account. See
    [`../README.md` "First-run login"](../README.md#first-run-login).
-3. **Wire the `@loom` trigger** — register the repo and add the webhook, per
+3. **Install the App on your repos** — `loom setup github-app` prints
+   `https://github.com/apps/<app-slug>/installations/new`; installing it both
+   wires the `@loom` trigger's webhook and allowlists the repo for cloning, no
+   separate webhook or `curl` registration needed. See
    [`../README.md` "Wire the @loom GitHub trigger"](../README.md#wire-the-loom-github-trigger).
-
-A `loom setup` wizard that walks this manifest-style flow automatically is
-planned (see weaver issue #350); until then it's these three manual steps.
 
 ## Durable state
 

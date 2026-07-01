@@ -45,7 +45,12 @@ def die(msg: str) -> None:
 def gcloud(project: str, *args: str, capture: bool = False) -> str:
     cmd = ["gcloud", f"--project={project}", *args]
     if capture:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        # stdin=DEVNULL: this path never wants input, and inheriting the
+        # parent's stdin risks hanging forever if it's a pipe that never
+        # closes (e.g. this script itself run non-interactively).
+        result = subprocess.run(
+            cmd, check=True, capture_output=True, text=True, stdin=subprocess.DEVNULL
+        )
         return result.stdout.strip()
     subprocess.run(cmd, check=True)
     return ""
@@ -56,6 +61,7 @@ def gcloud_exists(project: str, *args: str) -> bool:
         ["gcloud", f"--project={project}", *args],
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
     )
     return result.returncode == 0
 

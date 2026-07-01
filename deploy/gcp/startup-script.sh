@@ -94,18 +94,50 @@ fi
 ENV_FILE="${REPO_DIR}/deploy/standalone/.env"
 secret() { gcloud secrets versions access latest --project="$PROJECT" --secret="$1"; }
 
+# Formats one dotenv line exactly like crates/loom/src/envfile.rs::format_value:
+# a bare value if it's a single line with no quote/space/#, otherwise
+# double-quoted with backslash, quote, and newline escaped (in that order) —
+# so a multi-line value (the GitHub App's RSA private key) round-trips through
+# compose-go's dotenv parser (env_file) back to real newlines. This keeps this
+# hand-assembled .env byte-compatible with the one `loom setup` writes, since
+# both are read by the same parser.
+needs_quoting() {
+  local v="$1"
+  [ -z "$v" ] && return 0
+  case "$v" in
+    *$'\n'*) return 0 ;;
+    *'"'*) return 0 ;;
+    *'#'*) return 0 ;;
+    *[[:space:]]*) return 0 ;;
+  esac
+  return 1
+}
+env_line() {
+  local key="$1" value="$2"
+  if ! needs_quoting "$value"; then
+    printf '%s=%s\n' "$key" "$value"
+    return
+  fi
+  local esc="${value//\\/\\\\}"
+  esc="${esc//\"/\\\"}"
+  esc="${esc//$'\n'/\\n}"
+  printf '%s="%s"\n' "$key" "$esc"
+}
+
 echo "== writing ${ENV_FILE} =="
 umask 077
 {
-  echo "LOOM_DOMAIN=${LOOM_DOMAIN}"
-  echo "LOOM_OWNER_GITHUB=$(secret LOOM_OWNER_GITHUB)"
-  echo "GH_TOKEN=$(secret GH_TOKEN)"
-  echo "LOOM_GITHUB_WEBHOOK_SECRET=$(secret LOOM_GITHUB_WEBHOOK_SECRET)"
-  echo "ANTHROPIC_API_KEY=$(secret ANTHROPIC_API_KEY)"
-  echo "LOOM_GITHUB_CLIENT_ID=$(secret LOOM_GITHUB_CLIENT_ID)"
-  echo "LOOM_GITHUB_CLIENT_SECRET=$(secret LOOM_GITHUB_CLIENT_SECRET)"
+  env_line LOOM_DOMAIN "$LOOM_DOMAIN"
+  env_line LOOM_OWNER_GITHUB "$(secret LOOM_OWNER_GITHUB)"
+  env_line GH_TOKEN "$(secret GH_TOKEN)"
+  env_line LOOM_GITHUB_APP_ID "$(secret LOOM_GITHUB_APP_ID)"
+  env_line LOOM_GITHUB_APP_PRIVATE_KEY "$(secret LOOM_GITHUB_APP_PRIVATE_KEY)"
+  env_line LOOM_GITHUB_WEBHOOK_SECRET "$(secret LOOM_GITHUB_WEBHOOK_SECRET)"
+  env_line ANTHROPIC_API_KEY "$(secret ANTHROPIC_API_KEY)"
+  env_line LOOM_GITHUB_CLIENT_ID "$(secret LOOM_GITHUB_CLIENT_ID)"
+  env_line LOOM_GITHUB_CLIENT_SECRET "$(secret LOOM_GITHUB_CLIENT_SECRET)"
   if [ "$IMAGE_MODE" = "pull" ] && [ -n "$AR_IMAGE" ]; then
-    echo "LOOM_IMAGE=${AR_IMAGE}"
+    env_line LOOM_IMAGE "$AR_IMAGE"
   fi
 } >"$ENV_FILE"
 chmod 600 "$ENV_FILE"
