@@ -440,7 +440,10 @@ pub(super) async fn remove_user(
     }
 }
 
-// -- GitHub OAuth app config -------------------------------------------------
+// -- GitHub App / sign-in config ---------------------------------------------
+// One GitHub App backs loom: its OAuth client powers sign-in (`configured` /
+// `client_id`), and the same App's id + private key power the `@loom` trigger
+// (`app_configured` / `app_id` / `app_slug`).
 
 async fn github_config_view(st: &AppState) -> ApiResult<GithubConfigView> {
     // Both the OAuth client id and the App identity are resolved env-or-settings
@@ -469,7 +472,8 @@ pub(super) async fn get_github_config(
     Ok(Json(github_config_view(&st).await?))
 }
 
-/// `PUT /api/auth/github/config` — set the OAuth app id (and, optionally, secret).
+/// `PUT /api/auth/github/config` — set the sign-in OAuth client id (and,
+/// optionally, its secret).
 pub(super) async fn put_github_config(
     State(st): State<AppState>,
     Json(body): Json<SetGithubConfigReq>,
