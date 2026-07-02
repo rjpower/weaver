@@ -458,10 +458,13 @@ async fn apply_snapshot(
         }
     }
 
-    // Back-link the PR to its loom session — a one-time comment on the open PR, so
-    // someone reading the GitHub thread can jump to the live session. Skipped once
-    // the branch is tagged linked (here or by the trigger reply).
-    if snap.pr_state == "OPEN" {
+    // Back-link the PR to its loom session — a one-time comment posted when loom
+    // first sees the PR open, so someone reading the GitHub thread can jump to the
+    // live session. Gated on the open *transition* (not every poll while OPEN): a
+    // repo where loom can't comment then fails once, rather than re-posting — and
+    // logging a failure — on every 30s poll. Skipped once the branch is tagged
+    // linked (here or by the `@loom` reply).
+    if pr_just_opened(prev_state, snap) {
         maybe_post_backlink(state, session, branch, snap).await;
     }
 
@@ -506,10 +509,11 @@ fn slug_from_repo_root(repo_root: &str) -> Option<String> {
 }
 
 /// Post a one-time comment on the branch's open PR linking back to its loom
-/// session, unless the branch is already linked (the `@loom` reply tagged it, or a
-/// prior poll posted it). Managed repos only — the App gateway needs the slug —
-/// and only when a public base URL is configured, so the link resolves.
-/// Best-effort: every failure logs and returns, leaving the tag unset to retry.
+/// session, unless the branch is already linked (the `@loom` reply tagged it).
+/// Managed repos only — the App gateway needs the slug — and only when a public
+/// base URL is configured, so the link resolves. Best-effort: a failure logs and
+/// returns without setting the tag; the caller fires this only on the PR-open
+/// transition, so a failure is not retried on every poll.
 async fn maybe_post_backlink(
     state: &AppState,
     session: &Session,
