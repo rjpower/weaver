@@ -25,7 +25,8 @@ hand-rolled data URI. `weaver artifact rm <name>` removes one and its history.
 
 ## The division of labor
 
-- **goal** — the charter: what to do. `weaver goal set <file|->`.
+- **goal** — the charter: what to do. The `goal` artifact: `weaver artifact
+  write goal <file|->`.
 - **issues** — the only task ledger: state lives here, nowhere else.
 - **artifacts** — documents for the user to read.
 

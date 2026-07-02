@@ -682,15 +682,6 @@ pub struct ArtifactUpsertReq {
     pub repo: bool,
 }
 
-/// Body for `POST /api/branches/{id}/goal`: set the goal atomically —
-/// deriving a title when one isn't set yet and recording the `goal_set` event
-/// server-side, the same one-call semantics `weaver goal set` has always had
-/// against the local database.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BranchGoalReq {
-    pub goal: String,
-}
-
 /// Body for `POST /api/branches/{id}/status`: set the agent's attention level
 /// and current-state message in one call. `level` is `ok` | `attention` |
 /// `blocked`; an absent or empty `message` leaves the previous one in place.

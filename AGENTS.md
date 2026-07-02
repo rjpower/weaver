@@ -11,7 +11,7 @@ in-workspace agent sees). Run `weaver readme` for the agent workflow commands.
 
 Two binaries over loom's REST API:
 
-- **`weaver`** — the agent CLI: goal, status, issues, hook events. A thin HTTP
+- **`weaver`** — the agent CLI: status, issues, artifacts, hook events. A thin HTTP
   client of `loom` (`weaver-api::Client`) — every command needs a reachable
   `loom server run`.
 - **`loom`** — the orchestrator: REST + SSE server, Vue SPA, per-branch

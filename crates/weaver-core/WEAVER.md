@@ -9,7 +9,9 @@ This document describes how to work *with weaver*. It is distinct from any
 
 It is on your `PATH`. From anywhere in the worktree you can run:
 
-- `weaver goal` — print the task this branch was created for.
+- `weaver artifact show goal` — print the task this branch was created for. The
+  goal lives as an artifact named `goal`; update it with `weaver artifact write
+  goal <file|->` as your understanding evolves.
 - `weaver summary` — a quick catch-up on the branch: the goal, your current
   status, the outstanding tasks, and a hint or two for what to do next. Run it
   when you pick up or resume a branch. After a context compaction weaver replays
@@ -39,9 +41,7 @@ It is on your `PATH`. From anywhere in the worktree you can run:
   artifact ls` lists this branch's plus the shared ones; `weaver artifact show
   <name> [--rev N]` prints content; `weaver artifact rm <name>` removes it and
   its history (`--repo` targets the shared one).
-- `weaver goal set <file|->` — set the branch goal from a file or stdin (long
-  markdown goals without the shell-quoting pain). `weaver goal` prints it.
-- Division of labor: **goal = the charter (what to do); issues = the only task
+- Division of labor: **the `goal` artifact = the charter (what to do); issues = the only task
   ledger; artifacts = documents for the user to read.** A "plan" is just *an
   artifact named `plan`* following smartdoc conventions: prose, a mermaid
   diagram, and a task list whose items **reference issues** (`- #41 Index

@@ -535,7 +535,6 @@ pub fn router(state: AppState) -> Router {
         // of generic PATCH calls (which would miss the event or race a
         // partial write). No live session required — `weaver` runs as an
         // HTTP-only client of loom and these are its primary write path.
-        .route("/branches/{id}/goal", post(set_branch_goal))
         .route("/branches/{id}/status", post(set_branch_status))
         .route("/branches/{id}/events", post(create_branch_event))
         .route(
