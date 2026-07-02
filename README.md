@@ -107,8 +107,8 @@ loom session rm <branch>                      # remove worktree + terminal + db 
 loom open                             # open the web UI
 
 # Agent-facing (requires a reachable `loom server run`, via $WEAVER_API)
-weaver goal "ship the feature"
-weaver goal                           # print the current goal
+weaver artifact show goal             # print the current goal (the `goal` artifact)
+weaver artifact write goal -          # update it from stdin
 weaver summary                        # goal + outstanding tasks + next-step hints
 weaver status attention "ready for review"   # level (ok|attention|blocked) + current-state message
 weaver issue add "Backfill old rows" --body "ETA after the schema change"

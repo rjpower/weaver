@@ -87,7 +87,7 @@ One new noun, one demotion, one deletion — and a thin shared layer:
 
 | Job the plan tab did | New home |
 |---|---|
-| Tell agents what to do | **goal** — a branch-scoped `goal` artifact (markdown), set via `weaver goal set <file>` or the Artifacts editor |
+| Tell agents what to do | **goal** — a branch-scoped `goal` artifact (markdown), set via `weaver artifact write goal <file|->` or the Artifacts editor |
 | Steps synced to weaver | **issues** — the only task ledger; created directly, never parsed out of a doc |
 | Structured content for the user | **artifacts** — named, versioned documents in weaver.db, rendered by loom |
 
@@ -199,9 +199,9 @@ stays as-is.
 
 ### Goal: a well-known `goal` artifact
 
-The session goal is a branch-scoped artifact named `goal`. `weaver goal set
-<file|->` reads a file (or stdin) and appends a revision; the dashboard and the
-Artifacts tab edit it like any other document. So the goal is versioned, renders
+The session goal is a branch-scoped artifact named `goal`. `weaver artifact
+write goal <file|->` reads a file (or stdin) and appends a revision; the
+dashboard and the Artifacts tab edit it like any other document. So the goal is versioned, renders
 through the same markdown pipeline as every artifact (projection included — `the
 breakdown is #41 #42 #43, design in [the plan](artifact:plan)` stays live), and
 carries the same inline comment layer. This is what lets the goal *shift* over a
@@ -210,14 +210,14 @@ newest revision.
 
 The `goal` artifact is the **single source of truth**. `branches.goal` remains
 as a denormalized cache — the hot path for the fleet list and `?q=` search —
-refreshed from the artifact at every write: `branch::set_goal` (the setter every
-`goal set` / session-create / PATCH funnels through) and the direct
+refreshed from the artifact at every write: `branch::set_goal` (the setter that
+session-create / PATCH funnel through) and the direct
 artifact-write paths (the Artifacts editor, `weaver artifact write goal`) both
 call `branch::sync_goal_cache`. `branch::current_goal` reads the artifact, so
 `weaver summary`, the compact re-orientation, and `adopt()` on restart reflect
 the newest revision.
 
-Issue #117 floated auto-creating an artifact on `goal set` and warned against
+Issue #117 floated auto-creating an artifact on every goal write and warned against
 putting the same text in two places. That objection is answered by *ownership*,
 not avoidance: there is one owner (the artifact) and one derived cache kept in
 lockstep with it — not a second editable copy. The goal earns the artifact
@@ -351,7 +351,7 @@ Each step shippable alone:
    durable, out-of-repo doc store.
 2. **Loom surface** — routes, viewer, Overview pin, activity/SSE.
 3. **smartdoc + projection** — the crate, ref resolution in `GET`, status
-   chips in `MarkdownView`, `weaver goal set`.
+   chips in `MarkdownView`, the `goal` artifact.
 4. **The deletion** — retire `weaver plan`, the sync engine, `/plan` routes,
    `plan_task` (migration drops the column), `[plan].dir`; rewrite WEAVER.md
    and ship the skill; mark structured-projects.md superseded. Pre-launch,

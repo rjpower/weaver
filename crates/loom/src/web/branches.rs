@@ -4,7 +4,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use weaver_api::{BranchGoalReq, BranchStatusReq, BranchView, CreateEventReq, TagReq};
+use weaver_api::{BranchStatusReq, BranchView, CreateEventReq, TagReq};
 use weaver_core::branch as branch_mod;
 use weaver_core::tags;
 
@@ -66,43 +66,6 @@ pub(super) async fn patch_branch(
             "branch patched"
         );
     }
-    let branch = branch_mod::get(&st.db, &branch.id)
-        .await?
-        .ok_or_else(|| AppError::not_found("branch"))?;
-    Ok(Json(branch_view(&st.db, &branch).await?))
-}
-
-/// Set the goal atomically: derive a title when one isn't set yet, and record
-/// the `goal_set` event — the one-call semantics `weaver goal set` has always
-/// had against the local database, now reproduced server-side rather than
-/// composed client-side out of a generic `PATCH`.
-pub(super) async fn set_branch_goal(
-    State(st): State<AppState>,
-    Path(key): Path<String>,
-    Json(req): Json<BranchGoalReq>,
-) -> ApiResult<Json<BranchView>> {
-    let branch = require_branch(&st.db, &key).await?;
-    let goal = req.goal.trim();
-    if goal.is_empty() {
-        return Err(AppError::bad_request(
-            "a goal is required — pass text, --file <path>, or pipe via '-'",
-        ));
-    }
-    branch_mod::set_goal(&st.db, &branch.id, goal, "agent").await?;
-    if branch.title.is_empty() {
-        let title = branch_mod::derive_title(goal);
-        branch_mod::set_title(&st.db, &branch.id, &title).await?;
-    }
-    tracing::info!(branch = %branch.id, goal_len = goal.len(), "branch goal set");
-    events::record(
-        &st.db,
-        &st.bus,
-        &branch.id,
-        "goal_set",
-        json!({ "goal": goal }),
-    )
-    .await
-    .ok();
     let branch = branch_mod::get(&st.db, &branch.id)
         .await?
         .ok_or_else(|| AppError::not_found("branch"))?;
@@ -243,65 +206,6 @@ mod tests {
             ide: std::sync::Arc::new(crate::ide::IdeManager::new(crate::ide::ide_home())),
             trigger: crate::github_trigger::GithubTrigger::production(db),
         }
-    }
-
-    #[tokio::test]
-    async fn set_branch_goal_derives_title_and_records_one_event() {
-        let db = crate::db::connect_in_memory().await.unwrap();
-        let st = test_state(db.clone());
-        let branch = branch_mod::upsert(&db, "/r", "weaver/a", "main")
-            .await
-            .unwrap();
-        assert!(branch.title.is_empty());
-
-        let view = set_branch_goal(
-            State(st.clone()),
-            Path(branch.id.clone()),
-            Json(BranchGoalReq {
-                goal: "Ship the thing\nmore detail".to_string(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(view.goal, "Ship the thing\nmore detail");
-        assert_eq!(view.title, "Ship the thing", "an empty title is derived");
-
-        let events = events::history(&db, &branch.id, 10).await.unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, "goal_set");
-
-        // A pre-existing title is left alone.
-        let view2 = set_branch_goal(
-            State(st),
-            Path(branch.id.clone()),
-            Json(BranchGoalReq {
-                goal: "a new goal".to_string(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(view2.title, "Ship the thing");
-    }
-
-    #[tokio::test]
-    async fn set_branch_goal_rejects_empty() {
-        let db = crate::db::connect_in_memory().await.unwrap();
-        let st = test_state(db.clone());
-        let branch = branch_mod::upsert(&db, "/r", "weaver/a", "main")
-            .await
-            .unwrap();
-        let err = set_branch_goal(
-            State(st),
-            Path(branch.id),
-            Json(BranchGoalReq {
-                goal: "   ".to_string(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

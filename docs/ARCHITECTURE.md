@@ -11,8 +11,8 @@ weaver ships **two binaries** over **loom's REST API**:
   of `loom`, resolving "the current branch" solely from `$WEAVER_BRANCH` (set by
   loom for every session it launches — there is no git-cwd fallback). It carries
   no sqlite driver; `reqwest` (via `weaver-api`) is its only network dependency.
-  Agents call it to read and update the goal, report status, add issues, set
-  tags, and emit hook events. It **requires a reachable `loom server run`** —
+  Agents call it to read and update the `goal` artifact, report status, add
+  issues, set tags, and emit hook events. It **requires a reachable `loom server run`** —
   every command fails with a friendly error if the server can't be reached.
 - **`loom`** — the **orchestrator**: the REST + SSE server, the Vue web UI, the
   per-branch terminal supervisor + agent process (via the `sessions` table), the
@@ -44,7 +44,7 @@ other `weaver` subcommand.
 | `crates/weaver-core/` | lib: `branches`, `issues`, `events`, `db`, `migrations` (ordered SQL + `schema_migrations` indicator), `git`, `config`, `artifacts` (versioned documents), `repo_config` (`.weaver/config.toml`), `transcript` (agent conversation logs: raw → iris format → markdown), agent helpers. Pure logic; used by `loom` for DB access, and by `weaver` only for the DB-free pieces (`transcript`, `tags` constants/validators, the agent primer). |
 | `crates/weaver-api/` | typed loom REST client + DTOs (`Client`, `*View`/`*Req` types, `endpoint::default_client()` for resolving `$WEAVER_API`/`$LOOM_TOKEN`). Zero server deps (no `axum`, no sqlite driver) — the one cross-process seam `weaver` links against instead of `weaver-core`'s DB layer. |
 | `crates/smartdoc/` | the markdown-convention layer: parse references (`#N`, `artifact:<name>`), project live status into the render. Dependency-free of weaver. See [artifacts.md](artifacts.md). |
-| `crates/weaver/src/bin/weaver.rs` | the slim agent-facing CLI (`goal`, `summary`, `readme`, `status` [read or set level + message], `tag` [`set`/`rm`/`ls` a branch tag], `issue …`, `where`, `log`, `chatlog` [render the agent's conversation transcript], `hook`, `config`) — every command drives `weaver-api::Client` over HTTP; none touch sqlite |
+| `crates/weaver/src/bin/weaver.rs` | the slim agent-facing CLI (`summary`, `readme`, `status` [read or set level + message], `tag` [`set`/`rm`/`ls` a branch tag], `issue …`, `where`, `log`, `chatlog` [render the agent's conversation transcript], `hook`, `config`) — every command drives `weaver-api::Client` over HTTP; none touch sqlite |
 | `crates/loom/src/web.rs` | axum routes, request/response types, SSE — **the API surface** (incl. the auth middleware + login/token/user handlers) |
 | `crates/loom/src/auth.rs` | authentication core: token/password crypto, the `users`/`api_tokens`/`auth_sessions` tables, the machine-local token, and the GitHub OAuth calls. `axum`-free so it unit-tests directly |
 | `crates/loom/src/server.rs` | bind, write `server.json`, spawn bg tasks |

@@ -32,17 +32,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Print the goal, or set it (`goal set`).
-    ///
-    /// With no subcommand, prints the current branch's goal. `goal set` writes a
-    /// new goal — from text args, a `--file`, or stdin (`-`). A long markdown
-    /// goal stops being a shell-quoting exercise, so an agent can maintain the
-    /// goal as understanding evolves. The Overview renders it through the same
-    /// markdown pipeline as artifacts, projection included.
-    Goal {
-        #[command(subcommand)]
-        cmd: Option<GoalCmd>,
-    },
     /// Report the agent's status, or read it back.
     ///
     /// This is the agent's single channel for telling the dashboard how it is
@@ -227,18 +216,6 @@ enum IssueTagCmd {
 }
 
 #[derive(Subcommand)]
-enum GoalCmd {
-    /// Set the goal from text args, a `--file`, or stdin (`-`).
-    Set {
-        /// Goal text. Joined with spaces. Omit when using `--file` or `-`.
-        text: Vec<String>,
-        /// Read the goal from a file instead of the text args.
-        #[arg(long)]
-        file: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
 enum ArtifactCmd {
     /// Write an artifact: append a new revision (creating it if absent). Reads
     /// `<file>`, or stdin when `<file>` is `-` or omitted.
@@ -401,7 +378,6 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Goal { cmd } => cmd_goal(cmd).await,
         Cmd::Status { level, message } => cmd_status(level, message.join(" ")).await,
         Cmd::Tag { cmd } => cmd_tag(cmd).await,
         Cmd::Summary => cmd_summary().await,
@@ -458,23 +434,7 @@ fn attention_of(b: &BranchView) -> String {
         .unwrap_or_else(|| "ok".to_string())
 }
 
-/// Read content from a file path, or stdin when `path` is `None` or `"-"`.
-fn read_file_or_stdin(path: Option<&str>) -> Result<String> {
-    use std::io::Read;
-    match path {
-        Some(p) if p != "-" => std::fs::read_to_string(p).map_err(|e| anyhow!("reading {p}: {e}")),
-        _ => {
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .map_err(|e| anyhow!("reading stdin: {e}"))?;
-            Ok(buf)
-        }
-    }
-}
-
-/// Read raw bytes from a file path, or stdin when `path` is `None` or `"-"`. The
-/// binary-safe twin of [`read_file_or_stdin`], used where content may be an image.
+/// Read raw bytes from a file path, or stdin when `path` is `None` or `"-"`.
 fn read_bytes_or_stdin(path: Option<&str>) -> Result<Vec<u8>> {
     use std::io::Read;
     match path {
@@ -562,33 +522,6 @@ fn embed_image_markdown(alt: &str, filename: Option<&str>, bytes: &[u8]) -> Resu
     Ok(Some(format!("![{alt}](data:{mime};base64,{b64})\n")))
 }
 
-/// Print the goal, or set it. With no subcommand prints the current goal;
-/// `goal set` writes a new one from text args, a `--file`, or stdin (`-`).
-async fn cmd_goal(cmd: Option<GoalCmd>) -> Result<()> {
-    let client = client();
-    let key = branch_key()?;
-    let Some(GoalCmd::Set { text, file }) = cmd else {
-        let b = client.get_branch(&key).await?;
-        println!("{}", b.goal);
-        return Ok(());
-    };
-    // A `--file` (or `-` text) reads from disk/stdin; otherwise join the args.
-    let goal = if let Some(path) = file {
-        read_file_or_stdin(Some(&path))?
-    } else if text.as_slice() == ["-"] {
-        read_file_or_stdin(None)?
-    } else {
-        text.join(" ")
-    };
-    let goal = goal.trim_end().to_string();
-    if goal.is_empty() {
-        bail!("a goal is required — pass text, --file <path>, or pipe via '-'");
-    }
-    client.set_branch_goal(&key, &goal).await?;
-    println!("goal updated");
-    Ok(())
-}
-
 /// How many outstanding tasks `weaver summary` lists before collapsing the rest.
 const SUMMARY_TASK_CAP: usize = 10;
 
@@ -622,7 +555,7 @@ async fn render_summary(client: &Client, b: &BranchView) -> Result<String> {
     } else {
         "(none set)".to_string()
     };
-    let _ = writeln!(out, "Goal:    {goal}  (weaver goal)");
+    let _ = writeln!(out, "Goal:    {goal}  (weaver artifact show goal)");
 
     let attention = attention_of(b);
     let status = if b.description.is_empty() {

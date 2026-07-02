@@ -144,31 +144,17 @@ impl Env {
     }
 }
 
+/// The goal lives as the `goal` artifact; writing it keeps the branch's
+/// denormalized goal (what `weaver status` reads back) in sync.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn goal_set_and_get() {
+async fn goal_artifact_write_syncs_the_branch_goal() {
     let env = Env::start().await;
-    // No goal yet — prints an empty line.
-    let out = env.run(&["goal"]);
-    assert_eq!(out.trim(), "");
-
-    env.run(&["goal", "set", "ship", "the", "thing"]);
-    let out = env.run(&["goal"]);
+    env.run_with_stdin(&["artifact", "write", "goal"], "ship the thing\n");
+    let out = env.run(&["artifact", "show", "goal"]);
     assert_eq!(out.trim(), "ship the thing");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn goal_set_derives_a_title_only_once() {
-    let env = Env::start().await;
-    env.run(&["goal", "set", "ship the thing\nmore detail"]);
     let out = env.run(&["status"]);
-    assert!(out.contains("title:       ship the thing"), "status: {out}");
-
-    // A second goal set does not re-derive the title.
-    env.run(&["goal", "set", "a", "different", "goal"]);
-    let out = env.run(&["status"]);
-    assert!(out.contains("title:       ship the thing"), "status: {out}");
+    assert!(out.contains("goal:        ship the thing"), "status: {out}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -432,7 +418,7 @@ async fn seed_delegated_issue(env: &Env, child: &str, attention: &str, descripti
 #[serial]
 async fn summary_orients_an_agent_on_the_branch() {
     let env = Env::start().await;
-    env.run(&["goal", "set", "ship", "the", "feature"]);
+    env.run_with_stdin(&["artifact", "write", "goal"], "ship the feature\n");
     env.run(&["issue", "add", "wire", "up", "routes"]);
     env.run(&["issue", "add", "add", "tests"]);
     env.run(&["status", "ok", "routes", "wired"]);
@@ -449,7 +435,7 @@ async fn summary_orients_an_agent_on_the_branch() {
     assert!(out.contains("pick up #1"), "summary: {out}");
     // Every section advertises the command that drills into it.
     for hint in [
-        "(weaver goal)",
+        "(weaver artifact show goal)",
         "(weaver status)",
         "(weaver issue ls)",
         "weaver artifact",
@@ -488,7 +474,7 @@ async fn summary_caps_a_long_outstanding_list() {
 #[serial]
 async fn summary_with_no_open_tasks_suggests_wrapping_up() {
     let env = Env::start().await;
-    env.run(&["goal", "set", "tidy", "up"]);
+    env.run_with_stdin(&["artifact", "write", "goal"], "tidy up\n");
     let out = env.run(&["summary"]);
     assert!(out.contains("Outstanding: none"), "summary: {out}");
     assert!(out.contains("no open tasks"), "summary: {out}");
@@ -619,15 +605,6 @@ async fn artifact_comment_thread_and_resolve_roundtrip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn goal_set_from_stdin() {
-    let env = Env::start().await;
-    env.run_with_stdin(&["goal", "set", "-"], "ship it from stdin\n");
-    let out = env.run(&["goal"]);
-    assert_eq!(out.trim(), "ship it from stdin");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn hook_writes_an_event_row() {
     let env = Env::start().await;
     env.run(&["hook", "--event", "working"]);
@@ -689,7 +666,7 @@ async fn session_start_hook_injects_the_full_primer() {
 #[serial]
 async fn session_start_hook_after_compaction_replays_the_concise_summary() {
     let env = Env::start().await;
-    env.run(&["goal", "set", "ship", "the", "feature"]);
+    env.run_with_stdin(&["artifact", "write", "goal"], "ship the feature\n");
     env.run(&["issue", "add", "wire", "up", "routes"]);
     env.run(&["status", "ok", "routes", "wired"]);
 
@@ -740,7 +717,7 @@ async fn session_start_hook_after_compaction_replays_the_concise_summary() {
 #[serial]
 async fn set_status_with_no_id_reports_current_branch() {
     let env = Env::start().await;
-    env.run(&["goal", "set", "do", "the", "thing"]);
+    env.run_with_stdin(&["artifact", "write", "goal"], "do the thing\n");
     env.run(&["issue", "add", "step", "one"]);
     let out = env.run(&["status"]);
     assert!(out.contains("branch:      feature-test"), "status: {out}");

@@ -11,11 +11,11 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::dto::{
-    AnchorDto, ArtifactMeta, ArtifactUpsertReq, ArtifactView, BranchGoalReq, BranchStatusReq,
-    BranchView, CommentDto, CreateEventReq, CreateIssueReq, CreateOverlookerReq,
-    CreateRepoIssueReq, CreateReq, CreateTokenReq, CreatedTokenView, IssueView, NewCommentBody,
-    NewThreadBody, OverlookerView, PatchIssueReq, PatchOverlookerReq, PatchSessionReq,
-    RunOverlookerReq, SendReq, SessionView, SettingsEnvelope, TagReq, ThreadDto, TokenView,
+    AnchorDto, ArtifactMeta, ArtifactUpsertReq, ArtifactView, BranchStatusReq, BranchView,
+    CommentDto, CreateEventReq, CreateIssueReq, CreateOverlookerReq, CreateRepoIssueReq, CreateReq,
+    CreateTokenReq, CreatedTokenView, IssueView, NewCommentBody, NewThreadBody, OverlookerView,
+    PatchIssueReq, PatchOverlookerReq, PatchSessionReq, RunOverlookerReq, SendReq, SessionView,
+    SettingsEnvelope, TagReq, ThreadDto, TokenView,
 };
 
 /// A client for one loom server, identified by its base URL.
@@ -305,20 +305,6 @@ impl Client {
     pub async fn get_branch(&self, key: &str) -> Result<BranchView> {
         self.get_typed(&format!("/api/branches/{}", Self::seg(key)))
             .await
-    }
-
-    /// Set the goal, deriving a title when one isn't set yet and recording the
-    /// `goal_set` event server-side (`POST /api/branches/{key}/goal`).
-    pub async fn set_branch_goal(&self, key: &str, goal: &str) -> Result<BranchView> {
-        let req = BranchGoalReq {
-            goal: goal.to_string(),
-        };
-        self.send_typed(
-            Method::POST,
-            &format!("/api/branches/{}/goal", Self::seg(key)),
-            Some(&req),
-        )
-        .await
     }
 
     /// Set the agent's attention level and current-state message in one call
