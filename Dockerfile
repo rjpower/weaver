@@ -59,8 +59,15 @@ RUN set -eux; \
       > /etc/apt/sources.list.d/google-cloud-sdk.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends nodejs git ca-certificates gh google-cloud-cli tini; \
-    npm i -g @anthropic-ai/claude-code; \
     rm -rf /var/lib/apt/lists/*
+
+# Claude Code — the agent runtime loom's sessions launch — is deliberately NOT
+# baked into the image. The container runs as a non-root user, so a Claude
+# installed into the read-only system dirs (what `npm i -g` does) can't
+# auto-update and reports it's "installed in a read-only location". Instead
+# loom-entrypoint (below) runs Claude's own installer at first boot into the app
+# user's $HOME/.local — on the persisted loom_home volume, so it is writable,
+# auto-updates itself in place, and the updates survive container recreates.
 
 # code-server — the per-session embedded VS Code that `crate::ide` spawns and
 # reverse-proxies (one rooted at each worktree, behind loom's auth). The `.deb`
@@ -92,6 +99,17 @@ ARG HOST_GID=1000
 # still aborts the build instead of being masked by `|| true`.
 RUN if ! getent group "${HOST_GID}" >/dev/null; then groupadd -g "${HOST_GID}" app; fi; \
     useradd -m -u "${HOST_UID}" -g "${HOST_GID}" -d /home/app -s /bin/bash app
+
+# Set $HOME explicitly: the entrypoint and Claude's installer resolve
+# $HOME/.local, and `USER app` alone doesn't reliably export HOME.
+ENV HOME=/home/app
+# The writable, self-updating Claude install (see loom-entrypoint) and any client
+# packages added at runtime live under the app user's persisted $HOME, early on
+# PATH. NPM_CONFIG_PREFIX points `npm i -g` at a home dir too, so new CLI packages
+# can be installed live (and persist on the loom_home volume) without an image
+# rebuild — only OS/apt packages still need one.
+ENV NPM_CONFIG_PREFIX=/home/app/.npm-global \
+    PATH=/home/app/.local/bin:/home/app/.npm-global/bin:${PATH}
 
 # Where uv keeps its managed interpreters and wheel cache. Kept off /home/app so
 # the (large) Python builds don't bloat the home volume and can be reset on their
@@ -131,6 +149,31 @@ git config --system url.https://github.com/.insteadOf git@github.com:
 git config --system url.https://github.com/.insteadOf ssh://git@github.com/
 EOF
 
+# Container entrypoint: before the daemon starts, make sure the writable,
+# self-updating Claude install exists on the persisted $HOME volume, then hand
+# off to the CMD. Runs the install only for `loom server …` — one-shot admin
+# commands (`loom config set`, `loom setup`, the compose init service) skip it.
+RUN <<'EOF'
+cat > /usr/local/bin/loom-entrypoint <<'SH'
+#!/bin/sh
+set -eu
+if [ "${1:-}" = loom ] && [ "${2:-}" = server ] && [ ! -x "$HOME/.local/bin/claude" ]; then
+  echo "loom: installing self-updating Claude Code into $HOME/.local ..." >&2
+  # The stock native installer drops claude into $HOME/.local/bin (writable, on
+  # the volume); Claude then auto-updates itself in place. Pin with
+  # CLAUDE_CODE_VERSION (stable|latest|<version>; default stable). `curl | bash`
+  # can't surface a download failure through the pipe, so check the binary landed
+  # rather than trusting the exit status. Non-fatal: loom still boots either way;
+  # agents just lack `claude` until a boot with network installs it.
+  curl -fsSL https://claude.ai/install.sh | bash -s -- "${CLAUDE_CODE_VERSION:-stable}" || true
+  [ -x "$HOME/.local/bin/claude" ] \
+    || echo "loom: WARNING: Claude install failed (offline?); agents lack 'claude' until a later boot installs it" >&2
+fi
+exec "$@"
+SH
+chmod +x /usr/local/bin/loom-entrypoint
+EOF
+
 # loom resolves the tapestry PTY supervisor as a sibling of its own binary
 # (current_exe dir + /tapestry), so the two must land in the same directory.
 COPY --from=build /out/loom     /usr/local/bin/loom
@@ -153,8 +196,10 @@ EXPOSE 7878
 # they shell out to `gh`, `sleep`, MCP servers, etc. and routinely detach, so
 # those processes reparent to PID 1 when their immediate parent exits. With no
 # init to `wait()` on them they pile up as zombies for the container's whole
-# lifetime. tini reaps them and forwards signals through to loom.
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# lifetime. tini reaps them and forwards signals through to loom. loom-entrypoint
+# runs first (ensuring the writable Claude install) and then `exec`s the CMD, so
+# loom still ends up as tini's direct child for the reaping above to work.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/loom-entrypoint"]
 # `server run` is the foreground daemon (REST API + Vue UI + monitor loop); bind
 # off loopback so the Caddy container can reach it over the `web` network.
 CMD ["loom", "server", "run", "--addr", "0.0.0.0:7878"]

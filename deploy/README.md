@@ -288,7 +288,7 @@ removed only by `docker compose down -v` or `docker volume rm`):
 
 | Volume | Mount | Holds |
 |---|---|---|
-| `loom_home` | `/home/app` | The sqlite db (`~/.weaver/weaver.db`), the machine-local loom token, `~/.claude.json`, and the managed repo store (`WEAVER_REPOS_DIR`, default `~/.weaver/repos`) — the repos the `@loom` trigger clones and their worktrees. |
+| `loom_home` | `/home/app` | The sqlite db (`~/.weaver/weaver.db`), the machine-local loom token, `~/.claude.json`, the self-updating Claude Code install (`~/.local`) and any client packages added at runtime (`~/.npm-global`, `~/.local/bin`; see [Agent runtime](#agent-runtime--client-packages)), and the managed repo store (`WEAVER_REPOS_DIR`, default `~/.weaver/repos`) — the repos the `@loom` trigger clones and their worktrees. |
 | `uv` | `/opt/uv` | uv's managed Python interpreters and wheel cache. |
 | `caddy_data` | `/data` | Issued TLS certificates and the ACME account — back this up to avoid re-issuing on every fresh host. |
 | `caddy_config` | `/config` | Caddy's autosaved config. |
@@ -298,6 +298,37 @@ non-root `app` user the image runs as can write to it: a fresh standalone named
 volume would mount root-owned. To put repos on their own disk, point
 `WEAVER_REPOS_DIR` at a **bind mount** of a host directory you've `chown`ed to
 `HOST_UID:HOST_GID` instead.
+
+## Agent runtime & client packages
+
+The agent tooling the image ships splits by how it updates:
+
+- **Claude Code updates itself, no image rebuild.** The container runs as a
+  non-root user, so a Claude installed into the read-only system dirs could not
+  auto-update ("installed in a read-only location"). Instead, the first time the
+  daemon starts it runs Claude's native installer into the persisted `loom_home`
+  volume (`~/.local/bin/claude`), and Claude auto-updates itself in place from
+  then on — updates land without a rebuild and survive `up`/`down`/recreate. That
+  first install needs network (the deploy needs it anyway); if it fails loom
+  still comes up and installs on a later boot. Pin the tracked build with
+  `CLAUDE_CODE_VERSION` (`stable` — the default — `latest`, or an exact version
+  like `2.1.198`) in the `loom` service's `environment:` in
+  [`docker-compose.yml`](standalone/docker-compose.yml); force one live with
+  `docker compose exec loom claude install <version> --force`.
+
+- **Adding more client packages at runtime.** `~/.local/bin` and a home npm
+  prefix (`~/.npm-global/bin`) are on `PATH` and on the `loom_home` volume, so
+  the operator (or an agent) can install extra CLIs live and have them persist
+  across recreates:
+
+  ```sh
+  docker compose exec loom npm i -g <package>      # node CLIs → ~/.npm-global
+  docker compose exec loom uv tool install <tool>  # python CLIs → ~/.local/bin
+  ```
+
+  Only OS/system packages (`apt-get`) still need an image rebuild — the system
+  dirs are read-only to the non-root user. Add those to the
+  [`Dockerfile`](../Dockerfile) and rerun `docker compose up -d --build`.
 
 ## Operations
 
