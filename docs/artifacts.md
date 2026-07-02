@@ -87,7 +87,7 @@ One new noun, one demotion, one deletion — and a thin shared layer:
 
 | Job the plan tab did | New home |
 |---|---|
-| Tell agents what to do | **goal** — a branch-scoped `goal` artifact (markdown), set via `weaver artifact write goal <file>` or the Artifacts editor |
+| Tell agents what to do | **goal** — a branch-scoped `goal` artifact (markdown), set via `weaver artifact write goal <file|->` or the Artifacts editor |
 | Steps synced to weaver | **issues** — the only task ledger; created directly, never parsed out of a doc |
 | Structured content for the user | **artifacts** — named, versioned documents in weaver.db, rendered by loom |
 
@@ -210,7 +210,7 @@ newest revision.
 
 The `goal` artifact is the **single source of truth**. `branches.goal` remains
 as a denormalized cache — the hot path for the fleet list and `?q=` search —
-refreshed from the artifact at every write: `branch::set_goal` (the setter
+refreshed from the artifact at every write: `branch::set_goal` (the setter that
 session-create / PATCH funnel through) and the direct
 artifact-write paths (the Artifacts editor, `weaver artifact write goal`) both
 call `branch::sync_goal_cache`. `branch::current_goal` reads the artifact, so
