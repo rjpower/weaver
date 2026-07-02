@@ -316,3 +316,13 @@ export const setGithubConfig = (clientId: string, clientSecret?: string) =>
     client_id: clientId,
     ...(clientSecret !== undefined ? { client_secret: clientSecret } : {}),
   }) as Promise<GithubConfig>;
+
+// --- Server logs / debug ---------------------------------------------------
+
+/** A snapshot of the most recent server log lines (oldest first). The live tail
+ *  is an EventSource on `/api/logs/stream`, opened directly by the Logs panel. */
+export const getLogs = (limit = 500) =>
+  get(`/logs?limit=${limit}`) as Promise<import('./types').LogLine[]>;
+
+/** Build version, pid, and start time of the running server. */
+export const getServerStatus = () => get('/status') as Promise<import('./types').ServerStatus>;

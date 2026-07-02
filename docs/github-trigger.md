@@ -238,9 +238,12 @@ and which gate did it hit?* Work through it in order:
    `scripts/gh_app_deliveries.py` prints the same delivery log from the command
    line (it mints an App JWT from the key in `loom.toml`).
 
-3. **Read the server logs.** Each gate logs a distinct line — grep the loom
-   process (`docker compose logs -f loom`, or `RUST_LOG=loom=debug` for the
-   outbound `gh`/REST calls) for: `signature verification failed` (401, secret
+3. **Read the server logs.** The quickest path is **Settings → Logs** in the web
+   UI — a live, filterable mirror of the server's log stream, so you can watch a
+   delivery land without shelling into the box (handy on the Docker deploy). The
+   same lines go to the process stdout, so `docker compose logs -f loom` (or
+   `RUST_LOG=loom=debug` for the outbound `gh`/REST calls) works too. Each gate
+   logs a distinct line — look for: `signature verification failed` (401, secret
    mismatch), `duplicate delivery ignored` (a replay — see below), `commenter not
    authorized` (not an approved user), `session create failed` (repo not
    registered, or the clone failed), `per-repo rate limit hit`, and the success

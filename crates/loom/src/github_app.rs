@@ -262,6 +262,11 @@ impl GithubApp {
         }
         let jwt = self.current_jwt().await?;
         let fresh = self.fetch_installation_token(&jwt, installation_id).await?;
+        tracing::info!(
+            installation = installation_id,
+            expires_at = %fresh.expires_at,
+            "minted installation access token"
+        );
         let token = fresh.token.clone();
         self.tokens
             .lock()
@@ -399,6 +404,7 @@ impl GithubApi for GithubApp {
             .await
             .context("posting the issue comment")?;
         check_status(resp, "posting the issue comment").await?;
+        tracing::info!(repo, issue, "posted issue comment");
         Ok(())
     }
 }

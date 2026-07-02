@@ -68,6 +68,7 @@ mod branches;
 mod discussion;
 mod env;
 mod issues;
+mod logview;
 mod overlookers;
 mod repo_env;
 mod repos;
@@ -81,6 +82,7 @@ use branches::*;
 use discussion::*;
 use env::*;
 use issues::*;
+use logview::*;
 use overlookers::*;
 use repo_env::*;
 use repos::*;
@@ -601,6 +603,11 @@ pub fn router(state: AppState) -> Router {
         // container, for one-time setup like `gcloud auth login`.
         .route("/shell/terminal", get(crate::terminal::shell_ws))
         .route("/shell/restart", post(restart_shell))
+        // Server logs (Settings → Logs) — snapshot + live SSE tail + build status.
+        // Operator-only: server logs can carry tokens injected into agents.
+        .route("/logs", get(logs_snapshot))
+        .route("/logs/stream", get(logs_stream))
+        .route("/status", get(server_status))
         // Overlookers — periodic / triggered watch programs over the fleet.
         .route(
             "/overlookers",

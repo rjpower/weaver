@@ -568,3 +568,19 @@ export interface IrisLog {
   cwd?: string;
   messages: IrisMessage[];
 }
+
+/** One captured server log line. Mirrors `loom::logs::LogLine`. */
+export interface LogLine {
+  seq: number;
+  ts: string;
+  level: string;
+  target: string;
+  message: string;
+}
+
+/** Build/runtime status of the server. Mirrors `loom::web::logview::ServerStatus`. */
+export interface ServerStatus {
+  version: string;
+  pid: number;
+  started_at: string;
+}

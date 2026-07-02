@@ -289,9 +289,9 @@ pub struct GhCli;
 impl GithubApi for GhCli {
     async fn post_issue_comment(&self, repo: &str, issue: i64, body: &str) -> Result<()> {
         let number = issue.to_string();
-        gh_capture(&["issue", "comment", &number, "--repo", repo, "--body", body])
-            .await
-            .map(|_| ())
+        gh_capture(&["issue", "comment", &number, "--repo", repo, "--body", body]).await?;
+        tracing::info!(repo, issue, "posted issue comment");
+        Ok(())
     }
 }
 

@@ -1688,10 +1688,18 @@ async fn run_gcloud_with_stdin(args: &[&str], stdin_data: &str) -> Result<()> {
 }
 
 fn init_tracing() {
+    use tracing_subscriber::prelude::*;
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("loom=info,weaver_core=info,tower_http=warn"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Registry-of-layers so the ring-buffer capture (the in-browser log viewer)
+    // runs *alongside* the existing stdout output — `docker compose logs` is
+    // unchanged; the buffer just tees. The one `EnvFilter` gates both layers.
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(loom::logs::layer())
+        .init();
 }
 
 fn str_field<'a>(v: &'a Value, key: &str) -> &'a str {
