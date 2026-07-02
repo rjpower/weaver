@@ -4,8 +4,11 @@
 //! alongside loom's own `WEAVER_*` / `LOOM_TOKEN` — so the operator can add a
 //! registry token, a `GH_HOST`, an `ANTHROPIC_BASE_URL`, etc. at runtime from
 //! the settings pane, without rebuilding the image or editing the deploy env
-//! file. They are NOT applied to the env-stripped one-shot judgement agent
-//! (see [`crate::agent`]).
+//! file. The one-shot judgement agent runs env-stripped and gets none of them
+//! (see [`crate::agent`]); watch scripts are likewise stripped but do receive
+//! `GH_TOKEN` (via [`get`]), since loom's *own* GitHub reads — the PR poll loop
+//! and github watches' `gh` calls — run in the server process, which has no
+//! ambient GitHub auth of its own.
 //!
 //! This is a flat name/value store: unlike [`crate::config`] there is no
 //! registry of known keys, because the whole point is arbitrary,
@@ -80,6 +83,20 @@ pub async fn list(db: &Db) -> Result<Vec<EnvVar>> {
             updated_at: r.get::<String, _>("updated_at"),
         })
         .collect())
+}
+
+/// One variable's value, or `None` when unset (or on a DB error — callers use
+/// this for best-effort credential lookup, where a miss and an error are the same
+/// "no value" outcome). Used by loom's *own* GitHub operations — the PR poll loop
+/// and watch scripts — which run in the server process and so don't inherit the
+/// per-session agent environment.
+pub async fn get(db: &Db, name: &str) -> Option<String> {
+    sqlx::query_scalar::<_, String>("SELECT value FROM agent_env WHERE name = ?")
+        .bind(name)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// The variables as a plain `(name, value)` list — what [`crate::agent::launch`]
@@ -180,9 +197,17 @@ mod tests {
             ]
         );
 
+        // `get` reads a single value; a missing key is `None`.
+        assert_eq!(
+            get(&db, "GH_HOST").await.as_deref(),
+            Some("github.internal")
+        );
+        assert_eq!(get(&db, "MISSING").await, None);
+
         assert!(remove(&db, "API_TOKEN").await.unwrap());
         // Removing again is a no-op.
         assert!(!remove(&db, "API_TOKEN").await.unwrap());
         assert_eq!(list(&db).await.unwrap().len(), 1);
+        assert_eq!(get(&db, "API_TOKEN").await, None, "gone after remove");
     }
 }

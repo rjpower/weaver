@@ -284,10 +284,22 @@ pub async fn gh_available() -> bool {
 /// Fetch the pull request for `branch` (its remote head ref) from `repo_root`.
 /// `Ok(None)` means there is simply no PR for the branch yet; `Err` is a real
 /// failure (no GitHub remote, auth, `gh` missing) the caller logs and skips.
-pub async fn fetch_pr(repo_root: &Path, branch: &str) -> Result<Option<GithubStatus>> {
-    let out = Command::new("gh")
-        .args(["pr", "view", branch, "--json", PR_FIELDS])
-        .current_dir(repo_root)
+pub async fn fetch_pr(
+    repo_root: &Path,
+    branch: &str,
+    token: Option<&str>,
+) -> Result<Option<GithubStatus>> {
+    let mut cmd = Command::new("gh");
+    cmd.args(["pr", "view", branch, "--json", PR_FIELDS])
+        .current_dir(repo_root);
+    // The poll loop runs in the loom process, which carries no ambient `gh` auth
+    // (the operator's `GH_TOKEN` is session-scoped, not the server's). Without a
+    // token `gh pr view` fails and every branch's PR status stays blank — starving
+    // the pr-label / review-wait / archive-merged watches, which key off it.
+    if let Some(token) = token {
+        cmd.env("GH_TOKEN", token);
+    }
+    let out = cmd
         .output()
         .await
         .context("failed to spawn gh (is the GitHub CLI installed?)")?;
@@ -360,7 +372,16 @@ pub async fn refresh(
     branch: &Branch,
     archive_on_merge: bool,
 ) -> Result<Option<GithubStatus>> {
-    let snap = match fetch_pr(&PathBuf::from(&branch.repo_root), &branch.branch).await? {
+    // loom's own token for `gh` — the operator's `GH_TOKEN` from Settings →
+    // Environment (the server process has no ambient GitHub auth of its own).
+    let token = crate::agent_env::get(&state.db, "GH_TOKEN").await;
+    let snap = match fetch_pr(
+        &PathBuf::from(&branch.repo_root),
+        &branch.branch,
+        token.as_deref(),
+    )
+    .await?
+    {
         Some(s) => s,
         None => return Ok(None),
     };

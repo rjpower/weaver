@@ -90,6 +90,17 @@ fn survey_program() -> String {
     .to_string()
 }
 
+/// Fixture that echoes the `GH_TOKEN` it was handed into its summary, so a test
+/// can assert loom injects the operator's token into the (otherwise env-stripped)
+/// watch subprocess — what github watches need for their own `gh` calls.
+fn echo_env_program() -> String {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/integration/programs/echo_env.py"
+    )
+    .to_string()
+}
+
 /// A reactive fixture that declares a `pr.merged` subscription and surveys only
 /// the triggering session (via `triggered_sessions`).
 fn survey_triggered_program() -> String {
@@ -885,6 +896,52 @@ async fn rest_watch_lifecycle_and_validation() {
 // ---------------------------------------------------------------------------
 
 use loom::builtins::python3_available;
+
+/// A github watch shells out to `gh` (reading PR labels/state); loom must inject
+/// the operator's `GH_TOKEN` (Settings → Environment) into the otherwise
+/// env-stripped watch subprocess, or every github watch (pr-label, review-wait,
+/// archive-merged) is blind. The explicit inject wins over any ambient value, so
+/// the exact token reaches the process.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_subprocess_receives_operator_gh_token() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let ts = TestServer::start().await;
+    let state = engine_state(&ts).await;
+
+    let o = enabled_watch(
+        &state,
+        watch_store::NewWatch {
+            name: "echo-env".to_string(),
+            trigger_spec: json!({ "on": ["session.idle"] }).to_string(),
+            scope: json!({}).to_string(),
+            program: echo_env_program(),
+            capabilities: vec!["observe".to_string()],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Set the operator token (Settings → Environment) and fire a manual round.
+    loom::agent_env::set(&state.db, "GH_TOKEN", "ghtok-marker-xyz")
+        .await
+        .unwrap();
+    let run_id = watch::fire_now(&state, &o.name, false, "manual")
+        .await
+        .unwrap();
+
+    let runs = watch_store::recent_runs(&state.db, &o.id, 10)
+        .await
+        .unwrap();
+    let run = runs.iter().find(|r| r.id == run_id).unwrap();
+    assert_eq!(
+        run.summary, "token[ghtok-marker-xyz]",
+        "the operator's GH_TOKEN reaches the env-stripped watch subprocess"
+    );
+}
 
 /// A stored PR snapshot for a branch, as the GitHub poll loop would write it.
 fn pr_snapshot(state: &str, number: i64) -> weaver_core::github::GithubStatus {
