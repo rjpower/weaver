@@ -69,7 +69,7 @@ RUN set -eux; \
       > /etc/apt/sources.list.d/docker.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends nodejs git ca-certificates gh google-cloud-cli tini \
-      docker-ce-cli docker-buildx-plugin docker-compose-plugin; \
+      docker-ce-cli docker-buildx-plugin docker-compose-plugin sudo; \
     rm -rf /var/lib/apt/lists/*
 
 # Claude Code — the agent runtime loom's sessions launch — is deliberately NOT
@@ -160,25 +160,70 @@ git config --system url.https://github.com/.insteadOf git@github.com:
 git config --system url.https://github.com/.insteadOf ssh://git@github.com/
 EOF
 
+# Per-session memory limits. loom confines each terminal session to its own
+# memory-limited cgroup under /sys/fs/cgroup/agents (see backend::new_session);
+# this root-only script prepares that subtree at boot and delegates it to the
+# app user. cgroup v2's no-internal-process rule means the container-root cgroup
+# must be emptied into a leaf (init/) before controllers can be enabled on its
+# children, and migrating a session into agents/<name> additionally needs write
+# access to the source/destination *common ancestor's* cgroup.procs — hence the
+# chowns at the bottom. Needs the rw cgroupfs remount, which is why the compose
+# service runs with SYS_ADMIN + apparmor=unconfined (docker-compose.yml); where
+# that grant is absent this script fails and the entrypoint just warns — loom
+# runs fine, sessions are simply unlimited. The app user may run exactly this
+# script as root (sudoers line below), nothing else.
+RUN <<'EOF'
+cat > /usr/local/bin/loom-cgroup-init <<'SH'
+#!/bin/sh
+set -eu
+[ -f /sys/fs/cgroup/cgroup.controllers ] || { echo "cgroup v2 not mounted" >&2; exit 1; }
+if [ ! -w /sys/fs/cgroup ]; then
+  # Docker mounts the container's cgroup view read-only; replace it with a rw
+  # mount of the same (namespaced) tree.
+  umount /sys/fs/cgroup
+  mount -t cgroup2 cgroup2 /sys/fs/cgroup
+fi
+grep -qw memory /sys/fs/cgroup/cgroup.controllers || { echo "memory controller not delegated" >&2; exit 1; }
+mkdir -p /sys/fs/cgroup/init /sys/fs/cgroup/agents
+while read -r p; do
+  echo "$p" > /sys/fs/cgroup/init/cgroup.procs || true
+done < /sys/fs/cgroup/cgroup.procs
+echo +memory > /sys/fs/cgroup/cgroup.subtree_control
+echo +memory > /sys/fs/cgroup/agents/cgroup.subtree_control
+chown -R app /sys/fs/cgroup/agents
+chown app /sys/fs/cgroup/cgroup.procs /sys/fs/cgroup/init/cgroup.procs
+SH
+chmod 755 /usr/local/bin/loom-cgroup-init
+echo 'app ALL=(root) NOPASSWD: /usr/local/bin/loom-cgroup-init' > /etc/sudoers.d/loom-cgroup-init
+chmod 440 /etc/sudoers.d/loom-cgroup-init
+EOF
+
 # Container entrypoint: before the daemon starts, make sure the writable,
-# self-updating Claude install exists on the persisted $HOME volume, then hand
-# off to the CMD. Runs the install only for `loom server …` — one-shot admin
-# commands (`loom config set`, `loom setup`, the compose init service) skip it.
+# self-updating Claude install exists on the persisted $HOME volume and the
+# delegated session-cgroup subtree is prepared, then hand off to the CMD. Both
+# run only for `loom server …` — one-shot admin commands (`loom config set`,
+# `loom setup`, the compose init service) skip them.
 RUN <<'EOF'
 cat > /usr/local/bin/loom-entrypoint <<'SH'
 #!/bin/sh
 set -eu
-if [ "${1:-}" = loom ] && [ "${2:-}" = server ] && [ ! -x "$HOME/.local/bin/claude" ]; then
-  echo "loom: installing self-updating Claude Code into $HOME/.local ..." >&2
-  # The stock native installer drops claude into $HOME/.local/bin (writable, on
-  # the volume); Claude then auto-updates itself in place. Pin with
-  # CLAUDE_CODE_VERSION (stable|latest|<version>; default stable). `curl | bash`
-  # can't surface a download failure through the pipe, so check the binary landed
-  # rather than trusting the exit status. Non-fatal: loom still boots either way;
-  # agents just lack `claude` until a boot with network installs it.
-  curl -fsSL https://claude.ai/install.sh | bash -s -- "${CLAUDE_CODE_VERSION:-stable}" || true
-  [ -x "$HOME/.local/bin/claude" ] \
-    || echo "loom: WARNING: Claude install failed (offline?); agents lack 'claude' until a later boot installs it" >&2
+if [ "${1:-}" = loom ] && [ "${2:-}" = server ]; then
+  if [ ! -x "$HOME/.local/bin/claude" ]; then
+    echo "loom: installing self-updating Claude Code into $HOME/.local ..." >&2
+    # The stock native installer drops claude into $HOME/.local/bin (writable, on
+    # the volume); Claude then auto-updates itself in place. Pin with
+    # CLAUDE_CODE_VERSION (stable|latest|<version>; default stable). `curl | bash`
+    # can't surface a download failure through the pipe, so check the binary landed
+    # rather than trusting the exit status. Non-fatal: loom still boots either way;
+    # agents just lack `claude` until a boot with network installs it.
+    curl -fsSL https://claude.ai/install.sh | bash -s -- "${CLAUDE_CODE_VERSION:-stable}" || true
+    [ -x "$HOME/.local/bin/claude" ] \
+      || echo "loom: WARNING: Claude install failed (offline?); agents lack 'claude' until a later boot installs it" >&2
+  fi
+  # Delegate the per-session cgroup subtree (see loom-cgroup-init above).
+  # Non-fatal: without it sessions run with no memory limit.
+  sudo -n /usr/local/bin/loom-cgroup-init \
+    || echo "loom: WARNING: cgroup delegation failed; sessions run without memory limits" >&2
 fi
 exec "$@"
 SH

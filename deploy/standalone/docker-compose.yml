@@ -74,6 +74,23 @@ services:
     # "Security posture").
     group_add:
       - "${DOCKER_GID:-999}"
+    # Per-session memory limits (`session.memory_max_gb`): at boot the
+    # entrypoint runs loom-cgroup-init (see the Dockerfile), which remounts the
+    # container's own cgroup-v2 tree read-write and delegates an agents/
+    # subtree to the app user; each session then confines itself there and a
+    # runaway agent OOMs alone instead of taking the VM down. The remount is
+    # what needs SYS_ADMIN and an unconfined AppArmor profile — a wider grant
+    # than default, but this container already holds the root-equivalent
+    # docker.sock (above), so it adds nothing on this single-tenant box. Without
+    # these the init script fails and sessions simply run unlimited.
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
+    # The delegation dance assumes the container sees only its own cgroup
+    # subtree; private is the cgroup-v2 default, pinned here because the limits
+    # depend on it.
+    cgroup: private
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Persisted HOME for the container user. Everything stateful lives here and

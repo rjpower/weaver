@@ -371,6 +371,9 @@ pub struct AgentLaunchContext<'a> {
     pub effort: &'a str,
     /// Operator-managed environment variables exported into the session.
     pub extra_env: &'a [(String, String)],
+    /// Per-session memory ceiling in GiB (0 = unlimited), resolved from the
+    /// `session.memory_max_gb` setting by [`launch`].
+    pub memory_max_gb: u64,
 }
 
 impl AgentType for ClaudeAgentType {
@@ -554,6 +557,7 @@ pub async fn launch(db: &Db, spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<
         model: spec.model,
         effort: spec.effort,
         extra_env: spec.extra_env,
+        memory_max_gb: backend::memory_max_gb(db).await,
     };
     let resolved = resolve(db, spec.runtime)
         .await?
@@ -616,7 +620,7 @@ async fn start_terminal(
         session = ctx.term_session,
         "launching agent session"
     );
-    backend::new_session(ctx.term_session, ctx.work_dir, &script)
+    backend::new_session(ctx.term_session, ctx.work_dir, &script, ctx.memory_max_gb)
         .await
         .with_context(|| format!("terminal: launching session {}", ctx.term_session))?;
     tracing::info!(
@@ -930,6 +934,7 @@ mod tests {
             model,
             effort,
             extra_env: &[],
+            memory_max_gb: 0,
         }
     }
 

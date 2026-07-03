@@ -87,7 +87,13 @@ pub async fn ensure(st: &AppState) -> Result<()> {
     let script = shell_script(st, None).await;
     let cwd = shell_cwd();
     tracing::info!(session = SHELL_SESSION, cwd = %cwd.display(), "spawning operator scratch shell");
-    backend::new_session(SHELL_SESSION, &cwd, &script).await
+    backend::new_session(
+        SHELL_SESSION,
+        &cwd,
+        &script,
+        backend::memory_max_gb(&st.db).await,
+    )
+    .await
 }
 
 /// Reset the scratch shell: kill the current supervisor (best-effort) and bring
@@ -141,7 +147,7 @@ pub async fn ensure_debug(
     let script = shell_script(st, Some(&branch.id)).await;
     let cwd = PathBuf::from(&session.work_dir);
     tracing::info!(session = %name, cwd = %cwd.display(), "spawning session debug shell");
-    backend::new_session(&name, &cwd, &script).await?;
+    backend::new_session(&name, &cwd, &script, backend::memory_max_gb(&st.db).await).await?;
     Ok(name)
 }
 
