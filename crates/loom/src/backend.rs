@@ -28,13 +28,15 @@ pub async fn has_session(name: &str) -> bool {
 const AGENT_CGROUP_DIR: &str = "/sys/fs/cgroup/agents";
 
 /// The per-session memory ceiling in GiB, from the `session.memory_max_gb`
-/// setting. 0 = unlimited.
+/// setting. 0 = unlimited; the setting validates as a signed integer, so a
+/// stored negative clamps to 0 rather than silently reverting to the default.
 pub async fn memory_max_gb(db: &Db) -> u64 {
     let default = weaver_core::config::DEFAULT_SESSION_MEMORY_MAX_GB;
     weaver_core::config::get_or(db, "session.memory_max_gb", &default.to_string())
         .await
         .trim()
-        .parse()
+        .parse::<i64>()
+        .map(|v| v.max(0) as u64)
         .unwrap_or(default as u64)
 }
 
@@ -47,7 +49,7 @@ pub async fn memory_max_gb(db: &Db) -> u64 {
 /// warns into the session terminal so an unlimited session is visible.
 fn memory_prelude(name: &str, memory_max_gb: u64) -> String {
     let dir = format!("{AGENT_CGROUP_DIR}/{name}");
-    let bytes = memory_max_gb * 1024 * 1024 * 1024;
+    let bytes = memory_max_gb.saturating_mul(1024 * 1024 * 1024);
     // memory.swap.max is zeroed so the ceiling can't leak into swap on a host
     // that has any, but best-effort: the file is missing on kernels without
     // swap accounting, and the RAM cap alone is still worth keeping.
@@ -204,5 +206,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(memory_max_gb(&db).await, 0);
+        // A stored negative (the setting validates as a signed int) clamps to
+        // unlimited rather than reverting to the default.
+        weaver_core::config::apply(&db, &[("session.memory_max_gb".into(), Some("-1".into()))])
+            .await
+            .unwrap();
+        assert_eq!(memory_max_gb(&db).await, 0);
+    }
+
+    #[test]
+    fn memory_prelude_saturates_an_absurd_limit_instead_of_wrapping() {
+        let prelude = memory_prelude("s", u64::MAX / 2);
+        assert!(prelude.contains(&format!("echo {} > ", u64::MAX)));
     }
 }
