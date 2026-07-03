@@ -14,18 +14,70 @@
 
 use anyhow::Result;
 
+use crate::db::Db;
+
 /// Whether a session with this name has a live supervisor.
 pub async fn has_session(name: &str) -> bool {
     tapestry::Client::is_alive(name).await
 }
 
-/// Create a detached session running `script` via `sh -c` in `cwd`.
-pub async fn new_session(name: &str, cwd: &std::path::Path, script: &str) -> Result<()> {
-    tracing::info!(session = %name, cwd = %cwd.display(), "spawning terminal session");
+/// The delegated cgroup-v2 subtree sessions confine themselves under. Created
+/// and chowned to the loom user at container boot by `loom-cgroup-init` (see
+/// the Dockerfile); absent (the normal case outside the standalone deploy)
+/// the [`memory_prelude`] guard makes the confinement a no-op.
+const AGENT_CGROUP_DIR: &str = "/sys/fs/cgroup/agents";
+
+/// The per-session memory ceiling in GiB, from the `session.memory_max_gb`
+/// setting. 0 = unlimited.
+pub async fn memory_max_gb(db: &Db) -> u64 {
+    let default = weaver_core::config::DEFAULT_SESSION_MEMORY_MAX_GB;
+    weaver_core::config::get_or(db, "session.memory_max_gb", &default.to_string())
+        .await
+        .trim()
+        .parse()
+        .unwrap_or(default as u64)
+}
+
+/// Shell prelude that moves the session into its own memory-limited cgroup
+/// before the launch script proper runs — every process the session spawns
+/// inherits it, so a runaway agent OOMs alone inside its cgroup instead of
+/// taking the host down. Runs only where [`AGENT_CGROUP_DIR`] is writable (the
+/// delegated subtree the standalone deploy prepares at boot); elsewhere the
+/// guard falls through silently. A *failed* confinement attempt, by contrast,
+/// warns into the session terminal so an unlimited session is visible.
+fn memory_prelude(name: &str, memory_max_gb: u64) -> String {
+    let dir = format!("{AGENT_CGROUP_DIR}/{name}");
+    let bytes = memory_max_gb * 1024 * 1024 * 1024;
+    // memory.swap.max is zeroed so the ceiling can't leak into swap on a host
+    // that has any, but best-effort: the file is missing on kernels without
+    // swap accounting, and the RAM cap alone is still worth keeping.
+    format!(
+        "if [ -w {AGENT_CGROUP_DIR} ]; then \
+if mkdir -p '{dir}' 2>/dev/null && echo {bytes} > '{dir}/memory.max' 2>/dev/null \
+&& echo $$ > '{dir}/cgroup.procs' 2>/dev/null; then \
+echo 0 > '{dir}/memory.swap.max' 2>/dev/null || true; else \
+echo 'loom: warning: could not apply the {memory_max_gb}g session memory limit' >&2; fi; fi\n"
+    )
+}
+
+/// Create a detached session running `script` via `sh -c` in `cwd`. A non-zero
+/// `memory_max_gb` prepends the [`memory_prelude`] confining the session to
+/// that many GiB.
+pub async fn new_session(
+    name: &str,
+    cwd: &std::path::Path,
+    script: &str,
+    memory_max_gb: u64,
+) -> Result<()> {
+    tracing::info!(session = %name, cwd = %cwd.display(), memory_max_gb, "spawning terminal session");
+    let script = match memory_max_gb {
+        0 => script.to_string(),
+        gb => format!("{}{}", memory_prelude(name, gb), script),
+    };
     let result = tapestry::spawn_detached(&tapestry::LaunchOptions {
         name,
         cwd,
-        script,
+        script: &script,
         // The launch script already bakes the agent env in as `export`
         // statements (see agent::launch_script).
         env: &[],
@@ -113,5 +165,44 @@ fn key_bytes(key: &str) -> &[u8] {
         "Space" => b" ",
         "BSpace" => b"\x7f",
         other => other.as_bytes(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_prelude_confines_the_session_to_its_named_cgroup() {
+        let prelude = memory_prelude("weaver-abc123", 8);
+        // Guarded on the delegated subtree, so it no-ops where none exists.
+        assert!(prelude.starts_with("if [ -w /sys/fs/cgroup/agents ]; then "));
+        // The limit lands in this session's own cgroup, in bytes.
+        assert!(prelude.contains("mkdir -p '/sys/fs/cgroup/agents/weaver-abc123'"));
+        assert!(
+            prelude.contains("echo 8589934592 > '/sys/fs/cgroup/agents/weaver-abc123/memory.max'")
+        );
+        // The shell moves itself in, so everything it spawns inherits the cap.
+        assert!(prelude.contains("echo $$ > '/sys/fs/cgroup/agents/weaver-abc123/cgroup.procs'"));
+        // The cap can't leak into swap (best-effort — see memory_prelude).
+        assert!(prelude.contains("echo 0 > '/sys/fs/cgroup/agents/weaver-abc123/memory.swap.max'"));
+        // A failed attempt is loud in the session terminal.
+        assert!(prelude.contains("could not apply the 8g session memory limit"));
+        // Newline-terminated so the launch script proper starts on its own line.
+        assert!(prelude.ends_with("fi\n"));
+    }
+
+    #[tokio::test]
+    async fn memory_max_gb_reads_the_setting_and_defaults_to_8() {
+        let db = weaver_core::db::connect_in_memory().await.unwrap();
+        assert_eq!(memory_max_gb(&db).await, 8);
+        weaver_core::config::apply(&db, &[("session.memory_max_gb".into(), Some("12".into()))])
+            .await
+            .unwrap();
+        assert_eq!(memory_max_gb(&db).await, 12);
+        weaver_core::config::apply(&db, &[("session.memory_max_gb".into(), Some("0".into()))])
+            .await
+            .unwrap();
+        assert_eq!(memory_max_gb(&db).await, 0);
     }
 }

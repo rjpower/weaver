@@ -51,6 +51,11 @@ pub const DEFAULT_COOKIE_SECURE: bool = false;
 /// killed and the session is left in a visible error state. 600s mirrors the
 /// watch/lint-review precedent.
 pub const DEFAULT_SETUP_TIMEOUT_SECS: i64 = 600;
+/// Memory ceiling (GiB) applied to each terminal session via a per-session
+/// cgroup, where the runtime provides a delegated subtree (see
+/// `backend::new_session` in the `loom` crate). One runaway agent process then
+/// OOMs alone instead of taking the whole host down. 0 disables the limit.
+pub const DEFAULT_SESSION_MEMORY_MAX_GB: i64 = 8;
 
 // ---------------------------------------------------------------------------
 // Setting registry
@@ -369,6 +374,22 @@ pub const REGISTRY: &[SettingSpec] = &[
             arbitrary code from an unknown repo.",
         kind: SettingKind::Int,
         default: "600",
+        group: "Sessions",
+        options: &[],
+    },
+    SettingSpec {
+        key: "session.memory_max_gb",
+        label: "Session memory limit (GiB)",
+        description: "Memory ceiling for each terminal session — the agent and \
+            everything it spawns — enforced through a per-session cgroup. When a \
+            session crosses it, the kernel OOM-kills the biggest process inside \
+            that session only; the host and the other sessions are untouched. \
+            Applies where loom runs with a delegated cgroup subtree (the \
+            standalone Docker deploy prepares one at boot); elsewhere sessions \
+            run unlimited. 0 disables the limit. Takes effect for sessions \
+            launched after the change.",
+        kind: SettingKind::Int,
+        default: "8",
         group: "Sessions",
         options: &[],
     },

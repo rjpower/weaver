@@ -152,6 +152,16 @@ database included). This is deliberate for a single-tenant host running the
 owner's own agents; do not carry it into a deploy that runs code you do not
 trust.
 
+The `loom` container also runs with `SYS_ADMIN` and an unconfined AppArmor
+profile. These exist for one purpose: at boot, `loom-cgroup-init` (root-only,
+via a single sudoers line) remounts the container's own cgroup-v2 tree
+read-write and delegates an `agents/` subtree to the app user, which is what
+lets loom confine **each session to its own memory cgroup** (the
+`session.memory_max_gb` setting, default 8 GiB). A runaway agent process is
+then OOM-killed inside its session instead of stalling the whole VM. Next to
+the docker.sock mount these grants add no real capability on this box; remove
+them and loom still runs, with sessions simply unlimited.
+
 Background on these knobs is in the repo
 [README "Authentication"](../README.md#authentication) and
 [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md). To change one after the fact:
