@@ -28,6 +28,10 @@ const scratchFiles = ref<File[]>([]);
 const agents = ref<AgentMetadata[]>([]);
 const cloningRepo = ref(false);
 
+// Show the platform's submit modifier (⌘ on macOS, Ctrl elsewhere). Both are
+// wired up on the form; this is only the label.
+const metaKeyLabel = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl';
+
 const selectedAgent = computed<AgentMetadata | undefined>(() => {
   const selected = agent.value || agents.value[0]?.kind || '';
   return agents.value.find((a) => a.kind === selected);
@@ -257,6 +261,8 @@ loadAgents();
     autocomplete="off"
     data-testid="new-session-drawer"
     @submit.prevent="create"
+    @keydown.enter.meta.prevent="create"
+    @keydown.enter.ctrl.prevent="create"
   >
     <div class="border-b border-line px-4 py-3">
       <h2 class="text-sm font-semibold text-fg">New session</h2>
@@ -499,6 +505,11 @@ loadAgents();
       >
         Cancel
       </button>
+      <!-- Keyboard affordance: submit from anywhere in the form (the goal
+           textarea swallows a plain Enter) without reaching for the mouse. -->
+      <span class="ml-auto text-2xs text-faint">
+        <kbd class="font-mono">{{ metaKeyLabel }}</kbd> + <kbd class="font-mono">Enter</kbd> to create
+      </span>
     </div>
   </form>
 </template>

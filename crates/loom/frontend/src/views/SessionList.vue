@@ -176,7 +176,19 @@ const treeRows = computed<TreeRow[]>(() => {
 const error = ref('');
 const MISSING_GITHUB_TOKEN_ERROR = 'No GitHub token configured.';
 const tokenConfigWarning = computed(() => error.value.startsWith(MISSING_GITHUB_TOKEN_ERROR));
-const showForm = ref(false);
+
+// The New Session drawer is reflected in the URL (`/?new`), like the attention
+// filter above — so it's deep-linkable, the back button closes it, and the tab
+// title (composed in App.vue) can read "Weaver - New Session" while it's open.
+const showForm = computed(() => route.query.new !== undefined);
+function openForm() {
+  router.replace({ query: { ...route.query, new: null } });
+}
+function closeForm() {
+  const query = { ...route.query };
+  delete query.new;
+  router.replace({ query });
+}
 
 // A quiet pill's × clears that tag, then refreshes the row. The tag write
 // surface is the same DELETE the detail page uses.
@@ -259,7 +271,7 @@ async function handleCreated() {
           'ml-auto px-2.5 py-1 text-xs font-medium',
           showForm ? 'btn-secondary' : 'btn-primary',
         ]"
-        @click="showForm = !showForm"
+        @click="showForm ? closeForm() : openForm()"
       >
         {{ showForm ? 'Cancel' : 'New session' }}
       </button>
@@ -268,7 +280,7 @@ async function handleCreated() {
 
     <NewSessionDrawer
       v-if="showForm"
-      @close="showForm = false"
+      @close="closeForm"
       @created="handleCreated"
     />
 
@@ -319,10 +331,9 @@ async function handleCreated() {
         :data-session-id="s.id"
         :data-depth="depth"
         :class="[
-          'group flex cursor-pointer items-start gap-2.5 border-b border-line px-3 py-2 last:border-0',
+          'group relative flex cursor-pointer items-start gap-2.5 border-b border-line px-3 py-2 last:border-0',
           'min-h-11 transition-colors hover:bg-subtle',
         ]"
-        @click="$router.push(`/s/${s.id}`)"
       >
         <!-- Tree gutter: threads a child session under the one that launched it.
              Drawn only for nested rows, so a flat fleet is visually unchanged. -->
@@ -347,10 +358,13 @@ async function handleCreated() {
         <!-- Title + current-state (the work, in prose). -->
         <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-2">
+            <!-- Stretched link: the whole row is this anchor (see .stretched-link),
+                 so right-click → "open in new tab", middle-click, and ⌘/Ctrl-click
+                 all work. Interactive siblings below carry `relative z-10` to stay
+                 clickable above the overlay. -->
             <router-link
               :to="`/s/${s.id}`"
-              class="truncate text-sm font-semibold text-fg hover:text-accent"
-              @click.stop
+              class="stretched-link truncate text-sm font-semibold text-fg hover:text-accent"
             >
               {{ s.branch.title || s.branch.name }}
             </router-link>
@@ -360,6 +374,7 @@ async function handleCreated() {
             <SignalChip
               v-for="chip in signalChips(s)"
               :key="chip.key"
+              class="relative z-10"
               :chip="chip"
               :busy="clearingTag === `${s.id}:${chip.key}`"
               @clear="(key) => clearTag(s.id, key)"
@@ -375,6 +390,7 @@ async function handleCreated() {
             <TagPill
               v-for="t in quietTags(s)"
               :key="t.key"
+              class="relative z-10"
               :tag="t"
               :busy="clearingTag === `${s.id}:${t.key}`"
               @clear="(key) => clearTag(s.id, key)"
@@ -412,11 +428,11 @@ async function handleCreated() {
             by <span class="font-mono">{{ s.created_by }}</span>
           </span>
           <!-- PR snapshot (if any) — a quiet link straight to the GitHub PR. -->
-          <GithubStatus v-if="s.branch.github" :gh="s.branch.github" compact class="mt-0.5 justify-end" />
+          <GithubStatus v-if="s.branch.github" :gh="s.branch.github" compact class="relative z-10 mt-0.5 justify-end" />
           <router-link
             v-if="s.branch.open_issue_count"
             :to="`/s/${s.id}?tab=overview`"
-            class="block font-mono text-2xs text-muted hover:text-accent"
+            class="relative z-10 block font-mono text-2xs text-muted hover:text-accent"
             @click.stop
           >
             {{ s.branch.open_issue_count }} open issue{{ s.branch.open_issue_count === 1 ? '' : 's' }}

@@ -209,6 +209,19 @@ body {
   }
 }
 
+/* Stretched link: turns a nested anchor into the click target for its whole
+   positioned container, so a rich row (chips, sub-links, prose) is still one
+   real link — right-click "open in new tab", middle-click, and ⌘/Ctrl-click all
+   work natively. Put `relative` on the container and `stretched-link` on the
+   anchor; genuinely-interactive descendants opt back out with `relative z-10`.
+   (The Bootstrap idiom.) */
+.stretched-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
 /* Reusable presentation primitives. Token-only, so they're auto light/dark
    correct. Both pages use these instead of re-typing the class run. */
 

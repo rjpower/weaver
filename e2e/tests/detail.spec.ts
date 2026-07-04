@@ -34,14 +34,15 @@ test.describe('session detail view', () => {
     await page.goto(`${weaver.baseUrl}/s/${s.id}`);
 
     // The tab title tracks the open session (its title, falling back to the
-    // branch name) so several loom tabs are tellable apart. It's derived from
-    // the shared fleet snapshot, which the deep link fills a beat after landing,
-    // so toHaveTitle auto-retries until the row arrives.
-    await expect(page).toHaveTitle('tab-task · weaver');
+    // branch name) so several loom tabs are tellable apart, composed centrally
+    // as "Weaver - <Section>". It's derived from the shared fleet snapshot, which
+    // the deep link fills a beat after landing, so toHaveTitle auto-retries until
+    // the row arrives.
+    await expect(page).toHaveTitle('Weaver - tab-task');
 
-    // Leaving the session for the fleet list drops back to the bare app name.
+    // Leaving the session for the fleet list moves to the list's own section.
     await page.goto(`${weaver.baseUrl}/`);
-    await expect(page).toHaveTitle('weaver');
+    await expect(page).toHaveTitle('Weaver - Sessions');
   });
 
   test('clearing the attention chip marks the agent’s attention calm', async ({ page, weaver }) => {
