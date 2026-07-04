@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- weaver: a spool of thread on the brand blue -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#2f6fed"/>
+  <!-- spool core (behind the wound thread) -->
+  <rect x="24" y="16" width="16" height="32" rx="3" fill="#ffffff"/>
+  <!-- wound thread -->
+  <g stroke="#ffb020" stroke-width="3.2" stroke-linecap="round">
+    <line x1="24" y1="19"   x2="40" y2="19"/>
+    <line x1="24" y1="23.5" x2="40" y2="23.5"/>
+    <line x1="24" y1="28"   x2="40" y2="28"/>
+    <line x1="24" y1="32.5" x2="40" y2="32.5"/>
+    <line x1="24" y1="37"   x2="40" y2="37"/>
+    <line x1="24" y1="41.5" x2="40" y2="41.5"/>
+  </g>
+  <!-- flanges (top & bottom), capping the thread ends -->
+  <rect x="14" y="12" width="36" height="7" rx="3" fill="#ffffff"/>
+  <rect x="14" y="45" width="36" height="7" rx="3" fill="#ffffff"/>
+  <!-- loose thread tail -->
+  <polyline points="40,48 46,50 48,45 44,42" fill="none"
+    stroke="#ffb020" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

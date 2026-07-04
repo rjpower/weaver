@@ -1,5 +1,5 @@
 const path = require('path');
-const { HtmlRspackPlugin } = require('@rspack/core');
+const { HtmlRspackPlugin, CopyRspackPlugin } = require('@rspack/core');
 const { VueLoaderPlugin } = require('rspack-vue-loader');
 
 // One config, two modes. `npm run build` (rspack build --mode production) emits
@@ -32,6 +32,16 @@ module.exports = (_env, argv) => {
     plugins: [
       new VueLoaderPlugin(),
       new HtmlRspackPlugin({ template: './src/index.html', filename: 'index.html' }),
+      // The app icons are static assets referenced by absolute path in the HTML
+      // head (not imported modules), so copy them verbatim into the dist root
+      // where the loom server serves them alongside index.html.
+      new CopyRspackPlugin({
+        patterns: [
+          { from: 'src/favicon.svg' },
+          { from: 'src/favicon-32.png' },
+          { from: 'src/apple-touch-icon.png' },
+        ],
+      }),
     ],
     module: {
       rules: [

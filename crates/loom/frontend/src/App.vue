@@ -25,21 +25,27 @@ const authed = computed(() => me.authenticated);
 const { startFleetPoll, stopFleetPoll, sessionById } = useFleet();
 watch(authed, (ok) => (ok ? startFleetPoll() : stopFleetPoll()), { immediate: true });
 
-// The browser tab title tracks what you're looking at: on a session page it's
-// the session's title (falling back to its branch name), so several open loom
-// tabs are tellable apart at a glance; everywhere else it's the bare app name.
-// Derived from the shared fleet snapshot — the same source the page header reads
-// — so a rename reflects here on the next poll, and a deep link shows the base
-// title only until that row arrives (no wrong-name flash, just a late refine).
+// The browser tab title tracks what you're looking at, composed here in one
+// place so every route reads "Weaver - <Section>" consistently and several open
+// loom tabs are tellable apart at a glance. The section comes from (in priority
+// order): the live session name on a `/s/:id` page (falling back to its branch
+// name), the New Session drawer when it's open on the fleet list, else the
+// route's declared `meta.title`. The session name is read from the shared fleet
+// snapshot — the same source the page header uses — so a rename reflects on the
+// next poll and a deep link shows the base title only until that row arrives (no
+// wrong-name flash, just a late refine).
 const route = useRoute();
-const BASE_TITLE = 'weaver';
+const BASE_TITLE = 'Weaver';
+function withSection(section?: string | null): string {
+  return section ? `${BASE_TITLE} - ${section}` : BASE_TITLE;
+}
 const docTitle = computed(() => {
   const id = route.params.id;
   if (typeof id === 'string' && route.path.startsWith(`/s/${id}`)) {
-    const name = sessionById(id)?.branch.title || sessionById(id)?.branch.name;
-    if (name) return `${name} · ${BASE_TITLE}`;
+    return withSection(sessionById(id)?.branch.title || sessionById(id)?.branch.name);
   }
-  return BASE_TITLE;
+  if (route.path === '/' && route.query.new !== undefined) return withSection('New Session');
+  return withSection(route.meta.title as string | undefined);
 });
 watch(docTitle, (t) => (document.title = t), { immediate: true });
 

@@ -23,9 +23,12 @@ import './styles.css';
 
 const router = createRouter({
   history: createWebHistory(),
+  // `meta.title` is the tab-title section for a route ("Weaver - <title>",
+  // composed centrally in App.vue). The `/s/:id…` pages intentionally carry none
+  // — their section is the live session name, resolved from the fleet snapshot.
   routes: [
-    { path: '/login', component: Login, meta: { public: true } },
-    { path: '/', component: SessionList },
+    { path: '/login', component: Login, meta: { public: true, title: 'Login' } },
+    { path: '/', component: SessionList, meta: { title: 'Sessions' } },
     { path: '/s/:id', component: SessionDetail, props: true },
     // The old Files browser is gone — the embedded editor (a side panel on the
     // detail page) is the file surface now. Redirect stale links there.
@@ -35,12 +38,12 @@ const router = createRouter({
     // the same SessionDetail instance and stay deep-linkable.
     { path: '/s/:id/artifacts', component: SessionDetail, props: true },
     { path: '/s/:id/artifacts/:name', component: SessionDetail, props: true },
-    { path: '/issues', component: Issues },
-    { path: '/chat', component: Chat },
-    { path: '/watches', component: Watches },
-    { path: '/watches/:id', component: Watches, props: true },
-    { path: '/shell', component: Shell },
-    { path: '/settings', component: Settings },
+    { path: '/issues', component: Issues, meta: { title: 'Issues' } },
+    { path: '/chat', component: Chat, meta: { title: 'Chat' } },
+    { path: '/watches', component: Watches, meta: { title: 'Watches' } },
+    { path: '/watches/:id', component: Watches, props: true, meta: { title: 'Watches' } },
+    { path: '/shell', component: Shell, meta: { title: 'Shell' } },
+    { path: '/settings', component: Settings, meta: { title: 'Settings' } },
   ],
 });
 
