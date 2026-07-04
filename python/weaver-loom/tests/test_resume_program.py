@@ -125,6 +125,25 @@ def test_calm_session_is_never_nudged(capsys, monkeypatch):
     assert result["outcome"] == "noop"
 
 
+def test_bare_mention_of_overloaded_is_not_a_stall(capsys, monkeypatch):
+    # A screen that merely contains the ordinary English word "overloaded" (in
+    # the agent's own prose, a code comment, ...) is not the API-error banner
+    # and must never be mistaken for one.
+    prose = "  I split the overloaded handler into two smaller functions\n> "
+    client = StubClient(capabilities=["nudge"], sessions=[sess("s")], screens={"s": prose})
+    result = run_main(client, capsys, monkeypatch, now=1000, trigger={})
+    assert nudges(client) == []
+    assert result["outcome"] == "noop"
+
+
+def test_rate_limit_429_is_also_treated_as_a_stall(capsys, monkeypatch):
+    screen = "  thinking...\n● API Error: 429 Too Many Requests\n> "
+    client = StubClient(capabilities=["nudge"], sessions=[sess("s")], screens={"s": screen})
+    result = run_main(client, capsys, monkeypatch, now=1000, trigger={})
+    assert nudges(client) == [("nudge", "s", "continue", "resume")]
+    assert result["outcome"] == "ok"
+
+
 def test_pattern_and_nudge_text_are_configurable(capsys, monkeypatch):
     client = StubClient(
         capabilities=["nudge"],

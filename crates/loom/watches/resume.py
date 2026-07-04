@@ -35,10 +35,13 @@ from weaver_loom import Round
 #: (stale). The watch also re-triggers itself via wake_in for backoff rechecks.
 TRIGGERS = {"on": ["session.idle", "session.stale"]}
 
-#: The transient-error signature, overridable via params.pattern. Matches the
-#: Claude overload line (`API Error: 529 Overloaded`) and the bare word
-#: `Overloaded`; the `5\d\d` form also catches sibling 5xx API errors.
-DEFAULT_PATTERN = r"(?i)(api error:\s*5\d\d|overloaded)"
+#: The transient-error signature, overridable via params.pattern. Requires the
+#: `API Error: <code>` banner Claude Code itself prints — a bare `overloaded`
+#: (with no code) matched any mention of that ordinary English word anywhere
+#: on screen, including in the agent's own prose, and nudged sessions that
+#: were never actually stalled. `429` catches rate limiting, `5\d\d` sibling
+#: server errors (529 overloaded, 500, 503, ...).
+DEFAULT_PATTERN = r"(?i)api error:\s*(429|5\d\d)\b"
 
 #: What to type to resume; the conversation is intact, so "continue" is enough.
 DEFAULT_NUDGE = "continue"
