@@ -36,6 +36,16 @@ pub const DEFAULT_GITHUB_TRIGGER_PHRASE: &str = "@loom";
 /// The palette the browser terminal (xterm.js) renders with. `dark` keeps the
 /// classic black background; `light` swaps in a light, readable palette.
 pub const DEFAULT_TERMINAL_THEME: &str = "dark";
+/// The typeface the browser terminal renders with. A token, not a raw font
+/// stack: the frontend maps it to a concrete `font-family` (`plex` → the
+/// bundled IBM Plex Mono, `jetbrains` → the bundled JetBrains Mono, `system` →
+/// the platform monospace stack). Keeping it a token keeps the stored value
+/// stable and the CSS the frontend's concern.
+pub const DEFAULT_TERMINAL_FONT: &str = "plex";
+/// Point size the browser terminal renders at. The frontend clamps the applied
+/// value to a legible range (8–24) so a stray edit can't make the terminal
+/// unusable.
+pub const DEFAULT_TERMINAL_FONT_SIZE: i64 = 13;
 /// Whether requests from the loopback interface are trusted as the machine owner
 /// without a token or login. On by default: it keeps the local CLI, the agent,
 /// and watch scripts working with no configuration. Turn it off behind a
@@ -265,6 +275,29 @@ pub const REGISTRY: &[SettingSpec] = &[
         default: DEFAULT_TERMINAL_THEME,
         group: "Appearance",
         options: &["dark", "light"],
+    },
+    SettingSpec {
+        key: "terminal.font",
+        label: "Terminal font",
+        description: "Typeface for the in-browser terminal. `plex` is the \
+            bundled IBM Plex Mono; `jetbrains` is the bundled JetBrains Mono; \
+            `system` uses the platform's own monospace font. Takes effect the \
+            next time a terminal is opened.",
+        kind: SettingKind::Enum,
+        default: DEFAULT_TERMINAL_FONT,
+        group: "Appearance",
+        options: &["plex", "jetbrains", "system"],
+    },
+    SettingSpec {
+        key: "terminal.font_size",
+        label: "Terminal font size",
+        description: "Point size for the in-browser terminal. Clamped to a \
+            legible 8–24 range when applied. Takes effect the next time a \
+            terminal is opened.",
+        kind: SettingKind::Int,
+        default: "13",
+        group: "Appearance",
+        options: &[],
     },
     SettingSpec {
         key: "watch.enabled",
@@ -652,6 +685,19 @@ mod tests {
         assert_eq!(json["options"], serde_json::json!(["dark", "light"]));
         assert_eq!(json["value"], "dark");
         assert_eq!(json["is_default"], true);
+    }
+
+    #[test]
+    fn terminal_appearance_settings_validate() {
+        // Font is an enum: only the three declared tokens pass.
+        assert!(validate("terminal.font", "plex").is_ok());
+        assert!(validate("terminal.font", "jetbrains").is_ok());
+        assert!(validate("terminal.font", "system").is_ok());
+        assert!(validate("terminal.font", "comic-sans").is_err());
+        // Font size is an int: numbers pass, prose does not. (Range clamping is
+        // the frontend's job — the registry only guards the kind.)
+        assert!(validate("terminal.font_size", "14").is_ok());
+        assert!(validate("terminal.font_size", "large").is_err());
     }
 
     #[tokio::test]
