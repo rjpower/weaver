@@ -10,6 +10,7 @@ import EnvPanel from '../components/EnvPanel.vue';
 import LogsPanel from '../components/LogsPanel.vue';
 import AgentProfileEditor from '../components/AgentProfileEditor.vue';
 import CustomAgentsPanel from '../components/CustomAgentsPanel.vue';
+import AppearancePanel from '../components/AppearancePanel.vue';
 import SettingFieldRow from '../components/SettingFieldRow.vue';
 
 const route = useRoute();
@@ -81,7 +82,7 @@ const categories: CategoryItem[] = [
     id: 'appearance',
     label: 'Appearance',
     group: 'Appearance',
-    summary: 'Visual preferences for the workbench and terminal.',
+    summary: 'Theme, font, and size for the in-browser terminal, with a live preview.',
   },
   {
     id: 'env',
@@ -435,6 +436,7 @@ onMounted(load);
         <TokensPanel v-else-if="category === 'tokens'" />
         <AccountPanel v-else-if="category === 'account'" />
         <LogsPanel v-else-if="category === 'logs'" />
+        <AppearancePanel v-else-if="category === 'appearance'" />
 
         <div v-else-if="category === 'agents'" class="space-y-4">
           <AgentProfileEditor

@@ -6,6 +6,10 @@ import '@fontsource-variable/ibm-plex-sans/wght-italic.css';
 import '@fontsource/ibm-plex-mono/400.css';
 import '@fontsource/ibm-plex-mono/500.css';
 import '@fontsource/ibm-plex-mono/600.css';
+// A second bundled mono, offered as a terminal typeface in Appearance settings
+// (the platform stack is the third choice, needing no bundled face).
+import '@fontsource/jetbrains-mono/400.css';
+import '@fontsource/jetbrains-mono/500.css';
 import { createApp } from 'vue';
 import { createRouter, createWebHistory } from 'vue-router';
 import App from './App.vue';
