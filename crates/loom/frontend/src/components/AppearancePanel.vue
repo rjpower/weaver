@@ -261,7 +261,7 @@ onUnmounted(() => {
       <div class="grid gap-3 border-t border-line pt-4 md:grid-cols-[10rem_minmax(0,1fr)]">
         <div class="min-w-0">
           <div class="text-sm font-medium">Size</div>
-          <p class="mt-0.5 text-xs text-muted">Point size, {{ MIN_FONT_SIZE }}–{{ MAX_FONT_SIZE }}.</p>
+          <p class="mt-0.5 text-xs text-muted">Pixel size, {{ MIN_FONT_SIZE }}–{{ MAX_FONT_SIZE }}.</p>
         </div>
         <div class="flex flex-wrap items-center gap-2">
           <button
@@ -321,7 +321,7 @@ onUnmounted(() => {
         </button>
         <button
           class="btn-secondary px-3 py-1.5 text-xs disabled:opacity-50"
-          :disabled="busy || allDefault"
+          :disabled="busy || allDefault || !loaded"
           title="Reset theme, font, and size to their defaults"
           @click="resetDefaults"
         >

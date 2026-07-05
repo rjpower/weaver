@@ -9,7 +9,7 @@ test.describe('settings · terminal appearance', () => {
     const preview = page.getByTestId('appearance-preview');
     await expect(preview.locator('.xterm')).toBeVisible();
 
-    // Defaults: dark theme, IBM Plex Mono, 13pt.
+    // Defaults: dark theme, IBM Plex Mono, 13px.
     await expect(page.getByTestId('theme-dark')).toHaveAttribute('aria-pressed', 'true');
     await expect(page.getByTestId('font-plex')).toHaveAttribute('aria-pressed', 'true');
     await expect(page.getByTestId('font-size-input')).toHaveValue('13');

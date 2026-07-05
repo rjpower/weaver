@@ -42,9 +42,9 @@ pub const DEFAULT_TERMINAL_THEME: &str = "dark";
 /// the platform monospace stack). Keeping it a token keeps the stored value
 /// stable and the CSS the frontend's concern.
 pub const DEFAULT_TERMINAL_FONT: &str = "plex";
-/// Point size the browser terminal renders at. The frontend clamps the applied
-/// value to a legible range (8–24) so a stray edit can't make the terminal
-/// unusable.
+/// Pixel size the browser terminal renders at (xterm's `fontSize`, in CSS px).
+/// The frontend clamps the applied value to a legible range (8–24) so a stray
+/// edit can't make the terminal unusable.
 pub const DEFAULT_TERMINAL_FONT_SIZE: i64 = 13;
 /// Whether requests from the loopback interface are trusted as the machine owner
 /// without a token or login. On by default: it keeps the local CLI, the agent,
@@ -291,8 +291,8 @@ pub const REGISTRY: &[SettingSpec] = &[
     SettingSpec {
         key: "terminal.font_size",
         label: "Terminal font size",
-        description: "Point size for the in-browser terminal. Clamped to a \
-            legible 8–24 range when applied. Takes effect the next time a \
+        description: "Pixel size for the in-browser terminal (CSS px). Clamped \
+            to a legible 8–24 range when applied. Takes effect the next time a \
             terminal is opened.",
         kind: SettingKind::Int,
         default: "13",

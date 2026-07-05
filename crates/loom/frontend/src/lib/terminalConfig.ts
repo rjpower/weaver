@@ -72,8 +72,9 @@ export function fontStack(token: string | undefined): string {
   return FONT_STACKS[(token as FontToken) ?? DEFAULT_FONT] ?? FONT_STACKS[DEFAULT_FONT];
 }
 
-// Font size, in points. Clamp what we apply to a legible range so a stray edit
-// (or a stale value) can't render the terminal unusable.
+// Font size, in CSS pixels (xterm's `fontSize`). Clamp what we apply to a
+// legible range so a stray edit (or a stale value) can't render the terminal
+// unusable.
 export const DEFAULT_FONT_SIZE = 13;
 export const MIN_FONT_SIZE = 8;
 export const MAX_FONT_SIZE = 24;
