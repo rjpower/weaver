@@ -264,6 +264,35 @@ async fn non_trigger_comment_is_ignored() {
     assert!(fake.comments.lock().unwrap().is_empty());
 }
 
+/// The trigger is a **mention**, not a prefix: tagging the phrase mid-sentence
+/// launches, while a mention that only appears inside a quote does not. (The
+/// unit tests in `github_trigger` pin the matcher itself; this is the same
+/// distinction through the real handler.)
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mid_comment_mention_triggers_and_a_quoted_one_does_not() {
+    let (ts, fake) = boot().await;
+    let _remotes = prepare_repo(&ts).await;
+
+    // A quote-reply pastes the comment being answered; that is not a new trigger.
+    let quoted = trigger_body("rjpower", 8, "> @loom work on this\n\nagreed — nice one");
+    let resp = post(&ts, "d-quoted", Some(sign(SECRET, &quoted)), &quoted).await;
+    assert_eq!(resp.status(), 200, "a quoted mention is acknowledged");
+    assert_eq!(
+        session_count(&ts).await,
+        0,
+        "no session from a mention that only appears in a quote"
+    );
+    assert!(fake.comments.lock().unwrap().is_empty());
+
+    // ...but tagging it part-way through a comment does launch.
+    let body = trigger_body("rjpower", 8, "nice catch — @loom take it from here please");
+    let resp = post(&ts, "d-midtext", Some(sign(SECRET, &body)), &body).await;
+    assert_eq!(resp.status(), 200);
+    wait_for_sessions(&ts, 1).await;
+    wait_for_comments(&fake, 1).await;
+}
+
 /// A commenter who is not an approved loom user launches nothing — but instead of
 /// a silent drop, loom replies once with a friendly "request access" note so they
 /// know how to proceed. (Repo write access is not itself a grant — only the

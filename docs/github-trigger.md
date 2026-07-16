@@ -25,9 +25,15 @@ receiver, in order:
    no-op, so a repeat never launches a second session.
 3. **Filters** to `issue_comment` / `action == created`. Edits, deletions, other
    events, and the bot's own comments (set `github.bot_login`) are ignored.
-4. **Matches the command.** The comment must *begin* with the trigger phrase
-   (`github.trigger_phrase`, default `@loom`), matched case-insensitively. Fixed
-   prefix only — no free-text.
+4. **Matches the trigger.** The comment must tag the trigger phrase
+   (`github.trigger_phrase`, default `@loom`), matched case-insensitively
+   **anywhere** in the comment's prose — `please @loom rebase this` fires just as
+   `@loom rebase this` does. Two kinds of text don't count as tagging, because
+   they quote or discuss the phrase rather than address the bot with it: quoted
+   lines (`>`), so a quote-reply pasting an earlier `@loom` never re-fires the
+   thread; and code, fenced or inline, so a comment asking whether `` `@loom` ``
+   still works launches nothing. The mention must stand alone — `@loom-bot` and
+   `me@loom.dev` are not `@loom`.
 5. **Authorizes the commenter.** Their GitHub login must be an
    [approved loom user](#who-can-trigger) — the *same* allowlist that gates
    signing in to the app. Repo write access is **not** by itself a grant. An
@@ -146,9 +152,10 @@ launches nothing.
 
 ### Optional settings
 
-- `github.trigger_phrase` — the phrase a comment must begin with (default
-  `@loom`). Matched as a case-insensitive prefix, so `@loom rebase onto main`
-  triggers. Settable in **Settings → GitHub** or
+- `github.trigger_phrase` — the phrase that tags loom (default `@loom`). Matched
+  case-insensitively anywhere in a comment's prose, as a standalone mention
+  ([step 4](#how-it-works)) — both `@loom rebase onto main` and `can you rebase
+  this, @loom?` trigger. Settable in **Settings → GitHub** or
   `weaver config set github.trigger_phrase "…"`.
 - `github.bot_login` (or `LOOM_GITHUB_BOT_LOGIN`) — a GitHub login whose own
   comments are ignored, so a bot account can post without re-triggering itself.
@@ -247,9 +254,11 @@ picks a comment up later, so debugging is one question: *did the delivery arrive
 and which gate did it hit?* Work through it in order:
 
 1. **Was the comment the right shape?** It must be a PR/issue **conversation**
-   comment (an `issue_comment`) that *begins* with the trigger phrase. An inline
-   code-review comment and a review summary are different events loom does not
-   subscribe to, so `@loom` in those never fires.
+   comment (an `issue_comment`) that tags the trigger phrase in its prose — a
+   mention that sits only inside a quote or a code span is ignored by design
+   ([step 4](#how-it-works)). An inline code-review comment and a review summary
+   are different events loom does not subscribe to, so `@loom` in those never
+   fires.
 
 2. **Did GitHub deliver it, and what did loom answer?** The GitHub App's
    **Settings → Advanced → Recent Deliveries** (or the repo/org webhook's) shows
