@@ -239,7 +239,7 @@ pub(super) async fn github_webhook(
         &format!("{}#{number} (@{author})", slug.slug()),
     );
     tokio::spawn(async move {
-        match handle_trigger(st, headers, slug, event, author).await {
+        match handle_trigger(st, headers, slug, event, author, phrase).await {
             Ok(Some(id)) => {
                 crate::tasks::registry().finish(task_id, "done", &format!("session {id}"))
             }
@@ -264,6 +264,7 @@ async fn handle_trigger(
     slug: repo::RepoSlug,
     event: github_trigger::IssueCommentEvent,
     author: String,
+    phrase: String,
 ) -> Result<Option<String>, String> {
     // Honor the App's installation as the repo grant: auto-register any repo the
     // App is installed on into the managed allowlist, so the clone path below
@@ -336,8 +337,15 @@ async fn handle_trigger(
     if let Some(branch) = target_branch.as_deref() {
         if let Ok(Some(b)) = branch_mod::find_by_repo_branch(&st.db, &repo_root_str, branch).await {
             if let Ok(Some(sess)) = session_mod::active_for_branch(&st.db, &b.id).await {
-                if forward_comment_to_session(&sess, &author, is_pr, number, &event.comment.body)
-                    .await
+                if forward_comment_to_session(
+                    &sess,
+                    &author,
+                    is_pr,
+                    number,
+                    &event.comment.body,
+                    &phrase,
+                )
+                .await
                 {
                     crate::events::record(
                         &st.db,
@@ -499,6 +507,7 @@ async fn forward_comment_to_session(
     is_pr: bool,
     number: i64,
     comment: &str,
+    phrase: &str,
 ) -> bool {
     let (thread, cmd) = if is_pr {
         ("PR", "pr")
@@ -506,7 +515,7 @@ async fn forward_comment_to_session(
         ("issue", "issue")
     };
     let note = format!(
-        "New @loom comment from @{author} on {thread} #{number}:\n\n{}\n\n\
+        "New {phrase} comment from @{author} on {thread} #{number}:\n\n{}\n\n\
          (Reply on the thread with `gh {cmd} comment {number} --body \"…\"` if a response is warranted.)",
         comment.trim(),
     );

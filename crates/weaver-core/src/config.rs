@@ -215,11 +215,12 @@ pub const REGISTRY: &[SettingSpec] = &[
     SettingSpec {
         key: "github.trigger_phrase",
         label: "GitHub trigger phrase",
-        description: "The phrase an issue comment must begin with for the GitHub \
-            webhook to launch a session against that repo (default `@loom`). \
-            Matched case-insensitively against the start of the comment; kept a \
-            fixed prefix rather than free-text to limit the abuse surface. The \
-            webhook is only active once `LOOM_GITHUB_WEBHOOK_SECRET` is configured.",
+        description: "The phrase that tags loom into an issue or PR comment and \
+            launches a session against that repo (default `@loom`). Matched \
+            case-insensitively anywhere in the comment, as a standalone mention: \
+            quoted lines and code are ignored, and `@loom-bot` is a different \
+            name. The webhook is only active once `LOOM_GITHUB_WEBHOOK_SECRET` \
+            is configured.",
         kind: SettingKind::String,
         default: DEFAULT_GITHUB_TRIGGER_PHRASE,
         group: "GitHub",

@@ -10,7 +10,8 @@
 //! 2. **Dedupe** on the `X-GitHub-Delivery` GUID ([`record_delivery`]) so a
 //!    replayed or GitHub-retried delivery never launches a second session.
 //! 3. **Filter** to `issue_comment`/`created`, ignoring the bot's own comments.
-//! 4. **Parse** a fixed command prefix ([`is_trigger`]) — no free-text in v1.
+//! 4. **Match** the trigger phrase ([`is_trigger`]) — a standalone mention
+//!    anywhere in the comment's prose, quotes and code excluded.
 //! 5. **Authorize the commenter** ([`authorize`]): a known loom operator, or
 //!    someone with write/admin on the repo (checked via the GitHub API). Anyone
 //!    else is silently ignored; a per-repo rate limit blunts spam.
@@ -52,7 +53,7 @@ pub async fn webhook_secret(db: &Db) -> String {
     env_or_setting(db, "LOOM_GITHUB_WEBHOOK_SECRET", WEBHOOK_SECRET_KEY).await
 }
 
-/// The trigger phrase a comment must begin with, from the
+/// The phrase that tags loom into a comment ([`is_trigger`]), from the
 /// `github.trigger_phrase` setting (default `@loom`).
 pub async fn trigger_phrase(db: &Db) -> String {
     let phrase = config::get_or(
@@ -72,8 +73,13 @@ pub async fn trigger_phrase(db: &Db) -> String {
 
 /// The bot's own GitHub login, whose comments are ignored to prevent a
 /// self-trigger loop. `LOOM_GITHUB_BOT_LOGIN`, else the `github.bot_login`
-/// setting; `None` when unset (the command-prefix filter is the real guard, so
-/// this is defence in depth and optional).
+/// setting; `None` when unset.
+///
+/// Optional, but worth setting: loom's own replies never carry the phrase, and
+/// [`is_trigger`] ignores quoted text, so the common loops are already closed —
+/// but a session that replies on its thread and *mentions* the phrase in prose
+/// would tag itself. [`authorize`] is the backstop (the bot identity is not
+/// normally an approved user); this closes it a step earlier.
 pub async fn bot_login(db: &Db) -> Option<String> {
     let login = env_or_setting(db, "LOOM_GITHUB_BOT_LOGIN", BOT_LOGIN_KEY).await;
     let login = login.trim();
@@ -130,13 +136,130 @@ pub fn verify_signature(secret: &str, body: &[u8], header: Option<&str>) -> bool
 // Command + payload parsing.
 // ---------------------------------------------------------------------------
 
-/// Whether `body` begins with the trigger `phrase`, ignoring leading whitespace
-/// and case. The match is anchored to the **start** so a quote of an earlier
-/// comment, or the phrase buried mid-text, does not trigger.
+/// Whether `body` mentions the trigger `phrase` — matched case-insensitively
+/// **anywhere** in the comment's prose, so `please @loom rebase this` fires just
+/// as `@loom rebase this` does. People tag a bot mid-sentence; anchoring to the
+/// start only taught them the trigger was broken.
+///
+/// *Prose* is the load-bearing word. Two narrow exclusions keep "anywhere" from
+/// meaning "in text that isn't addressing the bot":
+///
+/// - **Quotes** ([`mentionable_text`] drops `>` lines). GitHub's quote-reply
+///   pastes the comment being answered verbatim, so a plain substring match
+///   would re-fire on every round of a thread.
+/// - **Code**, fenced or inline. Talking *about* the trigger — ``the phrase is
+///   `@loom` `` — is not using it.
+///
+/// The mention must also stand alone ([`mentions`]): `@loomer`, `me@loom.dev`,
+/// and `@loom-bot` do not tag `@loom`.
+///
+/// An empty phrase never matches, guarding a misconfigured setting.
 pub fn is_trigger(body: &str, phrase: &str) -> bool {
-    let body = body.trim_start().to_lowercase();
     let phrase = phrase.trim().to_lowercase();
-    !phrase.is_empty() && body.starts_with(&phrase)
+    if phrase.is_empty() {
+        return false;
+    }
+    mentions(&mentionable_text(body).to_lowercase(), &phrase)
+}
+
+/// Whether `text` contains `phrase` bounded by non-word characters on both
+/// sides. Both arguments must already be lowercased.
+///
+/// `-` counts as a word character because a GitHub login is `[A-Za-z0-9-]`:
+/// `@loom-bot` names a *different* account, not `@loom` with punctuation after
+/// it. Ordinary trailing punctuation (`@loom!`) is not a word character, so it
+/// still tags.
+fn mentions(text: &str, phrase: &str) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(phrase) {
+        let start = from + rel;
+        let end = start + phrase.len();
+        if !text[..start].chars().next_back().is_some_and(is_word)
+            && !text[end..].chars().next().is_some_and(is_word)
+        {
+            return true;
+        }
+        // This hit was glued to a word; a later one may still stand alone.
+        from = start + text[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+/// `body` reduced to the text a mention can live in: blockquote lines and code
+/// (fenced or inline) removed. Each removal leaves whitespace behind, so cutting
+/// a span never fuses its neighbours into one word.
+fn mentionable_text(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        match (fence, fence_marker(trimmed)) {
+            // Per CommonMark a block closes only on its own character, at least
+            // as long as the fence that opened it — so a ```` block can hold a
+            // ``` one (and a ``` block a ~~~ one) without ending early.
+            (Some((open, len)), Some((c, run))) if c == open && run >= len => fence = None,
+            (Some(_), _) => {}
+            (None, Some(marker)) => fence = Some(marker),
+            (None, None) if trimmed.starts_with('>') => {}
+            (None, None) => {
+                push_without_inline_code(line, &mut out);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// The character and length of a ```` ``` ````/`~~~` code-fence line (three or
+/// more of either), else `None`.
+fn fence_marker(trimmed: &str) -> Option<(char, usize)> {
+    let mut chars = trimmed.chars();
+    let c = chars.next().filter(|&c| c == '`' || c == '~')?;
+    let run = 1 + chars.take_while(|&x| x == c).count();
+    (run >= 3).then_some((c, run))
+}
+
+/// Append `line` to `out` with its inline-code spans blanked. A span opens on a
+/// run of backticks and closes on the next run of the *same* length, per
+/// CommonMark — so ``` ``@loom`` ``` is code, not a mention. An unclosed run is
+/// literal text: only the backticks go, and the rest of the line stays prose.
+fn push_without_inline_code(line: &str, out: &mut String) {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let run = backtick_run(&chars, i);
+        out.push(' ');
+        i = closing_run(&chars, i + run, run).unwrap_or(i + run);
+    }
+}
+
+/// How many backticks run consecutively from `i`.
+fn backtick_run(chars: &[char], i: usize) -> usize {
+    chars[i..].iter().take_while(|&&c| c == '`').count()
+}
+
+/// The index just past the first run of *exactly* `run` backticks at or after
+/// `from`, or `None` when the span is never closed.
+fn closing_run(chars: &[char], from: usize, run: usize) -> Option<usize> {
+    let mut i = from;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            i += 1;
+            continue;
+        }
+        let r = backtick_run(chars, i);
+        if r == run {
+            return Some(i + r);
+        }
+        i += r;
+    }
+    None
 }
 
 /// The `issue_comment` webhook payload, narrowed to the fields the trigger uses.
@@ -479,17 +602,70 @@ mod tests {
     }
 
     #[test]
-    fn is_trigger_anchors_to_the_start_ignoring_case_and_lead_space() {
-        let phrase = "@loom work on this";
-        assert!(is_trigger("@loom work on this issue please", phrase));
-        assert!(is_trigger("  @LOOM Work On This", phrase));
-        assert!(is_trigger("@loom work on this", phrase));
-        // Not at the start → ignored (e.g. quoting someone else).
-        assert!(!is_trigger("> @loom work on this", phrase));
-        assert!(!is_trigger("please @loom work on this", phrase));
+    fn is_trigger_matches_a_mention_anywhere_ignoring_case() {
+        let phrase = "@loom";
+        assert!(is_trigger("@loom rebase onto main", phrase));
+        assert!(is_trigger("  @LOOM Rebase Onto Main", phrase));
+        // The point of the substring match: people tag mid-sentence.
+        assert!(is_trigger("please @loom rebase this", phrase));
+        assert!(is_trigger("nice catch!\n\ncc @loom", phrase));
+        assert!(is_trigger("**@loom** — over to you", phrase));
         assert!(!is_trigger("just a normal comment", phrase));
         // An empty phrase never matches (guards a misconfigured setting).
         assert!(!is_trigger("anything", ""));
+        // A multi-word phrase behaves the same way.
+        let phrase = "@loom work on this";
+        assert!(is_trigger("ok — @loom work on this, please", phrase));
+        assert!(is_trigger("@loom work on this", phrase));
+        assert!(!is_trigger("@loom work on something else", phrase));
+    }
+
+    #[test]
+    fn is_trigger_ignores_quoted_and_code_text() {
+        let phrase = "@loom";
+        // GitHub's quote-reply pastes the comment being answered — matching it
+        // would re-fire the bot on every round of a thread.
+        assert!(!is_trigger(
+            "> @loom rebase onto main\n\ndone, thanks",
+            phrase
+        ));
+        // Talking *about* the trigger is not using it.
+        assert!(!is_trigger("does `@loom` still work?", phrase));
+        assert!(!is_trigger("does ``@loom`` still work?", phrase));
+        assert!(!is_trigger(
+            "```\n@loom rebase\n```\nthat's the syntax",
+            phrase
+        ));
+        assert!(!is_trigger("~~~\n@loom rebase\n~~~", phrase));
+        // A shorter inner fence doesn't close the block, so this is all code.
+        assert!(!is_trigger("````\n```\n@loom rebase\n```\n````", phrase));
+        // ...but a real mention alongside quoted or code text still fires.
+        assert!(is_trigger(
+            "> an earlier comment\n\n@loom take another pass",
+            phrase
+        ));
+        assert!(is_trigger(
+            "run `git rebase` first, then @loom verify",
+            phrase
+        ));
+        assert!(is_trigger("```\ncode\n```\n\n@loom review this", phrase));
+        // An unclosed backtick is literal text, not an open code span that
+        // swallows the rest of the comment.
+        assert!(is_trigger("weird ` backtick, @loom look", phrase));
+    }
+
+    #[test]
+    fn is_trigger_requires_a_standalone_mention() {
+        let phrase = "@loom";
+        assert!(!is_trigger("ping @loomer about it", phrase));
+        assert!(!is_trigger("mail me@loom.dev", phrase));
+        // A different account, not @loom with a hyphen after it.
+        assert!(!is_trigger("that's @loom-bot's job", phrase));
+        // Ordinary punctuation is not part of the mention.
+        assert!(is_trigger("over to you, @loom!", phrase));
+        assert!(is_trigger("(@loom)", phrase));
+        // A glued hit does not mask a real one later on.
+        assert!(is_trigger("me@loom.dev — and @loom, take a look", phrase));
     }
 
     #[test]
