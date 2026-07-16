@@ -137,9 +137,9 @@ pub fn verify_signature(secret: &str, body: &[u8], header: Option<&str>) -> bool
 // ---------------------------------------------------------------------------
 
 /// Whether `body` mentions the trigger `phrase` — matched case-insensitively
-/// **anywhere** in the comment's prose, so `please @loom rebase this` fires just
-/// as `@loom rebase this` does. People tag a bot mid-sentence; anchoring to the
-/// start only taught them the trigger was broken.
+/// **anywhere** in the comment's prose, because people tag a bot mid-sentence as
+/// readily as they open with it: `please @loom rebase this` tags as surely as
+/// `@loom rebase this`.
 ///
 /// *Prose* is the load-bearing word. Two narrow exclusions keep "anywhere" from
 /// meaning "in text that isn't addressing the bot":
