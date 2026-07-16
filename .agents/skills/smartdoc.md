@@ -22,6 +22,8 @@ hand-rolled data URI. `weaver artifact rm <name>` removes one and its history.
   for an artifact only when there's a document worth reading.
 - A committed design doc is still a normal repo file on a normal PR. weaver just
   isn't its manager.
+- A design that turns on research or a tradeoff goes out for peer review before
+  it is built — the loop is in `weaver readme` ("Designing before you build").
 
 ## The division of labor
 
