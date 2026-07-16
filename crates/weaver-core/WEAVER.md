@@ -177,6 +177,38 @@ has moved on since it was set (its timestamp predates your last activity).
   set `weaver status attention "<the question>"`, then continue with your
   best assumption.
 
+## Designing before you build
+
+When the task turns on research or a tradeoff — an architecture choice, a
+migration strategy, an API contract, a storage model, anything expensive to
+reverse — write the design down and have it reviewed before you build it. Skip
+this for a quick fix, a bug with an obvious cause, a rename, a doc tweak, a
+review comment, an issue reply: no tradeoff, no review, just write the code.
+
+1. Write it as an artifact — `weaver artifact write design <file>`: the
+   reasoning, the alternatives you rejected and why, the open questions. Name it
+   `design`; `plan` means the issue-referencing task list above. Stay `ok` — a
+   draft awaiting review is not something the user needs to look at.
+2. Send it to two reviewers, each checking it against the code. If you are
+   `claude`:
+
+   ```sh
+   ask="Peer-review the design on stdin against this repo. What is wrong, missing,
+   or over-built? Be concrete and blunt — no praise, no summary."
+   weaver artifact show design | codex exec -s read-only "$ask"
+   weaver artifact show design | claude -p --model fable "$ask"
+   ```
+
+   If you are `codex`: one of your own sub-agents, plus `claude -p --model fable`.
+   Run both in the background and in parallel — each takes minutes. If a reviewer
+   isn't on `PATH`, note it and go with one.
+3. Incorporate the findings and rev the artifact. The reviews will be partly
+   wrong; use judgment, not a patch queue. Fix what lands, record what you
+   rejected and why. `weaver artifact write design` appends the revision. Only
+   now surface it: raise `attention` with the URL, and if the session came from a
+   GitHub issue or PR, paste the design on that thread (`gh issue comment <n>` /
+   `gh pr comment <n>`) — a reader there can't open a loopback dashboard URL.
+
 ## Finishing work
 
 You are on a dedicated branch in your own worktree. There is no "merge" button —
