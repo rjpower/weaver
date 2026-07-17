@@ -551,7 +551,7 @@ async fn forward_comment_to_session(
          (Reply on the thread with `gh {cmd} comment {number} --body \"…\"` if a response is warranted.)",
         comment.trim(),
     );
-    if let Err(e) = backend::send_literal(&session.term_session, &note).await {
+    if let Err(e) = backend::paste(&session.term_session, &note).await {
         tracing::warn!(session = %session.id, error = %e, "github webhook: forwarding comment to session failed");
         return false;
     }

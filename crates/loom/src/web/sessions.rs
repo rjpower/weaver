@@ -2086,7 +2086,7 @@ pub(super) async fn send_session(
 ) -> ApiResult<Json<Value>> {
     let (session, branch) = require_session(&st.db, &key).await?;
     require_live_terminal(&session).await?;
-    backend::send_literal(&session.term_session, &req.text)
+    backend::paste(&session.term_session, &req.text)
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if req.submit {

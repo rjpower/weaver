@@ -111,3 +111,69 @@ async fn terminal_websocket_roundtrip() {
 
     client.delete(&format!("/api/sessions/{id}")).await.unwrap();
 }
+
+/// The HTTP `send` endpoint (the composer / webhook-forward path) must actually
+/// submit: it types via a bracketed-paste block and then presses Enter, and the
+/// command has to run. This is the regression guard for the "text lands in the
+/// entry box but never sends" bug — an agent TUI folds a bare trailing Enter into
+/// a raw multi-line burst as one more newline, so the send path frames the text
+/// as a paste (exactly as xterm.js does) to keep the Enter a distinct submit.
+/// Against a real PTY it also proves the paste markers are consumed by readline
+/// rather than corrupting the command.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_send_submits_via_bracketed_paste() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    let session = client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "send test", "cwd": ts.cwd(), "agent": "shell" }),
+        )
+        .await
+        .unwrap();
+    let id = session["id"].as_str().unwrap().to_string();
+
+    // Wait for the shell to be executing (not just echoing) before sending, using
+    // the same arithmetic marker the roundtrip test uses.
+    let mut term = connect_terminal(&ts.addr, &id).await;
+    let mut ready = false;
+    for _ in 0..15 {
+        send_input(&mut term, "echo RDY$((6 * 7))\n").await;
+        if drain_until(&mut term, "RDY42", Duration::from_secs(1))
+            .await
+            .contains("RDY42")
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "shell never came up");
+
+    // Drive the endpoint under test. `submit` defaults to true, so this types the
+    // command as a paste and follows it with Enter. `SEND$((21 * 2))` is the typed
+    // text; `SEND42` appears only in the OUTPUT, so draining for it confirms the
+    // shell executed the line rather than merely echoing the keystrokes.
+    let resp = client
+        .post(
+            &format!("/api/sessions/{id}/send"),
+            json!({ "text": "echo SEND$((21 * 2))" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp["submitted"],
+        json!(true),
+        "send should report a submit"
+    );
+
+    let out = drain_until(&mut term, "SEND42", Duration::from_secs(8)).await;
+    assert!(
+        out.contains("SEND42"),
+        "the paste + Enter never submitted the command; got:\n{out}"
+    );
+
+    term.send(Message::Close(None)).await.ok();
+    client.delete(&format!("/api/sessions/{id}")).await.unwrap();
+}

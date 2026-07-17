@@ -112,6 +112,44 @@ pub async fn send_literal(name: &str, text: &str) -> Result<()> {
     c.send(text.as_bytes()).await
 }
 
+/// Bracketed-paste framing (DECSET 2004), exactly what a terminal emulator emits
+/// around a paste. The markers tell the TUI "this block is content, not
+/// keystrokes", so a following [`send_enter`] is read as a distinct submit.
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Deliver `text` as a single bracketed-paste block, then pair with [`send_enter`]
+/// to submit — the reliable way to hand an agent a multi-line message.
+///
+/// Typing multi-line text verbatim ([`send_literal`]) and following it with a bare
+/// `Enter` does not submit: an agent TUI (Claude Code) treats the burst as a paste
+/// and folds the trailing `\r` into the composer as one more newline, so the whole
+/// message lands in the entry box unsent. Wrapping the text in bracketed-paste
+/// markers is how the interactive terminal avoids this — xterm.js frames every
+/// paste the same way — and the closing marker ends the paste so the subsequent
+/// `Enter` counts as a submit. Newlines are normalized to `\r`, matching xterm.js.
+///
+/// Loom only drives agents that enable bracketed paste; where 2004 mode is off the
+/// markers would land as literal text, so this is not a general typing primitive.
+pub async fn paste(name: &str, text: &str) -> Result<()> {
+    let framed = frame_paste(text);
+    tracing::debug!(session = %name, bytes = framed.len(), "pasting input to terminal");
+    let mut c = tapestry::Client::connect(name).await?;
+    c.send(&framed).await
+}
+
+/// Wrap `text` in bracketed-paste markers, normalizing newlines to `\r` first
+/// (what xterm.js does on paste). Split out from [`paste`] so the framing is
+/// unit-testable without a live terminal.
+fn frame_paste(text: &str) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+    let mut framed = Vec::with_capacity(PASTE_START.len() + normalized.len() + PASTE_END.len());
+    framed.extend_from_slice(PASTE_START);
+    framed.extend_from_slice(normalized.as_bytes());
+    framed.extend_from_slice(PASTE_END);
+    framed
+}
+
 /// Send a single named key (e.g. `Enter`, `Escape`) to the session.
 pub async fn send_key(name: &str, key: &str) -> Result<()> {
     let bytes = key_bytes(key);
@@ -176,6 +214,29 @@ fn key_bytes(key: &str) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_paste_wraps_in_bracketed_markers_and_normalizes_newlines() {
+        let framed = frame_paste("line one\nline two\r\nline three");
+        let s = String::from_utf8(framed).unwrap();
+        // The block is delimited so the TUI reads it as content and the following
+        // Enter as a distinct submit — the whole point of the fix.
+        assert!(
+            s.starts_with("\x1b[200~"),
+            "missing paste-start marker: {s:?}"
+        );
+        assert!(s.ends_with("\x1b[201~"), "missing paste-end marker: {s:?}");
+        // Every newline (both LF and CRLF) collapses to a single CR, matching xterm.js,
+        // and no stray LF survives inside the block.
+        assert_eq!(
+            s, "\x1b[200~line one\rline two\rline three\x1b[201~",
+            "newlines should normalize to a single CR"
+        );
+        assert!(
+            !s.contains('\n'),
+            "no LF should remain inside the paste block"
+        );
+    }
 
     #[test]
     fn memory_prelude_confines_the_session_to_its_named_cgroup() {
