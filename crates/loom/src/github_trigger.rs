@@ -298,6 +298,10 @@ impl IssuePayload {
 
 #[derive(Debug, Deserialize)]
 pub struct CommentPayload {
+    /// The comment's REST id — the handle a reaction acknowledges it by.
+    /// Defaults to 0 (treated as "unknown") if GitHub ever omits it.
+    #[serde(default)]
+    pub id: i64,
     #[serde(default)]
     pub body: String,
     pub user: UserPayload,
@@ -437,6 +441,25 @@ pub trait GithubApi: Send + Sync {
 
     /// Resolve pull request `number` of `repo` (`owner/name`) to its head branch.
     async fn pr_head(&self, repo: &str, number: i64) -> Result<PrHead>;
+
+    /// React to comment `comment_id` of `repo` with `content` (a GitHub
+    /// reaction name, e.g. `"eyes"`). The quiet acknowledgment: visible on the
+    /// comment itself, no thread noise, no notification.
+    async fn react_to_comment(&self, repo: &str, comment_id: i64, content: &str) -> Result<()>;
+
+    /// Fetch the live state of issue-or-PR `number` of `repo` — the minimal
+    /// snapshot `weaver issue show` renders beside the weaver ledger.
+    async fn issue_state(&self, repo: &str, number: i64) -> Result<IssueState>;
+}
+
+/// A thread's live state as GitHub reports it: `open`/`closed`, its title, and
+/// the ISO time of its last touch. Deliberately minimal — an agent that needs
+/// the discussion itself reads it with `gh`.
+#[derive(Debug, Clone)]
+pub struct IssueState {
+    pub state: String,
+    pub title: String,
+    pub updated_at: String,
 }
 
 /// The production [`GithubApi`]: shells out to the `gh` CLI with the ambient
@@ -473,6 +496,27 @@ impl GithubApi for GhCli {
             Err(e) if e.to_string().contains("HTTP 404") => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    async fn react_to_comment(&self, repo: &str, comment_id: i64, content: &str) -> Result<()> {
+        let path = format!("repos/{repo}/issues/comments/{comment_id}/reactions");
+        let field = format!("content={content}");
+        gh_capture(&["api", "-X", "POST", &path, "-f", &field]).await?;
+        tracing::info!(repo, comment = comment_id, content, "reacted to comment");
+        Ok(())
+    }
+
+    async fn issue_state(&self, repo: &str, number: i64) -> Result<IssueState> {
+        // The `issues` route serves PR threads too (state/title/updated_at are
+        // thread-level), so one call covers both kinds of tracking link.
+        let path = format!("repos/{repo}/issues/{number}");
+        let out = gh_capture(&["api", &path]).await?;
+        let v: serde_json::Value = serde_json::from_str(&out).context("parsing issue json")?;
+        Ok(IssueState {
+            state: v["state"].as_str().unwrap_or_default().to_string(),
+            title: v["title"].as_str().unwrap_or_default().to_string(),
+            updated_at: v["updated_at"].as_str().unwrap_or_default().to_string(),
+        })
     }
 
     async fn pr_head(&self, repo: &str, number: i64) -> Result<PrHead> {
@@ -781,6 +825,23 @@ mod tests {
             Ok(PrHead {
                 head_ref: "feature".to_string(),
                 cross_repo: false,
+            })
+        }
+
+        async fn react_to_comment(
+            &self,
+            _repo: &str,
+            _comment_id: i64,
+            _content: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn issue_state(&self, _repo: &str, _number: i64) -> Result<IssueState> {
+            Ok(IssueState {
+                state: "open".to_string(),
+                title: "t".to_string(),
+                updated_at: "2026-07-18T00:00:00Z".to_string(),
             })
         }
     }

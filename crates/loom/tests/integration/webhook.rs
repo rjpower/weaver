@@ -40,6 +40,11 @@ struct FakeGithub {
     /// What `pr_head` returns; a PR-flow test sets this to a branch it created in
     /// the fixture remote. `None` → a plain same-repo head named `feature`.
     pr_head: Mutex<Option<loom::github_trigger::PrHead>>,
+    /// Every `react_to_comment` call as `(repo, comment_id, content)`.
+    reactions: Mutex<Vec<(String, i64, String)>>,
+    /// When set, `react_to_comment` fails — an installation without the
+    /// reactions permission — so a test can watch the ack-comment fallback.
+    fail_reactions: Mutex<bool>,
 }
 
 #[async_trait::async_trait]
@@ -77,6 +82,34 @@ impl loom::github_trigger::GithubApi for FakeGithub {
                 head_ref: "feature".to_string(),
                 cross_repo: false,
             }))
+    }
+
+    async fn react_to_comment(
+        &self,
+        repo: &str,
+        comment_id: i64,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        if *self.fail_reactions.lock().unwrap() {
+            anyhow::bail!("Resource not accessible by integration (HTTP 403)");
+        }
+        self.reactions
+            .lock()
+            .unwrap()
+            .push((repo.to_string(), comment_id, content.to_string()));
+        Ok(())
+    }
+
+    async fn issue_state(
+        &self,
+        _repo: &str,
+        _number: i64,
+    ) -> anyhow::Result<loom::github_trigger::IssueState> {
+        Ok(loom::github_trigger::IssueState {
+            state: "open".to_string(),
+            title: "fixture issue".to_string(),
+            updated_at: "2026-07-18T00:00:00Z".to_string(),
+        })
     }
 }
 
@@ -142,10 +175,16 @@ async fn prepare_repo(ts: &TestServer) -> tempfile::TempDir {
 /// The raw JSON body of an `issue_comment.created` carrying `comment` from
 /// `login` on issue `number` of `acme/widgets`.
 fn trigger_body(login: &str, number: i64, comment: &str) -> Vec<u8> {
+    trigger_body_with_id(login, number, comment, 1001)
+}
+
+/// Like [`trigger_body`], with an explicit comment id — for tests that follow a
+/// reaction back to the comment it acknowledges.
+fn trigger_body_with_id(login: &str, number: i64, comment: &str, comment_id: i64) -> Vec<u8> {
     json!({
         "action": "created",
         "issue": {"number": number, "title": "Make it faster", "body": "perf please"},
-        "comment": {"body": comment, "user": {"login": login}},
+        "comment": {"id": comment_id, "body": comment, "user": {"login": login}},
         "repository": {"full_name": "acme/widgets"}
     })
     .to_string()
@@ -225,6 +264,18 @@ async fn wait_for_comments(fake: &FakeGithub, n: usize) {
     }
     let have = fake.comments.lock().unwrap().len();
     panic!("expected >= {n} replies, saw {have}");
+}
+
+/// Poll until the fake gateway has recorded at least `n` reactions.
+async fn wait_for_reactions(fake: &FakeGithub, n: usize) {
+    for _ in 0..200 {
+        if fake.reactions.lock().unwrap().len() >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let have = fake.reactions.lock().unwrap().len();
+    panic!("expected >= {n} reactions, saw {have}");
 }
 
 /// A missing signature, and one computed with the wrong secret, are both
@@ -551,7 +602,8 @@ async fn replayed_delivery_is_a_noop() {
 }
 
 /// A second @loom comment on a thread that already has a live session forwards the
-/// comment into that session (an ack, no duplicate) instead of spawning a new one.
+/// comment into that session and acknowledges it with a 👀 reaction on that
+/// comment — no ack comment, no duplicate session. The thread stays quiet.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeat_trigger_forwards_to_active_session() {
@@ -566,13 +618,69 @@ async fn repeat_trigger_forwards_to_active_session() {
         200
     );
     // Wait for the first session to exist *and* its reply to land, so the second
-    // delivery deterministically finds an active session to forward into (and its
-    // ack is the second comment, not a race with the first).
+    // delivery deterministically finds an active session to forward into.
     wait_for_sessions(&ts, 1).await;
     wait_for_comments(&fake, 1).await;
 
     // A second @loom on the same issue (new delivery) is forwarded, not forked.
-    let body2 = trigger_body("rjpower", 42, "@loom also handle the edge case");
+    let body2 = trigger_body_with_id("rjpower", 42, "@loom also handle the edge case", 2002);
+    assert_eq!(
+        post(&ts, "d-second", Some(sign(SECRET, &body2)), &body2)
+            .await
+            .status(),
+        200
+    );
+    wait_for_reactions(&fake, 1).await;
+    assert_eq!(
+        session_count(&ts).await,
+        1,
+        "the repeat trigger spawns no duplicate session"
+    );
+
+    // The forward is acknowledged where it was typed, not with a new comment.
+    let reactions = fake.reactions.lock().unwrap().clone();
+    assert_eq!(
+        reactions,
+        vec![("acme/widgets".to_string(), 2002, "eyes".to_string())],
+        "the triggering comment gets the 👀"
+    );
+    assert_eq!(
+        fake.comments.lock().unwrap().len(),
+        1,
+        "the forward posts no ack comment"
+    );
+
+    let id = ts.client.get("/api/sessions").await.unwrap()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ts.client
+        .delete(&format!("/api/sessions/{id}"))
+        .await
+        .unwrap();
+}
+
+/// When the reaction can't land (an App installation that predates the
+/// reactions permission), the forward falls back to the old ack comment —
+/// feedback that the note reached the session beats staying quiet.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forward_ack_falls_back_to_a_comment_when_the_reaction_fails() {
+    let (ts, fake) = boot().await;
+    let _remotes = prepare_repo(&ts).await;
+
+    let body = trigger_body("rjpower", 42, "@loom start");
+    assert_eq!(
+        post(&ts, "d-first", Some(sign(SECRET, &body)), &body)
+            .await
+            .status(),
+        200
+    );
+    wait_for_sessions(&ts, 1).await;
+    wait_for_comments(&fake, 1).await;
+
+    *fake.fail_reactions.lock().unwrap() = true;
+    let body2 = trigger_body("rjpower", 42, "@loom one more thing");
     assert_eq!(
         post(&ts, "d-second", Some(sign(SECRET, &body2)), &body2)
             .await
@@ -580,17 +688,11 @@ async fn repeat_trigger_forwards_to_active_session() {
         200
     );
     wait_for_comments(&fake, 2).await;
-    assert_eq!(
-        session_count(&ts).await,
-        1,
-        "the repeat trigger spawns no duplicate session"
-    );
 
     let comments = fake.comments.lock().unwrap().clone();
-    assert_eq!(comments.len(), 2, "one ack per trigger");
     assert!(
         comments[1].2.contains("Passed your note"),
-        "the repeat trigger is acked as a forward: {}",
+        "the forward is acked as a comment when the reaction fails: {}",
         comments[1].2
     );
 

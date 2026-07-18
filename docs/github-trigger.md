@@ -53,8 +53,11 @@ receiver, in order:
    duplicate. Otherwise loom creates the session, seeded with the issue/PR title,
    body, and the triggering comment, plus a primer on how to respond — push to the
    PR branch (or open a PR for an issue) and reply on the thread with `gh`.
-8. **Replies** on the thread with the session URL (or, for a forwarded comment,
-   that it was passed to the running session).
+8. **Replies** on the thread with the session URL. A forwarded comment is
+   acknowledged with a 👀 **reaction** on the triggering comment instead — seen,
+   passed along, no ack comment accumulating on an active thread. When the
+   reaction can't land (no comment id in the delivery, or a token that can't
+   react), loom falls back to the ack comment so the feedback isn't lost.
 
 Steps 6–8 (clone, create-or-forward, reply) run in a **detached task**: the
 handler returns `200` as soon as the gates pass. Cloning a large repo can outlast

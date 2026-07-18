@@ -5,6 +5,13 @@ review progress asynchronously through the loom dashboard.
 This document describes how to work *with weaver*. It is distinct from any
 `AGENTS.md` in the repo, which describes the project itself — read that too.
 
+Two CLIs share the loom server, split by subject. **`weaver` manages your
+current state and the work ledger** — status, tags, artifacts, issues, the
+event log — every command implicitly scoped to this branch or its repo.
+**`loom` manages sessions as objects** — launching, inspecting, and driving
+detached sessions, yours or a sub-tree's (see "Launching and tracking
+sub-sessions"). Report yourself with `weaver`; drive sessions with `loom`.
+
 ## The `weaver` CLI
 
 On your `PATH`; every command talks to the loom server, which is already
@@ -52,7 +59,8 @@ watches your progress without reading this terminal:
 ## Launching and tracking sub-sessions
 
 Fan work out into its own detached session — a parallel sub-tree on its own
-branch and worktree — and track it the way someone tracks you:
+branch and worktree — and track it the way someone tracks you. The session
+itself is `loom`'s to manage; the ledger that tracks it stays in `weaver`:
 
 - `loom session launch "<task>"` — spawn a sub-session; prints its branch and
   **tracking issue number**, your handle on the sub-tree. Forks from a

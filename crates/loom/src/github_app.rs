@@ -462,6 +462,76 @@ impl GithubApi for GithubApp {
         Ok(true)
     }
 
+    async fn react_to_comment(&self, repo: &str, comment_id: i64, content: &str) -> Result<()> {
+        if !self.is_configured().await {
+            tracing::debug!(
+                repo,
+                comment_id,
+                "app not configured; reacting via gh fallback"
+            );
+            return self
+                .fallback
+                .react_to_comment(repo, comment_id, content)
+                .await;
+        }
+        let slug = crate::repo::parse_slug(repo).map_err(|e| anyhow!(e))?;
+        let token = self.token_for_repo(&slug.owner, &slug.name).await?;
+        let url = format!(
+            "{}/repos/{}/{}/issues/comments/{comment_id}/reactions",
+            self.api_base, slug.owner, slug.name
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .header(reqwest::header::ACCEPT, GH_ACCEPT)
+            .header("X-GitHub-Api-Version", GH_API_VERSION)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "content": content }))
+            .send()
+            .await
+            .context("reacting to the comment")?;
+        check_status(resp, "reacting to the comment").await?;
+        tracing::info!(repo, comment = comment_id, content, "reacted to comment");
+        Ok(())
+    }
+
+    async fn issue_state(
+        &self,
+        repo: &str,
+        number: i64,
+    ) -> Result<crate::github_trigger::IssueState> {
+        if !self.is_configured().await {
+            tracing::debug!(
+                repo,
+                number,
+                "app not configured; fetching issue state via gh fallback"
+            );
+            return self.fallback.issue_state(repo, number).await;
+        }
+        let slug = crate::repo::parse_slug(repo).map_err(|e| anyhow!(e))?;
+        let token = self.token_for_repo(&slug.owner, &slug.name).await?;
+        let url = format!(
+            "{}/repos/{}/{}/issues/{number}",
+            self.api_base, slug.owner, slug.name
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .header(reqwest::header::ACCEPT, GH_ACCEPT)
+            .header("X-GitHub-Api-Version", GH_API_VERSION)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("fetching the issue")?;
+        let resp = check_status(resp, "fetching the issue").await?;
+        let v: serde_json::Value = resp.json().await.context("parsing issue json")?;
+        Ok(crate::github_trigger::IssueState {
+            state: v["state"].as_str().unwrap_or_default().to_string(),
+            title: v["title"].as_str().unwrap_or_default().to_string(),
+            updated_at: v["updated_at"].as_str().unwrap_or_default().to_string(),
+        })
+    }
+
     async fn pr_head(&self, repo: &str, number: i64) -> Result<PrHead> {
         if !self.is_configured().await {
             tracing::debug!(
@@ -667,6 +737,7 @@ MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBALB1n9OQb2v0gQ0F0G0t0Q0G0t0Q0G0t
         expiry_offset_secs: i64,
         comments: Mutex<Vec<Value>>,
         updates: Mutex<Vec<Value>>,
+        reactions: Mutex<Vec<Value>>,
         last_comment_auth: Mutex<Option<String>>,
     }
 
@@ -677,6 +748,7 @@ MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBALB1n9OQb2v0gQ0F0G0t0Q0G0t0Q0G0t
                 expiry_offset_secs,
                 comments: Mutex::new(Vec::new()),
                 updates: Mutex::new(Vec::new()),
+                reactions: Mutex::new(Vec::new()),
                 last_comment_auth: Mutex::new(None),
             })
         }
@@ -743,6 +815,27 @@ MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBALB1n9OQb2v0gQ0F0G0t0Q0G0t0Q0G0t
         StatusCode::OK
     }
 
+    async fn mock_react(
+        State(s): State<Arc<MockState>>,
+        Path((owner, name, comment_id)): Path<(String, String, i64)>,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        s.reactions.lock().unwrap().push(json!({
+            "repo": format!("{owner}/{name}"),
+            "comment": comment_id,
+            "content": body["content"],
+        }));
+        (StatusCode::CREATED, Json(json!({ "id": 1 })))
+    }
+
+    async fn mock_issue(Path((owner, name, number)): Path<(String, String, i64)>) -> Json<Value> {
+        Json(json!({
+            "state": "closed",
+            "title": format!("issue {number} of {owner}/{name}"),
+            "updated_at": "2026-07-18T12:00:00Z",
+        }))
+    }
+
     /// Spawn the mock GitHub REST server on a random port; returns its base URL.
     async fn spawn_mock(state: Arc<MockState>) -> String {
         let app = Router::new()
@@ -755,9 +848,14 @@ MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBALB1n9OQb2v0gQ0F0G0t0Q0G0t0Q0G0t
                 "/repos/{owner}/{name}/issues/{issue}/comments",
                 post(mock_comments),
             )
+            .route("/repos/{owner}/{name}/issues/{number}", get(mock_issue))
             .route(
                 "/repos/{owner}/{name}/issues/comments/{comment_id}",
                 patch(mock_update_comment),
+            )
+            .route(
+                "/repos/{owner}/{name}/issues/comments/{comment_id}/reactions",
+                post(mock_react),
             )
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -798,6 +896,27 @@ MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBALB1n9OQb2v0gQ0F0G0t0Q0G0t0Q0G0t
             Ok(PrHead {
                 head_ref: "fallback-head".to_string(),
                 cross_repo: false,
+            })
+        }
+
+        async fn react_to_comment(
+            &self,
+            _repo: &str,
+            _comment_id: i64,
+            _content: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn issue_state(
+            &self,
+            _repo: &str,
+            _number: i64,
+        ) -> Result<crate::github_trigger::IssueState> {
+            Ok(crate::github_trigger::IssueState {
+                state: "open".to_string(),
+                title: "fallback".to_string(),
+                updated_at: "2026-07-18T00:00:00Z".to_string(),
             })
         }
     }

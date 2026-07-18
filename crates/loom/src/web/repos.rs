@@ -358,18 +358,37 @@ async fn handle_trigger(
                     )
                     .await
                     .ok();
-                    let base = public_base(&st, &headers).await;
-                    let reply = format!(
-                        "Passed your note to the session already on this thread — {}",
-                        super::session_url(&base, &sess.id)
-                    );
-                    if let Err(e) = st
-                        .trigger
-                        .gh()
-                        .post_issue_comment(&slug.slug(), number, &reply)
-                        .await
-                    {
-                        tracing::warn!(error = %e, repo = %slug.slug(), "github webhook: posting forward-ack failed");
+                    // Acknowledge quietly: a 👀 reaction on the triggering
+                    // comment says "seen, forwarded" right where it was typed,
+                    // without an ack comment per mention piling up on the
+                    // thread. Fall back to the old ack comment if the reaction
+                    // can't land (no comment id, or an App installation that
+                    // predates the reactions permission grant) — feedback that
+                    // the note reached the session matters more than quiet.
+                    let reacted = event.comment.id > 0
+                        && st
+                            .trigger
+                            .gh()
+                            .react_to_comment(&slug.slug(), event.comment.id, "eyes")
+                            .await
+                            .map_err(|e| {
+                                tracing::warn!(error = %e, repo = %slug.slug(), "github webhook: reacting to forwarded comment failed");
+                            })
+                            .is_ok();
+                    if !reacted {
+                        let base = public_base(&st, &headers).await;
+                        let reply = format!(
+                            "Passed your note to the session already on this thread — {}",
+                            super::session_url(&base, &sess.id)
+                        );
+                        if let Err(e) = st
+                            .trigger
+                            .gh()
+                            .post_issue_comment(&slug.slug(), number, &reply)
+                            .await
+                        {
+                            tracing::warn!(error = %e, repo = %slug.slug(), "github webhook: posting forward-ack failed");
+                        }
                     }
                     tracing::info!(session = %sess.id, repo = %slug.slug(), number, "github webhook: forwarded comment to active session");
                     return Ok(None);
