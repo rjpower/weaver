@@ -218,12 +218,17 @@ review comment, an issue reply: no tradeoff, no review, just write the code.
    ask="Peer-review the design on stdin against this repo. What is wrong, missing,
    or over-built? Be concrete and blunt — no praise, no summary."
    weaver artifact show design | codex exec -s read-only "$ask"
-   weaver artifact show design | claude -p --model fable "$ask"
+   weaver artifact show design | env -u WEAVER_BRANCH claude -p --model fable "$ask"
    ```
 
    If you are `codex`: one of your own sub-agents, plus `claude -p --model fable`.
    Run both in the background and in parallel — each takes minutes. If a reviewer
    isn't on `PATH`, note it and go with one.
+
+   The `env -u WEAVER_BRANCH` is load-bearing: a nested `claude -p` reads this
+   worktree's `.claude/settings.local.json` and fires weaver's lifecycle hooks.
+   Carrying `$WEAVER_BRANCH` into it would stamp a spurious `idle` on your branch
+   mid-turn. Strip it from any `claude -p` you launch from inside the worktree.
 3. Incorporate the findings and rev the artifact. The reviews will be partly
    wrong; use judgment, not a patch queue. Fix what lands, record what you
    rejected and why. `weaver artifact write design` appends the revision. Only

@@ -864,6 +864,16 @@ fn apply_launch_gates(root: &mut Value, seed: &GateSeed) -> bool {
 /// subprocess so it runs fresh and isolated (the lint-review precedent).
 /// Mirrors `scripts/lint-review.py`'s `STRIPPED_ENV`. Shared by the one-shot
 /// agent here and the watch script executor.
+///
+/// `WEAVER_BRANCH` is stripped for a subtler reason than the rest. A nested
+/// `claude -p` still reads the worktree's `.claude/settings.local.json` and
+/// fires the weaver lifecycle hooks (`SessionStart`/`Stop`/…) — verified against
+/// a real `claude`; `--settings '{"hooks":{}}'` does *not* suppress them. Left in
+/// the child's env, `$WEAVER_BRANCH` makes each hook write an `idle`/`working`
+/// event attributed to the *parent* branch, mid-turn, corrupting the very signal
+/// the dashboard and `loom session wait` key on. Stripping it makes `weaver hook`
+/// a no-op (it has no branch to key on). These agents are pipe-in/pipe-out — they
+/// never call the `weaver` CLI — so they lose nothing by not carrying it.
 pub const STRIPPED_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "CLAUDECODE",
@@ -871,6 +881,7 @@ pub const STRIPPED_ENV: &[&str] = &[
     "CLAUDE_CODE_EXECPATH",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_CODE_SSE_PORT",
+    "WEAVER_BRANCH",
 ];
 
 /// Spawn a one-shot headless agent: write `prompt` to its stdin, capture
@@ -981,6 +992,17 @@ mod tests {
         // The `"shell"` runtime in the test helper builds the same bare shell.
         let script = launch_script("shell", None, None, LaunchMode::Fresh, "", "");
         assert_eq!(script, "exec \"${SHELL:-/bin/sh}\"");
+    }
+
+    /// A nested headless agent must not carry `$WEAVER_BRANCH`, or it fires the
+    /// worktree's weaver lifecycle hooks against the parent branch (see the
+    /// constant's own docs). Guard the strip so it can't silently regress.
+    #[test]
+    fn stripped_env_drops_the_branch_marker() {
+        assert!(
+            STRIPPED_ENV.contains(&"WEAVER_BRANCH"),
+            "nested agents must not inherit $WEAVER_BRANCH: {STRIPPED_ENV:?}"
+        );
     }
 
     fn custom_agent(name: &str, setup: &str, launch: &str, resume: &str) -> CustomAgent {
