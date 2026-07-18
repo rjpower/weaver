@@ -664,6 +664,38 @@ async fn hook_writes_an_event_row() {
     );
 }
 
+/// A nested, isolated agent (a headless `claude -p` review/lint/one-shot) still
+/// fires the worktree's weaver lifecycle hooks, but the spawner strips
+/// `$WEAVER_BRANCH` so the child cannot impersonate the parent. With no branch to
+/// key on, `weaver hook` must be a silent no-op: exit 0, print nothing, and — the
+/// load-bearing part — write no event that would stamp the parent branch's
+/// lifecycle mid-turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn hook_without_weaver_branch_is_a_silent_no_op() {
+    let env = Env::start().await;
+    let out = std::process::Command::new(weaver_bin())
+        .args(["hook", "--event", "idle"])
+        .env("WEAVER_API", format!("http://{}", env.addr))
+        .env_remove("WEAVER_BRANCH")
+        .env_remove("LOOM_TOKEN")
+        .output()
+        .expect("failed to spawn weaver");
+    assert!(out.status.success(), "the hook must never fail the agent");
+    assert!(
+        out.stdout.is_empty() && out.stderr.is_empty(),
+        "a branchless hook must be silent: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // And it recorded nothing against the seeded branch — the whole point.
+    let log = env.run(&["log"]);
+    assert!(
+        !log.contains("idle") && !log.contains("hook"),
+        "a branchless hook must not write an event: {log}"
+    );
+}
+
 /// `weaver readme` prints the full weaver workflow guide so an agent can pull
 /// the rules back on demand (e.g. after a compaction replayed only the catch-up).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1723,6 +1723,22 @@ fn compact_replay(b: &BranchView, summary: &str) -> String {
 }
 
 async fn cmd_hook(event: String) -> Result<()> {
+    // A nested, isolated agent — a headless `claude -p` review, lint, or one-shot
+    // spawned from inside a session — carries no `$WEAVER_BRANCH` (the spawner
+    // strips it precisely so the child doesn't impersonate the parent). It reads
+    // the worktree's `.claude/settings.local.json` all the same and fires these
+    // lifecycle hooks; with no branch to key on, the hook is intentionally inert.
+    // Return quietly — writing nothing, printing nothing — rather than surfacing
+    // the "not in a loom session" error `branch_key` would raise for a real
+    // command. This is the server-side half of the fix: even a nested agent that
+    // still fires the hook cannot stamp the parent branch's lifecycle.
+    if std::env::var("WEAVER_BRANCH")
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        return Ok(());
+    }
     // Hooks must never break the agent: best-effort, swallow errors.
     let result: Result<()> = (async {
         let client = client();
