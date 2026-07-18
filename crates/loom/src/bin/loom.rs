@@ -2116,11 +2116,27 @@ async fn cmd_launch(a: LaunchArgs) -> Result<()> {
     Ok(())
 }
 
+/// Percent-encode a session key for use as a single URL path segment. Branch-name
+/// keys contain `/` (`weaver/issue-6`), which raw interpolation would leave as a
+/// path separator — the request then misses the `/api/sessions/{id}/...` route
+/// entirely (a 404/405 from the server, not a resolution failure).
+fn enc_key(key: &str) -> String {
+    use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+    const SEG: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'%')
+        .add(b'/')
+        .add(b'?');
+    utf8_percent_encode(key, SEG).to_string()
+}
+
 /// Resolve a session view by key, surfacing a clearer error than a bare 404 when
 /// the key matches no live session.
 async fn fetch_session(client: &Client, key: &str) -> Result<Value> {
     client
-        .get(&format!("/api/sessions/{key}"))
+        .get(&format!("/api/sessions/{}", enc_key(key)))
         .await
         .with_context(|| format!("no live session for '{key}'"))
 }
@@ -2157,7 +2173,7 @@ async fn cmd_session_url(key: Option<String>) -> Result<()> {
     };
     let client = client::default();
     let res: Value = client
-        .get(&format!("/api/sessions/{key}/url"))
+        .get(&format!("/api/sessions/{}/url", enc_key(&key)))
         .await
         .with_context(|| format!("no live session for '{key}'"))?;
     let url = res
@@ -2275,7 +2291,7 @@ async fn cmd_session_send(key: String, message: String, submit: bool) -> Result<
     let client = client::default();
     client
         .post(
-            &format!("/api/sessions/{key}/send"),
+            &format!("/api/sessions/{}/send", enc_key(&key)),
             json!({ "text": message, "submit": submit }),
         )
         .await?;
@@ -2290,7 +2306,10 @@ async fn cmd_session_send(key: String, message: String, submit: bool) -> Result<
 async fn cmd_session_break(key: String) -> Result<()> {
     let client = client::default();
     client
-        .post(&format!("/api/sessions/{key}/interrupt"), json!({}))
+        .post(
+            &format!("/api/sessions/{}/interrupt", enc_key(&key)),
+            json!({}),
+        )
         .await?;
     println!("sent break (Escape) to {key}");
     Ok(())
@@ -2300,7 +2319,10 @@ async fn cmd_session_break(key: String) -> Result<()> {
 async fn cmd_session_preview(key: String, lines: usize) -> Result<()> {
     let client = client::default();
     let res = client
-        .get(&format!("/api/sessions/{key}/preview?lines={lines}"))
+        .get(&format!(
+            "/api/sessions/{}/preview?lines={lines}",
+            enc_key(&key)
+        ))
         .await?;
     print!("{}", str_field(&res, "screen"));
     // The capture is right-trimmed server-side; ensure a clean final newline.
@@ -2395,7 +2417,9 @@ async fn cmd_issues(all: bool, backlog: bool) -> Result<()> {
 
 async fn cmd_show(key: String) -> Result<()> {
     let client = client::default();
-    let ws = client.get(&format!("/api/sessions/{key}")).await?;
+    let ws = client
+        .get(&format!("/api/sessions/{}", enc_key(&key)))
+        .await?;
     print_session(&ws);
     Ok(())
 }
@@ -2410,7 +2434,10 @@ async fn cmd_session_rename(key: String, title: String) -> Result<()> {
     }
     let client = client::default();
     let ws = client
-        .patch(&format!("/api/sessions/{key}"), json!({ "title": title }))
+        .patch(
+            &format!("/api/sessions/{}", enc_key(&key)),
+            json!({ "title": title }),
+        )
         .await?;
     println!(
         "renamed {} → {}",
@@ -2491,7 +2518,9 @@ fn print_session(ws: &Value) {
 async fn cmd_attach(key: String) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let client = client::default();
-    let ws = client.get(&format!("/api/sessions/{key}")).await?;
+    let ws = client
+        .get(&format!("/api/sessions/{}", enc_key(&key)))
+        .await?;
     let session = ws
         .get("term_session")
         .and_then(Value::as_str)
@@ -2515,7 +2544,10 @@ async fn cmd_attach(key: String) -> Result<()> {
 async fn cmd_archive(key: String) -> Result<()> {
     let client = client::default();
     let res = client
-        .post(&format!("/api/sessions/{key}/archive"), json!({}))
+        .post(
+            &format!("/api/sessions/{}/archive", enc_key(&key)),
+            json!({}),
+        )
         .await?;
     println!(
         "archived {} (terminal + worktree removed; branch and history kept)",
@@ -2534,7 +2566,7 @@ async fn cmd_archive(key: String) -> Result<()> {
 async fn cmd_adopt(key: String) -> Result<()> {
     let client = client::default();
     let ws = client
-        .post(&format!("/api/sessions/{key}/adopt"), json!({}))
+        .post(&format!("/api/sessions/{}/adopt", enc_key(&key)), json!({}))
         .await?;
     println!(
         "adopted session {}  ({})",
@@ -2550,7 +2582,10 @@ async fn cmd_adopt(key: String) -> Result<()> {
 async fn cmd_recover(key: String) -> Result<()> {
     let client = client::default();
     let ws = client
-        .post(&format!("/api/sessions/{key}/recover"), json!({}))
+        .post(
+            &format!("/api/sessions/{}/recover", enc_key(&key)),
+            json!({}),
+        )
         .await?;
     println!(
         "recovered session {}  ({})",
@@ -2565,7 +2600,7 @@ async fn cmd_recover(key: String) -> Result<()> {
 
 async fn cmd_rm(key: String, keep_branch: bool) -> Result<()> {
     let client = client::default();
-    let path = format!("/api/sessions/{key}?keep_branch={keep_branch}");
+    let path = format!("/api/sessions/{}?keep_branch={keep_branch}", enc_key(&key));
     let res = client.delete(&path).await?;
     println!("removed session {key}");
     if let Some(warnings) = res.get("warnings").and_then(Value::as_array) {
@@ -3431,5 +3466,12 @@ mod tests {
         assert_eq!(action_summary(&would), "would mark s1: ok");
         let nudge = json!({ "action": "nudge", "session": "s1", "text": "try again" });
         assert_eq!(action_summary(&nudge), "nudge s1: try again");
+    }
+    #[test]
+    fn session_keys_encode_to_one_path_segment() {
+        // Branch-name keys carry a slash; ids pass through untouched.
+        assert_eq!(enc_key("weaver/issue-6"), "weaver%2Fissue-6");
+        assert_eq!(enc_key("la1djzrs"), "la1djzrs");
+        assert_eq!(enc_key("repo:weaver/issue-6"), "repo:weaver%2Fissue-6");
     }
 }
