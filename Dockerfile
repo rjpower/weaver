@@ -70,28 +70,47 @@ RUN set -eux; \
     apt-get update; \
     # Base runtime + the repo tools loom's agents shell out to. gh/gcloud/docker
     # come from the signed repos configured above; the rest are stock bookworm.
-    # The last group is the everyday dev CLIs an agent reaches for in a checkout —
+    # The last groups are the everyday dev CLIs an agent reaches for in a checkout —
     # jq/ripgrep/fd for search, build-essential/pkg-config for native builds, a
     # system python3, and the usual archive/editor/pager tools. (cargo, rustc and
     # cc already ship in the rust base image, so they are not repeated here.)
+    #
+    # bubblewrap + socat are the sandbox the agent runtimes reach for on Linux:
+    # Claude Code's sandboxed Bash runs commands under `bwrap` (with `socat`
+    # relaying network) and otherwise degrades to unsandboxed with a warning;
+    # Codex prefers a system `bwrap` over the one it bundles. Both need the
+    # unprivileged user namespaces this container already permits (the
+    # SYS_ADMIN + apparmor=unconfined grant in docker-compose.yml).
+    #
+    # The remaining tools round out what a general coding agent expects to find:
+    # sqlite3 (loom's own store is sqlite; agents inspect/seed .db files),
+    # openssh-client (git-over-SSH to non-GitHub remotes; see compose), patch +
+    # diffutils (applying diffs when a native edit won't fit), procps (ps/pkill
+    # to manage servers an agent spawns), rsync, file, gettext-base (envsubst in
+    # CI/templating), and shellcheck (agents lint the shell they write).
     apt-get install -y --no-install-recommends \
       nodejs git ca-certificates gh google-cloud-cli tini \
       docker-ce-cli docker-buildx-plugin docker-compose-plugin sudo \
       jq ripgrep fd-find build-essential pkg-config \
       python3 python3-pip python3-venv \
-      unzip zip less wget vim tree; \
+      unzip zip less wget vim tree \
+      bubblewrap socat \
+      sqlite3 openssh-client patch diffutils procps rsync file \
+      gettext-base shellcheck; \
     rm -rf /var/lib/apt/lists/*; \
     # Debian ships fd as `fdfind` to avoid a name clash; expose the conventional
     # `fd` name agents (and fd-aware tools) expect.
     ln -s "$(command -v fdfind)" /usr/local/bin/fd
 
-# Claude Code — the agent runtime loom's sessions launch — is deliberately NOT
-# baked into the image. The container runs as a non-root user, so a Claude
-# installed into the read-only system dirs (what `npm i -g` does) can't
-# auto-update and reports it's "installed in a read-only location". Instead
-# loom-entrypoint (below) runs Claude's own installer at first boot into the app
-# user's $HOME/.local — on the persisted loom_home volume, so it is writable,
-# auto-updates itself in place, and the updates survive container recreates.
+# The agent runtimes loom's sessions launch — Claude Code (`claude`) and the
+# OpenAI Codex CLI (`codex`) — are deliberately NOT baked into the image. The
+# container runs as a non-root user, so a runtime installed into the read-only
+# system dirs (what a build-time `npm i -g` lands in) can neither self-update
+# (Claude reports it's "installed in a read-only location") nor be bumped live.
+# Instead loom-entrypoint (below) installs both at first boot into the app user's
+# $HOME on the persisted loom_home volume, where they are writable, update in
+# place (`claude` auto-updates; `codex update` on demand), and survive container
+# recreates. Pin either with CLAUDE_CODE_VERSION / CODEX_VERSION (see compose).
 
 # code-server — the per-session embedded VS Code that `crate::ide` spawns and
 # reverse-proxies (one rooted at each worktree, behind loom's auth). The `.deb`
@@ -211,8 +230,8 @@ echo 'app ALL=(root) NOPASSWD: /usr/local/bin/loom-cgroup-init' > /etc/sudoers.d
 chmod 440 /etc/sudoers.d/loom-cgroup-init
 EOF
 
-# Container entrypoint: before the daemon starts, make sure the writable,
-# self-updating Claude install exists on the persisted $HOME volume and the
+# Container entrypoint: before the daemon starts, make sure the agent runtimes
+# (`claude` + `codex`) are installed on the persisted $HOME volume and the
 # delegated session-cgroup subtree is prepared, then hand off to the CMD. Both
 # run only for `loom server …` — one-shot admin commands (`loom config set`,
 # `loom setup`, the compose init service) skip them.
@@ -232,6 +251,19 @@ if [ "${1:-}" = loom ] && [ "${2:-}" = server ]; then
     curl -fsSL https://claude.ai/install.sh | bash -s -- "${CLAUDE_CODE_VERSION:-stable}" || true
     [ -x "$HOME/.local/bin/claude" ] \
       || echo "loom: WARNING: Claude install failed (offline?); agents lack 'claude' until a later boot installs it" >&2
+  fi
+  if ! command -v codex >/dev/null 2>&1; then
+    echo "loom: installing Codex CLI into $HOME/.npm-global ..." >&2
+    # The Codex runtime installs the same way client packages do: `npm i -g`
+    # lands `codex` in $HOME/.npm-global/bin (NPM_CONFIG_PREFIX, on the volume,
+    # early on PATH), so it persists across recreates and can be bumped live with
+    # `codex update`. Pin with CODEX_VERSION (an npm dist-tag or exact version;
+    # default `latest`). Non-fatal — like Claude, loom still boots and agents can
+    # add it on a later networked boot. Codex is useless without OpenAI auth
+    # (OPENAI_API_KEY, or `codex login`); installing the CLI needs neither.
+    npm install -g "@openai/codex@${CODEX_VERSION:-latest}" || true
+    command -v codex >/dev/null 2>&1 \
+      || echo "loom: WARNING: Codex install failed (offline?); the codex runtime is unavailable until a later boot installs it" >&2
   fi
   # Delegate the per-session cgroup subtree (see loom-cgroup-init above).
   # Non-fatal: without it sessions run with no memory limit.

@@ -30,8 +30,8 @@ services:
   network only. It is never published to the host; the only way in is through
   Caddy.
 
-loom drives the agents your sessions run (`gh`, `git`, `claude`, `uv`, an
-embedded VS Code), so the image is large and self-contained.
+loom drives the agents your sessions run (`gh`, `git`, `claude`, `codex`, `uv`,
+an embedded VS Code), so the image is large and self-contained.
 
 ## Prerequisites
 
@@ -102,7 +102,8 @@ and why; you don't hand-edit `.env` itself.
 | `LOOM_OWNER_GITHUB` | **yes** | GitHub login seeded as the first approved user on a fresh database — the only account that can sign in until it approves others. Approved users are also who may drive the `@loom` trigger; add more in **Settings → Approved users**. |
 | `GH_TOKEN` | **yes** | GitHub token loom uses to clone private repos, push branches, and reply to `@loom` comments. |
 | `LOOM_GITHUB_WEBHOOK_SECRET` | for `@loom` | Shared secret for the inbound webhook; must match the secret on the GitHub webhook. Until set, the webhook rejects every delivery. |
-| `ANTHROPIC_API_KEY` | for Claude | API key for the Claude agents. Alternatively log in interactively (see [first-run](#claude-authentication)). |
+| `ANTHROPIC_API_KEY` | for Claude | API key for the Claude agents. Alternatively log in interactively (see [first-run](#agent-authentication)). |
+| `OPENAI_API_KEY` | for Codex | API key for the Codex agents; only needed if you launch the `codex` runtime. Alternatively log in interactively (see [first-run](#agent-authentication)). |
 | `LOOM_GITHUB_CLIENT_ID` / `_SECRET` | for login | GitHub OAuth app — the owner's only way to sign in on a fresh DB (see [first-run](#first-run-login)). Callback: `https://<LOOM_DOMAIN>/api/auth/github/callback`. |
 | `LOOM_TLS_EMAIL` | no | ACME contact for cert-expiry notices; only used if you uncomment the global block in the Caddyfile. |
 | `HOST_UID` / `HOST_GID` | no (1000) | uid:gid the image runs as — matters only if you bind-mount a host dir. |
@@ -120,10 +121,11 @@ environment, with the environment winning (see `loom_config`'s module docs).
 (cloning private repos; the Claude launch-gate). Every *session* loom launches
 also needs them — `loom setup secrets --config /home/app/loom.toml` (run via
 `docker compose exec loom` against the running deploy, or as part of the
-[Quick start](#quick-start) sequence before first start) prompts for both and
-stores them as operator environment variables, live for every session from
-then on, no restart. Run it in addition to (not instead of) rendering them
-into `.env` above.
+[Quick start](#quick-start) sequence before first start) prompts for the agent
+keys (`ANTHROPIC_API_KEY` for Claude, `OPENAI_API_KEY` for Codex) and `GH_TOKEN`,
+and stores them as operator environment variables, live for every session from
+then on, no restart. Leave a key blank to skip it. Run it in addition to (not
+instead of) rendering them into `.env` above.
 
 ## Security posture
 
@@ -259,13 +261,20 @@ For automation, the `loom` CLI inside the container is already authenticated as
 the owner (via the machine-local token loom injects), so it works without a
 login — e.g. `docker compose exec loom loom token add ci`.
 
-### Claude authentication
+### Agent authentication
 
 If you did not set `ANTHROPIC_API_KEY`, log in to Claude once interactively; the
 credentials persist in `~/.claude.json` on the `loom_home` volume:
 
 ```sh
 docker compose exec loom claude    # follow the prompts, then exit
+```
+
+The Codex runtime authenticates the same way — set `OPENAI_API_KEY`, or log in
+once interactively (persisted under `~/.codex` on the same volume):
+
+```sh
+docker compose exec loom codex login    # follow the prompts, then exit
 ```
 
 ## Wire the `@loom` GitHub trigger
@@ -322,18 +331,36 @@ volume would mount root-owned. To put repos on their own disk, point
 
 The agent tooling the image ships splits by how it updates:
 
-- **Claude Code updates itself, no image rebuild.** The container runs as a
-  non-root user, so a Claude installed into the read-only system dirs could not
-  auto-update ("installed in a read-only location"). Instead, the first time the
-  daemon starts it runs Claude's native installer into the persisted `loom_home`
-  volume (`~/.local/bin/claude`), and Claude auto-updates itself in place from
-  then on — updates land without a rebuild and survive `up`/`down`/recreate. That
-  first install needs network (the deploy needs it anyway); if it fails loom
-  still comes up and installs on a later boot. Pin the tracked build with
-  `CLAUDE_CODE_VERSION` (`stable` — the default — `latest`, or an exact version
-  like `2.1.198`) in the `loom` service's `environment:` in
-  [`docker-compose.yml`](standalone/docker-compose.yml); force one live with
-  `docker compose exec loom claude install <version> --force`.
+- **The agent runtimes install at first boot, no image rebuild.** The container
+  runs as a non-root user, so a runtime installed into the read-only system dirs
+  could neither self-update (Claude reports "installed in a read-only location")
+  nor be bumped live. Instead, the first time the daemon starts it installs both
+  `claude` and `codex` into the persisted `loom_home` volume (`~/.local/bin` and
+  the home npm prefix `~/.npm-global/bin`), where updates land without a rebuild
+  and survive `up`/`down`/recreate. That first install needs network (the deploy
+  needs it anyway); if it fails loom still comes up and installs on a later boot.
+  - **Claude Code** auto-updates itself in place. Pin the tracked build with
+    `CLAUDE_CODE_VERSION` (`stable` — the default — `latest`, or an exact version
+    like `2.1.198`); force one live with
+    `docker compose exec loom claude install <version> --force`.
+  - **Codex CLI** updates on demand rather than automatically. Pin with
+    `CODEX_VERSION` (an npm dist-tag or exact version; default `latest`); bump one
+    live with `docker compose exec loom codex update` (or reinstall with
+    `docker compose exec loom npm i -g @openai/codex@<version>`).
+
+  Set either pin in the `loom` service's `environment:` in
+  [`docker-compose.yml`](standalone/docker-compose.yml).
+
+- **Command sandboxing.** The image ships `bubblewrap` + `socat`, the sandbox
+  the runtimes reach for on Linux: Claude Code's sandboxed Bash runs commands
+  under `bwrap` (falling back to unsandboxed with a warning if it can't), and
+  Codex prefers a system `bwrap` over the one it bundles. Both rely on the
+  unprivileged user namespaces this container already permits via its
+  `SYS_ADMIN` + `apparmor=unconfined` grant (see
+  [Security posture](#security-posture)); a fresh `/proc` mount can still fail
+  in this nested setting, so a runtime may need its weaker-nested-sandbox escape
+  hatch (Codex `--no-proc`; Claude `enableWeakerNestedSandbox`) to sandbox at
+  all. The container is itself the trust boundary either way.
 
 - **Adding more client packages at runtime.** `~/.local/bin` and a home npm
   prefix (`~/.npm-global/bin`) are on `PATH` and on the `loom_home` volume, so
