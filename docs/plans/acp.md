@@ -9,8 +9,7 @@ The design of record for moving agent sessions from the terminal-driven model
 to [ACP](https://agentclientprotocol.com) (weaver issue #504): can the
 terminal-driven agent model move to ACP, does the terminal survive as a
 backstop, and what does the chat surface become? Nothing here ships yet; the
-migration-plan phases materialise into weaver issues when the design is
-agreed.
+migration-plan phases are tracked as weaver issues #505–#512.
 
 ## Verdict
 
@@ -493,7 +492,7 @@ The mockup renders, by daylight and by lamplight:
 Phased so each lands green and reversible; the terminal path runs unchanged
 throughout:
 
-1. **Spike (throwaway):** drive `claude-agent-acp` from a Rust bin via the
+1. **Spike (throwaway)** (#505): drive `claude-agent-acp` from a Rust bin via the
    pinned `agent-client-protocol` 1.x crate against a scratch worktree.
    Verify: settings hooks fire (SessionStart primer, compaction); the
    `_meta.claudeCode.options` launch mapping (model, appendSystemPrompt,
@@ -501,22 +500,22 @@ throughout:
    preserve tool-call payloads?); headless OAuth-credential auth; sub-agent
    tool-call attribution legibility; stderr capture. This de-risks every
    load-bearing assumption in one throwaway.
-2. **Tapestry relay mode:** the frame spool, `SUBSCRIBE`/`FRAME`/`ACK`
+2. **Tapestry relay mode** (#506): the frame spool, `SUBSCRIBE`/`FRAME`/`ACK`
    opcodes, ack-watermark truncation, stderr log, exit status —
    `backend::{new_relay_session, subscribe_relay}`. The hard phase; sized
    as such.
-3. **Loom ACP client + journal:** `loom::acp` (connection management,
+3. **Loom ACP client + journal** (#507): `loom::acp` (connection management,
    policy-mode permission answering, journal writes with upstream-id
    idempotency, EventBus deltas, persisted in-flight request ids);
    `chat_blocks` migration; the `/chat` + `/chat/stream` + `/prompt` routes;
    `pending_prompt` queueing. Interactive permission answering is *not*
    here — it ships with the UI that exercises it (5b).
-4. **Protocol axis + lifecycle:** `protocol` on sessions/agents and every
+4. **Protocol axis + lifecycle** (#508): `protocol` on sessions/agents and every
    path that branches on it (create, validate, adopt, recover, archive,
    watches, CLI); turn-driven status edges; hook-bundle split; adopt via
    capability-checked `load`/`resume` with fresh-session fallback; archive
    capture from the journal.
-5. **SPA, in two steps.**
+5. **SPA, in two steps** (#509, #510).
    **5a — parity rewire:** `SessionConversation` swaps its data source from
    the iris endpoint to journal + SSE; composer posts to `/prompt`; Stop =
    cancel. Minimal visual change, immediately live-streaming.
@@ -527,9 +526,9 @@ throughout:
    the adapter log). E2e drives a **fake ACP agent** (a ~100-line node
    script speaking scripted JSON-RPC) — cheap determinism the PTY path
    never had.
-6. **Codex over `codex-acp`** (whichever of the two lineages is current),
+6. **Codex over `codex-acp`** (#511) (whichever of the two lineages is current),
    retiring the hookless-lifecycle carve-outs.
-7. **Flip the builtin default** to ACP; keep `--protocol terminal` as the
+7. **Flip the builtin default** (#512) to ACP; keep `--protocol terminal` as the
    documented fallback; deploy installs both adapters from npm, pinned,
    beside the CLIs. Existing terminal sessions keep their PTY until
    archived; **adopt after the flip converts** — the adapter's session ids
