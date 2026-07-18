@@ -135,6 +135,15 @@ pub struct SessionView {
     /// handed back to whoever launched it). Only populated on the create
     /// response; `None` on the list/get/patch paths, which don't recompute it.
     pub tracking_issue: Option<i64>,
+    /// Manual park override for the fleet list's resting shelf: `"parked"` (pinned
+    /// to the shelf), `"active"` (kept live even when idle), or `null` (auto — the
+    /// client parks it once idle past the threshold). See the `sessions.park`
+    /// column.
+    pub park: Option<String>,
+    /// Manual fleet-list sort key, or `null` to follow the automatic
+    /// urgency-then-recency order. Placed rows and untouched rows share one
+    /// numeric axis so they interleave.
+    pub sort_order: Option<f64>,
     pub branch: BranchView,
 }
 
@@ -540,6 +549,17 @@ pub struct PatchSessionReq {
     /// The agent's current-state message — the prose shown beside the level.
     #[serde(default)]
     pub description: Option<String>,
+    /// Park override: `"parked"` pins the row to the resting shelf, `"active"`
+    /// keeps it live even when idle, `"auto"` clears the override back to
+    /// idle-driven. Absent leaves it unchanged. (JSON can't distinguish `null`
+    /// from absent for `Option<String>`, so the reset value is the string
+    /// `"auto"`, mapped to a stored `NULL`.)
+    #[serde(default)]
+    pub park: Option<String>,
+    /// New manual sort key for this row (the drag midpoint). Absent leaves the
+    /// order unchanged.
+    #[serde(default)]
+    pub sort_order: Option<f64>,
 }
 
 /// Body for `PUT /api/sessions/{id}/tags/{key}`: set (upsert) a tag. The `key`

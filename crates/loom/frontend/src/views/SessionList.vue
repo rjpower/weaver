@@ -11,9 +11,20 @@ import NewSessionDrawer from '../components/NewSessionDrawer.vue';
 import SessionRowActions from '../components/SessionRowActions.vue';
 import SessionRemedyButton from '../components/SessionRemedyButton.vue';
 import { timeAgo } from '../lib/time';
-import { effectiveAttention, idleTag, lifecycleDot, messageOf, priorityRank, quietTags, signalChips } from '../lib/sessionState';
+import {
+  effectiveAttention,
+  idleTag,
+  lifecycleDot,
+  messageOf,
+  orderKey,
+  parkLabel,
+  priorityRank,
+  quietTags,
+  shelved,
+  signalChips,
+} from '../lib/sessionState';
 import { useFleet } from '../lib/sessionsStore';
-import { del } from '../api';
+import { del, setSessionOrder, setSessionPark } from '../api';
 
 // Named so App.vue's <keep-alive :include> matches it — the fleet list stays
 // alive across navigation (instant return, no refetch flash, no re-animate).
@@ -106,7 +117,13 @@ interface TreeRow {
 // ok), then newest-first within the same urgency — so a blocked/attention child
 // can never sink to the bottom of the fleet. A parent that's filtered/archived
 // out of the visible set (or was never tracked) drops its orphaned children up.
-const treeRows = computed<TreeRow[]>(() => {
+// The shared tree build. Groups visible sessions into threads, ranks each
+// thread by its loudest member, then splits the top-level threads two ways: the
+// live list, and the resting "Parked" shelf (long-idle / in-review / hand-parked
+// threads that need nothing from you). Live threads carry the manual drag order;
+// the shelf sorts by most-recent activity. Exposes the ordered live roots so the
+// drop math can find a dragged row's new neighbours.
+const partitioned = computed(() => {
   const list = visibleSessions.value;
   const present = new Set(list.map((s) => s.branch.id));
   const children = new Map<string, Session[]>();
@@ -156,25 +173,171 @@ const treeRows = computed<TreeRow[]>(() => {
   const byUrgencyThenNewest = (a: Session, b: Session) =>
     subtreeRank(b) - subtreeRank(a) || byNewest(a, b);
 
-  const rows: TreeRow[] = [];
-  const seen = new Set<string>(); // guard against any cycle in the parent links
-  const walk = (node: Session, depth: number, verticals: boolean[], isLast: boolean) => {
-    if (seen.has(node.branch.id)) return;
-    seen.add(node.branch.id);
-    rows.push({ session: node, depth, verticals, isLast });
-    const kids = [...(children.get(node.branch.id) ?? [])].sort(byUrgencyThenNewest);
-    kids.forEach((kid, i) => {
-      const last = i === kids.length - 1;
-      // The implicit root isn't a drawn column, so a top-level node's children
-      // start with no ancestor lines; deeper, append this node's continuation.
-      const childVerticals = depth === 0 ? [] : [...verticals, !isLast];
-      walk(kid, depth + 1, childVerticals, last);
-    });
+  // Split top-level threads. A thread goes to the shelf when its root rests AND
+  // nothing in its subtree needs a human (subtreeRank ≤ 0) — a blocked child
+  // keeps the whole thread live even under a hand-parked parent.
+  const liveRoots: Session[] = [];
+  const shelfRoots: Session[] = [];
+  for (const r of roots) {
+    if (shelved(r) && subtreeRank(r) <= 0) shelfRoots.push(r);
+    else liveRoots.push(r);
+  }
+  // Live order: the manual/auto interleave key (drag places a row exactly; the
+  // rest keep urgency-then-newest). Shelf order: most-recently-active first.
+  liveRoots.sort(
+    (a, b) => orderKey(a, subtreeRank(a)) - orderKey(b, subtreeRank(b)) || byNewest(a, b),
+  );
+  shelfRoots.sort((a, b) => (b.last_activity_at || '').localeCompare(a.last_activity_at || ''));
+
+  const buildRows = (rootsList: Session[]): TreeRow[] => {
+    const rows: TreeRow[] = [];
+    const seen = new Set<string>(); // guard against any cycle in the parent links
+    const walk = (node: Session, depth: number, verticals: boolean[], isLast: boolean) => {
+      if (seen.has(node.branch.id)) return;
+      seen.add(node.branch.id);
+      rows.push({ session: node, depth, verticals, isLast });
+      const kids = [...(children.get(node.branch.id) ?? [])].sort(byUrgencyThenNewest);
+      kids.forEach((kid, i) => {
+        const last = i === kids.length - 1;
+        // The implicit root isn't a drawn column, so a top-level node's children
+        // start with no ancestor lines; deeper, append this node's continuation.
+        const childVerticals = depth === 0 ? [] : [...verticals, !isLast];
+        walk(kid, depth + 1, childVerticals, last);
+      });
+    };
+    rootsList.forEach((r, i) => walk(r, 0, [], i === rootsList.length - 1));
+    return rows;
   };
-  const sortedRoots = [...roots].sort(byUrgencyThenNewest);
-  sortedRoots.forEach((r, i) => walk(r, 0, [], i === sortedRoots.length - 1));
-  return rows;
+
+  return {
+    liveRows: buildRows(liveRoots),
+    shelfRows: buildRows(shelfRoots),
+    liveRoots,
+    rankOf: (s: Session) => subtreeRank(s),
+  };
 });
+
+const liveRows = computed(() => partitioned.value.liveRows);
+const shelfRows = computed(() => partitioned.value.shelfRows);
+// Threads on the shelf (top-level rows only) — the count beside "Parked".
+const shelfCount = computed(() => shelfRows.value.filter((r) => r.depth === 0).length);
+
+// ── Drag to reorder · drag to park ──────────────────────────────────────────
+// One gesture does both: drag a row within the live list to place it (persists a
+// midpoint sort key), or drag it onto the Parked shelf to rest it (and drag a
+// resting row back out to keep it live). Only top-level threads drag; children
+// ride with their root. HTML5 native DnD so keyboard/`⌘`-click on the row's link
+// still work — the grip is the only draggable handle.
+const draggingId = ref('');
+const dropBeforeId = ref(''); // the live row the dragged thread would land above
+const dropAtEnd = ref(false); // …or past the last live row
+const overShelf = ref(false); // hovering the shelf drop zone
+const parkedOpen = ref(false); // the shelf disclosure
+
+function onDragStart(id: string, e: DragEvent) {
+  draggingId.value = id;
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', id); // Firefox needs a payload to drag
+  }
+}
+
+function onDragEnd() {
+  draggingId.value = '';
+  dropBeforeId.value = '';
+  dropAtEnd.value = false;
+  overShelf.value = false;
+}
+
+// Hovering a live row: mark whether we'd drop above or below it (pointer vs the
+// row's vertical midpoint). Only top-level rows are drop anchors.
+function onRowDragOver(rowId: string, e: DragEvent) {
+  if (!draggingId.value) return;
+  e.preventDefault();
+  overShelf.value = false;
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  const below = e.clientY > rect.top + rect.height / 2;
+  const roots = partitioned.value.liveRoots;
+  const idx = roots.findIndex((r) => r.id === rowId);
+  if (idx === -1) return;
+  const anchor = below ? roots[idx + 1] : roots[idx];
+  dropAtEnd.value = below && idx === roots.length - 1;
+  dropBeforeId.value = dropAtEnd.value ? '' : anchor?.id ?? '';
+}
+
+function neighbourKey(root: Session | undefined): number | null {
+  if (!root) return null;
+  return orderKey(root, partitioned.value.rankOf(root));
+}
+
+// Commit a live-list drop: place the dragged thread between its new neighbours by
+// giving it the midpoint sort key, and — if it came off the shelf — keep it live.
+async function commitReorder() {
+  const id = draggingId.value;
+  if (!id) return;
+  const roots = partitioned.value.liveRoots.filter((r) => r.id !== id);
+  let above: Session | undefined;
+  let below: Session | undefined;
+  if (dropAtEnd.value) {
+    above = roots[roots.length - 1];
+  } else {
+    const idx = roots.findIndex((r) => r.id === dropBeforeId.value);
+    below = idx === -1 ? roots[0] : roots[idx];
+    above = idx <= 0 ? undefined : roots[idx - 1];
+  }
+  const ka = neighbourKey(above);
+  const kb = neighbourKey(below);
+  // Midpoint, with a wide gap when dropping past an end so there's room to spare.
+  const key =
+    ka !== null && kb !== null ? (ka + kb) / 2
+    : ka !== null ? ka + 1e9
+    : kb !== null ? kb - 1e9
+    : 0;
+  const dragged = sessions.value.find((s) => s.id === id);
+  const wasShelved = dragged ? shelved(dragged) : false;
+  // Optimistic: reflect immediately, then persist.
+  if (dragged) {
+    dragged.sort_order = key;
+    if (wasShelved) dragged.park = 'active';
+  }
+  onDragEnd();
+  try {
+    if (wasShelved) await setSessionPark(id, 'active');
+    await setSessionOrder(id, key);
+    await refresh();
+  } catch (e) {
+    error.value = (e as Error).message;
+  }
+}
+
+// Commit a shelf drop: rest the dragged thread on the shelf.
+async function commitPark() {
+  const id = draggingId.value;
+  if (!id) return;
+  const dragged = sessions.value.find((s) => s.id === id);
+  if (dragged) dragged.park = 'parked';
+  parkedOpen.value = true;
+  onDragEnd();
+  try {
+    await setSessionPark(id, 'parked');
+    await refresh();
+  } catch (e) {
+    error.value = (e as Error).message;
+  }
+}
+
+// The row ⋯ menu's Park / Keep-live verbs — the accessible, no-drag path.
+async function setPark(id: string, state: 'parked' | 'active' | 'auto') {
+  const dragged = sessions.value.find((s) => s.id === id);
+  if (dragged) dragged.park = state === 'auto' ? null : state;
+  if (state === 'parked') parkedOpen.value = true; // reveal where the row landed
+  try {
+    await setSessionPark(id, state);
+    await refresh();
+  } catch (e) {
+    error.value = (e as Error).message;
+  }
+}
 const error = ref('');
 const MISSING_GITHUB_TOKEN_ERROR = 'No GitHub token configured.';
 const tokenConfigWarning = computed(() => error.value.startsWith(MISSING_GITHUB_TOKEN_ERROR));
@@ -328,9 +491,24 @@ async function handleCreated() {
     <!-- No `overflow-hidden` on the list: a row's ⋯ menu drops out of its row and
          would be clipped by it. The corners the clip used to round are rounded on
          the first/last row instead. -->
-    <ul v-if="sessions.length" data-testid="session-list" class="fade-in rounded-md border border-line bg-surface">
+    <!-- Every session is resting — the live list is empty but the fleet isn't.
+         Point at the shelf below rather than reading as "no sessions". -->
+    <p
+      v-if="sessions.length && !liveRows.length"
+      class="rounded-md border border-dashed border-line px-4 py-3 text-center font-serif text-[13px] italic text-muted"
+    >
+      All sessions are resting on the shelf below.
+    </p>
+
+    <ul
+      v-if="liveRows.length"
+      data-testid="session-list"
+      class="fade-in rounded-md border border-line bg-surface"
+      @dragover.prevent
+      @drop.prevent="commitReorder"
+    >
       <li
-        v-for="{ session: s, depth, verticals, isLast } in treeRows"
+        v-for="{ session: s, depth, verticals, isLast } in liveRows"
         :key="s.id"
         data-testid="session-card"
         :data-session-id="s.id"
@@ -338,8 +516,30 @@ async function handleCreated() {
         :class="[
           'group relative flex cursor-pointer items-start gap-2.5 border-b border-line px-3 py-2 last:border-0',
           'min-h-11 transition-colors hover:bg-subtle first:rounded-t-md last:rounded-b-md',
+          draggingId === s.id && 'opacity-40',
+          dropBeforeId === s.id && 'drop-before',
+          dropAtEnd && isLast && depth === 0 && 'drop-after',
         ]"
+        @dragover="depth === 0 && onRowDragOver(s.id, $event)"
+        @drop.prevent="commitReorder"
       >
+        <!-- Drag grip (top-level threads only): the one draggable handle, so the
+             row's link still click/⌘-clicks. Drag within the list to reorder, or
+             onto the Parked shelf below to rest the thread. Hover/focus-revealed. -->
+        <button
+          v-if="depth === 0"
+          type="button"
+          draggable="true"
+          data-testid="session-drag"
+          class="relative z-10 -ml-1 mt-1 shrink-0 cursor-grab text-faint opacity-0 transition-opacity hover:text-fg focus-visible:opacity-100 group-hover:opacity-100 active:cursor-grabbing"
+          title="Drag to reorder, or onto Parked to rest"
+          aria-label="Reorder or park this session"
+          @dragstart="onDragStart(s.id, $event)"
+          @dragend="onDragEnd"
+          @click.prevent
+        >⠿</button>
+        <span v-else class="-ml-1 w-3 shrink-0" aria-hidden="true"></span>
+
         <!-- Tree gutter: threads a child session under the one that launched it.
              Drawn only for nested rows, so a flat fleet is visually unchanged. -->
         <div v-if="depth > 0" class="tree-gutter" aria-hidden="true">
@@ -369,7 +569,7 @@ async function handleCreated() {
                  clickable above the overlay. -->
             <router-link
               :to="`/s/${s.id}`"
-              class="stretched-link truncate text-sm font-semibold text-fg hover:text-accent"
+              class="stretched-link truncate font-serif text-[15px] font-semibold text-fg hover:text-accent"
             >
               {{ s.branch.title || s.branch.name }}
             </router-link>
@@ -406,18 +606,20 @@ async function handleCreated() {
             />
           </div>
 
-          <!-- Current-state headline (agent's status message), else the goal.
-               On an attention row the goal steps up from faint to muted so the
-               metadata doesn't recede next to the loud chip. -->
+          <!-- Current-state headline (agent's status message), else the goal —
+               both in the serif prose voice. The status note is italic, a live
+               margin annotation; the goal is roman and quieter beneath it. On an
+               attention row the goal steps up from faint to muted so the metadata
+               doesn't recede next to the loud chip. -->
           <p
             v-if="messageOf(s)"
-            class="mt-0.5 truncate text-xs text-muted"
+            class="mt-0.5 truncate font-serif text-[13px] italic text-muted"
           >
             {{ messageOf(s) }}
           </p>
           <p
             v-if="s.branch.goal"
-            class="mt-0.5 truncate text-xs"
+            class="mt-0.5 truncate font-serif text-[13px]"
             :class="effectiveAttention(s).level === 'ok' ? 'text-faint' : 'text-muted'"
           >
             {{ s.branch.goal }}
@@ -451,16 +653,125 @@ async function handleCreated() {
           </span>
         </div>
 
-        <!-- The row's ⋯ menu: every lifecycle verb (Adopt/Recover, Archive,
-             Remove). The fleet list is where a human surveys and tidies a fleet,
-             so it acts here rather than only from inside a session. -->
+        <!-- The row's ⋯ menu: park, then every lifecycle verb (Adopt/Recover,
+             Archive, Remove). The fleet list is where a human surveys and tidies
+             a fleet, so it acts here rather than only from inside a session. -->
         <SessionRowActions
           :ws="s"
           class="mt-0.5"
           @changed="refresh"
           @error="error = $event"
+          @park="setPark(s.id, $event)"
         />
       </li>
     </ul>
+
+    <!-- The Parked shelf — resting threads (long idle, in review, or parked by
+         hand) collapsed out of the live list so a stale fleet doesn't drag the
+         eye. Also a drop target: drag a live row here to rest it; the "Keep live"
+         verb (and dragging a row back out) returns it. Shown while empty only
+         mid-drag, so there's always somewhere to drop. -->
+    <section
+      v-if="shelfCount || draggingId"
+      data-testid="parked-shelf"
+      class="mt-3 rounded-md transition-shadow"
+      :class="overShelf && draggingId ? 'shadow-[inset_0_0_0_1px_var(--accent)]' : ''"
+      @dragover.prevent="draggingId && (overShelf = true)"
+      @dragleave="overShelf = false"
+      @drop.prevent="commitPark"
+    >
+      <button
+        type="button"
+        data-testid="parked-toggle"
+        class="flex w-full items-center gap-2 px-1 py-1.5 text-2xs font-medium uppercase tracking-wider text-faint transition-colors hover:text-muted"
+        @click="parkedOpen = !parkedOpen"
+      >
+        <span class="inline-block w-2 transition-transform" :class="parkedOpen || draggingId ? 'rotate-90' : ''">▸</span>
+        Parked
+        <span class="font-serif text-[11px] normal-case italic tracking-normal text-faint">resting — nothing for you</span>
+        <span class="h-px flex-1 bg-line"></span>
+        <span class="font-mono lowercase tracking-normal">{{ shelfCount }}</span>
+      </button>
+
+      <ul
+        v-if="parkedOpen || draggingId"
+        class="fade-in overflow-hidden rounded-md border border-line bg-surface"
+      >
+        <li
+          v-for="{ session: s, depth } in shelfRows"
+          :key="s.id"
+          data-testid="parked-card"
+          :data-session-id="s.id"
+          class="group relative flex items-start gap-2.5 border-b border-line px-3 py-2 opacity-65 transition-opacity last:border-0 hover:bg-subtle hover:opacity-100"
+        >
+          <button
+            v-if="depth === 0"
+            type="button"
+            draggable="true"
+            data-testid="parked-drag"
+            class="relative z-10 -ml-1 mt-1 shrink-0 cursor-grab text-faint opacity-0 transition-opacity hover:text-fg focus-visible:opacity-100 group-hover:opacity-100 active:cursor-grabbing"
+            title="Drag back into the live list to keep it going"
+            aria-label="Return this session to the live list"
+            @dragstart="onDragStart(s.id, $event)"
+            @dragend="onDragEnd"
+            @click.prevent
+          >⠿</button>
+          <span v-else class="-ml-1 w-3 shrink-0" aria-hidden="true"></span>
+
+          <span
+            class="mt-1.5 h-2 w-2 shrink-0 rounded-full"
+            :class="lifecycleDot(s)"
+            aria-hidden="true"
+          ></span>
+
+          <div class="min-w-0 flex-1">
+            <div class="flex flex-wrap items-center gap-2">
+              <router-link
+                :to="`/s/${s.id}`"
+                class="stretched-link truncate font-serif text-[15px] font-medium text-fg hover:text-accent"
+              >
+                {{ s.branch.title || s.branch.name }}
+              </router-link>
+              <span class="meta-chip !text-[10px] uppercase tracking-wide text-info">{{ parkLabel(s) }}</span>
+            </div>
+            <p v-if="s.branch.goal" class="mt-0.5 truncate font-serif text-[13px] text-faint">
+              {{ s.branch.goal }}
+            </p>
+          </div>
+
+          <div class="shrink-0 text-right">
+            <span class="block truncate font-mono text-2xs text-faint">{{ s.branch.branch }}</span>
+            <span v-if="s.last_activity_at" class="mt-0.5 block font-mono text-2xs text-faint">
+              {{ timeAgo(s.last_activity_at) }}
+            </span>
+          </div>
+
+          <button
+            v-if="depth === 0"
+            type="button"
+            data-testid="parked-keep-live"
+            class="relative z-10 mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-2xs text-muted opacity-0 transition-opacity hover:bg-subtle hover:text-fg focus-visible:opacity-100 group-hover:opacity-100"
+            title="Return this session to the live list"
+            @click.stop="setPark(s.id, 'active')"
+          >Keep live</button>
+        </li>
+
+        <li v-if="!shelfRows.length" class="px-3 py-4 text-center font-serif text-[13px] italic text-faint">
+          Drop a session here to rest it.
+        </li>
+      </ul>
+    </section>
   </div>
 </template>
+
+<style scoped>
+/* Drag-reorder insertion indicator: a crisp accent rule on the edge the dragged
+   thread would land against — top when dropping above a row, bottom past the
+   last one. Inset so it sits inside the row's border without shifting layout. */
+.drop-before {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.drop-after {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+</style>

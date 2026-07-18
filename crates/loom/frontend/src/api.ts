@@ -255,6 +255,16 @@ export const resolveThread = (id: string, name: string, tid: number) =>
 export const sendMessage = (id: string, text: string, submit = true) =>
   post(`/sessions/${id}/send`, { text, submit });
 
+/** Set a session's park override — the fleet list's resting shelf. `'parked'`
+ *  pins it to the shelf, `'active'` keeps it live even when idle, `'auto'` clears
+ *  the override back to idle-driven. */
+export const setSessionPark = (id: string, park: 'parked' | 'active' | 'auto') =>
+  patch(`/sessions/${id}`, { park }) as Promise<Session>;
+
+/** Set a session's manual sort key (the drag-reorder midpoint). */
+export const setSessionOrder = (id: string, sort_order: number) =>
+  patch(`/sessions/${id}`, { sort_order }) as Promise<Session>;
+
 // --- Chat (the fleet concierge) --------------------------------------------
 
 /** Get-or-create the singleton fleet concierge and return its session view —

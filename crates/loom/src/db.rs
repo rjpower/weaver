@@ -37,6 +37,18 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- security boundary: the fleet stays co-owned, this just records who/what
     -- launched each session.
     created_by         TEXT,
+    -- Park state — the fleet-list resting shelf, a tier above archived: the
+    -- session keeps its terminal + worktree and stays resumable, it's just
+    -- collapsed out of the live list. Tri-state: NULL = auto (parked-in-view
+    -- once idle past the threshold, live otherwise), 'parked' = pinned to the
+    -- shelf by hand, 'active' = kept live by hand even when idle. Set by
+    -- dragging a row into/out of the Parked region.
+    park               TEXT,
+    -- Manual sort key for the fleet list. NULL = follow the automatic
+    -- urgency-then-recency order; a number places the row exactly (assigned as
+    -- the midpoint of its neighbours on drag). Shares one numeric axis with the
+    -- derived auto-order so manually-placed and untouched rows interleave.
+    sort_order         REAL,
     created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_active_branch
@@ -266,6 +278,8 @@ async fn migrate_loom(pool: &Db) -> Result<()> {
     // added here rather than as a numbered migration in weaver-core/migrations —
     // matching `model`/`effort`/`parent_branch_id`/`managed_by` above.)
     add_column_if_missing(pool, "sessions", "created_by", "TEXT").await?;
+    add_column_if_missing(pool, "sessions", "park", "TEXT").await?;
+    add_column_if_missing(pool, "sessions", "sort_order", "REAL").await?;
     // GitHub profile captured at sign-in for commit attribution (see the `users`
     // schema above). Added here for databases predating the columns; a fresh DB
     // already has them from the `CREATE TABLE` and these are no-ops.

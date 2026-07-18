@@ -384,6 +384,8 @@ mod tests {
             parent_branch_id: None,
             managed_by: None,
             created_by: None,
+            park: None,
+            sort_order: None,
         }
     }
 
