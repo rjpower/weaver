@@ -32,8 +32,11 @@ owner_github = "your-github-login"
 # github_client_secret = ""
 
 # Paste-once agent secrets — `loom setup secrets` prompts for these (hidden
-# input) instead of you typing them in cleartext here.
+# input) instead of you typing them in cleartext here. anthropic_api_key feeds
+# the Claude runtime, openai_api_key the Codex runtime; set only the ones you
+# use (either can also be an interactive `claude` / `codex login` instead).
 # anthropic_api_key = ""
+# openai_api_key = ""
 # gh_token = ""
 
 # Deploy-mechanism knobs — every one has a sensible compose-level default, so

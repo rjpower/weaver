@@ -59,6 +59,8 @@ pub struct LoomConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gh_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_email: Option<String>,
@@ -146,6 +148,12 @@ pub static FIELDS: &[FieldSpec] = &[
         secret: true,
         get_fn: |c| c.anthropic_api_key.as_deref(),
         set_fn: |c, v| c.anthropic_api_key = Some(v),
+    },
+    FieldSpec {
+        env_name: "OPENAI_API_KEY",
+        secret: true,
+        get_fn: |c| c.openai_api_key.as_deref(),
+        set_fn: |c, v| c.openai_api_key = Some(v),
     },
     FieldSpec {
         env_name: "GH_TOKEN",
@@ -401,6 +409,7 @@ mod tests {
                 "LOOM_GITHUB_WEBHOOK_SECRET",
                 "LOOM_GITHUB_CLIENT_SECRET",
                 "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
                 "GH_TOKEN",
             ]
         );

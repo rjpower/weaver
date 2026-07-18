@@ -1415,9 +1415,10 @@ async fn cmd_setup_secrets(opts: SecretsOpts) -> Result<()> {
         "ANTHROPIC_API_KEY",
         existing_names.contains("ANTHROPIC_API_KEY"),
     )?;
+    let openai = prompt_secret("OPENAI_API_KEY", existing_names.contains("OPENAI_API_KEY"))?;
     let gh_token = prompt_secret("GH_TOKEN", existing_names.contains("GH_TOKEN"))?;
 
-    if anthropic.is_none() && gh_token.is_none() {
+    if anthropic.is_none() && openai.is_none() && gh_token.is_none() {
         println!("nothing entered — existing values kept unchanged");
         return Ok(());
     }
@@ -1426,6 +1427,10 @@ async fn cmd_setup_secrets(opts: SecretsOpts) -> Result<()> {
     if let Some(v) = &anthropic {
         loom::agent_env::set(&db, "ANTHROPIC_API_KEY", v).await?;
         stored.push("ANTHROPIC_API_KEY");
+    }
+    if let Some(v) = &openai {
+        loom::agent_env::set(&db, "OPENAI_API_KEY", v).await?;
+        stored.push("OPENAI_API_KEY");
     }
     if let Some(v) = &gh_token {
         loom::agent_env::set(&db, "GH_TOKEN", v).await?;
