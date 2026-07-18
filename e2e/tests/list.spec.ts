@@ -136,7 +136,7 @@ test.describe('session list view', () => {
     expect(updated.branch.tags.find((t) => t.key === 'priority')).toBeUndefined();
   });
 
-  test('a session awaiting external review is parked below the calm default', async ({
+  test('a session awaiting external review rests on the Parked shelf', async ({
     page,
     weaver,
   }) => {
@@ -154,21 +154,22 @@ test.describe('session list view', () => {
 
     await page.goto(weaver.baseUrl);
 
-    // Sort order top→bottom: the raised row floats up, the parked row sinks below
-    // the calm default — so a scanning user meets what needs them first and the
-    // "nothing to do, waiting on a reviewer" row last.
-    const ids = await page
+    // The live list holds only what a scanning user should look at: the raised row
+    // floats up, then the calm one. The "nothing to do, waiting on a reviewer" row
+    // is collapsed onto the resting shelf, out of the flow.
+    const liveIds = await page
+      .getByTestId('session-list')
       .getByTestId('session-card')
       .evaluateAll((els) => els.map((e) => e.getAttribute('data-session-id')));
-    expect(ids).toEqual([attn.id, calm.id, parked.id]);
+    expect(liveIds).toEqual([attn.id, calm.id]);
 
-    // The parked row carries the quiet `awaiting: review` pill (no loud chip) and
-    // does not count toward "needs attention" — the user has no action there.
-    const card = page.locator(`[data-session-id="${parked.id}"]`);
-    const pill = card.getByTestId('tag-pill');
-    await expect(pill).toContainText('awaiting');
-    await expect(pill).toContainText('review');
-    await expect(card.getByTestId('signal-chip')).toHaveCount(0);
+    // The parked row rests on the shelf, labelled why it's resting, and still does
+    // not count toward "needs attention" — the user has no action there.
+    await page.getByTestId('parked-toggle').click();
+    const shelfCard = page.getByTestId('parked-shelf').locator(`[data-session-id="${parked.id}"]`);
+    await expect(shelfCard).toBeVisible();
+    await expect(shelfCard).toContainText('in review');
+    await expect(shelfCard.getByTestId('signal-chip')).toHaveCount(0);
     await expect(page.getByTestId('filter-attention')).toContainText('1');
   });
 

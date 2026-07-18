@@ -160,6 +160,76 @@ export function priorityRank(s: Session): number {
   return isParked(s) ? -1 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// The resting shelf ("Parked") + manual order
+// ---------------------------------------------------------------------------
+
+// How long an agent may rest before the fleet list quietly shelves its row. The
+// list is a projection of REST state (docs/loom-ui.md): this threshold is a pure
+// view concern, applied client-side over the row's `last_activity_at`, never a
+// stored flag — only the *manual* park override (`park`) is persisted.
+export const IDLE_PARK_DAYS = 3;
+const DAY_MS = 86_400_000;
+
+// Milliseconds since the agent last did anything (its `last_activity_at`, or the
+// creation time as a floor). Recomputed each poll tick, so idle rows drift onto
+// the shelf on their own within a poll interval.
+export function idleMs(s: Session): number {
+  const last = Date.parse(s.last_activity_at || s.created_at);
+  if (Number.isNaN(last)) return 0;
+  return Math.max(0, Date.now() - last);
+}
+
+export type ParkReason = 'manual' | 'review' | 'idle';
+
+// Why a session rests on the shelf, or `null` if it belongs in the live list.
+// A session is shelved when it needs nothing from you *and* one of:
+//   • you parked it by hand              → 'manual'  (park === 'parked')
+//   • it's waiting on an external review  → 'review'  (the PARKED tag, isParked)
+//   • the agent has rested past the idle threshold → 'idle'
+// A loud signal always keeps a row live (you need to see it), and an explicit
+// 'active' override pins a row live even when idle.
+export function parkReason(s: Session): ParkReason | null {
+  if (s.status === 'archived') return null;
+  if (effectiveAttention(s).level !== 'ok') return null; // needs a human → live
+  if (s.park === 'active') return null; // kept live by hand
+  if (s.park === 'parked') return 'manual';
+  if (isParked(s)) return 'review';
+  if (idleMs(s) >= IDLE_PARK_DAYS * DAY_MS) return 'idle';
+  return null;
+}
+
+export function shelved(s: Session): boolean {
+  return parkReason(s) !== null;
+}
+
+// A short mono label for the shelf badge — what kind of rest this is.
+export function parkLabel(s: Session): string {
+  const reason = parkReason(s);
+  if (reason === 'review') return 'in review';
+  if (reason === 'idle') {
+    const days = Math.floor(idleMs(s) / DAY_MS);
+    return days >= 1 ? `idle ${days}d` : 'idle';
+  }
+  return 'parked';
+}
+
+// The numeric key a top-level thread sorts by. A manual `sort_order` (assigned as
+// the midpoint of its neighbours on drag) places the row exactly; absent, it
+// falls back to the automatic order — urgency first (blocked, then attention),
+// then newest. Both live on one ascending axis (smaller = higher), so a dragged
+// row lands where dropped while every untouched row keeps its automatic spot.
+// `subtreeRank` is the thread's loudest member (SessionList floats a thread to
+// its max), so a thread with a blocked child rises as a whole.
+export function autoOrderKey(s: Session, subtreeRank: number): number {
+  const created = Date.parse(s.created_at) || 0;
+  return -subtreeRank * 1e15 - created;
+}
+
+export function orderKey(s: Session, subtreeRank: number): number {
+  return s.sort_order ?? autoOrderKey(s, subtreeRank);
+}
+
 // One loud tag surfaced as an individually-dismissable chip. Unlike
 // effectiveAttention (which resolves the single loudest level for filtering,
 // sorting and counts), this surfaces EACH loud tag so a human can clear them

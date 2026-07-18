@@ -121,6 +121,26 @@ not VS Code:
   radius 4px on controls and 6px on panels. The 4/8/12/16 spacing grid.
 - **Numbers**: `tabular-nums` globally.
 
+## Fleet list: order & the resting shelf
+
+The fleet list is where a long day's fatigue accumulates, so two controls keep it
+from becoming a wall of stale rows:
+
+- **The resting shelf ("Parked").** Below the live list sits a collapsed shelf
+  for threads that need nothing from you right now — hand-parked, waiting on an
+  external reviewer, or simply long idle (the agent has rested past
+  `IDLE_PARK_DAYS`). Shelf rows are dimmed, labelled with *why* they rest (`in
+  review` / `idle 6d` / `parked`), and one click (or a drag) away from live. A
+  loud signal always keeps a thread live — a session that needs a human never
+  hides. The idle threshold is a pure client view over `last_activity_at`; only
+  the manual override (`park`: `'parked'` / `'active'`) is persisted.
+- **Manual order.** A hover-revealed grip (`⠿`) drags a top-level thread to
+  reorder it, or onto the shelf to rest it (drag back out, or "Keep live", to
+  return it). A drag persists one midpoint `sort_order`; placed and untouched
+  rows share one numeric axis (`orderKey`), so a dragged row lands exactly where
+  dropped while every other row keeps its automatic urgency-then-recency spot.
+  The grip is the only draggable handle, so the row's link still click/⌘-clicks.
+
 ## Recurring pieces
 
 - `meta-chip` / `tag-pill` / `pill` utilities (styles.css) for mono metadata,

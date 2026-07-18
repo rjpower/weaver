@@ -291,6 +291,8 @@ pub(crate) async fn session_view(
         parent_id: session.parent_branch_id.clone(),
         created_by: session.created_by.clone(),
         tracking_issue: None,
+        park: session.park.clone(),
+        sort_order: session.sort_order,
         branch: bv,
     })
 }

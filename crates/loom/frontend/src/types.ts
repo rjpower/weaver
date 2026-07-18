@@ -94,6 +94,15 @@ export interface Session {
   /** The tracking issue opened for this session's task at launch (the handle
    *  the launcher follows). Only set on the create response. */
   tracking_issue: number | null;
+  /** Manual park override for the fleet list's resting shelf: `'parked'` pins the
+   *  row to the shelf, `'active'` keeps it live even when idle, `null` = auto (the
+   *  client shelves it once idle past the threshold). Set by dragging a row
+   *  into/out of the Parked region. */
+  park: 'parked' | 'active' | null;
+  /** Manual fleet-list sort key, or `null` to follow the automatic
+   *  urgency-then-recency order. Placed and untouched rows share one numeric axis
+   *  so they interleave. Set by drag-reordering. */
+  sort_order: number | null;
   branch: Branch;
 }
 

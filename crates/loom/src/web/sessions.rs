@@ -1415,6 +1415,20 @@ pub(super) async fn patch_session(
         .await
         .ok();
     }
+    // Park override — the fleet list's resting shelf. `"auto"` clears the manual
+    // override back to idle-driven (stored NULL); `"parked"` / `"active"` pin it.
+    if let Some(park) = &req.park {
+        let stored = match park.as_str() {
+            "auto" => None,
+            "parked" => Some("parked"),
+            "active" => Some("active"),
+            other => return Err(AppError::bad_request(format!("invalid park '{other}'"))),
+        };
+        session_mod::set_park(&st.db, &session.id, stored).await?;
+    }
+    if let Some(order) = req.sort_order {
+        session_mod::set_sort_order(&st.db, &session.id, order).await?;
+    }
     let (session, branch) = require_session(&st.db, &session.id).await?;
     Ok(Json(session_view(&st.db, &session, &branch).await?))
 }

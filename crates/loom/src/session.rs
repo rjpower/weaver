@@ -41,6 +41,19 @@ pub struct Session {
     /// the resolving [`crate::auth::Principal`]; a tracking/UX field, never a
     /// security boundary.
     pub created_by: Option<String>,
+    /// Park state — the fleet list's resting shelf (a tier above archived: the
+    /// terminal + worktree stay, the session stays resumable, it's just
+    /// collapsed out of the live list). Tri-state: `None` = auto (parked-in-view
+    /// once idle past the threshold, live otherwise), `Some("parked")` = pinned
+    /// to the shelf by hand, `Some("active")` = kept live by hand even when idle.
+    /// The idle threshold itself is a client view concern; the server only
+    /// stores the explicit override.
+    pub park: Option<String>,
+    /// Manual fleet-list sort key. `None` = follow the automatic
+    /// urgency-then-recency order; a number places the row exactly (assigned as
+    /// the midpoint of its neighbours on drag), on one numeric axis with the
+    /// derived auto-order so placed and untouched rows interleave.
+    pub sort_order: Option<f64>,
 }
 
 /// Session **lifecycle** states — the mechanical, orchestrator-owned axis: is
@@ -255,6 +268,31 @@ pub async fn touch(db: &Db, id: &str) -> Result<()> {
         .execute(db)
         .await?;
     tracing::debug!(session = %id, "session activity touched");
+    Ok(())
+}
+
+/// Set the manual park override — `Some("parked")` / `Some("active")` / `None`
+/// (auto). See [`Session::park`]. The fleet list writes this when a row is
+/// dragged into or out of the Parked shelf.
+pub async fn set_park(db: &Db, id: &str, park: Option<&str>) -> Result<()> {
+    sqlx::query("UPDATE sessions SET park = ? WHERE id = ?")
+        .bind(park)
+        .bind(id)
+        .execute(db)
+        .await?;
+    tracing::info!(session = %id, park = park.unwrap_or("auto"), "session park changed");
+    Ok(())
+}
+
+/// Set the manual fleet-list sort key. See [`Session::sort_order`]. The list
+/// writes the dragged row's new midpoint key here.
+pub async fn set_sort_order(db: &Db, id: &str, order: f64) -> Result<()> {
+    sqlx::query("UPDATE sessions SET sort_order = ? WHERE id = ?")
+        .bind(order)
+        .bind(id)
+        .execute(db)
+        .await?;
+    tracing::debug!(session = %id, order, "session sort_order changed");
     Ok(())
 }
 
