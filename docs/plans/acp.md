@@ -262,7 +262,7 @@ files — the same out-of-band channel the launch env (`WEAVER_API`,
 New loom-owned table (created in `migrate_loom`, like the other loom tables):
 
 ```
-chat_blocks(id, session_id, turn, seq, kind, payload TEXT/json, created_at,
+chat_blocks(id, session_id, turn, seq, kind, payload TEXT (JSON), created_at,
             UNIQUE(session_id, turn, seq))
 ```
 
