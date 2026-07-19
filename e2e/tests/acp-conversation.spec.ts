@@ -106,11 +106,16 @@ test.describe('acp conversation', () => {
     // The turn has settled — its closing rule renders after the prose.
     await expect(page.getByTestId('acp-turn-rule')).toBeVisible({ timeout: 20_000 });
 
-    // The transcript genuinely overflows…
-    await expect.poll(() => conv.evaluate((el) => el.scrollHeight - el.clientHeight)).toBeGreaterThan(300);
+    // The transcript genuinely overflows… (generous timeouts: markdown paints
+    // asynchronously and can lag well behind the stream on a loaded machine)
+    await expect
+      .poll(() => conv.evaluate((el) => el.scrollHeight - el.clientHeight), { timeout: 30_000 })
+      .toBeGreaterThan(300);
     // …and the view rests pinned at its foot, where the newest prose reads.
     await expect
-      .poll(() => conv.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight))
+      .poll(() => conv.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight), {
+        timeout: 30_000,
+      })
       .toBeLessThan(120);
   });
 

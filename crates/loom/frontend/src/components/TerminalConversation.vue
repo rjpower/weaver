@@ -13,6 +13,7 @@ import {
 import { get, sendMessage } from '../api';
 import type { IrisLog, IrisBlock, Session } from '../types';
 import { canSend, conversationState, effectiveAttention, TONE_TEXT } from '../lib/sessionState';
+import { useFollowFoot } from '../lib/followFoot';
 import MarkdownView from './MarkdownView.vue';
 
 // The Conversation tab for a *terminal-backend* session (`protocol='terminal'`):
@@ -406,45 +407,14 @@ function toggleAll() {
   open.value = allOpen.value ? new Set() : new Set(model.value.foldKeys);
 }
 
-// ── Follow-the-foot scroll ──────────────────────────────────────────────────
-// The chat opens at its newest exchange and stays *pinned* there while content
-// grows; scrolling up releases the pin, scrolling back to the foot re-arms it.
-// Growth lands asynchronously — markdown parses off-tick, images load, the pane
-// un-hides from a v-show tab — so a ResizeObserver on the transcript body does
-// the following; a one-shot scroll after nextTick would race the paint and
-// strand the view mid-history.
+// ── Follow-the-foot scroll (lib/followFoot.ts): pinned-at-the-newest-exchange. ──
 const convScroll = ref<HTMLElement | null>(null);
 const convBody = ref<HTMLElement | null>(null);
-const pinned = ref(true);
-
-// Whether the stream is scrolled to (near) its foot. A missing scroll root
-// counts as "at the bottom" (nothing scrolled yet).
-function nearBottom(): boolean {
-  const el = convScroll.value;
-  if (!el) return true;
-  return el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-}
-function scrollToBottom() {
-  const el = convScroll.value;
-  if (el) el.scrollTop = el.scrollHeight;
-}
+const { pinned, scrollToBottom, trackPin } = useFollowFoot(convScroll, convBody);
 function onScroll() {
-  pinned.value = nearBottom();
+  trackPin();
   updateActive();
 }
-let bodyRO: ResizeObserver | null = null;
-watch(convBody, (el) => {
-  bodyRO?.disconnect();
-  if (!el) return;
-  bodyRO ??= new ResizeObserver(() => {
-    if (pinned.value) scrollToBottom();
-  });
-  bodyRO.observe(el);
-});
-onUnmounted(() => {
-  bodyRO?.disconnect();
-  bodyRO = null;
-});
 
 // ── Prompt jump-list (scroll-spy) ───────────────────────────────────────────
 const activeAnchor = ref('');

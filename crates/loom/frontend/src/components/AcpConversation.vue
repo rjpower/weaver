@@ -35,6 +35,7 @@ import type {
   TurnEndPayload,
 } from '../types';
 import { canSend } from '../lib/sessionState';
+import { useFollowFoot } from '../lib/followFoot';
 import MarkdownView from './MarkdownView.vue';
 
 // The Conversation surface for an *ACP* session (`protocol='acp'`): typeset
@@ -581,45 +582,14 @@ const elapsedLabel = computed(() => {
   return `${m}:${String(s).padStart(2, '0')}`;
 });
 
-// ── Follow-the-foot scroll ───────────────────────────────────────────────────
-// A chat opens at its newest exchange and stays *pinned* there while content
-// grows; scrolling up releases the pin, scrolling back to the foot re-arms it.
-// Growth lands asynchronously — markdown parses off-tick, images load, the pane
-// un-hides from a v-show tab — so a ResizeObserver on the transcript body does
-// the following; a one-shot scroll after nextTick would race the paint and
-// strand the view mid-history.
+// ── Follow-the-foot scroll (lib/followFoot.ts): pinned-at-the-newest-exchange. ──
 const convScroll = ref<HTMLElement | null>(null);
 const convBody = ref<HTMLElement | null>(null);
-const pinned = ref(true);
-function nearBottom(): boolean {
-  const el = convScroll.value;
-  if (!el) return true;
-  return el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-}
-function scrollToBottom() {
-  const el = convScroll.value;
-  if (el) el.scrollTop = el.scrollHeight;
-}
-function autoFollow() {
-  if (pinned.value) nextTick(scrollToBottom);
-}
+const { pinned, scrollToBottom, autoFollow, trackPin } = useFollowFoot(convScroll, convBody);
 function onScroll() {
-  pinned.value = nearBottom();
+  trackPin();
   updateActive();
 }
-let bodyRO: ResizeObserver | null = null;
-watch(convBody, (el) => {
-  bodyRO?.disconnect();
-  if (!el) return;
-  bodyRO ??= new ResizeObserver(() => {
-    if (pinned.value) scrollToBottom();
-  });
-  bodyRO.observe(el);
-});
-onUnmounted(() => {
-  bodyRO?.disconnect();
-  bodyRO = null;
-});
 
 // ── Jump-list scroll-spy ─────────────────────────────────────────────────────
 const activeAnchor = ref('');

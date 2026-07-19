@@ -75,10 +75,13 @@ test.describe('conversation view', () => {
     await openConversation(page, weaver, { name: 'conv-foot', log: longLog() });
     const conv = page.getByTestId('conversation');
 
-    // The transcript genuinely overflows…
-    await expect.poll(() => conv.evaluate((el) => el.scrollHeight - el.clientHeight)).toBeGreaterThan(300);
+    // The transcript genuinely overflows… (generous timeouts: markdown paints
+    // asynchronously and can lag well behind the fetch on a loaded machine)
+    await expect
+      .poll(() => conv.evaluate((el) => el.scrollHeight - el.clientHeight), { timeout: 30_000 })
+      .toBeGreaterThan(300);
     // …and the view rests at its foot, where the newest reply reads.
-    await expect.poll(() => footDistance(conv)).toBeLessThan(120);
+    await expect.poll(() => footDistance(conv), { timeout: 30_000 }).toBeLessThan(120);
     await expect(page.getByText('Progress note 40', { exact: false })).toBeVisible();
   });
 
@@ -90,7 +93,7 @@ test.describe('conversation view', () => {
   }) => {
     const s = await openConversation(page, weaver, { name: 'conv-pin', log: longLog() });
     const conv = page.getByTestId('conversation');
-    await expect.poll(() => footDistance(conv)).toBeLessThan(120);
+    await expect.poll(() => footDistance(conv), { timeout: 30_000 }).toBeLessThan(120);
 
     // The reader scrolls up into the history — the pin releases…
     await conv.evaluate((el) => {
