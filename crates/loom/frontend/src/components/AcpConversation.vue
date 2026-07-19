@@ -439,6 +439,10 @@ async function pickConfig(option: AcpConfigOption, value: string | boolean) {
   configBusy.value = option.id;
   try {
     const response = await setSessionConfigOption(id.value, option.id, value);
+    // Clear the write lock before publishing the acknowledged value. Vue can
+    // paint that value before this async function's `finally` runs; keeping the
+    // lock through that paint makes an immediate click on the next pill vanish.
+    configBusy.value = '';
     // The response is the full state acknowledged by the agent. This matters
     // when changing one value also changes another control's choices (a model
     // switch can alter its supported reasoning efforts).
