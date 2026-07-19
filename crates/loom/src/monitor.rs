@@ -386,6 +386,12 @@ mod tests {
             created_by: None,
             park: None,
             sort_order: None,
+            protocol: "terminal".to_string(),
+            acp_session_id: None,
+            acp_ack_seq: 0,
+            acp_inflight: None,
+            current_mode: None,
+            pending_prompt: None,
         }
     }
 
