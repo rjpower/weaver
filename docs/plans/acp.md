@@ -245,13 +245,21 @@ things `claude_command` passes as argv today. The mapping:
   session's first `user_message` block. The launch prompt finally becomes a
   real prompt instead of a shell-quoted argv splice.
 - **Model / effort** (real session columns, real UI controls) →
-  `_meta.claudeCode.options` for the Claude adapter, session config options
-  for Codex; both capability-gated at `initialize`.
+  `_meta.claudeCode.options` for the Claude adapter; `CODEX_CONFIG` (a JSON
+  object merged into the Codex session config: `model`,
+  `model_reasoning_effort`) for codex-acp.
 - **System primer**: the worktree path keeps riding the `SessionStart`
   settings hook exactly as today; the paths that use
   `--append-system-prompt-file` (concierge, adopt re-orientation) map to the
-  adapter's `appendSystemPrompt` option.
-- **Permission posture** → the session's launch mode (below).
+  Claude adapter's `appendSystemPrompt` option. Codex has no analogue, so a
+  primer-only codex launch seeds the primer positionally, as its terminal
+  path does.
+- **Permission posture** → the session's launch mode (below). The Claude
+  adapter takes it via `_meta` permissionMode; codex-acp boots in
+  `INITIAL_AGENT_MODE` (`read-only` | `agent` | `agent-full-access`, mapped
+  from the claude-flavored vocabulary, codex ids passing through).
+- **Codex auth** → `DEFAULT_AUTH_REQUEST={"methodId":"api-key"}` +
+  `OPENAI_API_KEY` (already threaded by the deploy), headless.
 
 Anything an adapter can't take via the protocol falls back to env/config
 files — the same out-of-band channel the launch env (`WEAVER_API`,

@@ -424,7 +424,8 @@ impl AgentType for CodexAgentType {
             supports_hooks: false,
             supports_concierge: true,
             builtin: true,
-            // Codex is terminal-only this phase; ACP support is phase 6.
+            // The declared default; an explicit `protocol: acp` on the create
+            // request opts a launch into the codex-acp adapter.
             protocol: "terminal".to_string(),
         }
     }
@@ -708,9 +709,9 @@ pub const DEFAULT_ACP_MODE: &str = "bypassPermissions";
 
 /// Resolve the execution backend for a launch: the agent's declared `protocol`
 /// unless the create request overrides it. A blank/absent override keeps the
-/// declared value. The only override honoured this phase is opting the builtin
-/// `claude` into `acp`; `codex` is rejected (phase 6), and a terminal-only custom
-/// agent has no ACP adapter, so it is rejected too. Returns a key-free reason.
+/// declared value. Both builtins may opt into `acp` (claude via
+/// `claude-agent-acp`, codex via `codex-acp`); a terminal-only custom agent has
+/// no ACP adapter, so it is rejected. Returns a key-free reason.
 pub fn resolve_protocol(meta: &AgentMetadata, requested: Option<&str>) -> Result<String, String> {
     let declared = if meta.protocol.is_empty() {
         "terminal"
@@ -729,14 +730,15 @@ pub fn resolve_protocol(meta: &AgentMetadata, requested: Option<&str>) -> Result
         return Ok(declared.to_string());
     }
     if req == "acp" {
-        // Opting into ACP: only the builtin claude may this phase.
-        return match meta.kind.as_str() {
-            "claude" => Ok("acp".to_string()),
-            "codex" => Err(
-                "codex does not support the acp protocol yet (terminal only this phase)"
-                    .to_string(),
-            ),
-            other => Err(format!("agent '{other}' does not support the acp protocol")),
+        // Opting into ACP: both builtins have an adapter; a terminal custom
+        // agent does not.
+        return if meta.builtin {
+            Ok("acp".to_string())
+        } else {
+            Err(format!(
+                "agent '{}' does not support the acp protocol",
+                meta.kind
+            ))
         };
     }
     // req == "terminal" while declared == "acp": force the terminal fallback. Only
@@ -771,6 +773,7 @@ pub struct AcpLaunchSpec<'a> {
     pub work_dir: &'a Path,
     pub server_addr: &'a str,
     pub model: &'a str,
+    pub effort: &'a str,
     /// The positional opening prompt file (`goal.txt`) — its *content* becomes the
     /// first `session/prompt`. `None` boots the session idle.
     pub goal_file: Option<&'a Path>,
@@ -789,18 +792,24 @@ pub struct AcpLaunchSpec<'a> {
 /// this resolves the `claude-agent-acp` adapter command, installs the
 /// SessionStart-only hook bundle (the work-cycle hooks and the launch-gate seed
 /// are redundant under ACP), and maps model/primer/mode into `_meta.claudeCode.
-/// options`. For a custom acp agent it runs the agent's `launch` command verbatim
-/// (its setup stage first) as the adapter, with no `_meta`.
+/// options`. For the builtin codex it resolves the `codex-acp` adapter and maps
+/// the same inputs onto its env contract (`CODEX_CONFIG`, `INITIAL_AGENT_MODE`,
+/// `DEFAULT_AUTH_REQUEST`) — codex is hookless, so the primer rides the opening
+/// prompt exactly as it does on the terminal path. For a custom acp agent it
+/// runs the agent's `launch` command verbatim (its setup stage first) as the
+/// adapter, with no `_meta`.
 pub async fn build_acp_launch(
     db: &Db,
     spec: &AcpLaunchSpec<'_>,
     open: AcpOpen,
 ) -> Result<AcpLaunch> {
-    let is_claude = spec.custom.is_none();
+    let is_codex = spec.custom.is_none() && spec.runtime == "codex";
+    let is_claude = spec.custom.is_none() && !is_codex;
     let adapter_cmd = match spec.custom {
         // A custom acp agent's `launch` command *is* the adapter (its setup stage
         // runs first, as for a terminal custom agent).
         Some(agent) => join_shell(&[agent.setup.trim(), agent.launch.trim()]),
+        None if is_codex => codex_acp_cmd(db).await,
         None => claude_acp_cmd(db).await,
     };
 
@@ -816,12 +825,32 @@ pub async fn build_acp_launch(
     }
 
     let primer_text = read_opt(spec.primer_file).await;
-    let goal_text = read_opt(spec.goal_file).await;
+    let mut goal_text = read_opt(spec.goal_file).await;
+    if is_codex && goal_text.is_none() {
+        // No appendSystemPrompt analogue: a primer-only launch (the concierge
+        // shape) seeds the primer positionally, mirroring the terminal path's
+        // `goal_file.or(primer_file)`.
+        goal_text = primer_text.clone();
+    }
     let meta = if is_claude {
         claude_acp_meta(spec.model, primer_text.as_deref(), spec.mode)
     } else {
         None
     };
+
+    let mut env = session_env(spec.server_addr, spec.branch_id, spec.extra_env);
+    if is_codex {
+        // Adapter-contract env, deferring to any operator-provided value.
+        push_env_default(
+            &mut env,
+            "DEFAULT_AUTH_REQUEST",
+            r#"{"methodId":"api-key"}"#,
+        );
+        if let Some(cfg) = codex_acp_config(spec.model, spec.effort) {
+            push_env_default(&mut env, "CODEX_CONFIG", &cfg);
+        }
+        push_env_default(&mut env, "INITIAL_AGENT_MODE", &codex_acp_mode(spec.mode));
+    }
 
     let (new_or_load, goal) = match open {
         AcpOpen::Fresh => (
@@ -838,11 +867,22 @@ pub async fn build_acp_launch(
     Ok(AcpLaunch {
         adapter_cmd,
         cwd: spec.work_dir.to_path_buf(),
-        env: session_env(spec.server_addr, spec.branch_id, spec.extra_env),
+        env,
         new_or_load,
-        mode: Some(spec.mode.to_string()),
+        // Codex boots directly in its mapped mode via `INITIAL_AGENT_MODE`; a
+        // post-setup `session/set_mode` would re-send a claude-flavored id it
+        // does not advertise.
+        mode: (!is_codex).then(|| spec.mode.to_string()),
         goal,
     })
+}
+
+/// Append `(key, value)` unless `key` is already present (an operator override
+/// via extra_env wins over the adapter-contract default).
+fn push_env_default(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if !env.iter().any(|(k, _)| k == key) {
+        env.push((key.to_string(), value.to_string()));
+    }
 }
 
 /// The `claude-agent-acp` adapter command: `WEAVER_CLAUDE_ACP_CMD` (env) wins,
@@ -862,6 +902,55 @@ async fn claude_acp_cmd(db: &Db) -> String {
         return cmd;
     }
     "npx --yes @agentclientprotocol/claude-agent-acp".to_string()
+}
+
+/// The `codex-acp` adapter command: `WEAVER_CODEX_ACP_CMD` (env) wins, then the
+/// `acp.codex_cmd` setting, else the pinned npm default (which bundles a
+/// compatible `@openai/codex`).
+async fn codex_acp_cmd(db: &Db) -> String {
+    if let Ok(cmd) = std::env::var("WEAVER_CODEX_ACP_CMD") {
+        let cmd = cmd.trim();
+        if !cmd.is_empty() {
+            return cmd.to_string();
+        }
+    }
+    if let Some(cmd) = weaver_core::config::get(db, "acp.codex_cmd")
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return cmd;
+    }
+    "npx --yes @agentclientprotocol/codex-acp".to_string()
+}
+
+/// The `CODEX_CONFIG` JSON for the codex adapter (merged into the Codex session
+/// config): model and reasoning effort, only when set. `None` when neither is.
+fn codex_acp_config(model: &str, effort: &str) -> Option<String> {
+    let mut cfg = Map::new();
+    let model = model.trim();
+    if !model.is_empty() {
+        cfg.insert("model".to_string(), json!(model));
+    }
+    if let Some(e) = effort_flag(effort) {
+        cfg.insert("model_reasoning_effort".to_string(), json!(e));
+    }
+    if cfg.is_empty() {
+        return None;
+    }
+    Some(Value::Object(cfg).to_string())
+}
+
+/// Map the launch mode onto a codex-acp `INITIAL_AGENT_MODE` id. The create API
+/// speaks the claude-flavored vocabulary; codex's own ids pass through, so an
+/// operator can name `read-only`/`agent`/`agent-full-access` directly.
+fn codex_acp_mode(mode: &str) -> String {
+    match mode.trim() {
+        "bypassPermissions" => "agent-full-access".to_string(),
+        "acceptEdits" | "default" | "" => "agent".to_string(),
+        "plan" => "read-only".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// The `_meta.claudeCode.options` object for the claude adapter — only the fields
@@ -1630,8 +1719,8 @@ mod tests {
             "terminal"
         );
 
-        // codex rejects acp this phase.
-        assert!(resolve_protocol(&codex, Some("acp")).is_err());
+        // codex opts into acp via codex-acp.
+        assert_eq!(resolve_protocol(&codex, Some("acp")).unwrap(), "acp");
 
         // A terminal-only custom agent has no acp adapter.
         assert!(resolve_protocol(&term_custom, Some("acp")).is_err());
@@ -1640,6 +1729,49 @@ mod tests {
 
         // An unknown protocol name is rejected.
         assert!(resolve_protocol(&claude, Some("grpc")).is_err());
+    }
+
+    #[test]
+    fn codex_acp_config_carries_only_configured_fields() {
+        assert!(codex_acp_config("", "").is_none());
+
+        let cfg: Value =
+            serde_json::from_str(&codex_acp_config("gpt-5.3-codex", "high").unwrap()).unwrap();
+        assert_eq!(cfg["model"], "gpt-5.3-codex");
+        assert_eq!(cfg["model_reasoning_effort"], "high");
+
+        let model_only: Value =
+            serde_json::from_str(&codex_acp_config("gpt-5.3-codex", " ").unwrap()).unwrap();
+        assert_eq!(model_only["model"], "gpt-5.3-codex");
+        assert!(model_only.get("model_reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn codex_acp_mode_maps_the_claude_vocabulary_and_passes_codex_ids_through() {
+        assert_eq!(codex_acp_mode("bypassPermissions"), "agent-full-access");
+        assert_eq!(codex_acp_mode("acceptEdits"), "agent");
+        assert_eq!(codex_acp_mode("default"), "agent");
+        assert_eq!(codex_acp_mode(""), "agent");
+        assert_eq!(codex_acp_mode("plan"), "read-only");
+        // Codex's own ids are honoured verbatim.
+        assert_eq!(codex_acp_mode("read-only"), "read-only");
+        assert_eq!(codex_acp_mode("agent-full-access"), "agent-full-access");
+    }
+
+    #[test]
+    fn push_env_default_defers_to_an_existing_key() {
+        let mut env = vec![(
+            "CODEX_CONFIG".to_string(),
+            "{\"model\":\"mine\"}".to_string(),
+        )];
+        push_env_default(&mut env, "CODEX_CONFIG", "{\"model\":\"ours\"}");
+        push_env_default(&mut env, "INITIAL_AGENT_MODE", "agent");
+        assert_eq!(env.len(), 2);
+        assert_eq!(env[0].1, "{\"model\":\"mine\"}");
+        assert_eq!(
+            env[1],
+            ("INITIAL_AGENT_MODE".to_string(), "agent".to_string())
+        );
     }
 
     #[test]

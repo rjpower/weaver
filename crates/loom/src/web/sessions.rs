@@ -1095,8 +1095,8 @@ pub(crate) async fn create_session_core(
             work_dir = %work_dir.display(), mode = %mode, "launching acp session"
         );
         let session = session_mod::insert(&st.db, &new_session).await?;
-        // A custom acp agent supplies its own adapter command; the builtin claude
-        // resolves the `claude-agent-acp` adapter.
+        // A custom acp agent supplies its own adapter command; a builtin
+        // resolves its adapter (claude-agent-acp / codex-acp).
         let custom = if agent::builtin_agent_type(&runtime).is_some() {
             None
         } else {
@@ -1110,6 +1110,7 @@ pub(crate) async fn create_session_core(
                 work_dir: &work_dir,
                 server_addr: &st.addr,
                 model: &model,
+                effort: &effort,
                 goal_file: goal_file.as_deref(),
                 primer_file: primer_file.as_deref(),
                 extra_env: &extra_env,
@@ -1957,6 +1958,7 @@ async fn adopt_acp(st: &AppState, session: &Session, branch: &Branch) -> Result<
                 work_dir: &work_dir,
                 server_addr: &st.addr,
                 model: &session.model,
+                effort: &session.effort,
                 goal_file: goal_file.as_deref(),
                 primer_file: primer_file.as_deref(),
                 extra_env: &extra_env,

@@ -1045,3 +1045,127 @@ async fn preview_renders_the_journal_tail_as_text() {
         "the turn boundary is marked: {screen}"
     );
 }
+
+/// I. Phase 6, the builtin codex over codex-acp: a REST create with
+///    `protocol: "acp"` resolves the `acp.codex_cmd` adapter (the fake here),
+///    stamps the row, and drives a full goal turn through the journal.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn builtin_codex_launches_over_codex_acp() {
+    let ts = TestServer::start().await;
+    loom::config::apply(
+        &ts.state.db,
+        &[("acp.codex_cmd".to_string(), Some(agent_cmd()))],
+    )
+    .await
+    .unwrap();
+
+    let created = ts
+        .client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "say:codex online", "cwd": ts.cwd(),
+                    "agent": "codex", "protocol": "acp" }),
+        )
+        .await
+        .expect("builtin codex creates over acp");
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["protocol"], "acp", "the session row is stamped acp");
+
+    let chat = poll_chat(&ts, &id, Duration::from_secs(20), |blocks| {
+        blocks.iter().any(|b| b["kind"] == "turn_end")
+    })
+    .await;
+    let blocks = chat["blocks"].as_array().unwrap();
+    let reply = blocks
+        .iter()
+        .find(|b| b["kind"] == "agent_message")
+        .expect("the goal turn replied");
+    assert_eq!(reply["payload"]["text"], "codex online");
+}
+
+/// J. Phase 6, the codex launch mapping: `build_acp_launch` resolves the
+///    codex-acp adapter and maps model/effort/mode onto its env contract
+///    (`CODEX_CONFIG`, `INITIAL_AGENT_MODE`, `DEFAULT_AUTH_REQUEST`) instead of
+///    `_meta` + `session/set_mode`, with operator env winning over the defaults
+///    and a primer-only launch seeding the primer positionally.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_acp_launch_maps_the_adapter_contract() {
+    let ts = TestServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let goal = dir.path().join("goal.txt");
+    let primer = dir.path().join("primer.txt");
+    tokio::fs::write(&goal, "ship it").await.unwrap();
+    tokio::fs::write(&primer, "orient first").await.unwrap();
+
+    let env_of = |launch: &AcpLaunch, key: &str| {
+        launch
+            .env
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .collect::<Vec<_>>()
+    };
+    let addr = ts.addr.to_string();
+    let spec = |goal_file, extra_env| loom::agent::AcpLaunchSpec {
+        branch_id: "b-codex",
+        runtime: "codex",
+        work_dir: dir.path(),
+        server_addr: &addr,
+        model: "gpt-5.3-codex",
+        effort: "high",
+        goal_file,
+        primer_file: Some(primer.as_path()),
+        extra_env,
+        mode: "bypassPermissions",
+        custom: None,
+    };
+
+    let launch = loom::agent::build_acp_launch(
+        &ts.state.db,
+        &spec(Some(goal.as_path()), &[]),
+        loom::agent::AcpOpen::Fresh,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        launch.adapter_cmd, "npx --yes @agentclientprotocol/codex-acp",
+        "the pinned npm default resolves when neither env nor config names one"
+    );
+    assert_eq!(
+        env_of(&launch, "DEFAULT_AUTH_REQUEST"),
+        vec![r#"{"methodId":"api-key"}"#.to_string()]
+    );
+    assert_eq!(
+        env_of(&launch, "INITIAL_AGENT_MODE"),
+        vec!["agent-full-access"]
+    );
+    let cfg: Value = serde_json::from_str(&env_of(&launch, "CODEX_CONFIG")[0]).unwrap();
+    assert_eq!(cfg["model"], "gpt-5.3-codex");
+    assert_eq!(cfg["model_reasoning_effort"], "high");
+    assert!(
+        launch.mode.is_none(),
+        "the mode boots via INITIAL_AGENT_MODE, not a claude-id set_mode"
+    );
+    assert_eq!(launch.goal.as_deref(), Some("ship it"));
+    match &launch.new_or_load {
+        NewOrLoad::New { meta, .. } => assert!(meta.is_none(), "codex takes no _meta"),
+        NewOrLoad::Load { .. } => panic!("a fresh launch opens session/new"),
+    }
+
+    // An operator-provided CODEX_CONFIG wins; a goalless launch seeds the primer.
+    let operator = [(
+        "CODEX_CONFIG".to_string(),
+        r#"{"model":"mine"}"#.to_string(),
+    )];
+    let launch = loom::agent::build_acp_launch(
+        &ts.state.db,
+        &spec(None, &operator),
+        loom::agent::AcpOpen::Fresh,
+    )
+    .await
+    .unwrap();
+    assert_eq!(env_of(&launch, "CODEX_CONFIG"), vec![r#"{"model":"mine"}"#]);
+    assert_eq!(launch.goal.as_deref(), Some("orient first"));
+}
