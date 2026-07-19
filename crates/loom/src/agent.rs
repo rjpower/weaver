@@ -4,15 +4,16 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use crate::acp::{AcpLaunch, NewOrLoad};
 use crate::backend;
 use crate::custom_agents::CustomAgent;
 use crate::db::Db;
-use weaver_core::agent::hooks_json;
+use weaver_core::agent::{hooks_json, HookMode};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentChoice {
@@ -50,6 +51,11 @@ pub struct AgentMetadata {
     /// True for the code-shipped `claude`/`codex`; false for an operator-defined
     /// custom agent (which the UI may edit or delete).
     pub builtin: bool,
+    /// The agent's declared execution backend: `"terminal"` or `"acp"`. The
+    /// builtins declare `"acp"`; a custom agent reports its stored `protocol`.
+    /// A create request may override a builtin's default (`--protocol
+    /// terminal` keeps the PTY); see [`resolve_protocol`].
+    pub protocol: String,
 }
 
 pub struct AgentInstance {
@@ -387,6 +393,9 @@ impl AgentType for ClaudeAgentType {
             supports_hooks: true,
             supports_concierge: true,
             builtin: true,
+            // ACP is the builtin default; `--protocol terminal` keeps the PTY
+            // fallback.
+            protocol: "acp".to_string(),
         }
     }
 
@@ -416,6 +425,9 @@ impl AgentType for CodexAgentType {
             supports_hooks: false,
             supports_concierge: true,
             builtin: true,
+            // ACP is the builtin default; `--protocol terminal` keeps the PTY
+            // fallback.
+            protocol: "acp".to_string(),
         }
     }
 
@@ -441,6 +453,11 @@ impl AgentType for CustomAgentType {
             supports_hooks: self.agent.reports_status,
             supports_concierge: false,
             builtin: false,
+            protocol: if self.agent.protocol.is_empty() {
+                "terminal".to_string()
+            } else {
+                self.agent.protocol.clone()
+            },
         }
     }
 
@@ -577,13 +594,9 @@ pub async fn launch(db: &Db, spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<
 }
 
 async fn prepare_claude(ctx: &AgentLaunchContext<'_>) {
-    let loom_exe = std::env::current_exe().ok();
-    let weaver_dir = loom_exe.as_deref().and_then(Path::parent);
-    let weaver_bin = weaver_dir
-        .map(|d| d.join("weaver").display().to_string())
-        .unwrap_or_else(|| "weaver".to_string());
+    let weaver_bin = weaver_bin_path();
 
-    if let Err(e) = install_hooks(ctx.work_dir, &weaver_bin).await {
+    if let Err(e) = install_hooks(ctx.work_dir, &weaver_bin, HookMode::Terminal).await {
         tracing::warn!(work_dir = %ctx.work_dir.display(), error = %e,
             "agent hook setup failed; launching without lifecycle hooks");
     }
@@ -600,25 +613,14 @@ async fn start_terminal(
 ) -> Result<AgentInstance> {
     let loom_exe = std::env::current_exe().ok();
     let weaver_dir = loom_exe.as_deref().and_then(Path::parent);
-    let api_url = format!("http://{}", ctx.server_addr);
-    // Hand the agent the machine-local token so its in-worktree `loom session …`
-    // calls authenticate even when loopback trust is off. Absent file ⇒ omit it
-    // (loopback trust then covers the local case).
-    let local_token = read_local_token();
-    let mut env = vec![
-        ("WEAVER_API", api_url.as_str()),
-        ("WEAVER_BRANCH", ctx.branch_id),
-    ];
-    if let Some(token) = local_token.as_deref() {
-        env.push(("LOOM_TOKEN", token));
-    }
-    // Operator-managed vars are applied last, so for any shared name they'd win.
-    // That's safe because `agent_env::validate_name` reserves loom's own
-    // WEAVER_*/LOOM_ prefixes, so a stored var can never shadow the environment
-    // loom needs — everything else the agent's tools read is theirs to set.
-    for (k, v) in ctx.extra_env {
-        env.push((k.as_str(), v.as_str()));
-    }
+    // The session environment loom injects (WEAVER_API/WEAVER_BRANCH/LOOM_TOKEN +
+    // operator vars) — the same set the ACP relay launch delivers (see
+    // [`session_env`] / [`build_acp_launch`]).
+    let env_owned = session_env(ctx.server_addr, ctx.branch_id, ctx.extra_env);
+    let env: Vec<(&str, &str)> = env_owned
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     // The env is delivered to the child through the process environment (see
     // `backend::new_session` → `tapestry::spawn_detached`), not `export`-ed into
     // the script — so tokens/keys never appear on any process's argv.
@@ -658,9 +660,380 @@ pub fn read_local_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The session environment loom injects into an agent process — the same set for
+/// the terminal (PTY) and ACP (relay) backends: `WEAVER_API`, `WEAVER_BRANCH`, the
+/// machine-local `LOOM_TOKEN` (when minted), then the operator-managed vars last
+/// (so a stored var wins any shared name — safe, since `agent_env::validate_name`
+/// reserves loom's own `WEAVER_*`/`LOOM_` prefixes). Delivered out of band via the
+/// process environment, never on argv.
+pub fn session_env(
+    server_addr: &str,
+    branch_id: &str,
+    extra_env: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = vec![
+        ("WEAVER_API".to_string(), format!("http://{server_addr}")),
+        ("WEAVER_BRANCH".to_string(), branch_id.to_string()),
+    ];
+    if let Some(token) = read_local_token() {
+        env.push(("LOOM_TOKEN".to_string(), token));
+    }
+    for (k, v) in extra_env {
+        env.push((k.clone(), v.clone()));
+    }
+    env
+}
+
+/// The `weaver` binary path — a sibling of the running executable (they ship
+/// together), falling back to bare `weaver` on `PATH`.
+fn weaver_bin_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|d| d.join("weaver").display().to_string())
+        .unwrap_or_else(|| "weaver".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// ACP launch mapping (protocol='acp' sessions)
+//
+// The ACP analogue of the terminal launch path: instead of building an argv the
+// PTY runs, it builds an [`AcpLaunch`] the relay runs (adapter command + env +
+// `_meta` options + the goal as the first prompt), which [`crate::acp::start`]
+// then brings up. See docs/plans/acp.md "Launch mapping".
+// ---------------------------------------------------------------------------
+
+/// The permission posture an ACP session boots in when the create request names
+/// none — the moral equivalent of the retired pre-seeded launch gates.
+pub const DEFAULT_ACP_MODE: &str = "bypassPermissions";
+
+/// Resolve the execution backend for a launch: the agent's declared `protocol`
+/// unless the create request overrides it. A blank/absent override keeps the
+/// declared value. Both builtins may opt into `acp` (claude via
+/// `claude-agent-acp`, codex via `codex-acp`); a terminal-only custom agent has
+/// no ACP adapter, so it is rejected. Returns a key-free reason.
+pub fn resolve_protocol(meta: &AgentMetadata, requested: Option<&str>) -> Result<String, String> {
+    let declared = if meta.protocol.is_empty() {
+        "terminal"
+    } else {
+        meta.protocol.as_str()
+    };
+    let Some(req) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(declared.to_string());
+    };
+    if req != "terminal" && req != "acp" {
+        return Err(format!(
+            "unknown protocol '{req}' (expected 'terminal' or 'acp')"
+        ));
+    }
+    if req == declared {
+        return Ok(declared.to_string());
+    }
+    if req == "acp" {
+        // Opting into ACP: both builtins have an adapter; a terminal custom
+        // agent does not.
+        return if meta.builtin {
+            Ok("acp".to_string())
+        } else {
+            Err(format!(
+                "agent '{}' does not support the acp protocol",
+                meta.kind
+            ))
+        };
+    }
+    // req == "terminal" while declared == "acp": force the terminal fallback. Only
+    // a builtin has a terminal launch path; an acp custom agent has no terminal
+    // command to run.
+    if meta.builtin {
+        Ok("terminal".to_string())
+    } else {
+        Err(format!(
+            "agent '{}' is acp-only and has no terminal fallback",
+            meta.kind
+        ))
+    }
+}
+
+/// How [`build_acp_launch`] opens the ACP session.
+pub enum AcpOpen {
+    /// A fresh `session/new`; the goal file's content seeds the first prompt.
+    Fresh,
+    /// Reload an existing agent session id (`session/load` — history replays, no
+    /// new goal). Used by adopt when the adapter advertised `loadSession`.
+    Load(String),
+}
+
+/// Everything [`build_acp_launch`] needs — the ACP analogue of [`LaunchSpec`],
+/// carrying the same launch inputs but mapping them onto the adapter / `_meta` /
+/// goal shape the protocol takes.
+pub struct AcpLaunchSpec<'a> {
+    pub branch_id: &'a str,
+    /// The resolved runtime: the builtin `claude`, or a custom agent's name.
+    pub runtime: &'a str,
+    pub work_dir: &'a Path,
+    pub server_addr: &'a str,
+    pub model: &'a str,
+    pub effort: &'a str,
+    /// The positional opening prompt file (`goal.txt`) — its *content* becomes the
+    /// first `session/prompt`. `None` boots the session idle.
+    pub goal_file: Option<&'a Path>,
+    /// The system-context file (`primer.txt`) — its content becomes the adapter's
+    /// `appendSystemPrompt` option (the `--append-system-prompt-file` analogue).
+    pub primer_file: Option<&'a Path>,
+    pub extra_env: &'a [(String, String)],
+    /// The launch permission posture (`bypassPermissions`, `acceptEdits`, …).
+    pub mode: &'a str,
+    /// The resolved custom agent when `runtime` names one (its `launch` command is
+    /// the ACP adapter); `None` for the builtin claude.
+    pub custom: Option<&'a CustomAgent>,
+}
+
+/// Build the [`AcpLaunch`] for a `protocol='acp'` session. For the builtin claude
+/// this resolves the `claude-agent-acp` adapter command, installs the
+/// SessionStart-only hook bundle (the work-cycle hooks and the launch-gate seed
+/// are redundant under ACP), and maps model/primer/mode into `_meta.claudeCode.
+/// options`. For the builtin codex it resolves the `codex-acp` adapter and maps
+/// the same inputs onto its env contract (`CODEX_CONFIG`, `INITIAL_AGENT_MODE`,
+/// `DEFAULT_AUTH_REQUEST`) — codex is hookless, so the primer rides the opening
+/// prompt exactly as it does on the terminal path. For a custom acp agent it
+/// runs the agent's `launch` command verbatim (its setup stage first) as the
+/// adapter, with no `_meta`.
+pub async fn build_acp_launch(
+    db: &Db,
+    spec: &AcpLaunchSpec<'_>,
+    open: AcpOpen,
+) -> Result<AcpLaunch> {
+    let is_codex = spec.custom.is_none() && spec.runtime == "codex";
+    let is_claude = spec.custom.is_none() && !is_codex;
+    let adapter_cmd = match spec.custom {
+        // A custom acp agent's `launch` command *is* the adapter (its setup stage
+        // runs first, as for a terminal custom agent).
+        Some(agent) => join_shell(&[agent.setup.trim(), agent.launch.trim()]),
+        None if is_codex => codex_acp_cmd(db).await,
+        None => claude_acp_cmd(db).await,
+    };
+
+    if is_claude {
+        // Install only the SessionStart primer hook; the work-cycle hooks and the
+        // launch-gate seed are redundant under ACP (protocol turn edges + the
+        // bypass posture replace them).
+        let weaver_bin = weaver_bin_path();
+        if let Err(e) = install_hooks(spec.work_dir, &weaver_bin, HookMode::Acp).await {
+            tracing::warn!(work_dir = %spec.work_dir.display(), error = %e,
+                "acp hook setup failed; launching without the primer hook");
+        }
+    }
+
+    let primer_text = read_opt(spec.primer_file).await;
+    let mut goal_text = read_opt(spec.goal_file).await;
+    if is_codex && goal_text.is_none() {
+        // No appendSystemPrompt analogue: a primer-only launch (the concierge
+        // shape) seeds the primer positionally, mirroring the terminal path's
+        // `goal_file.or(primer_file)`.
+        goal_text = primer_text.clone();
+    }
+    let meta = if is_claude {
+        claude_acp_meta(spec.model, primer_text.as_deref(), spec.mode)
+    } else {
+        None
+    };
+
+    let mut env = session_env(spec.server_addr, spec.branch_id, spec.extra_env);
+    if is_codex {
+        // Adapter-contract env, deferring to any operator-provided value.
+        push_env_default(
+            &mut env,
+            "DEFAULT_AUTH_REQUEST",
+            r#"{"methodId":"api-key"}"#,
+        );
+        if let Some(cfg) = codex_acp_config(spec.model, spec.effort) {
+            push_env_default(&mut env, "CODEX_CONFIG", &cfg);
+        }
+        push_env_default(&mut env, "INITIAL_AGENT_MODE", &codex_acp_mode(spec.mode));
+    }
+
+    let (new_or_load, goal) = match open {
+        AcpOpen::Fresh => (
+            NewOrLoad::New {
+                cwd: spec.work_dir.to_path_buf(),
+                meta,
+            },
+            goal_text.filter(|g| !g.trim().is_empty()),
+        ),
+        // A load replays history — no goal, and `_meta` is unused.
+        AcpOpen::Load(id) => (NewOrLoad::Load { acp_session_id: id }, None),
+    };
+
+    Ok(AcpLaunch {
+        adapter_cmd,
+        cwd: spec.work_dir.to_path_buf(),
+        env,
+        new_or_load,
+        // Codex boots directly in its mapped mode via `INITIAL_AGENT_MODE`; a
+        // post-setup `session/set_mode` would re-send a claude-flavored id it
+        // does not advertise.
+        mode: (!is_codex).then(|| spec.mode.to_string()),
+        goal,
+    })
+}
+
+/// Append `(key, value)` unless `key` is already present (an operator override
+/// via extra_env wins over the adapter-contract default).
+fn push_env_default(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if !env.iter().any(|(k, _)| k == key) {
+        env.push((key.to_string(), value.to_string()));
+    }
+}
+
+/// Where the claude CLI records its conversations (`~/.claude/projects`).
+pub fn claude_projects_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join("projects"))
+}
+
+/// The newest claude conversation recorded for `work_dir` under `projects_dir`:
+/// claude munges the cwd into a directory name (every non-alphanumeric byte
+/// becomes `-`) holding one `<session-id>.jsonl` per conversation. These are
+/// the sessions `claude --continue` resumes, and the ACP adapter loads the same
+/// ids — which is what lets an orphaned terminal session adopt into ACP over
+/// its own history. `None` when nothing is recorded for that directory.
+pub fn latest_claude_session_id(projects_dir: &Path, work_dir: &Path) -> Option<String> {
+    let munged: String = work_dir
+        .display()
+        .to_string()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in std::fs::read_dir(projects_dir.join(munged)).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
+            newest = Some((modified, stem.to_string()));
+        }
+    }
+    newest.map(|(_, id)| id)
+}
+
+/// The default command for an npm-distributed ACP adapter: the installed bin
+/// when present (the deploy pins exact versions onto PATH), else `npx` fetching
+/// the package at launch (the dev-machine path).
+fn npm_adapter_cmd(bin: &str, package: &str) -> String {
+    format!("command -v {bin} >/dev/null 2>&1 && exec {bin}; exec npx --yes {package}")
+}
+
+/// The `claude-agent-acp` adapter command: `WEAVER_CLAUDE_ACP_CMD` (env) wins,
+/// then the `acp.claude_cmd` setting, else the npm default.
+async fn claude_acp_cmd(db: &Db) -> String {
+    if let Ok(cmd) = std::env::var("WEAVER_CLAUDE_ACP_CMD") {
+        let cmd = cmd.trim();
+        if !cmd.is_empty() {
+            return cmd.to_string();
+        }
+    }
+    if let Some(cmd) = weaver_core::config::get(db, "acp.claude_cmd")
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return cmd;
+    }
+    npm_adapter_cmd("claude-agent-acp", "@agentclientprotocol/claude-agent-acp")
+}
+
+/// The `codex-acp` adapter command: `WEAVER_CODEX_ACP_CMD` (env) wins, then the
+/// `acp.codex_cmd` setting, else the npm default (the package bundles a
+/// compatible `@openai/codex`).
+async fn codex_acp_cmd(db: &Db) -> String {
+    if let Ok(cmd) = std::env::var("WEAVER_CODEX_ACP_CMD") {
+        let cmd = cmd.trim();
+        if !cmd.is_empty() {
+            return cmd.to_string();
+        }
+    }
+    if let Some(cmd) = weaver_core::config::get(db, "acp.codex_cmd")
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return cmd;
+    }
+    npm_adapter_cmd("codex-acp", "@agentclientprotocol/codex-acp")
+}
+
+/// The `CODEX_CONFIG` JSON for the codex adapter (merged into the Codex session
+/// config): model and reasoning effort, only when set. `None` when neither is.
+fn codex_acp_config(model: &str, effort: &str) -> Option<String> {
+    let mut cfg = Map::new();
+    let model = model.trim();
+    if !model.is_empty() {
+        cfg.insert("model".to_string(), json!(model));
+    }
+    if let Some(e) = effort_flag(effort) {
+        cfg.insert("model_reasoning_effort".to_string(), json!(e));
+    }
+    if cfg.is_empty() {
+        return None;
+    }
+    Some(Value::Object(cfg).to_string())
+}
+
+/// Map the launch mode onto a codex-acp `INITIAL_AGENT_MODE` id. The create API
+/// speaks the claude-flavored vocabulary; codex's own ids pass through, so an
+/// operator can name `read-only`/`agent`/`agent-full-access` directly.
+fn codex_acp_mode(mode: &str) -> String {
+    match mode.trim() {
+        "bypassPermissions" => "agent-full-access".to_string(),
+        "acceptEdits" | "default" | "" => "agent".to_string(),
+        "plan" => "read-only".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// The `_meta.claudeCode.options` object for the claude adapter — only the fields
+/// that are actually configured (model, the primer as `appendSystemPrompt`, the
+/// permission mode). `None` when nothing is set.
+fn claude_acp_meta(model: &str, primer: Option<&str>, mode: &str) -> Option<Value> {
+    let mut options = Map::new();
+    let model = model.trim();
+    if !model.is_empty() {
+        options.insert("model".to_string(), json!(model));
+    }
+    if let Some(p) = primer.map(str::trim).filter(|s| !s.is_empty()) {
+        options.insert("appendSystemPrompt".to_string(), json!(p));
+    }
+    let mode = mode.trim();
+    if !mode.is_empty() {
+        options.insert("permissionMode".to_string(), json!(mode));
+    }
+    if options.is_empty() {
+        return None;
+    }
+    Some(json!({ "claudeCode": { "options": options } }))
+}
+
+/// Read a file's content, or `None` when the path is absent or unreadable.
+async fn read_opt(path: Option<&Path>) -> Option<String> {
+    match path {
+        Some(p) => tokio::fs::read_to_string(p).await.ok(),
+        None => None,
+    }
+}
+
 /// Write (merging into any existing file) `.claude/settings.local.json` so the
-/// agent reports status to weaver via hooks.
-pub async fn install_hooks(work_dir: &Path, weaver_bin: &str) -> Result<()> {
+/// agent reports status to weaver via hooks. `mode` selects the bundle: a
+/// terminal session installs the full working/idle set; an ACP session installs
+/// only `SessionStart` (its turn edges come from the protocol — see
+/// [`weaver_core::agent::HookMode`]).
+pub async fn install_hooks(work_dir: &Path, weaver_bin: &str, mode: HookMode) -> Result<()> {
     let dir = work_dir.join(".claude");
     tokio::fs::create_dir_all(&dir).await?;
     let path = dir.join("settings.local.json");
@@ -668,10 +1041,10 @@ pub async fn install_hooks(work_dir: &Path, weaver_bin: &str) -> Result<()> {
         Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| json!({})),
         Err(_) => json!({}),
     };
-    let hooks = hooks_json(weaver_bin);
+    let hooks = hooks_json(weaver_bin, mode);
     root["hooks"] = hooks["hooks"].clone();
     tokio::fs::write(&path, serde_json::to_string_pretty(&root)?).await?;
-    tracing::debug!(path = %path.display(), "claude hooks installed");
+    tracing::debug!(path = %path.display(), ?mode, "claude hooks installed");
     Ok(())
 }
 
@@ -1013,6 +1386,7 @@ mod tests {
             launch: launch.to_string(),
             resume: resume.to_string(),
             reports_status: false,
+            protocol: "terminal".to_string(),
             created_at: String::new(),
             updated_at: String::new(),
         }
@@ -1355,5 +1729,141 @@ mod tests {
         assert!(apply_launch_gates(&mut root, &seed(false, None, None)));
         assert!(root.is_object());
         assert_eq!(root["hasCompletedOnboarding"], json!(true));
+    }
+
+    fn meta_for(kind: &str, protocol: &str, builtin: bool) -> AgentMetadata {
+        AgentMetadata {
+            kind: kind.to_string(),
+            label: kind.to_string(),
+            models: Vec::new(),
+            efforts: Vec::new(),
+            accepts_raw_model: false,
+            supports_hooks: false,
+            supports_concierge: false,
+            builtin,
+            protocol: protocol.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_protocol_honours_declared_and_overrides() {
+        let claude = meta_for("claude", "terminal", true);
+        let codex = meta_for("codex", "terminal", true);
+        let acp_custom = meta_for("my-acp", "acp", false);
+        let term_custom = meta_for("aider", "terminal", false);
+
+        // No override → declared.
+        assert_eq!(resolve_protocol(&claude, None).unwrap(), "terminal");
+        assert_eq!(resolve_protocol(&acp_custom, None).unwrap(), "acp");
+        assert_eq!(resolve_protocol(&claude, Some("")).unwrap(), "terminal");
+
+        // claude opts into acp; forcing terminal on it is a no-op.
+        assert_eq!(resolve_protocol(&claude, Some("acp")).unwrap(), "acp");
+        assert_eq!(
+            resolve_protocol(&claude, Some("terminal")).unwrap(),
+            "terminal"
+        );
+
+        // codex opts into acp via codex-acp.
+        assert_eq!(resolve_protocol(&codex, Some("acp")).unwrap(), "acp");
+
+        // A terminal-only custom agent has no acp adapter.
+        assert!(resolve_protocol(&term_custom, Some("acp")).is_err());
+        // An acp-only custom agent has no terminal fallback.
+        assert!(resolve_protocol(&acp_custom, Some("terminal")).is_err());
+
+        // An unknown protocol name is rejected.
+        assert!(resolve_protocol(&claude, Some("grpc")).is_err());
+    }
+
+    #[test]
+    fn latest_claude_session_id_picks_the_newest_recorded_conversation() {
+        let projects = tempfile::tempdir().unwrap();
+        let work_dir = Path::new("/w/repo/.worktrees/fix_things");
+        // claude's munge: every non-alphanumeric byte becomes '-'.
+        let munged = projects.path().join("-w-repo--worktrees-fix-things");
+        std::fs::create_dir_all(&munged).unwrap();
+
+        assert_eq!(
+            latest_claude_session_id(projects.path(), work_dir),
+            None,
+            "an empty project dir records no conversation"
+        );
+        assert_eq!(
+            latest_claude_session_id(projects.path(), Path::new("/elsewhere")),
+            None,
+            "a directory claude never saw records nothing"
+        );
+
+        std::fs::write(munged.join("older.jsonl"), "{}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(munged.join("newer.jsonl"), "{}").unwrap();
+        std::fs::write(munged.join("not-a-session.txt"), "").unwrap();
+        assert_eq!(
+            latest_claude_session_id(projects.path(), work_dir).as_deref(),
+            Some("newer")
+        );
+    }
+
+    #[test]
+    fn codex_acp_config_carries_only_configured_fields() {
+        assert!(codex_acp_config("", "").is_none());
+
+        let cfg: Value =
+            serde_json::from_str(&codex_acp_config("gpt-5.3-codex", "high").unwrap()).unwrap();
+        assert_eq!(cfg["model"], "gpt-5.3-codex");
+        assert_eq!(cfg["model_reasoning_effort"], "high");
+
+        let model_only: Value =
+            serde_json::from_str(&codex_acp_config("gpt-5.3-codex", " ").unwrap()).unwrap();
+        assert_eq!(model_only["model"], "gpt-5.3-codex");
+        assert!(model_only.get("model_reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn codex_acp_mode_maps_the_claude_vocabulary_and_passes_codex_ids_through() {
+        assert_eq!(codex_acp_mode("bypassPermissions"), "agent-full-access");
+        assert_eq!(codex_acp_mode("acceptEdits"), "agent");
+        assert_eq!(codex_acp_mode("default"), "agent");
+        assert_eq!(codex_acp_mode(""), "agent");
+        assert_eq!(codex_acp_mode("plan"), "read-only");
+        // Codex's own ids are honoured verbatim.
+        assert_eq!(codex_acp_mode("read-only"), "read-only");
+        assert_eq!(codex_acp_mode("agent-full-access"), "agent-full-access");
+    }
+
+    #[test]
+    fn push_env_default_defers_to_an_existing_key() {
+        let mut env = vec![(
+            "CODEX_CONFIG".to_string(),
+            "{\"model\":\"mine\"}".to_string(),
+        )];
+        push_env_default(&mut env, "CODEX_CONFIG", "{\"model\":\"ours\"}");
+        push_env_default(&mut env, "INITIAL_AGENT_MODE", "agent");
+        assert_eq!(env.len(), 2);
+        assert_eq!(env[0].1, "{\"model\":\"mine\"}");
+        assert_eq!(
+            env[1],
+            ("INITIAL_AGENT_MODE".to_string(), "agent".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_acp_meta_sets_only_configured_fields() {
+        // Nothing configured → no _meta at all.
+        assert!(claude_acp_meta("", None, "").is_none());
+
+        let m = claude_acp_meta("opus", Some("be careful"), "bypassPermissions").unwrap();
+        let opts = &m["claudeCode"]["options"];
+        assert_eq!(opts["model"], "opus");
+        assert_eq!(opts["appendSystemPrompt"], "be careful");
+        assert_eq!(opts["permissionMode"], "bypassPermissions");
+
+        // A blank primer is dropped; model/mode still ride.
+        let m2 = claude_acp_meta("sonnet", Some("  "), "plan").unwrap();
+        let opts2 = &m2["claudeCode"]["options"];
+        assert_eq!(opts2["model"], "sonnet");
+        assert!(opts2.get("appendSystemPrompt").is_none());
+        assert_eq!(opts2["permissionMode"], "plan");
     }
 }

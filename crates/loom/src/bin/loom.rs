@@ -199,6 +199,11 @@ enum IssueCmd {
 }
 
 /// Subcommands under `loom session` — the uniform way to drive a child session.
+// `Launch` carries the flattened `LaunchOpts` arg struct, which clap derives
+// against by value — boxing it (clippy's `large_enum_variant` suggestion) would
+// fight the `Subcommand` derive. This is a short-lived CLI dispatch enum, so the
+// size skew is harmless.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum SessionCmd {
     /// Launch a new session: worktree + terminal + agent, seeded with a task.
@@ -626,6 +631,15 @@ struct LaunchOpts {
     /// selected agent's default.
     #[arg(long)]
     effort: Option<String>,
+    /// Execution backend: `terminal` forces the PTY fallback for a builtin;
+    /// `acp` opts in explicitly. Omit to use the agent's default (acp for the
+    /// builtins).
+    #[arg(long)]
+    protocol: Option<String>,
+    /// ACP launch permission posture: `bypassPermissions` (the default),
+    /// `acceptEdits`, `default`, or `plan`. Ignored for a terminal launch.
+    #[arg(long)]
+    mode: Option<String>,
 }
 
 #[tokio::main]
@@ -1954,6 +1968,8 @@ struct LaunchArgs {
     branch: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    protocol: Option<String>,
+    mode: Option<String>,
 }
 
 impl From<LaunchOpts> for LaunchArgs {
@@ -1970,6 +1986,8 @@ impl From<LaunchOpts> for LaunchArgs {
             branch: o.branch,
             model: o.model,
             effort: o.effort,
+            protocol: o.protocol,
+            mode: o.mode,
         }
     }
 }
@@ -2050,6 +2068,8 @@ async fn cmd_launch(a: LaunchArgs) -> Result<()> {
         branch,
         model,
         effort,
+        protocol,
+        mode,
     } = a;
     let client = client::default();
     let target = resolve_repo_target(repo.as_deref())?;
@@ -2087,6 +2107,8 @@ async fn cmd_launch(a: LaunchArgs) -> Result<()> {
                 "parent_branch": parent_branch,
                 "model": model,
                 "effort": effort,
+                "protocol": protocol,
+                "mode": mode,
             }),
         )
         .await?;
@@ -3179,6 +3201,8 @@ mod tests {
             branch: None,
             model: None,
             effort: None,
+            protocol: None,
+            mode: None,
         }
     }
 

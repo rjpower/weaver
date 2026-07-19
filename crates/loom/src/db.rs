@@ -202,6 +202,10 @@ CREATE TABLE IF NOT EXISTS user_github_tokens (
 --   * `resume` — the adopt/resume command (blank falls back to `launch`).
 -- `reports_status` records whether the agent fires weaver's lifecycle hooks, which
 -- drive the idle/attention signals (a fresh session is `running` immediately).
+-- `protocol` is the execution backend loom drives this agent through: 'terminal'
+-- (a PTY supervisor running an interactive command — the default) or 'acp' (a
+-- headless adapter under a relay supervisor, whose `launch` command is the ACP
+-- adapter spoken to over stdio). See `custom_agents::Protocol`.
 CREATE TABLE IF NOT EXISTS custom_agents (
     name           TEXT PRIMARY KEY,
     label          TEXT NOT NULL,
@@ -209,9 +213,32 @@ CREATE TABLE IF NOT EXISTS custom_agents (
     launch         TEXT NOT NULL DEFAULT '',
     resume         TEXT NOT NULL DEFAULT '',
     reports_status INTEGER NOT NULL DEFAULT 0,
+    protocol       TEXT NOT NULL DEFAULT 'terminal',
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+-- The chat journal for ACP (protocol='acp') sessions: one row per consolidated
+-- *block* of a session's conversation, in the order it reached a terminal state.
+-- Loom's ACP client (crate::acp) accumulates streaming chunk deltas in memory and
+-- writes a row here per block (a whole agent/user message, a tool call reaching a
+-- terminal status, a plan, a permission resolution, a turn end). Every write is
+-- idempotent — `INSERT OR IGNORE` on the (session_id, turn, seq) key — so a relay
+-- replay after a loom restart re-ingests without duplicating. `payload` is the
+-- block's JSON body (its shape keyed by `kind`; see crate::chat). `session_id`
+-- is TEXT to match the string `sessions.id` it references.
+CREATE TABLE IF NOT EXISTS chat_blocks (
+    id         INTEGER PRIMARY KEY,
+    session_id TEXT    NOT NULL,
+    turn       INTEGER NOT NULL,
+    seq        INTEGER NOT NULL,
+    kind       TEXT    NOT NULL,
+    payload    TEXT    NOT NULL,
+    created_at TEXT    NOT NULL,
+    UNIQUE(session_id, turn, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_chat_blocks_session
+    ON chat_blocks(session_id, turn, seq);
 "#;
 
 /// Open the shared database and apply loom's additional tables on top of the
@@ -280,6 +307,53 @@ async fn migrate_loom(pool: &Db) -> Result<()> {
     add_column_if_missing(pool, "sessions", "created_by", "TEXT").await?;
     add_column_if_missing(pool, "sessions", "park", "TEXT").await?;
     add_column_if_missing(pool, "sessions", "sort_order", "REAL").await?;
+    // The execution backend for this session: 'terminal' (a PTY supervisor
+    // driving an interactive TUI — the historical path) or 'acp' (a headless
+    // adapter under a relay supervisor, driven by crate::acp over the Agent
+    // Client Protocol). Sessions predating the column are all terminal.
+    add_column_if_missing(
+        pool,
+        "sessions",
+        "protocol",
+        "TEXT NOT NULL DEFAULT 'terminal'",
+    )
+    .await?;
+    // The agent's own on-disk session id for an ACP session (the `session/new`
+    // /`session/load` id), NULL for a terminal session or before setup completes.
+    add_column_if_missing(pool, "sessions", "acp_session_id", "TEXT").await?;
+    // The relay spool cursor: the highest frame seq loom has durably journaled a
+    // block boundary for. crate::acp subscribes from this on (re)attach so an
+    // un-acked frame replays exactly-once.
+    add_column_if_missing(
+        pool,
+        "sessions",
+        "acp_ack_seq",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    // Outstanding client->agent request state that does not survive loom's
+    // process — the in-flight `session/prompt` request id + its turn — as JSON
+    // (e.g. `{"prompt_id":7,"turn":3}`), re-adopted on attach so the eventual
+    // turn-end response is recognized. NULL when no turn is in flight.
+    add_column_if_missing(pool, "sessions", "acp_inflight", "TEXT").await?;
+    // The session's current ACP mode id (the gating posture: `bypassPermissions`,
+    // `acceptEdits`, `default`, `plan`, …). NULL until the agent reports one.
+    add_column_if_missing(pool, "sessions", "current_mode", "TEXT").await?;
+    // The durable prompt queue: a paragraph-appended user message accumulated
+    // while a turn is in flight, dispatched as one `session/prompt` at the next
+    // turn boundary. Empty/NULL when nothing is queued.
+    add_column_if_missing(pool, "sessions", "pending_prompt", "TEXT").await?;
+    // The custom agent's execution backend: 'terminal' (a PTY running its launch
+    // command) or 'acp' (its launch command is an ACP adapter driven over stdio).
+    // Added here for databases created before the column; a fresh DB has it from
+    // the `CREATE TABLE` above and this is a no-op.
+    add_column_if_missing(
+        pool,
+        "custom_agents",
+        "protocol",
+        "TEXT NOT NULL DEFAULT 'terminal'",
+    )
+    .await?;
     // GitHub profile captured at sign-in for commit attribution (see the `users`
     // schema above). Added here for databases predating the columns; a fresh DB
     // already has them from the `CREATE TABLE` and these are no-ops.

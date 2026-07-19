@@ -255,6 +255,39 @@ export const resolveThread = (id: string, name: string, tid: number) =>
 export const sendMessage = (id: string, text: string, submit = true) =>
   post(`/sessions/${id}/send`, { text, submit });
 
+// --- ACP conversation (protocol='acp' sessions) ----------------------------
+
+import type { ChatSnapshot, PromptAck } from './types';
+
+/** The journaled conversation snapshot for an ACP session — the transcript a
+ *  client paints before tailing `/chat/stream` (`GET /sessions/{id}/chat`). A
+ *  terminal session 409s (it has no chat journal). */
+export const getSessionChat = (id: string) =>
+  get(`/sessions/${id}/chat`) as Promise<ChatSnapshot>;
+
+/** Send a user message to an ACP session (`session/prompt`). Returns 202 with
+ *  `{ queued, turn }` — `queued` when a turn was already in flight (the message
+ *  joins the durable queue for the next turn). */
+export const promptSession = (id: string, text: string, by?: string) =>
+  post(`/sessions/${id}/prompt`, { text, by }) as Promise<PromptAck>;
+
+/** Interrupt the in-flight turn: `session/cancel` for an ACP session, an Escape
+ *  keystroke for a terminal one. */
+export const interruptSession = (id: string) =>
+  post(`/sessions/${id}/interrupt`) as Promise<{ interrupted: boolean }>;
+
+/** Answer a pending permission request (`{option_id}`). 404 for an unknown id,
+ *  409 when it was already resolved. */
+export const answerPermission = (id: string, requestId: string, optionId: string, by?: string) =>
+  post(`/sessions/${id}/permissions/${encodeURIComponent(requestId)}`, {
+    option_id: optionId,
+    by,
+  }) as Promise<{ resolved: boolean; option_id: string }>;
+
+/** Change an ACP session's mode (`session/set_mode`). */
+export const setSessionMode = (id: string, modeId: string, by?: string) =>
+  put(`/sessions/${id}/mode`, { mode_id: modeId, by }) as Promise<{ mode_id: string }>;
+
 /** Set a session's park override — the fleet list's resting shelf. `'parked'`
  *  pins it to the shelf, `'active'` keeps it live even when idle, `'auto'` clears
  *  the override back to idle-driven. */

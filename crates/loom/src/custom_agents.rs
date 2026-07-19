@@ -29,6 +29,11 @@ use crate::db::{now_iso, Db};
 /// no longer a builtin, so a user may define it themselves.
 pub const RESERVED_NAMES: &[&str] = &["claude", "codex", "concierge"];
 
+/// The execution backends a custom agent may declare (the `protocol` column).
+/// `terminal` runs its `launch` command in a PTY; `acp` runs its `launch`
+/// command as an [ACP](crate::acp) adapter spoken to over stdio.
+pub const PROTOCOLS: &[&str] = &["terminal", "acp"];
+
 /// One custom agent definition — a row of the `custom_agents` table and the shape
 /// the API returns for the editor. Every field is operator-supplied except the
 /// timestamps.
@@ -47,6 +52,10 @@ pub struct CustomAgent {
     /// Whether the agent fires weaver's lifecycle hooks — the working / idle /
     /// attention signals, surfaced as the runtime's `supports_hooks` capability.
     pub reports_status: bool,
+    /// Execution backend: `"terminal"` (the `launch` command runs in a PTY) or
+    /// `"acp"` (the `launch` command is an [ACP](crate::acp) adapter loom drives
+    /// over stdio). Empty reads as `"terminal"`.
+    pub protocol: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -86,6 +95,17 @@ pub fn validate_fields(agent: &CustomAgent) -> std::result::Result<(), String> {
     if agent.label.trim().is_empty() {
         return Err("label must not be empty".to_string());
     }
+    // `protocol` is a closed set; empty is normalized to `terminal` by the caller.
+    if !agent.protocol.is_empty() && !PROTOCOLS.contains(&agent.protocol.as_str()) {
+        return Err(format!(
+            "protocol '{}' is not one of {PROTOCOLS:?}",
+            agent.protocol
+        ));
+    }
+    // An acp agent's `launch` command *is* the adapter, so it can't be blank.
+    if agent.protocol == "acp" && agent.launch.trim().is_empty() {
+        return Err("an acp agent needs a `launch` command (its ACP adapter)".to_string());
+    }
     // Every stage command is optional: an agent with no `launch` execs a bare
     // login shell, which is a legitimate manual-terminal agent (the role the old
     // builtin "shell" filled).
@@ -100,12 +120,21 @@ fn row_to_agent(r: &sqlx::sqlite::SqliteRow) -> CustomAgent {
         launch: r.get::<String, _>("launch"),
         resume: r.get::<String, _>("resume"),
         reports_status: r.get::<i64, _>("reports_status") != 0,
+        protocol: {
+            let p = r.get::<String, _>("protocol");
+            if p.is_empty() {
+                "terminal".to_string()
+            } else {
+                p
+            }
+        },
         created_at: r.get::<String, _>("created_at"),
         updated_at: r.get::<String, _>("updated_at"),
     }
 }
 
-const COLUMNS: &str = "name, label, setup, launch, resume, reports_status, created_at, updated_at";
+const COLUMNS: &str =
+    "name, label, setup, launch, resume, reports_status, protocol, created_at, updated_at";
 
 /// Every custom agent, ordered by name.
 pub async fn list(db: &Db) -> Result<Vec<CustomAgent>> {
@@ -131,16 +160,23 @@ pub async fn exists(db: &Db, name: &str) -> Result<bool> {
 /// preserved on update; `updated_at` is refreshed.
 pub async fn set(db: &Db, agent: &CustomAgent) -> Result<()> {
     let now = now_iso();
+    // Empty protocol is normalized to the terminal default at rest.
+    let protocol = if agent.protocol.trim().is_empty() {
+        "terminal"
+    } else {
+        agent.protocol.trim()
+    };
     sqlx::query(
         "INSERT INTO custom_agents
-             (name, label, setup, launch, resume, reports_status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             (name, label, setup, launch, resume, reports_status, protocol, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(name) DO UPDATE SET
              label = excluded.label,
              setup = excluded.setup,
              launch = excluded.launch,
              resume = excluded.resume,
              reports_status = excluded.reports_status,
+             protocol = excluded.protocol,
              updated_at = excluded.updated_at",
     )
     .bind(&agent.name)
@@ -149,6 +185,7 @@ pub async fn set(db: &Db, agent: &CustomAgent) -> Result<()> {
     .bind(&agent.launch)
     .bind(&agent.resume)
     .bind(i64::from(agent.reports_status))
+    .bind(protocol)
     .bind(&now)
     .bind(&now)
     .execute(db)
@@ -180,6 +217,7 @@ mod tests {
             launch: "aider --message".to_string(),
             resume: String::new(),
             reports_status: false,
+            protocol: "terminal".to_string(),
             created_at: String::new(),
             updated_at: String::new(),
         }
@@ -218,6 +256,58 @@ mod tests {
         a.launch = String::new();
         a.setup = String::new();
         assert!(validate_fields(&a).is_ok());
+    }
+
+    #[test]
+    fn validate_fields_checks_the_protocol() {
+        let mut a = agent("aider");
+        a.protocol = "terminal".to_string();
+        assert!(validate_fields(&a).is_ok());
+        // A blank protocol is allowed (normalized to terminal at rest).
+        a.protocol = String::new();
+        assert!(validate_fields(&a).is_ok());
+        // An unknown protocol is rejected.
+        a.protocol = "grpc".to_string();
+        assert!(validate_fields(&a).is_err());
+        // An acp agent needs a launch command (its adapter).
+        a.protocol = "acp".to_string();
+        a.launch = "my-adapter --acp".to_string();
+        assert!(validate_fields(&a).is_ok());
+        a.launch = String::new();
+        assert!(validate_fields(&a).is_err());
+    }
+
+    #[tokio::test]
+    async fn protocol_round_trips_and_defaults_to_terminal() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        set(
+            &db,
+            &CustomAgent {
+                protocol: "acp".to_string(),
+                launch: "adapter --acp".to_string(),
+                ..agent("acp-agent")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get(&db, "acp-agent").await.unwrap().unwrap().protocol,
+            "acp"
+        );
+        // A blank protocol persists as the terminal default.
+        set(
+            &db,
+            &CustomAgent {
+                protocol: String::new(),
+                ..agent("plain")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get(&db, "plain").await.unwrap().unwrap().protocol,
+            "terminal"
+        );
     }
 
     #[tokio::test]

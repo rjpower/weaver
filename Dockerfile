@@ -265,6 +265,21 @@ if [ "${1:-}" = loom ] && [ "${2:-}" = server ]; then
     command -v codex >/dev/null 2>&1 \
       || echo "loom: WARNING: Codex install failed (offline?); the codex runtime is unavailable until a later boot installs it" >&2
   fi
+  if ! command -v claude-agent-acp >/dev/null 2>&1 || ! command -v codex-acp >/dev/null 2>&1; then
+    echo "loom: installing the ACP adapters into $HOME/.npm-global ..." >&2
+    # The ACP adapters loom's sessions speak through (docs/plans/acp.md). Exact
+    # pins, not dist-tags: two upstream projects releasing weekly sit between
+    # loom and the agents, so the fleet moves versions only via a deliberate
+    # CLAUDE_ACP_VERSION / CODEX_ACP_VERSION bump. Installed on the volume so
+    # they persist across recreates; loom's launch default (`npx --yes …`)
+    # resolves these installed bins from PATH without a network fetch.
+    # Non-fatal like the CLIs above.
+    npm install -g \
+      "@agentclientprotocol/claude-agent-acp@${CLAUDE_ACP_VERSION:-0.59.0}" \
+      "@agentclientprotocol/codex-acp@${CODEX_ACP_VERSION:-1.1.4}" || true
+    { command -v claude-agent-acp >/dev/null 2>&1 && command -v codex-acp >/dev/null 2>&1; } \
+      || echo "loom: WARNING: ACP adapter install failed (offline?); acp sessions fall back to npx fetching at launch" >&2
+  fi
   # Delegate the per-session cgroup subtree (see loom-cgroup-init above).
   # Non-fatal: without it sessions run with no memory limit.
   sudo -n /usr/local/bin/loom-cgroup-init \

@@ -1197,6 +1197,7 @@ mod tests {
                 parent_branch_id: None,
                 managed_by: None,
                 created_by: None,
+                protocol: "terminal".to_string(),
             },
         )
         .await
@@ -1208,6 +1209,7 @@ mod tests {
             addr: "127.0.0.1:0".to_string(),
             ide: std::sync::Arc::new(crate::ide::IdeManager::new(crate::ide::ide_home())),
             trigger,
+            acp: crate::acp::AcpRegistry::new(),
         };
         Fixture {
             _repo: repo,

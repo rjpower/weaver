@@ -48,16 +48,18 @@ other `weaver` subcommand.
 | `crates/loom/src/web.rs` | axum routes, request/response types, SSE — **the API surface** (incl. the auth middleware + login/token/user handlers) |
 | `crates/loom/src/auth.rs` | authentication core: token/password crypto, the `users`/`api_tokens`/`auth_sessions` tables, the machine-local token, and the GitHub OAuth calls. `axum`-free so it unit-tests directly |
 | `crates/loom/src/server.rs` | bind, write `server.json`, spawn bg tasks |
-| `crates/loom/src/monitor.rs` | status detection, orphan marking, hook-event consumer |
+| `crates/loom/src/monitor.rs` | status detection, orphan marking, hook-event consumer, and the shared lifecycle-promotion path (`promote_lifecycle`) both the terminal hook consumer and the ACP turn-boundary driver (`record_acp_lifecycle`) run through |
 | `crates/loom/src/watch.rs` | the watch engine: cron timer + event dispatcher + the round executor (the script subprocess executor every program runs on) |
 | `crates/loom/src/builtins.rs` | the builtin watch program registry; the script programs are real Python files in `crates/loom/watches/`, embedded into the binary |
 | `python/weaver-loom/` | the pure-Python layer over the loom REST API (`weaver_loom`: client + watch round context); stdlib-only, uv-buildable, vendored onto every script's `PYTHONPATH` by the engine; server-free contract tests in `tests/` (`uv run pytest`, CI's `python-binding` job) |
-| `crates/loom/src/agent.rs` | launching agents into per-session terminals + installing `.claude/settings.local.json` hooks + the one-shot headless agent behind `POST /api/agent/oneshot` |
+| `crates/loom/src/agent.rs` | launching agents: resolving the execution `protocol`, launching a `terminal` agent into a per-session PTY (installing its `.claude/settings.local.json` hooks) or building an `acp` launch (`build_acp_launch` — the adapter command, `_meta` options, and goal), plus the one-shot headless agent behind `POST /api/agent/oneshot` |
 | `crates/loom/src/session.rs` | `Session` row + sqlx queries |
-| `crates/loom/src/chatlog.rs` | conversation log: capture at archive (write the iris `chat.json` + rendered `chat.md` under `session.log_dir`) and serve it for the Conversation tab (`conversation()` — live transcript, else the capture) |
-| `crates/loom/src/backend.rs` | the terminal-management seam: every programmatic terminal op (create/has/capture/send/kill/list) drives the session's `tapestry` supervisor |
-| `crates/tapestry/` | the terminal backend: a per-session detached PTY supervisor (PTY + vt100 screen emulator + unix control socket) that outlives loom and streams raw PTY bytes, so an attached xterm owns its own scrollback/search |
+| `crates/loom/src/chatlog.rs` | conversation log: capture at archive (write the iris `chat.json` + rendered `chat.md` under `session.log_dir`) and serve it for the Conversation tab (`conversation()` — a terminal session's live transcript, an acp session's chat journal mapped to iris (`journal_to_log`), else the capture) |
+| `crates/loom/src/backend.rs` | the terminal-management seam: every programmatic terminal op (create/has/capture/send/kill/list) drives the session's `tapestry` supervisor. Also the ACP transport seam — `new_relay_session`/`subscribe_relay`/`relay_write`/`relay_ack` drive a session's tapestry **relay** supervisor (a durable JSON-RPC frame spool) |
+| `crates/tapestry/` | the per-session detached supervisor that outlives loom. Two modes: a **terminal** (PTY + vt100 screen emulator + unix control socket, streaming raw PTY bytes so an attached xterm owns its own scrollback/search), and a **relay** (a headless stdio subprocess whose stdout is split into newline-delimited frames, spooled with monotonic seqs, and replayed to a subscriber from any cursor — the durable transport under `loom::acp`) |
 | `crates/loom/src/terminal.rs` | WebSocket ⇄ live-terminal bridge: xterm.js ⇄ the tapestry session socket |
+| `crates/loom/src/acp/` | the [Agent Client Protocol](https://agentclientprotocol.com) client: one `tokio` task per `protocol='acp'` session drives a headless adapter subprocess (under a tapestry relay) over JSON-RPC 2.0 — consolidating streaming `session/update`s into journal blocks, block-boundary acking the relay spool, running the turn state machine, and answering permission requests. `start`/`attach` register a task into the `AppState.acp` registry the `/chat`, `/prompt`, `/permissions`, `/mode`, `/interrupt` routes drive. `acp/wire.rs` holds the JSON-RPC line codec + serde types |
+| `crates/loom/src/chat.rs` | the ACP **chat journal**: the durable, block-structured (`chat_blocks`, one row per `(session_id, turn, seq)`) conversation record `loom::acp` writes idempotently and the `/chat` routes read |
 | `crates/loom/src/github.rs` | `gh` CLI shell-out: issue seeding, PR opening, and the PR-status poll loop (snapshots each branch's PR; archives on merge) |
 | `crates/loom/src/client.rs` | HTTP client used by the `loom` CLI to talk to its own daemon |
 | `crates/loom/src/bin/loom.rs` | the orchestrator CLI (`server`, `session`, `ps`, `attach`, …) |
@@ -149,10 +151,14 @@ PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 npm test
   concurrency among loom's own connections.
   - Core tables: `branches`, `issues`, `events`, `settings`.
   - Loom tables (`crates/loom/src/db.rs`): `sessions`, `recent_repos`,
-    `branch_github` (per-branch PR snapshot), and the auth tables `users`
-    (the approved-operator allowlist, seeded with the owner), `api_tokens`
-    (hashed bearer tokens), and `auth_sessions` (hashed login cookies). See
-    [Authentication](#authentication).
+    `branch_github` (per-branch PR snapshot), `chat_blocks` (the ACP
+    [chat journal](#rest-api): one row per `(session_id, turn, seq)` block),
+    and the auth tables `users` (the approved-operator allowlist, seeded with
+    the owner), `api_tokens` (hashed bearer tokens), and `auth_sessions`
+    (hashed login cookies). See [Authentication](#authentication). Loom-owned
+    tables migrate via `add_column_if_missing` / `CREATE ... IF NOT EXISTS` in
+    `migrate_loom`, not the numbered core migrations below (those run before
+    loom creates its tables).
   - **Schema migrations** (`weaver-core/src/migrations.rs`): ordered SQL files
     under `crates/weaver-core/migrations/` (`NNNN_name.sql`, embedded with
     `include_str!`), applied at startup and recorded in a `schema_migrations`
@@ -189,7 +195,7 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | Method + path | What it does |
 |---|---|
 | `GET /api/health` | liveness probe |
-| `GET /api/sessions` / `POST /api/sessions` | list / create sessions (create takes optional `scratch: [{name, content_base64}]` and `parent_branch`; opens a tracking issue and returns its id as `tracking_issue`) |
+| `GET /api/sessions` / `POST /api/sessions` | list / create sessions (create takes optional `scratch: [{name, content_base64}]`, `parent_branch`, `protocol` (`terminal`\|`acp`, an opt-in override of the agent's declared default), and `mode` (the initial ACP permission posture); opens a tracking issue and returns its id as `tracking_issue`) |
 | `GET PATCH DELETE /api/sessions/{id}` | session CRUD (status, title, goal, description) |
 | `PUT DELETE /api/sessions/{id}/tags/{key}` | set (upsert) / clear a branch tag — the well-known `attention` and `triage` keys plus any free-form key |
 | `GET /api/sessions/{id}/url` | the session's dashboard URL as `{url}`, built from the externally-visible origin (`auth.base_url`, else the request's own Host) — what `loom session url` prints, so an agent can link a PR back to its session without inventing a loopback link |
@@ -202,9 +208,14 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `GET /api/sessions/{id}/{diff,log,events}` | reads + SSE stream |
 | `GET /api/sessions/{id}/conversation` | the agent conversation as a normalized iris log (live transcript, else the archive capture); 404 when there is none — backs the Conversation tab |
 | `GET /api/sessions/{id}/terminal` | WebSocket: xterm.js ⇄ the session's tapestry PTY (the interaction surface) |
-| `POST /api/sessions/{id}/send` | type `{text}` into the agent's terminal; `submit` (default true) follows it with Enter to trigger a round |
-| `POST /api/sessions/{id}/interrupt` | send a break (Escape) to the terminal — stop the current turn |
-| `GET /api/sessions/{id}/preview?lines=N` | capture the screen as `{screen}`; `lines` adds scrollback above the visible screen |
+| `POST /api/sessions/{id}/send` | type `{text}` into the agent's terminal (`submit`, default true, follows it with Enter); for an `acp` session it delegates to the prompt queue (a `session/prompt`), keeping the same `nudge` audit |
+| `POST /api/sessions/{id}/interrupt` | stop the current turn — a break (Escape) to the terminal for a `terminal` session, `session/cancel` for an `acp` one |
+| `GET /api/sessions/{id}/preview?lines=N` | capture the screen as `{screen}`; `lines` adds scrollback above the visible screen (for an `acp` session, `{screen}` is the last `lines` journal blocks rendered as compact text) |
+| `GET /api/sessions/{id}/chat` | `{blocks: [ChatBlockView], live_turn}` — the ACP session's journal snapshot (per-block conversation record) plus the in-flight turn, if any |
+| `GET /api/sessions/{id}/chat/stream` | SSE tail of the live journal: `block` (a committed block), `delta` (a streaming message/thought chunk), `tool` (a live tool-call update), `turn` (started / ended) |
+| `POST /api/sessions/{id}/prompt` | `{text}` → 202 `{queued, turn}` — dispatch a user message as a `session/prompt`, or append it to the durable queue when a turn is already in flight |
+| `POST /api/sessions/{id}/permissions/{request_id}` | `{option_id}` → answer an open permission request (200 / 404 unknown / 409 already resolved) |
+| `PUT /api/sessions/{id}/mode` | `{mode_id}` → change the ACP session's permission mode (`session/set_mode`), journaled as a `mode_change` |
 | `GET /api/branches` / `GET PATCH /api/branches/{id}` | list / inspect / edit tracked branches |
 | `GET POST /api/branches/{id}/issues` | issues claimed by the branch / create one |
 | `GET /api/issues?all=…` | the cross-repo issue board (every repo's issues; `all=true` includes closed) — what the loom Issues pane reads |
@@ -212,7 +223,7 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `PUT DELETE /api/issues/{id}/tags/{key}` | set (upsert) / clear a free-form issue label — quiet `(key, value)` pills, no loud `attention`/`triage` ladder |
 | `GET POST /api/repos/issues?repo_root=…` | repo-wide board (`scope=repo\|backlog`) / create a backlog item |
 | `GET /api/repos/recent` / `GET /api/repos/branches?cwd=…` | recent repos / branches in a repo |
-| `GET /api/agents` | first-class agent types and their advertised model/effort selectors — backs the create-session form and server-side validation |
+| `GET /api/agents` | first-class agent types, their advertised model/effort selectors, and their execution `protocol` (`terminal`\|`acp`) — backs the create-session form and server-side validation |
 | `GET PATCH /api/settings` | settings registry |
 | `GET /api/auth/me` | caller identity + sign-in methods (public; never 401s) |
 | `POST /api/auth/login` / `POST /api/auth/logout` | username/password login / drop the session (public) |
@@ -228,7 +239,9 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 `SessionView` (`/api/sessions[/...]`) returns session-specific fields
 top-level (`id`, `status`, `work_dir`, `term_session`, `agent_kind`, `model`,
 `effort`, `pending_prompt`, `github_repo`, `last_activity_at`,
-`created_at`, `updated_at`, `parent_id`, and — on the create response only —
+`created_at`, `updated_at`, `parent_id`, `protocol` (`terminal` or `acp`),
+`acp_session_id`, `current_mode`, `usage` (`{used, size}` context window, from
+the journal's latest `usage` block), and — on the create response only —
 `tracking_issue`) plus a nested `branch: BranchView`
 (`id`, `name`, `title`, `goal`, `description`, `tags`,
 `repo_root`, `branch`, `base_branch`, `created_at`, `updated_at`,
@@ -290,8 +303,12 @@ or the create form's base field — can pin any ref instead.
 primitives over the supervisor's control socket (see `backend::send_literal`,
 `send_key`, `capture`), distinct from the interactive terminal WebSocket: they
 let an agent or script type into, interrupt, or read back a child session
-uniformly. Each requires a live terminal (else 409). The CLI's `loom session
-{send,break,preview}` wrap them.
+uniformly. For a `terminal` session each requires a live terminal (else 409). An
+`acp` session has no PTY, so the same verbs map onto the protocol — keeping the
+CLI (`loom session {send,break,preview}`) and its `nudge` audit uniform across
+backends: `send` delegates to the prompt queue (a `session/prompt`, queued when a
+turn is in flight), `interrupt` is a `session/cancel`, and `preview` renders the
+last journal blocks as compact plain text instead of a vt100 screen capture.
 
 ## Runtime conventions
 
@@ -310,9 +327,13 @@ uniformly. Each requires a live terminal (else 409). The CLI's `loom session
   table, and loom's monitor tick promotes the new row into a session status
   change and a fresh `EventBus` notification.
 - **No tracking-branch state in the server:** loom can be killed and restarted
-  at any time. Terminal supervisors and worktrees survive (the supervisor is a
-  detached process, independent of `loom server run`); "orphaned" is a first-class
-  status, recovered via `loom session adopt` (or the Adopt button in the UI).
+  at any time. Terminal *and* relay supervisors and worktrees survive (the
+  supervisor is a detached process, independent of `loom server run`); "orphaned"
+  is a first-class status, recovered via `loom session adopt` (or the Adopt button
+  in the UI). On startup loom re-attaches every live-relay ACP session so its
+  journal keeps flowing; adopt re-attaches when the relay outlived a crashed task,
+  or respawns the adapter and reopens the conversation via `session/load` (falling
+  back to a fresh session re-oriented from the goal) when the relay is gone too.
 
 ## Status & tags
 
@@ -348,11 +369,21 @@ agent's own `attention` self-report stays the *server-side* signal — what
 outside marks surface on the dashboard without spuriously waking sub-agent
 tracking.
 
-**Lifecycle** is driven by the selected agent protocol. Claude Code currently
-provides lifecycle hooks, so its protocol merges a `hooks` block into the
-worktree's `.claude/settings.local.json` (see `loom::agent::install_hooks` and
-`weaver_core::agent::hooks_json`); hookless agents — Codex, and any custom agent
-whose `reports_status` is off — start `running` immediately:
+**Protocol axis.** Every agent declares an execution `protocol` — `terminal`
+(the agent runs in a PTY loom drives by keystroke) or `acp` (a headless adapter
+loom drives over the [Agent Client Protocol](https://agentclientprotocol.com)).
+The builtins are `terminal`; a custom agent carries its own `custom_agents.protocol`
+column. A create may **override** to `acp` where the agent allows it (Claude opts
+in; Codex rejects it, as `codex-acp` is a later phase), and the resolved protocol
+is stamped on the `sessions` row at create, immutable thereafter. The row's
+protocol — not the agent kind — is what every downstream path (launch, lifecycle,
+drive routes, adopt, archive) branches on.
+
+**Lifecycle** is driven by that protocol. A `terminal` session's lifecycle rides
+Claude Code's hooks, so that path merges a `hooks` block into the worktree's
+`.claude/settings.local.json` (see `loom::agent::install_hooks` and
+`weaver_core::agent::hooks_json`); hookless terminal agents — Codex, and any
+custom agent whose `reports_status` is off — start `running` immediately:
 
 | Claude hook event | shells out to |
 |---|---|
@@ -369,6 +400,18 @@ promotes a freshly `launching` session); `session-start` is recorded for the
 primer injection but the launch path owns the initial status, so it drives no
 liveness here. Liveness is all a work hook proves, so that is all the
 orchestrator tracks — it does not infer working/waiting/idle from stillness.
+
+An **`acp` session drives the same lifecycle from the protocol's turn boundaries**
+rather than hooks: the acp task calls `monitor::record_acp_lifecycle` at turn
+start (`working`) and turn end (`idle`), which records the very `hook` event row
+`weaver hook` would and then runs the shared `promote_lifecycle` path — so the
+status lift and tag mutations live in exactly one place across both backends. The
+monitor's `apply_hook` therefore *ignores* an acp session (a stray work-cycle hook
+a user's own settings might still fire must not move it), and the acp task is the
+sole driver. Claude-over-ACP installs **only** the `SessionStart` primer hook (the
+`additionalContext` injection is still wanted); the work-cycle hooks and the
+launch-gate seed are redundant under ACP, where the protocol's turn edges and the
+`bypassPermissions` posture replace them.
 
 The hooks also stamp a soothing, **quiet `idle` tag** — the calm "resting, no one
 needed" state, deliberately *not* on the loud ladder, so an idle agent never
@@ -409,11 +452,14 @@ any `archived` session as calm regardless of a stale tag left on the branch.
 
 Archiving also **captures the agent's conversation log** (`crate::chatlog`,
 inside the shared `web::archive`, so both the Archive button and the
-merge-archive poller get it). The agent's transcript lives outside the worktree —
-Claude Code under `~/.claude/projects/<munged-cwd>/`, Codex under
-`~/.codex/sessions/` — so it survives the worktree removal; capture locates it,
-normalizes it through `weaver_core::transcript` (raw → **iris format** → a
-rendered markdown log), and writes `chat.json` (iris) + `chat.md` under
+merge-archive poller get it). For a `terminal` session the agent's transcript
+lives outside the worktree — Claude Code under `~/.claude/projects/<munged-cwd>/`,
+Codex under `~/.codex/sessions/` — so it survives the worktree removal; capture
+locates it and normalizes it through `weaver_core::transcript`. An `acp` session
+has no external JSONL: its transcript **is** loom's own chat journal, mapped to
+the same iris shape (`chatlog::journal_to_log`). Either way capture produces the
+same pipeline output (raw → **iris format** → a rendered markdown log) and writes
+`chat.json` (iris) + `chat.md` under
 `<session.log_dir>/<branch>/` (`session.log_dir` defaults to
 `~/.iris/logs/sessions`). It is best-effort: a missing or unreadable transcript
 is a logged warning, never a failed archive. The same conversion/render pipeline
@@ -421,8 +467,10 @@ backs `weaver chatlog`, which renders the current worktree's (or a named file's)
 transcript on demand.
 
 The dashboard surfaces this as a **Conversation tab** on the session detail,
-backed by `GET /api/sessions/{id}/conversation` (`chatlog::conversation` →
-the live transcript when present, else the archived `chat.json`). The Vue viewer
+backed by `GET /api/sessions/{id}/conversation` (`chatlog::conversation` → for a
+`terminal` session the live transcript when present, else the archived
+`chat.json`; for an `acp` session the chat journal mapped to iris live, so the
+existing tab keeps working before the SPA rewires onto `/chat`). The Vue viewer
 renders the iris log natively — user/assistant turns, collapsible thinking, and
 each tool call with its result — so a session stays reviewable in the UI after
 its terminal is gone. While the agent is still live the tab is also drivable: a

@@ -1,14 +1,33 @@
 //! Agent-facing helpers that are pure (no terminal management, no process spawning): the
 //! Claude Code hook config and the SessionStart primer (a WEAVER.md).
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+
+/// Which hook bundle [`hooks_json`] installs, chosen by the session's execution
+/// backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookMode {
+    /// The full lifecycle bundle for a terminal (PTY) session: `SessionStart`
+    /// (primer) plus the work-cycle hooks (`UserPromptSubmit`/`Notification`/
+    /// `Stop`) that drive working/waiting/idle.
+    Terminal,
+    /// Only `SessionStart` (primer + compaction re-orientation) — for an ACP
+    /// session, whose turn boundaries come from the protocol itself, so the
+    /// work-cycle hooks are redundant and are dropped (loom drives status/idle
+    /// from the ACP turn edges instead; see `loom::acp` / `loom::monitor`).
+    Acp,
+}
 
 /// Claude Code hook config that reports session status to weaver.
 ///
 /// Hooks shell out to `weaver hook --event <name>`. The CLI itself resolves the
 /// current branch (from `$WEAVER_BRANCH` or cwd) and writes an `events` row;
 /// the orchestrator picks it up on its monitor tick. No daemon required.
-pub fn hooks_json(weaver_bin: &str) -> Value {
+///
+/// `mode` selects the bundle: a terminal session installs the full set;
+/// an ACP session installs only `SessionStart`, since its working/idle edges
+/// are the protocol's turn boundaries, not the work-cycle hooks.
+pub fn hooks_json(weaver_bin: &str, mode: HookMode) -> Value {
     let hook = |event: &str| {
         json!([{
             "hooks": [{
@@ -17,14 +36,14 @@ pub fn hooks_json(weaver_bin: &str) -> Value {
             }]
         }])
     };
-    json!({
-        "hooks": {
-            "SessionStart": hook("session-start"),
-            "UserPromptSubmit": hook("working"),
-            "Notification": hook("waiting"),
-            "Stop": hook("idle"),
-        }
-    })
+    let mut hooks = Map::new();
+    hooks.insert("SessionStart".into(), hook("session-start"));
+    if mode == HookMode::Terminal {
+        hooks.insert("UserPromptSubmit".into(), hook("working"));
+        hooks.insert("Notification".into(), hook("waiting"));
+        hooks.insert("Stop".into(), hook("idle"));
+    }
+    json!({ "hooks": hooks })
 }
 
 /// The builtin WEAVER.md — how an agent works inside a weaver session — kept as
@@ -60,7 +79,7 @@ mod tests {
 
     #[test]
     fn hooks_point_at_the_weaver_binary() {
-        let hooks = hooks_json("/usr/bin/weaver");
+        let hooks = hooks_json("/usr/bin/weaver", HookMode::Terminal);
         let stop = hooks["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
@@ -69,11 +88,27 @@ mod tests {
 
     #[test]
     fn session_start_hook_uses_a_distinct_event() {
-        let hooks = hooks_json("/usr/bin/weaver");
+        let hooks = hooks_json("/usr/bin/weaver", HookMode::Terminal);
         let cmd = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
         assert_eq!(cmd, "/usr/bin/weaver hook --event session-start");
+    }
+
+    #[test]
+    fn acp_mode_installs_only_the_session_start_hook() {
+        // An ACP session's turn boundaries are the protocol's, so only the
+        // primer hook is installed — the work-cycle hooks are dropped.
+        let hooks = hooks_json("/usr/bin/weaver", HookMode::Acp);
+        let obj = hooks["hooks"].as_object().unwrap();
+        assert_eq!(
+            obj.keys().collect::<Vec<_>>(),
+            vec!["SessionStart"],
+            "only SessionStart is installed for acp: {hooks}"
+        );
+        assert!(obj.get("UserPromptSubmit").is_none());
+        assert!(obj.get("Stop").is_none());
+        assert!(obj.get("Notification").is_none());
     }
 
     #[test]

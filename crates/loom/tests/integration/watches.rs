@@ -41,6 +41,7 @@ async fn engine_state(ts: &TestServer) -> AppState {
         bus: EventBus::new(),
         addr: ts.addr.to_string(),
         ide: std::sync::Arc::new(loom::ide::IdeManager::new(loom::ide::ide_home())),
+        acp: loom::acp::AcpRegistry::new(),
     }
 }
 
@@ -1362,6 +1363,7 @@ async fn insert_managed_session(
             parent_branch_id: None,
             managed_by: Some(watch_id.to_string()),
             created_by: None,
+            protocol: "terminal".to_string(),
         },
     )
     .await

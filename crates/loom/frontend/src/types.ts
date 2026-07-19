@@ -103,7 +103,166 @@ export interface Session {
    *  urgency-then-recency order. Placed and untouched rows share one numeric axis
    *  so they interleave. Set by drag-reordering. */
   sort_order: number | null;
+  /** Execution backend: `'terminal'` (a PTY + interactive TUI) or `'acp'` (a
+   *  headless adapter driven over the Agent Client Protocol). Older/terminal rows
+   *  read as `'terminal'`. The Conversation surface renders from the chat journal
+   *  when this is `'acp'`, and from the iris scrape otherwise. */
+  protocol: 'terminal' | 'acp';
+  /** The agent's own on-disk ACP session id for an `acp` session, or null. */
+  acp_session_id: string | null;
+  /** The current ACP mode id (gating posture: `bypassPermissions`, `acceptEdits`,
+   *  `default`, `plan`), or null for a terminal session / before one is set. */
+  current_mode: string | null;
+  /** The latest context-window usage an ACP agent reported, or null. */
+  usage: AcpUsage | null;
+  /** The ACP modes the adapter offers, when the server exposes them. Absent today
+   *  (SessionView carries only `current_mode`), so the mode chip falls back to the
+   *  well-known claude/codex mode set — see `AcpConversation`. */
+  available_modes?: string[];
   branch: Branch;
+}
+
+// ── ACP conversation surface ────────────────────────────────────────────────
+// The chat journal + live SSE tail an `acp` session's Conversation renders from.
+// These hand-mirror loom's `chat.rs` / `acp/mod.rs` serde shapes: the block
+// contract (`GET /sessions/{id}/chat`) and the four `/chat/stream` SSE events.
+
+/** Context-window usage `{used, size}` (tokens). */
+export interface AcpUsage {
+  used?: number | null;
+  size?: number | null;
+}
+
+/** The closed set of chat-journal block kinds. */
+export type ChatBlockKind =
+  | 'user_message'
+  | 'agent_message'
+  | 'thought'
+  | 'tool_call'
+  | 'plan'
+  | 'permission_request'
+  | 'mode_change'
+  | 'usage'
+  | 'turn_end';
+
+/** One journaled block. `payload` is opaque JSON keyed by `kind` (the payload
+ *  interfaces below). Addressed by `(turn, seq)`. Mirrors `chat::ChatBlockView`. */
+export interface ChatBlock {
+  turn: number;
+  seq: number;
+  kind: ChatBlockKind;
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
+/** `GET /sessions/{id}/chat` — the journal snapshot plus the in-flight turn (the
+ *  turn number of a `session/prompt` still running, else null). */
+export interface ChatSnapshot {
+  blocks: ChatBlock[];
+  live_turn: number | null;
+}
+
+// -- block payloads (by kind) --
+export interface UserMessagePayload {
+  text: string;
+  by: string | null;
+}
+export interface AgentMessagePayload {
+  text: string;
+}
+export interface ThoughtPayload {
+  text: string;
+  ms: number | null;
+}
+export interface ToolTextContent {
+  type: 'text';
+  text: string;
+}
+export interface ToolDiffContent {
+  type: 'diff';
+  path: string;
+  old: string | null;
+  new: string;
+}
+export type ToolContent = ToolTextContent | ToolDiffContent;
+export interface ToolLocation {
+  path: string;
+  line: number | null;
+}
+export interface ToolCallPayload {
+  tool_call_id: string;
+  title: string;
+  tool_kind: string;
+  status: string;
+  content: ToolContent[];
+  locations: ToolLocation[];
+}
+export interface PlanEntry {
+  content: string;
+  status: string;
+}
+export interface PlanPayload {
+  entries: PlanEntry[];
+}
+export interface PermissionOption {
+  option_id: string;
+  name: string;
+  kind: string;
+}
+export interface PermissionOutcome {
+  option_id: string;
+  by: string;
+  at: string;
+}
+export interface PermissionPayload {
+  request_id: string;
+  tool_call_id: string | null;
+  title: string;
+  options: PermissionOption[];
+  outcome: PermissionOutcome | null;
+}
+export interface UsagePayload {
+  used: number | null;
+  size: number | null;
+}
+export interface TurnEndPayload {
+  stop_reason: string;
+}
+
+// -- `/chat/stream` SSE events --
+/** `block` — a whole journaled block (upsert by `(turn, seq)`). Same shape as a
+ *  snapshot block; a resolved `permission_request` re-emits its own block. */
+export type SseBlock = ChatBlock;
+/** `delta` — a streamed chunk of the in-flight message/thought (append to a
+ *  shadow block until the whole block journals). */
+export interface SseDelta {
+  turn: number;
+  kind: 'agent_message' | 'thought';
+  text: string;
+}
+/** `tool` — live tool-call state, before it reaches a terminal status (then a
+ *  `tool_call` block supersedes it). */
+export interface SseTool {
+  turn: number;
+  tool_call_id: string;
+  title: string;
+  tool_kind: string;
+  status: string;
+  content: ToolContent[];
+  locations: ToolLocation[];
+}
+/** `turn` — the turn drove live (`started`) or ended (`ended` + stop reason). */
+export interface SseTurn {
+  turn: number;
+  state: 'started' | 'ended';
+  stop_reason?: string;
+}
+
+/** `POST /sessions/{id}/prompt` 202 body: whether the message queued behind a
+ *  live turn, and the turn it belongs to. */
+export interface PromptAck {
+  queued: boolean;
+  turn: number | null;
 }
 
 export interface AgentChoice {

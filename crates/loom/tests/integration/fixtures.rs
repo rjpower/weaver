@@ -89,6 +89,7 @@ pub async fn seed_shell_agent(db: &loom::db::Db) {
             launch: String::new(),
             resume: String::new(),
             reports_status: false,
+            protocol: "terminal".to_string(),
             created_at: String::new(),
             updated_at: String::new(),
         },
@@ -118,6 +119,11 @@ pub struct TestServer {
     /// proxy tests register a stub upstream on it instead of spawning a real
     /// code-server.
     pub ide: std::sync::Arc<loom::ide::IdeManager>,
+    /// A clone of the server's [`AppState`] — the DB pool, event bus, and ACP
+    /// registry are all `Arc`/pool-shared, so this handle drives the *same*
+    /// server (the ACP suite calls `loom::acp::start` on it, and the task
+    /// registers in the registry the HTTP routes read).
+    pub state: AppState,
     repo: TempDir,
     _home: TempDir,
 }
@@ -174,6 +180,7 @@ impl TestServer {
             addr: addr.to_string(),
             ide: std::sync::Arc::new(loom::ide::IdeManager::new(loom::ide::ide_home())),
             trigger,
+            acp: loom::acp::AcpRegistry::new(),
         };
         // The watch master switch ships on by default, but these tests
         // drive the engine directly and must not race the background loop that
@@ -189,9 +196,11 @@ impl TestServer {
         // execs a bare login shell and is hookless (so it comes up `running`
         // immediately, never stuck `launching`).
         seed_shell_agent(&state.db).await;
-        // Keep a handle to the editor manager before `state` moves into serve, so
-        // a test can register a stub upstream on the same instance.
+        // Keep a handle to the editor manager and a full state clone before
+        // `state` moves into serve, so a test can register a stub upstream on the
+        // same IDE manager and drive the same ACP registry.
         let ide = state.ide.clone();
+        let state_clone = state.clone();
         tokio::spawn(server::serve(state, listener));
 
         std::env::set_var("WEAVER_API", format!("http://{addr}"));
@@ -212,6 +221,7 @@ impl TestServer {
             client,
             addr,
             ide,
+            state: state_clone,
             repo,
             _home: home,
         }
@@ -360,4 +370,28 @@ pub async fn drain_until(ws: &mut TermWs, marker: &str, timeout: Duration) -> St
         }
     }
     String::from_utf8_lossy(&buf).to_string()
+}
+
+/// The command that runs the scripted fake ACP agent
+/// (`tests/fixtures/fake-acp-agent.mjs`) over stdio.
+pub fn fake_acp_agent_cmd() -> String {
+    format!(
+        "node {}/tests/fixtures/fake-acp-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+/// Pin both builtin ACP adapter commands to the fake agent, so a test that
+/// launches `claude`/`codex` (directly or via the concierge) never fetches or
+/// runs a real adapter.
+pub async fn pin_fake_acp_adapters(ts: &TestServer) {
+    loom::config::apply(
+        &ts.state.db,
+        &[
+            ("acp.claude_cmd".to_string(), Some(fake_acp_agent_cmd())),
+            ("acp.codex_cmd".to_string(), Some(fake_acp_agent_cmd())),
+        ],
+    )
+    .await
+    .expect("pinning the fake acp adapters");
 }

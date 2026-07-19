@@ -137,6 +137,10 @@ pub struct AppState {
     /// and per-repo rate limiter. Shared across requests; a test swaps in a fake
     /// gateway via [`crate::github_trigger::GithubTrigger::with_gateway`].
     pub trigger: std::sync::Arc<crate::github_trigger::GithubTrigger>,
+    /// The registry of live ACP session tasks ([`crate::acp`]) — the seam the
+    /// `/chat`, `/prompt`, `/permissions`, `/mode`, and `/interrupt` routes drive
+    /// an `acp` session through, and subscribe to its SSE stream on.
+    pub acp: crate::acp::AcpRegistry,
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +277,16 @@ pub(crate) async fn session_view(
     branch: &Branch,
 ) -> ApiResult<SessionView> {
     let bv = branch_view(db, branch).await?;
+    // The latest usage block is a cheap indexed query; `None` for a terminal
+    // session (or an ACP session before the agent reports usage).
+    let usage = if session.protocol == "acp" {
+        crate::chat::latest_usage(db, &session.id)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
     Ok(SessionView {
         id: session.id.clone(),
         status: session.status.clone(),
@@ -293,6 +307,10 @@ pub(crate) async fn session_view(
         tracking_issue: None,
         park: session.park.clone(),
         sort_order: session.sort_order,
+        protocol: session.protocol.clone(),
+        acp_session_id: session.acp_session_id.clone(),
+        current_mode: session.current_mode.clone(),
+        usage,
         branch: bv,
     })
 }
@@ -581,6 +599,16 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/send", post(send_session))
         .route("/sessions/{id}/interrupt", post(interrupt_session))
         .route("/sessions/{id}/preview", get(preview_session))
+        // The ACP chat journal + live stream, and the ACP drive routes (a
+        // `session/prompt` queueing send, a permission answer, a mode change).
+        .route("/sessions/{id}/chat", get(get_session_chat))
+        .route("/sessions/{id}/chat/stream", get(chat_stream))
+        .route("/sessions/{id}/prompt", post(prompt_session))
+        .route(
+            "/sessions/{id}/permissions/{request_id}",
+            post(answer_permission),
+        )
+        .route("/sessions/{id}/mode", axum::routing::put(set_mode))
         .route(
             "/sessions/{id}/tags/{key}",
             axum::routing::put(set_session_tag).delete(clear_session_tag),

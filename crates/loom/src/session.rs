@@ -54,6 +54,34 @@ pub struct Session {
     /// the midpoint of its neighbours on drag), on one numeric axis with the
     /// derived auto-order so placed and untouched rows interleave.
     pub sort_order: Option<f64>,
+    /// Execution backend: `"terminal"` (a PTY supervisor + interactive TUI) or
+    /// `"acp"` (a headless adapter under a relay supervisor, driven by
+    /// [`crate::acp`]). Defaults to `"terminal"`; rows predating the column read
+    /// as terminal.
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+    /// The agent's own on-disk ACP session id, or `None` for a terminal session
+    /// (or an ACP session before setup completes).
+    pub acp_session_id: Option<String>,
+    /// The relay spool cursor — the highest frame seq loom has durably journaled
+    /// a block boundary for. [`crate::acp`] subscribes from here on (re)attach.
+    #[serde(default)]
+    pub acp_ack_seq: i64,
+    /// Outstanding client->agent request state as JSON (`{"prompt_id":N,"turn":N}`),
+    /// re-adopted on attach so a replayed turn-end response is recognized. `None`
+    /// when no turn is in flight.
+    pub acp_inflight: Option<String>,
+    /// The session's current ACP mode id (gating posture), or `None` until the
+    /// agent reports one.
+    pub current_mode: Option<String>,
+    /// The durable prompt queue: a paragraph-appended user message accumulated
+    /// while a turn is in flight, dispatched as one prompt at the next turn
+    /// boundary. `None`/empty when nothing is queued.
+    pub pending_prompt: Option<String>,
+}
+
+fn default_protocol() -> String {
+    "terminal".to_string()
 }
 
 /// Session **lifecycle** states — the mechanical, orchestrator-owned axis: is
@@ -94,15 +122,24 @@ pub struct NewSession {
     /// The principal (username) that launched this session, or `None` for an
     /// engine-created (warm) session. See [`Session::created_by`].
     pub created_by: Option<String>,
+    /// Execution backend, stamped once at create from the resolved agent/override
+    /// and immutable thereafter: `"terminal"` or `"acp"`. See [`Session::protocol`].
+    pub protocol: String,
 }
 
 pub async fn insert(db: &Db, s: &NewSession) -> Result<Session> {
     let now = now_iso();
+    let protocol = if s.protocol.trim().is_empty() {
+        "terminal"
+    } else {
+        s.protocol.trim()
+    };
     sqlx::query(
         "INSERT INTO sessions
          (id, branch_id, work_dir, term_session, agent_kind, model, effort, status,
-          github_repo, parent_branch_id, managed_by, created_by, last_activity_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          github_repo, parent_branch_id, managed_by, created_by, protocol,
+          last_activity_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&s.id)
     .bind(&s.branch_id)
@@ -116,6 +153,7 @@ pub async fn insert(db: &Db, s: &NewSession) -> Result<Session> {
     .bind(&s.parent_branch_id)
     .bind(&s.managed_by)
     .bind(&s.created_by)
+    .bind(protocol)
     .bind(&now)
     .bind(&now)
     .execute(db)
@@ -296,6 +334,97 @@ pub async fn set_sort_order(db: &Db, id: &str, order: f64) -> Result<()> {
     Ok(())
 }
 
+/// Mark a session as ACP-backed and record the agent's on-disk session id (the
+/// `session/new`/`session/load` id). Called by [`crate::acp::start`] once the
+/// adapter has opened its session.
+pub async fn set_acp(db: &Db, id: &str, acp_session_id: &str) -> Result<()> {
+    sqlx::query("UPDATE sessions SET protocol = 'acp', acp_session_id = ? WHERE id = ?")
+        .bind(acp_session_id)
+        .bind(id)
+        .execute(db)
+        .await?;
+    tracing::info!(session = %id, acp_session_id, "session marked acp");
+    Ok(())
+}
+
+/// Advance the persisted relay spool cursor to `seq` — the highest frame seq loom
+/// has durably journaled a block boundary for. [`crate::acp`] subscribes from
+/// this on (re)attach.
+pub async fn set_ack_seq(db: &Db, id: &str, seq: i64) -> Result<()> {
+    sqlx::query("UPDATE sessions SET acp_ack_seq = ? WHERE id = ?")
+        .bind(seq)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Persist (or clear, with `None`) the outstanding client->agent request state —
+/// the in-flight prompt id + turn — so a replayed turn-end response is recognized
+/// after a loom restart. `inflight` is the JSON body or `None` to clear.
+pub async fn set_inflight(db: &Db, id: &str, inflight: Option<&str>) -> Result<()> {
+    sqlx::query("UPDATE sessions SET acp_inflight = ? WHERE id = ?")
+        .bind(inflight)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Record the session's current ACP mode id (the gating posture).
+pub async fn set_current_mode(db: &Db, id: &str, mode_id: &str) -> Result<()> {
+    sqlx::query("UPDATE sessions SET current_mode = ? WHERE id = ?")
+        .bind(mode_id)
+        .bind(id)
+        .execute(db)
+        .await?;
+    tracing::info!(session = %id, mode = %mode_id, "session mode changed");
+    Ok(())
+}
+
+/// Append `text` to the durable prompt queue as a new paragraph (the queue holds
+/// sends that arrived while a turn was in flight; it dispatches as one prompt at
+/// the next turn boundary). Returns the full queued text after the append.
+pub async fn append_pending_prompt(db: &Db, id: &str, text: &str) -> Result<String> {
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT pending_prompt FROM sessions WHERE id = ?")
+            .bind(id)
+            .fetch_optional(db)
+            .await?
+            .flatten();
+    let combined = match existing.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(prev) => format!("{prev}\n\n{text}"),
+        None => text.to_string(),
+    };
+    sqlx::query("UPDATE sessions SET pending_prompt = ? WHERE id = ?")
+        .bind(&combined)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(combined)
+}
+
+/// Read the durable prompt queue (empty string when nothing is queued).
+/// [`clear_pending_prompt`] empties it once the text has been dispatched.
+pub async fn read_pending_prompt(db: &Db, id: &str) -> Result<String> {
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT pending_prompt FROM sessions WHERE id = ?")
+            .bind(id)
+            .fetch_optional(db)
+            .await?
+            .flatten();
+    Ok(existing.unwrap_or_default())
+}
+
+/// Clear the durable prompt queue (called once it has been dispatched as a prompt).
+pub async fn clear_pending_prompt(db: &Db, id: &str) -> Result<()> {
+    sqlx::query("UPDATE sessions SET pending_prompt = NULL WHERE id = ?")
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 pub async fn delete(db: &Db, id: &str) -> Result<()> {
     sqlx::query("DELETE FROM sessions WHERE id = ?")
         .bind(id)
@@ -330,6 +459,7 @@ mod tests {
             parent_branch_id: None,
             managed_by: managed_by.map(str::to_string),
             created_by: None,
+            protocol: "terminal".to_string(),
         }
     }
 

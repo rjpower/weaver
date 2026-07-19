@@ -1,0 +1,510 @@
+//! The chat journal for ACP sessions — the durable, block-structured record of a
+//! session's conversation that [`crate::acp`] writes and the `/chat` REST routes
+//! read.
+//!
+//! One row per consolidated *block*, addressed by `(session_id, turn, seq)`:
+//! `turn` is the 0-based prompt cycle, `seq` the 0-based position within it.
+//! Every write is idempotent — `INSERT OR IGNORE` on that key — so a relay spool
+//! replay after a loom restart re-ingests the same frames without duplicating a
+//! block. The one mutable block is `permission_request`: inserted open, then
+//! `UPDATE`d in place with its outcome when resolved (keyed by the upstream
+//! request id inside the payload).
+//!
+//! `payload` is opaque JSON here; its shape is keyed by `kind` (see the block
+//! kinds documented on [`crate::acp`]). This module only stores and reads it.
+
+use anyhow::Result;
+use serde::Serialize;
+use serde_json::Value;
+use sqlx::Row;
+
+use crate::db::{now_iso, Db};
+
+/// Block kinds. The set is closed; [`crate::acp`] maps ACP `session/update`
+/// variants onto these.
+pub mod kind {
+    pub const USER_MESSAGE: &str = "user_message";
+    pub const AGENT_MESSAGE: &str = "agent_message";
+    pub const THOUGHT: &str = "thought";
+    pub const TOOL_CALL: &str = "tool_call";
+    pub const PLAN: &str = "plan";
+    pub const PERMISSION_REQUEST: &str = "permission_request";
+    pub const MODE_CHANGE: &str = "mode_change";
+    pub const USAGE: &str = "usage";
+    pub const TURN_END: &str = "turn_end";
+}
+
+/// One journaled block as the `/chat` routes expose it. `payload` is passed
+/// through as JSON — the client renders it by `kind`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatBlockView {
+    pub turn: i64,
+    pub seq: i64,
+    pub kind: String,
+    pub payload: Value,
+    pub created_at: String,
+}
+
+/// Insert a block idempotently. Returns `true` when the row was newly written,
+/// `false` when `(session_id, turn, seq)` already existed (a replay). `payload`
+/// is serialized to a JSON string for storage.
+pub async fn insert(
+    db: &Db,
+    session_id: &str,
+    turn: i64,
+    seq: i64,
+    kind: &str,
+    payload: &Value,
+) -> Result<bool> {
+    let res = sqlx::query(
+        "INSERT OR IGNORE INTO chat_blocks (session_id, turn, seq, kind, payload, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(session_id)
+    .bind(turn)
+    .bind(seq)
+    .bind(kind)
+    .bind(payload.to_string())
+    .bind(now_iso())
+    .execute(db)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Every block for a session, in `(turn, seq)` order — the transcript snapshot
+/// the client fetches before tailing the SSE stream.
+pub async fn list(db: &Db, session_id: &str) -> Result<Vec<ChatBlockView>> {
+    let rows = sqlx::query(
+        "SELECT turn, seq, kind, payload, created_at FROM chat_blocks
+         WHERE session_id = ? ORDER BY turn ASC, seq ASC",
+    )
+    .bind(session_id)
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(row_to_view).collect())
+}
+
+fn row_to_view(r: sqlx::sqlite::SqliteRow) -> ChatBlockView {
+    ChatBlockView {
+        turn: r.get("turn"),
+        seq: r.get("seq"),
+        kind: r.get("kind"),
+        payload: serde_json::from_str(&r.get::<String, _>("payload")).unwrap_or(Value::Null),
+        created_at: r.get("created_at"),
+    }
+}
+
+/// The highest `(turn, seq)` present for a session, or `None` when the journal is
+/// empty. Used on task (re)start to resume the block cursor without double-writing.
+pub async fn max_turn_seq(db: &Db, session_id: &str) -> Result<Option<(i64, i64)>> {
+    // The lexicographic max of (turn, seq): the max turn, then the max seq within it.
+    let row = sqlx::query(
+        "SELECT turn, seq FROM chat_blocks WHERE session_id = ?
+         ORDER BY turn DESC, seq DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|r| (r.get("turn"), r.get("seq"))))
+}
+
+/// The `(turn, seq)` and payload of every still-open `permission_request` block
+/// for a session — those whose payload `outcome` is JSON null. On task restart
+/// [`crate::acp`] reloads these so a REST answer can still resolve one; the
+/// matching un-acked frame replays the JSON-RPC id.
+pub async fn open_permissions(db: &Db, session_id: &str) -> Result<Vec<ChatBlockView>> {
+    let rows = sqlx::query(
+        "SELECT turn, seq, kind, payload, created_at FROM chat_blocks
+         WHERE session_id = ? AND kind = ? ORDER BY turn ASC, seq ASC",
+    )
+    .bind(session_id)
+    .bind(kind::PERMISSION_REQUEST)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(row_to_view)
+        .filter(|v| v.payload.get("outcome").map(Value::is_null).unwrap_or(true))
+        .collect())
+}
+
+/// The journal's knowledge of a `permission_request`, looked up by its
+/// upstream `request_id`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PermissionOutcome {
+    /// No such request journaled.
+    Unknown,
+    /// Journaled, still awaiting an answer.
+    Open,
+    /// Answered with this option id.
+    Resolved(String),
+}
+
+/// The current outcome of a `permission_request` identified by its upstream
+/// `request_id`. Lets a replayed permission frame decide whether to re-send a
+/// stored answer.
+pub async fn permission_outcome(
+    db: &Db,
+    session_id: &str,
+    request_id: &str,
+) -> Result<PermissionOutcome> {
+    let rows = sqlx::query("SELECT payload FROM chat_blocks WHERE session_id = ? AND kind = ?")
+        .bind(session_id)
+        .bind(kind::PERMISSION_REQUEST)
+        .fetch_all(db)
+        .await?;
+    for r in rows {
+        let payload: Value =
+            serde_json::from_str(&r.get::<String, _>("payload")).unwrap_or(Value::Null);
+        if payload.get("request_id").and_then(Value::as_str) == Some(request_id) {
+            return Ok(match payload.get("outcome") {
+                Some(Value::Null) | None => PermissionOutcome::Open,
+                Some(o) => match o.get("option_id").and_then(Value::as_str) {
+                    Some(id) => PermissionOutcome::Resolved(id.to_string()),
+                    None => PermissionOutcome::Open,
+                },
+            });
+        }
+    }
+    Ok(PermissionOutcome::Unknown)
+}
+
+/// Resolve an open `permission_request` in place: set its `outcome` to the chosen
+/// option, author, and time. Idempotent — matches the block by `request_id` and
+/// only touches a block whose outcome is still null, so a re-answer (or replay)
+/// is a no-op. Returns the updated block on success, `None` when no open block
+/// with that `request_id` exists.
+pub async fn resolve_permission(
+    db: &Db,
+    session_id: &str,
+    request_id: &str,
+    option_id: &str,
+    by: &str,
+) -> Result<Option<ChatBlockView>> {
+    let rows = sqlx::query(
+        "SELECT turn, seq, kind, payload, created_at FROM chat_blocks
+         WHERE session_id = ? AND kind = ?",
+    )
+    .bind(session_id)
+    .bind(kind::PERMISSION_REQUEST)
+    .fetch_all(db)
+    .await?;
+    for r in rows {
+        let mut view = row_to_view(r);
+        if view.payload.get("request_id").and_then(Value::as_str) != Some(request_id) {
+            continue;
+        }
+        // Only an open block is resolvable; a resolved one is left untouched.
+        if !view
+            .payload
+            .get("outcome")
+            .map(Value::is_null)
+            .unwrap_or(true)
+        {
+            return Ok(None);
+        }
+        if let Value::Object(map) = &mut view.payload {
+            map.insert(
+                "outcome".to_string(),
+                serde_json::json!({ "option_id": option_id, "by": by, "at": now_iso() }),
+            );
+        }
+        sqlx::query(
+            "UPDATE chat_blocks SET payload = ? WHERE session_id = ? AND turn = ? AND seq = ?",
+        )
+        .bind(view.payload.to_string())
+        .bind(session_id)
+        .bind(view.turn)
+        .bind(view.seq)
+        .execute(db)
+        .await?;
+        return Ok(Some(view));
+    }
+    Ok(None)
+}
+
+/// Whether a `tool_call` block for `tool_call_id` is already journaled — the
+/// idempotency check that keeps a replayed terminal tool-call frame from
+/// re-journaling the block at a fresh seq (tool calls have no `(turn, seq)`
+/// stability across a restart, but their upstream id is stable).
+pub async fn tool_call_exists(db: &Db, session_id: &str, tool_call_id: &str) -> Result<bool> {
+    let rows = sqlx::query("SELECT payload FROM chat_blocks WHERE session_id = ? AND kind = ?")
+        .bind(session_id)
+        .bind(kind::TOOL_CALL)
+        .fetch_all(db)
+        .await?;
+    Ok(rows.into_iter().any(|r| {
+        serde_json::from_str::<Value>(&r.get::<String, _>("payload"))
+            .ok()
+            .and_then(|p| {
+                p.get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some(tool_call_id)
+    }))
+}
+
+/// Whether a `turn_end` block is already journaled for `turn` — the idempotency
+/// check that keeps a replayed prompt-response frame from re-journaling turn end.
+pub async fn has_turn_end(db: &Db, session_id: &str, turn: i64) -> Result<bool> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chat_blocks WHERE session_id = ? AND turn = ? AND kind = ?",
+    )
+    .bind(session_id)
+    .bind(turn)
+    .bind(kind::TURN_END)
+    .fetch_one(db)
+    .await?;
+    Ok(n > 0)
+}
+
+/// Render the last `last_n` journal blocks as compact plain text — the ACP
+/// analogue of the terminal `preview` screen (`[who] text` lines for prose, a
+/// one-liner for the machine's apparatus). CLI convenience only.
+pub fn preview_text(blocks: &[ChatBlockView], last_n: usize) -> String {
+    let start = blocks.len().saturating_sub(last_n);
+    let mut out = String::new();
+    for b in &blocks[start..] {
+        let line = preview_line(b);
+        if !line.is_empty() {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// One journal block as a single compact preview line (empty to skip it).
+fn preview_line(b: &ChatBlockView) -> String {
+    let p = &b.payload;
+    let text = |key: &str| p.get(key).and_then(Value::as_str).unwrap_or("").trim();
+    match b.kind.as_str() {
+        kind::USER_MESSAGE => format!("[you] {}", text("text")),
+        kind::AGENT_MESSAGE => format!("[agent] {}", text("text")),
+        kind::THOUGHT => format!("[thinking] {}", text("text")),
+        kind::TOOL_CALL => {
+            let tool_kind = p.get("tool_kind").and_then(Value::as_str).unwrap_or("tool");
+            let title = p.get("title").and_then(Value::as_str).unwrap_or("");
+            let status = p.get("status").and_then(Value::as_str).unwrap_or("");
+            format!("  · {tool_kind} {title} [{status}]")
+        }
+        kind::PLAN => {
+            let n = p
+                .get("entries")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            format!("[plan] {n} entries")
+        }
+        kind::PERMISSION_REQUEST => {
+            let title = p.get("title").and_then(Value::as_str).unwrap_or("");
+            let outcome = p
+                .get("outcome")
+                .and_then(|o| o.get("option_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("pending");
+            format!("[permission] {title} ({outcome})")
+        }
+        kind::MODE_CHANGE => format!("[mode] {}", text("mode_id")),
+        kind::USAGE => {
+            let used = p.get("used").and_then(Value::as_i64).unwrap_or(0);
+            let size = p.get("size").and_then(Value::as_i64).unwrap_or(0);
+            format!("[usage] {used}/{size}")
+        }
+        kind::TURN_END => {
+            let reason = p.get("stop_reason").and_then(Value::as_str).unwrap_or("");
+            format!("— turn {} · {reason} —", b.turn)
+        }
+        _ => String::new(),
+    }
+}
+
+/// The latest `usage` block's payload for a session (`{used, size}`), or `None`.
+/// A cheap query feeding [`SessionView::usage`](weaver_api::SessionView).
+pub async fn latest_usage(db: &Db, session_id: &str) -> Result<Option<Value>> {
+    let row = sqlx::query(
+        "SELECT payload FROM chat_blocks WHERE session_id = ? AND kind = ?
+         ORDER BY turn DESC, seq DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(kind::USAGE)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.and_then(|r| serde_json::from_str(&r.get::<String, _>("payload")).ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn seed_session(db: &Db) -> String {
+        let branch = weaver_core::branch::upsert(db, "/repo", "weaver/chat", "main")
+            .await
+            .unwrap();
+        crate::session::insert(
+            db,
+            &crate::session::NewSession {
+                id: "chatsess".to_string(),
+                branch_id: branch.id,
+                work_dir: "/w".to_string(),
+                term_session: "weaver-chatsess".to_string(),
+                agent_kind: "claude".to_string(),
+                model: String::new(),
+                effort: String::new(),
+                status: "running".to_string(),
+                github_repo: None,
+                parent_branch_id: None,
+                managed_by: None,
+                created_by: None,
+                protocol: "acp".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        "chatsess".to_string()
+    }
+
+    #[tokio::test]
+    async fn insert_is_idempotent_on_turn_seq() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let s = seed_session(&db).await;
+        assert!(insert(
+            &db,
+            &s,
+            0,
+            0,
+            kind::USER_MESSAGE,
+            &json!({"text":"hi","by":null})
+        )
+        .await
+        .unwrap());
+        // Same (turn, seq) again — a replay — is ignored, not duplicated.
+        assert!(!insert(
+            &db,
+            &s,
+            0,
+            0,
+            kind::USER_MESSAGE,
+            &json!({"text":"hi","by":null})
+        )
+        .await
+        .unwrap());
+        let blocks = list(&db, &s).await.unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, kind::USER_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn max_turn_seq_is_lexicographic() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let s = seed_session(&db).await;
+        insert(&db, &s, 0, 0, kind::USER_MESSAGE, &json!({}))
+            .await
+            .unwrap();
+        insert(&db, &s, 0, 5, kind::TURN_END, &json!({}))
+            .await
+            .unwrap();
+        insert(&db, &s, 1, 2, kind::AGENT_MESSAGE, &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(max_turn_seq(&db, &s).await.unwrap(), Some((1, 2)));
+    }
+
+    #[tokio::test]
+    async fn permission_resolution_is_idempotent_by_request_id() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let s = seed_session(&db).await;
+        insert(
+            &db,
+            &s,
+            0,
+            1,
+            kind::PERMISSION_REQUEST,
+            &json!({ "request_id": "req-1", "tool_call_id": null, "title": "edit",
+                     "options": [{"option_id":"allow","name":"Allow","kind":"allow_once"}],
+                     "outcome": null }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(open_permissions(&db, &s).await.unwrap().len(), 1);
+        assert_eq!(
+            permission_outcome(&db, &s, "req-1").await.unwrap(),
+            PermissionOutcome::Open
+        );
+        assert_eq!(
+            permission_outcome(&db, &s, "req-absent").await.unwrap(),
+            PermissionOutcome::Unknown
+        );
+
+        let resolved = resolve_permission(&db, &s, "req-1", "allow", "alice")
+            .await
+            .unwrap()
+            .expect("open request resolves");
+        assert_eq!(resolved.payload["outcome"]["option_id"], "allow");
+        assert_eq!(resolved.payload["outcome"]["by"], "alice");
+
+        // No longer open; a second resolve is a no-op.
+        assert!(open_permissions(&db, &s).await.unwrap().is_empty());
+        assert!(resolve_permission(&db, &s, "req-1", "allow", "bob")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            permission_outcome(&db, &s, "req-1").await.unwrap(),
+            PermissionOutcome::Resolved("allow".to_string())
+        );
+    }
+
+    #[test]
+    fn preview_text_renders_compact_lines_for_the_tail() {
+        let block = |turn: i64, seq: i64, kind: &str, payload: Value| ChatBlockView {
+            turn,
+            seq,
+            kind: kind.to_string(),
+            payload,
+            created_at: String::new(),
+        };
+        let blocks = vec![
+            block(
+                0,
+                0,
+                kind::USER_MESSAGE,
+                json!({"text":"do the thing","by":null}),
+            ),
+            block(
+                0,
+                1,
+                kind::TOOL_CALL,
+                json!({"tool_kind":"edit","title":"file.rs","status":"completed"}),
+            ),
+            block(0, 2, kind::AGENT_MESSAGE, json!({"text":"done"})),
+            block(0, 3, kind::TURN_END, json!({"stop_reason":"end_turn"})),
+        ];
+        // The whole tail.
+        let all = preview_text(&blocks, 40);
+        assert!(all.contains("[you] do the thing"), "{all}");
+        assert!(all.contains("· edit file.rs [completed]"), "{all}");
+        assert!(all.contains("[agent] done"), "{all}");
+        assert!(all.contains("turn 0 · end_turn"), "{all}");
+        // Only the last N.
+        let tail = preview_text(&blocks, 1);
+        assert!(tail.contains("end_turn"));
+        assert!(!tail.contains("[you]"), "only the last block: {tail}");
+    }
+
+    #[tokio::test]
+    async fn latest_usage_returns_the_newest() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let s = seed_session(&db).await;
+        insert(&db, &s, 0, 3, kind::USAGE, &json!({"used":100,"size":200}))
+            .await
+            .unwrap();
+        insert(&db, &s, 1, 4, kind::USAGE, &json!({"used":150,"size":200}))
+            .await
+            .unwrap();
+        assert_eq!(latest_usage(&db, &s).await.unwrap().unwrap()["used"], 150);
+    }
+}

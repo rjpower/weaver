@@ -391,6 +391,7 @@ mod tests {
             addr: "127.0.0.1:0".to_string(),
             ide: std::sync::Arc::new(crate::ide::IdeManager::new(crate::ide::ide_home())),
             trigger: crate::github_trigger::GithubTrigger::production(db),
+            acp: crate::acp::AcpRegistry::new(),
         }
     }
 
