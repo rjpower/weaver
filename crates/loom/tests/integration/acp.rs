@@ -75,12 +75,22 @@ async fn make_session(ts: &TestServer, id: &str) {
 /// Bring up a fresh ACP session (relay + handshake + task) with the given launch
 /// mode and optional goal.
 async fn start_new(ts: &TestServer, id: &str, mode: Option<&str>, goal: Option<&str>) {
+    start_new_with_env(ts, id, mode, goal, vec![]).await;
+}
+
+async fn start_new_with_env(
+    ts: &TestServer,
+    id: &str,
+    mode: Option<&str>,
+    goal: Option<&str>,
+    env: Vec<(String, String)>,
+) {
     make_session(ts, id).await;
     let cwd = ts.repo_path().to_path_buf();
     let launch = AcpLaunch {
         adapter_cmd: agent_cmd(),
         cwd: cwd.clone(),
-        env: vec![],
+        env,
         new_or_load: NewOrLoad::New { cwd, meta: None },
         mode: mode.map(str::to_string),
         goal: goal.map(str::to_string),
@@ -542,6 +552,129 @@ async fn prompt_queues_during_a_live_turn() {
             .any(|b| b["kind"] == "agent_message" && b["payload"]["text"] == "second"),
         "the queued turn ran"
     );
+}
+
+/// 4b. A steering-capable adapter injects a mid-turn prompt into the active
+/// turn instead of writing the durable next-turn queue.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_steers_a_live_turn_when_advertised() {
+    let ts = TestServer::start().await;
+    start_new_with_env(
+        &ts,
+        "acp-steer",
+        None,
+        None,
+        vec![("FAKE_ACP_STEERING".to_string(), "1".to_string())],
+    )
+    .await;
+
+    let first = ts
+        .client
+        .post(
+            "/api/sessions/acp-steer/prompt",
+            json!({ "text": "wait:1500|say:first" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["queued"], false);
+    assert_eq!(first["steered"], false);
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let second = ts
+        .client
+        .post(
+            "/api/sessions/acp-steer/prompt",
+            json!({ "text": "say:changed course" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["queued"], false);
+    assert_eq!(second["steered"], true, "response: {second}");
+    assert_eq!(second["turn"], 0);
+
+    let session = session_mod::get(&ts.state.db, "acp-steer")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        session.pending_prompt.as_deref().unwrap_or("").is_empty(),
+        "a successful steer must not touch the next-turn queue"
+    );
+
+    let chat = poll_chat(&ts, "acp-steer", Duration::from_secs(10), |blocks| {
+        count_kind(blocks, "turn_end") >= 1
+            && blocks.iter().any(|b| {
+                b["kind"] == "agent_message" && b["payload"]["text"] == "changed coursefirst"
+            })
+    })
+    .await;
+    let blocks = chat["blocks"].as_array().unwrap();
+    assert_eq!(count_kind(blocks, "turn_end"), 1);
+    assert!(blocks.iter().any(|b| {
+        b["kind"] == "user_message"
+            && b["turn"] == 0
+            && b["payload"]["text"] == "say:changed course"
+            && b["payload"]["steered"] == true
+    }));
+}
+
+/// 4c. If a turn ends during injection, codex-acp starts the message itself and
+/// reports `startedNewTurn`; loom adopts and closes that adapter-owned turn.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_adopts_a_turn_started_by_steering() {
+    let ts = TestServer::start().await;
+    start_new_with_env(
+        &ts,
+        "acp-steer-race",
+        None,
+        None,
+        vec![
+            ("FAKE_ACP_STEERING".to_string(), "1".to_string()),
+            (
+                "FAKE_ACP_STEERING_FORCE_NEW_TURN".to_string(),
+                "1".to_string(),
+            ),
+        ],
+    )
+    .await;
+
+    ts.client
+        .post(
+            "/api/sessions/acp-steer-race/prompt",
+            json!({ "text": "wait:300|say:first" }),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = ts
+        .client
+        .post(
+            "/api/sessions/acp-steer-race/prompt",
+            json!({ "text": "wait:100|say:second" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["queued"], false);
+    assert_eq!(second["steered"], false);
+    assert_eq!(second["turn"], 1);
+
+    let chat = poll_chat(&ts, "acp-steer-race", Duration::from_secs(10), |blocks| {
+        count_kind(blocks, "turn_end") == 2
+    })
+    .await;
+    assert_eq!(chat["live_turn"], Value::Null);
+    let blocks = chat["blocks"].as_array().unwrap();
+    assert!(blocks.iter().any(|b| {
+        b["kind"] == "user_message"
+            && b["turn"] == 1
+            && b["payload"]["text"] == "wait:100|say:second"
+            && b["payload"]["steered"] == false
+    }));
+    assert!(blocks.iter().any(|b| {
+        b["kind"] == "agent_message" && b["turn"] == 1 && b["payload"]["text"] == "second"
+    }));
 }
 
 /// 5. Crash recovery: stop the loom-side task mid-turn, re-attach, and the

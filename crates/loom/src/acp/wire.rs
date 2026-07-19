@@ -62,6 +62,8 @@ pub mod method {
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_LOAD: &str = "session/load";
     pub const SESSION_PROMPT: &str = "session/prompt";
+    /// Experimental codex-acp extension for adding input to the active turn.
+    pub const SESSION_STEERING: &str = "_session/steering";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_SET_MODE: &str = "session/set_mode";
     pub const SESSION_UPDATE: &str = "session/update";
@@ -153,9 +155,35 @@ pub enum SessionUpdate {
         #[serde(default)]
         size: Option<u64>,
     },
-    /// Anything else (available_commands_update, session_info_update, …): ignored.
+    /// codex-acp's thread lifecycle. Loom normally owns turn boundaries through
+    /// the `session/prompt` response; this closes the rare turn that the
+    /// steering extension starts internally after racing an end-of-turn.
+    SessionInfoUpdate {
+        #[serde(default, rename = "_meta")]
+        meta: SessionInfoMeta,
+    },
+    /// Anything else (available_commands_update, …): ignored.
     #[serde(other)]
     Other,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SessionInfoMeta {
+    #[serde(default)]
+    pub codex: Option<CodexSessionInfo>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexSessionInfo {
+    #[serde(default)]
+    pub thread_status: Option<ThreadStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThreadStatus {
+    #[serde(rename = "type")]
+    pub kind: String,
 }
 
 /// A content block. Only text is consumed; other types degrade to
@@ -308,12 +336,15 @@ pub struct PromptResult {
     pub stop_reason: String,
 }
 
-/// The `initialize` result — the agent's capabilities (we read `loadSession`).
+/// The `initialize` result — the standard agent capabilities plus extension
+/// metadata advertised by individual adapters.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResult {
     #[serde(default)]
     pub agent_capabilities: AgentCapabilities,
+    #[serde(default, rename = "_meta")]
+    pub meta: InitializeMeta,
 }
 
 /// The subset of agent capabilities loom checks.
@@ -322,6 +353,33 @@ pub struct InitializeResult {
 pub struct AgentCapabilities {
     #[serde(default)]
     pub load_session: bool,
+}
+
+/// Adapter-specific capabilities carried in the initialize result's `_meta`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct InitializeMeta {
+    #[serde(default)]
+    pub steering: SteeringCapability,
+}
+
+/// The codex-acp steering capability (`_meta.steering.supported`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SteeringCapability {
+    #[serde(default)]
+    pub supported: bool,
+}
+
+/// The result of codex-acp's `_session/steering` extension.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SteeringOutcome {
+    Injected,
+    StartedNewTurn,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SteeringResult {
+    pub outcome: SteeringOutcome,
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +414,14 @@ pub fn load_session_params(session_id: &str, cwd: &str) -> Value {
 
 /// `session/prompt` params carrying a single text block.
 pub fn prompt_params(session_id: &str, text: &str) -> Value {
+    serde_json::json!({
+        "sessionId": session_id,
+        "prompt": [ { "type": "text", "text": text } ],
+    })
+}
+
+/// codex-acp `_session/steering` params carrying a single text block.
+pub fn steering_params(session_id: &str, text: &str) -> Value {
     serde_json::json!({
         "sessionId": session_id,
         "prompt": [ { "type": "text", "text": text } ],
@@ -578,6 +644,18 @@ mod tests {
 
         let pr: PromptResult = serde_json::from_value(json!({ "stopReason": "end_turn" })).unwrap();
         assert_eq!(pr.stop_reason, "end_turn");
+
+        let init: InitializeResult = serde_json::from_value(json!({
+            "agentCapabilities": { "loadSession": true },
+            "_meta": { "steering": { "supported": true } },
+        }))
+        .unwrap();
+        assert!(init.agent_capabilities.load_session);
+        assert!(init.meta.steering.supported);
+
+        let steer: SteeringResult =
+            serde_json::from_value(json!({ "outcome": "startedNewTurn" })).unwrap();
+        assert_eq!(steer.outcome, SteeringOutcome::StartedNewTurn);
     }
 
     #[test]
@@ -588,6 +666,16 @@ mod tests {
         assert_eq!(v["method"], "initialize");
         assert_eq!(v["id"], 1);
         assert_eq!(v["params"]["protocolVersion"], 1);
+
+        let steer = request_line(
+            2,
+            method::SESSION_STEERING,
+            steering_params("sess-1", "pivot"),
+        );
+        let v: Value = serde_json::from_slice(&steer[..steer.len() - 1]).unwrap();
+        assert_eq!(v["method"], "_session/steering");
+        assert_eq!(v["params"]["sessionId"], "sess-1");
+        assert_eq!(v["params"]["prompt"][0]["text"], "pivot");
 
         let resp = response_line(&json!(7), permission_selected("allow-once"));
         let v: Value = serde_json::from_slice(&resp[..resp.len() - 1]).unwrap();

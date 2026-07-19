@@ -63,7 +63,8 @@ const shadows = reactive(
 const liveTools = reactive(new Map<string, SseTool>());
 const turnLive = ref(false);
 const liveTurnNo = ref<number | null>(null);
-const optimistic = ref<{ text: string; queued: boolean }[]>([]);
+const optimistic = ref<{ key: number; text: string; state: 'sent' | 'steered' | 'queued' }[]>([]);
+let nextOptimisticKey = 0;
 
 // The live mode, seeded from the session and advanced by `mode_change` blocks or
 // a local set — so the composer chip reads true without a refetch.
@@ -158,7 +159,7 @@ function onTurn(ev: SseTurn) {
   } else {
     turnLive.value = false;
     liveTurnNo.value = null;
-    optimistic.value = optimistic.value.filter((o) => o.queued);
+    optimistic.value = optimistic.value.filter((o) => o.state === 'queued');
   }
 }
 
@@ -228,12 +229,20 @@ async function submitPrompt() {
   sending.value = true;
   sendError.value = '';
   const text = draft.value;
+  const pending = { key: nextOptimisticKey++, text, state: 'sent' as const };
+  optimistic.value.push(pending);
+  autoFollow();
   try {
     const ack = await promptSession(id.value, text);
-    optimistic.value.push({ text, queued: ack.queued });
+    const index = optimistic.value.findIndex((o) => o.key === pending.key);
+    if (index >= 0) {
+      optimistic.value[index].state = ack.queued ? 'queued' : ack.steered ? 'steered' : 'sent';
+    }
     draft.value = '';
     autoFollow();
   } catch (e) {
+    const index = optimistic.value.findIndex((o) => o.key === pending.key);
+    if (index >= 0) optimistic.value.splice(index, 1);
     sendError.value = (e as Error).message ?? 'Failed to send';
   } finally {
     sending.value = false;
@@ -318,7 +327,16 @@ interface ActivityItem {
 
 type Row =
   | { type: 'turnRule'; key: string; turn: number; stop: string; ctx: number | null; loud: boolean }
-  | { type: 'user'; key: string; anchor: string; n: number; time: string; text: string }
+  | {
+      type: 'user';
+      key: string;
+      anchor: string;
+      n: number;
+      turn: number;
+      time: string;
+      text: string;
+      steered: boolean;
+    }
   | { type: 'agent'; key: string; time: string; text: string; streaming: boolean }
   | { type: 'thought'; key: string; text: string; streaming: boolean }
   | { type: 'activity'; key: string; items: ActivityItem[]; failures: number }
@@ -391,11 +409,22 @@ const model = computed<{ rows: Row[]; toc: TocItem[] }>(() => {
     switch (b.kind) {
       case 'user_message': {
         flushActivity();
-        n += 1;
-        const anchor = `acp-turn-${b.turn}`;
-        const text = (b.payload as unknown as UserMessagePayload).text ?? '';
-        rows.push({ type: 'user', key: k, anchor, n, time: shortTime(b.created_at), text });
-        toc.push({ anchor, n, title: titleOf(text) });
+        const user = b.payload as unknown as UserMessagePayload;
+        const steered = user.steered === true;
+        if (!steered) n += 1;
+        const anchor = steered ? `acp-steer-${b.turn}-${b.seq}` : `acp-turn-${b.turn}`;
+        const text = user.text ?? '';
+        rows.push({
+          type: 'user',
+          key: k,
+          anchor,
+          n,
+          turn: b.turn,
+          time: shortTime(b.created_at),
+          text,
+          steered,
+        });
+        if (!steered) toc.push({ anchor, n, title: titleOf(text) });
         break;
       }
       case 'agent_message':
@@ -698,6 +727,9 @@ function goTo(anchor: string) {
             >
               <header class="acp-rule">
                 <span class="acp-label text-accent">You</span>
+                <span v-if="row.steered" class="acp-queued" data-testid="acp-steered"
+                  >steered turn {{ row.turn + 1 }}</span
+                >
                 <span class="acp-time">{{ row.time }}</span>
               </header>
               <MarkdownView :id="id" path="" :source="row.text" />
@@ -850,15 +882,18 @@ function goTo(anchor: string) {
 
           <!-- Optimistic (in-flight / queued) user messages. -->
           <section
-            v-for="(o, i) in optimistic"
-            :key="`opt-${i}`"
+            v-for="o in optimistic"
+            :key="`opt-${o.key}`"
             class="acp-speaker"
             data-testid="acp-optimistic"
           >
             <header class="acp-rule">
               <span class="acp-label text-accent">You</span>
-              <span v-if="o.queued" class="acp-queued" data-testid="acp-queued"
+              <span v-if="o.state === 'queued'" class="acp-queued" data-testid="acp-queued"
                 >queued for next turn</span
+              >
+              <span v-else-if="o.state === 'steered'" class="acp-queued" data-testid="acp-steered"
+                >steering current turn</span
               >
             </header>
             <MarkdownView :id="id" path="" :source="o.text" />
