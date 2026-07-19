@@ -487,6 +487,10 @@ struct PendingPerm {
 
 struct Task {
     db: Db,
+    /// The loom event bus — used to drive the turn-boundary status/idle lifecycle
+    /// through [`crate::monitor::record_acp_lifecycle`] (working at turn start,
+    /// idle at turn end), the sole reason the acp task holds it.
+    bus: crate::events::EventBus,
     registry: AcpRegistry,
     /// This task's registry generation — used to remove only its own slot on exit.
     generation: u64,
@@ -514,6 +518,11 @@ struct Task {
     current_mode: Option<String>,
     #[allow(dead_code)]
     load_session_cap: bool,
+    /// Latched for the duration of a `session/load` replay: the adapter re-streams
+    /// the whole conversation as `session/update` notifications, but we already
+    /// hold it in the journal, so journal writes are suppressed (and the seq
+    /// cursor left untouched) until the load response lands.
+    suppress_journal: bool,
 
     highest_seq: u64,
     acked: u64,
@@ -532,6 +541,7 @@ impl Task {
     ) -> Self {
         Self {
             db: state.db.clone(),
+            bus: state.bus.clone(),
             registry: state.acp.clone(),
             generation: 0,
             session_id: session.id.clone(),
@@ -550,6 +560,7 @@ impl Task {
             pending_perms: HashMap::new(),
             current_mode: None,
             load_session_cap: false,
+            suppress_journal: false,
             highest_seq: 0,
             acked: 0,
             journal_failed: false,
@@ -580,6 +591,7 @@ impl Task {
 
         Ok(Self {
             db: state.db.clone(),
+            bus: state.bus.clone(),
             registry: state.acp.clone(),
             generation: 0,
             session_id: session.id.clone(),
@@ -598,6 +610,7 @@ impl Task {
             pending_perms: HashMap::new(),
             current_mode: session.current_mode.clone(),
             load_session_cap: false,
+            suppress_journal: false,
             highest_seq: session.acp_ack_seq.max(0) as u64,
             acked: session.acp_ack_seq.max(0) as u64,
             journal_failed: false,
@@ -650,6 +663,20 @@ impl Task {
             }
             NewOrLoad::Load { acp_session_id } => {
                 self.acp_session_id = acp_session_id.clone();
+                // Continue the *existing* journal: seed the turn/seq cursor from it
+                // so a post-load prompt opens a fresh turn (rather than colliding
+                // with `Task::fresh`'s zeroed counters). `turns_dispatched > 0` makes
+                // the next `start_turn` advance the turn.
+                let (max_turn, max_seq) = chat::max_turn_seq(&self.db, &self.session_id)
+                    .await?
+                    .unwrap_or((0, -1));
+                self.current_turn = max_turn;
+                self.next_seq = max_seq + 1;
+                self.turns_dispatched = if max_seq < 0 { 0 } else { max_turn + 1 };
+                // The adapter re-streams the whole conversation as `session/update`
+                // notifications during the load — we already hold it — so suppress
+                // re-journaling for the duration of the call.
+                self.suppress_journal = true;
                 let id = self.next_id();
                 let params =
                     wire::load_session_params(acp_session_id, &launch.cwd.to_string_lossy());
@@ -658,6 +685,11 @@ impl Task {
                     .await?;
                 // History replays as `session/update` notifications during the call.
                 let (res, err) = self.recv_until_response(id).await?;
+                self.suppress_journal = false;
+                // Drop any consolidation the suppressed replay left half-open so it
+                // can't flush stale history into a later turn.
+                self.buf = None;
+                self.tools.clear();
                 if res.is_none() {
                     bail!("session/load failed: {err:?}");
                 }
@@ -953,6 +985,10 @@ impl Task {
             json!({ "turn": turn, "state": "ended", "stop_reason": stop }),
         );
 
+        // Turn end ⇒ the `idle` lifecycle edge: stamp the quiet `idle` mark (the
+        // "resting, no one needed" state). Mirrors the terminal path's `Stop` hook.
+        crate::monitor::record_acp_lifecycle(&self.db, &self.bus, &self.session_id, "idle").await;
+
         // Dispatch the durable queue as the next turn, if non-empty.
         let pending = session::take_pending_prompt(&self.db, &self.session_id)
             .await
@@ -993,6 +1029,11 @@ impl Task {
                 wire::prompt_params(&self.acp_session_id, &text),
             ))
             .await?;
+        // Turn start ⇒ the `working` lifecycle edge: status `running`, the calm
+        // `idle` mark and the agent's `attention` tag cleared. Mirrors what the
+        // terminal path's `UserPromptSubmit` hook does (see `crate::monitor`).
+        crate::monitor::record_acp_lifecycle(&self.db, &self.bus, &self.session_id, "working")
+            .await;
         Ok(())
     }
 
@@ -1188,6 +1229,17 @@ impl Task {
     async fn journal_block(&mut self, kind: &str, payload: Value) -> ChatBlockView {
         let turn = self.current_turn;
         let seq = self.next_seq;
+        // A `session/load` replay is already in the journal: don't rewrite it, and
+        // leave the seq cursor where the seeded continuation expects it.
+        if self.suppress_journal {
+            return ChatBlockView {
+                turn,
+                seq,
+                kind: kind.to_string(),
+                payload,
+                created_at: now_iso(),
+            };
+        }
         self.next_seq += 1;
         let inserted = chat::insert(&self.db, &self.session_id, turn, seq, kind, &payload).await;
         let view = ChatBlockView {

@@ -105,6 +105,7 @@ async fn start_server() -> (TestHome, loom::client::Client, db::Db, String) {
             launch: String::new(),
             resume: String::new(),
             reports_status: false,
+            protocol: "terminal".to_string(),
             created_at: String::new(),
             updated_at: String::new(),
         },

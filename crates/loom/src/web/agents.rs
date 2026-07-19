@@ -32,6 +32,10 @@ pub(super) struct CustomAgentBody {
     resume: String,
     #[serde(default)]
     reports_status: bool,
+    /// Execution backend: `"terminal"` (the default) or `"acp"`. Blank/absent is
+    /// normalized to `"terminal"` by [`custom_agents::set`].
+    #[serde(default)]
+    protocol: String,
 }
 
 impl CustomAgentBody {
@@ -45,6 +49,7 @@ impl CustomAgentBody {
             launch: self.launch,
             resume: self.resume,
             reports_status: self.reports_status,
+            protocol: self.protocol.trim().to_string(),
             created_at: String::new(),
             updated_at: String::new(),
         }

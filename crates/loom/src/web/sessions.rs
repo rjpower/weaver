@@ -629,17 +629,31 @@ pub(crate) async fn create_session_core(
             .await
         }
     };
-    match agent::metadata_for(&st.db, &runtime).await? {
+    // Resolve the execution backend (terminal|acp) from the agent's declared
+    // protocol and the optional request override, validating model/effort against
+    // the same metadata. Stamped on the session row at insert, immutable after.
+    let protocol = match agent::metadata_for(&st.db, &runtime).await? {
         // Blank model/effort means the agent's own default; a non-empty value must
         // be one the agent offers. A custom agent offers none, so any explicit
         // selector is rejected here.
         Some(meta) => {
             agent::validate_model(&meta, &model).map_err(AppError::bad_request)?;
             agent::validate_effort(&meta, &effort).map_err(AppError::bad_request)?;
+            agent::resolve_protocol(&meta, req.protocol.as_deref())
+                .map_err(AppError::bad_request)?
         }
         None => return Err(AppError::bad_request(format!("unknown agent '{runtime}'"))),
-    }
-    tracing::debug!(model = %model, effort = %effort, "resolved and validated model/effort");
+    };
+    // The ACP launch permission posture (ignored for a terminal launch): the
+    // request's mode, else the bypass default (the retired pre-seeded gates).
+    let mode = req
+        .mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(agent::DEFAULT_ACP_MODE)
+        .to_string();
+    tracing::debug!(model = %model, effort = %effort, protocol = %protocol, "resolved and validated model/effort/protocol");
     ensure_github_token_available(&st.db, &extra_env, created_by.as_deref(), &runtime).await?;
     tracing::debug!(runtime = %runtime, "github token availability check passed");
 
@@ -995,6 +1009,7 @@ pub(crate) async fn create_session_core(
                         parent_branch_id: parent.as_ref().map(|b| b.id.clone()),
                         managed_by: None,
                         created_by: created_by.clone(),
+                        protocol: protocol.clone(),
                     },
                 )
                 .await?;
@@ -1055,54 +1070,127 @@ pub(crate) async fn create_session_core(
         }
     }
 
-    tracing::info!(
-        session = %session_id,
-        branch = %branch.id,
-        runtime = %runtime,
-        work_dir = %work_dir.display(),
-        env_vars = extra_env.len(),
-        "launching agent terminal"
-    );
-    agent::launch(
-        &st.db,
-        &agent::LaunchSpec {
-            branch_id: &branch.id,
-            runtime: &runtime,
-            work_dir: &work_dir,
-            term_session: &term_session,
-            goal_file: goal_file.as_deref(),
-            primer_file: primer_file.as_deref(),
-            server_addr: &st.addr,
-            model: &model,
-            effort: &effort,
-            extra_env: &extra_env,
-        },
-        agent::LaunchMode::Fresh,
-    )
-    .await
-    .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    tracing::info!(session = %session_id, branch = %branch.id, "agent terminal launched");
-
-    // Live the moment the terminal spawns — there is no `launching` state.
+    // Live the moment the agent spawns — there is no `launching` state.
     let status = agent::initial_status(&st.db, &runtime).await;
-    let session = session_mod::insert(
-        &st.db,
-        &NewSession {
-            id: session_id.clone(),
-            branch_id: branch.id.clone(),
-            work_dir: work_dir.display().to_string(),
-            term_session,
-            agent_kind: agent,
-            model,
-            effort,
-            status: status.to_string(),
-            github_repo: github_repo.clone(),
-            parent_branch_id: parent.as_ref().map(|b| b.id.clone()),
-            managed_by: None,
-            created_by,
-        },
-    )
-    .await?;
+    let session = if protocol == "acp" {
+        // The ACP path inserts the row *first* — `acp::start` binds a relay to it
+        // and reads it back — then brings up the headless adapter over the relay.
+        tracing::info!(
+            session = %session_id, branch = %branch.id, runtime = %runtime,
+            work_dir = %work_dir.display(), mode = %mode, "launching acp session"
+        );
+        let session = session_mod::insert(
+            &st.db,
+            &NewSession {
+                id: session_id.clone(),
+                branch_id: branch.id.clone(),
+                work_dir: work_dir.display().to_string(),
+                term_session: term_session.clone(),
+                agent_kind: agent.clone(),
+                model: model.clone(),
+                effort: effort.clone(),
+                status: status.to_string(),
+                github_repo: github_repo.clone(),
+                parent_branch_id: parent.as_ref().map(|b| b.id.clone()),
+                managed_by: None,
+                created_by: created_by.clone(),
+                protocol: "acp".to_string(),
+            },
+        )
+        .await?;
+        // A custom acp agent supplies its own adapter command; the builtin claude
+        // resolves the `claude-agent-acp` adapter.
+        let custom = if agent::builtin_agent_type(&runtime).is_some() {
+            None
+        } else {
+            custom_agents::get(&st.db, &runtime).await?
+        };
+        let launch = agent::build_acp_launch(
+            &st.db,
+            &agent::AcpLaunchSpec {
+                branch_id: &branch.id,
+                runtime: &runtime,
+                work_dir: &work_dir,
+                server_addr: &st.addr,
+                model: &model,
+                goal_file: goal_file.as_deref(),
+                primer_file: primer_file.as_deref(),
+                extra_env: &extra_env,
+                mode: &mode,
+                custom: custom.as_ref(),
+            },
+            agent::AcpOpen::Fresh,
+        )
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if let Err(e) = crate::acp::start(&st, &session.id, launch).await {
+            // Mark the row errored (visible, inspectable) rather than leaving a
+            // running row with no live task behind it.
+            let _ = session_mod::set_status(&st.db, &session.id, "error").await;
+            events::record(
+                &st.db,
+                &st.bus,
+                &branch.id,
+                "status",
+                json!({ "status": "error", "reason": "acp launch failed" }),
+            )
+            .await
+            .ok();
+            return Err(AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("acp launch failed: {e}"),
+            ));
+        }
+        tracing::info!(session = %session.id, branch = %branch.id, "acp session launched");
+        session
+    } else {
+        tracing::info!(
+            session = %session_id,
+            branch = %branch.id,
+            runtime = %runtime,
+            work_dir = %work_dir.display(),
+            env_vars = extra_env.len(),
+            "launching agent terminal"
+        );
+        agent::launch(
+            &st.db,
+            &agent::LaunchSpec {
+                branch_id: &branch.id,
+                runtime: &runtime,
+                work_dir: &work_dir,
+                term_session: &term_session,
+                goal_file: goal_file.as_deref(),
+                primer_file: primer_file.as_deref(),
+                server_addr: &st.addr,
+                model: &model,
+                effort: &effort,
+                extra_env: &extra_env,
+            },
+            agent::LaunchMode::Fresh,
+        )
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        tracing::info!(session = %session_id, branch = %branch.id, "agent terminal launched");
+        session_mod::insert(
+            &st.db,
+            &NewSession {
+                id: session_id.clone(),
+                branch_id: branch.id.clone(),
+                work_dir: work_dir.display().to_string(),
+                term_session,
+                agent_kind: agent,
+                model,
+                effort,
+                status: status.to_string(),
+                github_repo: github_repo.clone(),
+                parent_branch_id: parent.as_ref().map(|b| b.id.clone()),
+                managed_by: None,
+                created_by,
+                protocol: "terminal".to_string(),
+            },
+        )
+        .await?
+    };
     tracing::debug!(session = %session.id, status = %status, "inserted session row");
 
     if let Err(e) = repo::record_use(&st.db, &branch.repo_root).await {
@@ -1554,6 +1642,11 @@ pub(crate) async fn archive(
     warnings.extend(log_warnings);
     tracing::debug!(session = %session.id, "captured conversation transcript before teardown");
 
+    // Stop the ACP task (drops its handle so the task winds down) before killing
+    // the relay supervisor below — for a terminal session this is a no-op.
+    if session.protocol == "acp" {
+        st.acp.stop(&session.id);
+    }
     backend::kill_session(&session.term_session).await.ok();
     crate::shell::kill_debug_all(&session.id).await;
     st.ide.kill(&session.id);
@@ -1771,6 +1864,9 @@ pub(crate) async fn create_warm_session(
             managed_by: Some(watch.id.clone()),
             // Engine-created infrastructure, no user behind it.
             created_by: None,
+            // Warm sessions stay on the terminal backend (the watch judging
+            // agent is `claude`, terminal by default this phase).
+            protocol: "terminal".to_string(),
         },
     )
     .await?;
@@ -1793,6 +1889,9 @@ pub(crate) async fn adopt(
     session: &Session,
     branch: &Branch,
 ) -> Result<(), AppError> {
+    if session.protocol == "acp" {
+        return adopt_acp(st, session, branch).await;
+    }
     tracing::info!(session = %session.id, branch = %branch.id, "adopting orphaned session");
     if backend::has_session(&session.term_session).await {
         return Err(AppError::conflict(
@@ -1808,6 +1907,106 @@ pub(crate) async fn adopt(
     }
     tracing::debug!(session = %session.id, work_dir = %work_dir.display(), "adopt preflight checks passed");
     resume_agent(st, session, branch, "session adopted").await
+}
+
+/// Adopt an ACP session: respawn its relay + adapter and reopen the conversation.
+/// When the relay supervisor is still alive but loom has no task for it (a crashed
+/// task), just re-attach ([`crate::acp::attach`]). When the relay is gone, respawn
+/// it and reopen via `session/load` (the adapter advertised `loadSession` and we
+/// have its id), falling back to a fresh session re-oriented from the goal file.
+async fn adopt_acp(st: &AppState, session: &Session, branch: &Branch) -> Result<(), AppError> {
+    tracing::info!(session = %session.id, branch = %branch.id, "adopting acp session");
+    if st.acp.is_live(&session.id) {
+        return Err(AppError::conflict("session already has a live ACP task"));
+    }
+    let work_dir = PathBuf::from(&session.work_dir);
+    if !work_dir.exists() {
+        return Err(AppError::bad_request(format!(
+            "worktree {} no longer exists on disk — cannot adopt",
+            session.work_dir
+        )));
+    }
+
+    if backend::has_session(&session.term_session).await {
+        // The relay outlived a crashed task — re-attach from the persisted cursor.
+        tracing::info!(session = %session.id, "acp relay alive; re-attaching");
+        crate::acp::attach(st, &session.id)
+            .await
+            .map_err(|e| AppError::conflict(e.to_string()))?;
+    } else {
+        // The relay is gone — respawn the adapter and reopen the conversation.
+        let repo_root = PathBuf::from(&branch.repo_root);
+        let repo_cfg = repo_cfg_or_default(&repo_root);
+        let extra_env = launch_env(&st.db, &repo_root, &repo_cfg).await;
+        let runtime = launch_runtime(&st.db, &session.agent_kind).await;
+        let custom = if agent::builtin_agent_type(&runtime).is_some() {
+            None
+        } else {
+            custom_agents::get(&st.db, &runtime).await?
+        };
+        let run_dir = db::run_dir(&session.id);
+        let primer_file = {
+            let f = run_dir.join("primer.txt");
+            f.exists().then_some(f)
+        };
+        let goal_file = {
+            let f = run_dir.join("goal.txt");
+            f.exists().then_some(f)
+        };
+        let mode = session
+            .current_mode
+            .clone()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| agent::DEFAULT_ACP_MODE.to_string());
+        // A respawned relay has a fresh spool (seq 1..) and no in-flight turn —
+        // reset the persisted cursor + inflight so a later attach replays cleanly.
+        session_mod::set_ack_seq(&st.db, &session.id, 0).await.ok();
+        session_mod::set_inflight(&st.db, &session.id, None)
+            .await
+            .ok();
+        // Reopen via session/load where the adapter advertised it and we have an
+        // id; otherwise a fresh session re-oriented from the goal file.
+        let open = match session.acp_session_id.as_deref().filter(|s| !s.is_empty()) {
+            Some(id) => agent::AcpOpen::Load(id.to_string()),
+            None => agent::AcpOpen::Fresh,
+        };
+        let launch = agent::build_acp_launch(
+            &st.db,
+            &agent::AcpLaunchSpec {
+                branch_id: &branch.id,
+                runtime: &runtime,
+                work_dir: &work_dir,
+                server_addr: &st.addr,
+                model: &session.model,
+                goal_file: goal_file.as_deref(),
+                primer_file: primer_file.as_deref(),
+                extra_env: &extra_env,
+                mode: &mode,
+                custom: custom.as_ref(),
+            },
+            open,
+        )
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        crate::acp::start(st, &session.id, launch)
+            .await
+            .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    // A re-adopted ACP session is live again — mark it running.
+    let status = agent::initial_status(&st.db, &session.agent_kind).await;
+    session_mod::set_status(&st.db, &session.id, status).await?;
+    events::record(
+        &st.db,
+        &st.bus,
+        &branch.id,
+        "status",
+        json!({ "status": status, "reason": "session adopted" }),
+    )
+    .await
+    .ok();
+    tracing::info!(session = %session.id, branch = %branch.id, "acp session adopted");
+    Ok(())
 }
 
 /// Re-launch a session's agent in a worktree that already exists on disk: the
@@ -2142,6 +2341,29 @@ pub(super) async fn send_session(
     Json(req): Json<SendReq>,
 ) -> ApiResult<Json<Value>> {
     let (session, branch) = require_session(&st.db, &key).await?;
+    // For an ACP session a send *is* a `session/prompt` (queued when a turn is in
+    // flight): delegate to the prompt queue, keeping the same `nudge` audit. This
+    // is what makes `loom session send` work uniformly across both backends.
+    if session.protocol == "acp" {
+        let handle = require_acp_task(&st, &session)?;
+        let by = author_or_manual(req.by.as_deref());
+        let ack = handle
+            .prompt(req.text.clone(), Some(by.clone()))
+            .await
+            .map_err(|e| AppError::conflict(e.to_string()))?;
+        events::record(
+            &st.db,
+            &st.bus,
+            &branch.id,
+            "nudge",
+            json!({ "by": by, "text": req.text }),
+        )
+        .await
+        .ok();
+        return Ok(Json(
+            json!({ "sent": true, "submitted": true, "queued": ack.queued, "turn": ack.turn }),
+        ));
+    }
     require_live_terminal(&session).await?;
     backend::paste(&session.term_session, &req.text)
         .await
@@ -2204,6 +2426,15 @@ pub(super) async fn preview_session(
     Query(q): Query<PreviewQuery>,
 ) -> ApiResult<Json<Value>> {
     let (session, _) = require_session(&st.db, &key).await?;
+    // An ACP session has no vt100 screen; its `preview` is the last N journal
+    // blocks rendered as plain text (CLI convenience). `lines` is the block count,
+    // defaulting to a reasonable tail when unset.
+    if session.protocol == "acp" {
+        let blocks = crate::chat::list(&st.db, &session.id).await?;
+        let n = if q.lines == 0 { 40 } else { q.lines };
+        let screen = crate::chat::preview_text(&blocks, n);
+        return Ok(Json(json!({ "screen": screen })));
+    }
     require_live_terminal(&session).await?;
     let screen = backend::capture(&session.term_session, q.lines)
         .await

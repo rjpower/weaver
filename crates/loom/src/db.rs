@@ -202,6 +202,10 @@ CREATE TABLE IF NOT EXISTS user_github_tokens (
 --   * `resume` — the adopt/resume command (blank falls back to `launch`).
 -- `reports_status` records whether the agent fires weaver's lifecycle hooks, which
 -- drive the idle/attention signals (a fresh session is `running` immediately).
+-- `protocol` is the execution backend loom drives this agent through: 'terminal'
+-- (a PTY supervisor running an interactive command — the default) or 'acp' (a
+-- headless adapter under a relay supervisor, whose `launch` command is the ACP
+-- adapter spoken to over stdio). See `custom_agents::Protocol`.
 CREATE TABLE IF NOT EXISTS custom_agents (
     name           TEXT PRIMARY KEY,
     label          TEXT NOT NULL,
@@ -209,6 +213,7 @@ CREATE TABLE IF NOT EXISTS custom_agents (
     launch         TEXT NOT NULL DEFAULT '',
     resume         TEXT NOT NULL DEFAULT '',
     reports_status INTEGER NOT NULL DEFAULT 0,
+    protocol       TEXT NOT NULL DEFAULT 'terminal',
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -338,6 +343,17 @@ async fn migrate_loom(pool: &Db) -> Result<()> {
     // while a turn is in flight, dispatched as one `session/prompt` at the next
     // turn boundary. Empty/NULL when nothing is queued.
     add_column_if_missing(pool, "sessions", "pending_prompt", "TEXT").await?;
+    // The custom agent's execution backend: 'terminal' (a PTY running its launch
+    // command) or 'acp' (its launch command is an ACP adapter driven over stdio).
+    // Added here for databases created before the column; a fresh DB has it from
+    // the `CREATE TABLE` above and this is a no-op.
+    add_column_if_missing(
+        pool,
+        "custom_agents",
+        "protocol",
+        "TEXT NOT NULL DEFAULT 'terminal'",
+    )
+    .await?;
     // GitHub profile captured at sign-in for commit attribution (see the `users`
     // schema above). Added here for databases predating the columns; a fresh DB
     // already has them from the `CREATE TABLE` and these are no-ops.

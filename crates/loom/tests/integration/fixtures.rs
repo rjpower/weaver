@@ -89,6 +89,7 @@ pub async fn seed_shell_agent(db: &loom::db::Db) {
             launch: String::new(),
             resume: String::new(),
             reports_status: false,
+            protocol: "terminal".to_string(),
             created_at: String::new(),
             updated_at: String::new(),
         },

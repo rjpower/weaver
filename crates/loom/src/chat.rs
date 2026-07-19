@@ -250,6 +250,66 @@ pub async fn has_turn_end(db: &Db, session_id: &str, turn: i64) -> Result<bool> 
     Ok(n > 0)
 }
 
+/// Render the last `last_n` journal blocks as compact plain text — the ACP
+/// analogue of the terminal `preview` screen (`[who] text` lines for prose, a
+/// one-liner for the machine's apparatus). CLI convenience only.
+pub fn preview_text(blocks: &[ChatBlockView], last_n: usize) -> String {
+    let start = blocks.len().saturating_sub(last_n);
+    let mut out = String::new();
+    for b in &blocks[start..] {
+        let line = preview_line(b);
+        if !line.is_empty() {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// One journal block as a single compact preview line (empty to skip it).
+fn preview_line(b: &ChatBlockView) -> String {
+    let p = &b.payload;
+    let text = |key: &str| p.get(key).and_then(Value::as_str).unwrap_or("").trim();
+    match b.kind.as_str() {
+        kind::USER_MESSAGE => format!("[you] {}", text("text")),
+        kind::AGENT_MESSAGE => format!("[agent] {}", text("text")),
+        kind::THOUGHT => format!("[thinking] {}", text("text")),
+        kind::TOOL_CALL => {
+            let tool_kind = p.get("tool_kind").and_then(Value::as_str).unwrap_or("tool");
+            let title = p.get("title").and_then(Value::as_str).unwrap_or("");
+            let status = p.get("status").and_then(Value::as_str).unwrap_or("");
+            format!("  · {tool_kind} {title} [{status}]")
+        }
+        kind::PLAN => {
+            let n = p
+                .get("entries")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            format!("[plan] {n} entries")
+        }
+        kind::PERMISSION_REQUEST => {
+            let title = p.get("title").and_then(Value::as_str).unwrap_or("");
+            let outcome = p
+                .get("outcome")
+                .and_then(|o| o.get("option_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("pending");
+            format!("[permission] {title} ({outcome})")
+        }
+        kind::MODE_CHANGE => format!("[mode] {}", text("mode_id")),
+        kind::USAGE => {
+            let used = p.get("used").and_then(Value::as_i64).unwrap_or(0);
+            let size = p.get("size").and_then(Value::as_i64).unwrap_or(0);
+            format!("[usage] {used}/{size}")
+        }
+        kind::TURN_END => {
+            let reason = p.get("stop_reason").and_then(Value::as_str).unwrap_or("");
+            format!("— turn {} · {reason} —", b.turn)
+        }
+        _ => String::new(),
+    }
+}
+
 /// The latest `usage` block's payload for a session (`{used, size}`), or `None`.
 /// A cheap query feeding [`SessionView::usage`](weaver_api::SessionView).
 pub async fn latest_usage(db: &Db, session_id: &str) -> Result<Option<Value>> {
@@ -288,6 +348,7 @@ mod tests {
                 parent_branch_id: None,
                 managed_by: None,
                 created_by: None,
+                protocol: "acp".to_string(),
             },
         )
         .await
@@ -381,6 +442,43 @@ mod tests {
             permission_outcome(&db, &s, "req-1").await.unwrap(),
             Some(Some("allow".to_string()))
         );
+    }
+
+    #[test]
+    fn preview_text_renders_compact_lines_for_the_tail() {
+        let block = |turn: i64, seq: i64, kind: &str, payload: Value| ChatBlockView {
+            turn,
+            seq,
+            kind: kind.to_string(),
+            payload,
+            created_at: String::new(),
+        };
+        let blocks = vec![
+            block(
+                0,
+                0,
+                kind::USER_MESSAGE,
+                json!({"text":"do the thing","by":null}),
+            ),
+            block(
+                0,
+                1,
+                kind::TOOL_CALL,
+                json!({"tool_kind":"edit","title":"file.rs","status":"completed"}),
+            ),
+            block(0, 2, kind::AGENT_MESSAGE, json!({"text":"done"})),
+            block(0, 3, kind::TURN_END, json!({"stop_reason":"end_turn"})),
+        ];
+        // The whole tail.
+        let all = preview_text(&blocks, 40);
+        assert!(all.contains("[you] do the thing"), "{all}");
+        assert!(all.contains("· edit file.rs [completed]"), "{all}");
+        assert!(all.contains("[agent] done"), "{all}");
+        assert!(all.contains("turn 0 · end_turn"), "{all}");
+        // Only the last N.
+        let tail = preview_text(&blocks, 1);
+        assert!(tail.contains("end_turn"));
+        assert!(!tail.contains("[you]"), "only the last block: {tail}");
     }
 
     #[tokio::test]

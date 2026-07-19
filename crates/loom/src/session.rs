@@ -122,15 +122,24 @@ pub struct NewSession {
     /// The principal (username) that launched this session, or `None` for an
     /// engine-created (warm) session. See [`Session::created_by`].
     pub created_by: Option<String>,
+    /// Execution backend, stamped once at create from the resolved agent/override
+    /// and immutable thereafter: `"terminal"` or `"acp"`. See [`Session::protocol`].
+    pub protocol: String,
 }
 
 pub async fn insert(db: &Db, s: &NewSession) -> Result<Session> {
     let now = now_iso();
+    let protocol = if s.protocol.trim().is_empty() {
+        "terminal"
+    } else {
+        s.protocol.trim()
+    };
     sqlx::query(
         "INSERT INTO sessions
          (id, branch_id, work_dir, term_session, agent_kind, model, effort, status,
-          github_repo, parent_branch_id, managed_by, created_by, last_activity_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          github_repo, parent_branch_id, managed_by, created_by, protocol,
+          last_activity_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&s.id)
     .bind(&s.branch_id)
@@ -144,6 +153,7 @@ pub async fn insert(db: &Db, s: &NewSession) -> Result<Session> {
     .bind(&s.parent_branch_id)
     .bind(&s.managed_by)
     .bind(&s.created_by)
+    .bind(protocol)
     .bind(&now)
     .bind(&now)
     .execute(db)
@@ -448,6 +458,7 @@ mod tests {
             parent_branch_id: None,
             managed_by: managed_by.map(str::to_string),
             created_by: None,
+            protocol: "terminal".to_string(),
         }
     }
 

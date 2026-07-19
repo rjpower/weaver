@@ -1363,6 +1363,7 @@ async fn insert_managed_session(
             parent_branch_id: None,
             managed_by: Some(watch_id.to_string()),
             created_by: None,
+            protocol: "terminal".to_string(),
         },
     )
     .await

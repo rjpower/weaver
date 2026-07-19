@@ -97,6 +97,7 @@ async fn hook_event_drives_session_status() {
             launch: String::new(),
             resume: String::new(),
             reports_status: false,
+            protocol: "terminal".to_string(),
             created_at: String::new(),
             updated_at: String::new(),
         },

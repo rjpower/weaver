@@ -13,9 +13,10 @@ use serial_test::serial;
 use tokio::sync::broadcast;
 
 use loom::acp::{self, AcpLaunch, NewOrLoad, SseEvent};
+use loom::backend;
 use loom::session::{self as session_mod, NewSession};
 
-use crate::fixtures::TestServer;
+use crate::fixtures::{branch_tag_value, TestServer};
 
 /// The relay command that launches the scripted fake ACP agent over stdio.
 fn agent_cmd() -> String {
@@ -46,6 +47,7 @@ async fn make_session(ts: &TestServer, id: &str) {
             parent_branch_id: None,
             managed_by: None,
             created_by: None,
+            protocol: "acp".to_string(),
         },
     )
     .await
@@ -681,4 +683,365 @@ async fn chat_routes_reject_terminal_sessions() {
         .delete(&format!("/api/sessions/{id}"))
         .await
         .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// REST create → turn-driven lifecycle → adopt / archive / preview
+//
+// Phase-4's protocol axis and turn-driven lifecycle over the *public* API: a
+// custom agent whose ACP adapter is the scripted fake, created through
+// `POST /api/sessions`, then driven and torn down exactly as the dashboard does.
+// ---------------------------------------------------------------------------
+
+/// Seed a custom agent whose ACP `launch` command is the scripted fake adapter,
+/// so `POST /api/sessions` resolves `protocol='acp'` and brings it up over a relay.
+async fn seed_acp_agent(ts: &TestServer, name: &str) {
+    loom::custom_agents::set(
+        &ts.state.db,
+        &loom::custom_agents::CustomAgent {
+            name: name.to_string(),
+            label: "Fake ACP".to_string(),
+            setup: String::new(),
+            launch: agent_cmd(),
+            resume: String::new(),
+            reports_status: false,
+            protocol: "acp".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// REST-create a session with `goal` against `agent`, returning the `SessionView`.
+async fn rest_create(ts: &TestServer, agent: &str, goal: &str) -> Value {
+    ts.client
+        .post(
+            "/api/sessions",
+            json!({ "goal": goal, "cwd": ts.cwd(), "agent": agent }),
+        )
+        .await
+        .expect("acp session creates")
+}
+
+/// Poll `GET /api/sessions/{id}` until `pred` accepts the view, returning it.
+async fn poll_view(
+    ts: &TestServer,
+    id: &str,
+    timeout: Duration,
+    pred: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let view = ts.client.get(&format!("/api/sessions/{id}")).await.unwrap();
+        if pred(&view) {
+            return view;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("session view never satisfied the predicate; last: {view}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A. REST create stamps `protocol='acp'`, seeds the goal as turn 0, and the
+///    turn-driven lifecycle runs: turn end stamps the quiet `idle` mark, and a
+///    `/send` dispatches turn 1 (clearing `idle`) while recording the nudge audit.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_create_drives_the_turn_lifecycle() {
+    let ts = TestServer::start().await;
+    seed_acp_agent(&ts, "fakeacp").await;
+
+    let created = rest_create(&ts, "fakeacp", "say:hello").await;
+    let id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["protocol"], "acp", "the session row is stamped acp");
+
+    // The goal dispatched turn 0: the journal holds the goal as the first
+    // `user_message`, the agent's reply, and a `turn_end` once it settles.
+    let chat = poll_chat(&ts, &id, Duration::from_secs(15), |blocks| {
+        blocks.iter().any(|b| b["kind"] == "turn_end")
+    })
+    .await;
+    let blocks = chat["blocks"].as_array().unwrap();
+    let user0 = blocks
+        .iter()
+        .find(|b| b["kind"] == "user_message" && b["turn"] == 0)
+        .expect("a turn-0 user_message");
+    assert!(
+        user0["payload"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("say:hello"),
+        "the goal seeded turn 0's user_message: {user0}"
+    );
+    assert_eq!(
+        count_kind(blocks, "agent_message"),
+        1,
+        "the goal turn replied"
+    );
+
+    // Turn end ⇒ the quiet `idle` mark (the ACP task's `idle` lifecycle edge),
+    // and the live session reads `running`.
+    let view = poll_view(&ts, &id, Duration::from_secs(10), |v| {
+        branch_tag_value(v, "idle") == "idle"
+    })
+    .await;
+    assert_eq!(view["status"], "running", "the live session reads running");
+
+    // A send during idle dispatches at once as turn 1 and clears `idle` (the
+    // `working` edge). The `wait` keeps the turn live long enough to observe it.
+    let sent = ts
+        .client
+        .post(
+            &format!("/api/sessions/{id}/send"),
+            json!({ "text": "wait:1500|say:again" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sent["queued"], false,
+        "an idle session dispatches the send at once"
+    );
+    assert_eq!(sent["turn"], 1, "the send opened turn 1");
+
+    // The `working` edge cleared the `idle` mark...
+    poll_view(&ts, &id, Duration::from_secs(5), |v| {
+        branch_tag_value(v, "idle").is_empty()
+    })
+    .await;
+    // ...and the send became turn 1's user_message.
+    poll_chat(&ts, &id, Duration::from_secs(15), |blocks| {
+        blocks.iter().any(|b| {
+            b["kind"] == "user_message"
+                && b["turn"] == 1
+                && b["payload"]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("say:again")
+        })
+    })
+    .await;
+
+    // The send is also a `nudge` audit event — parity with the terminal path.
+    let nudges = loom::events::since(&ts.state.db, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "nudge")
+        .count();
+    assert_eq!(nudges, 1, "the send recorded exactly one nudge audit event");
+}
+
+/// B. Adopt after a full crash (task + relay gone): the monitor orphans the row,
+///    `/adopt` respawns the relay and reopens via `session/load`, and the journal
+///    continues without duplicating the replayed history.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopt_reopens_via_load_without_duplicates() {
+    let ts = TestServer::start().await;
+    seed_acp_agent(&ts, "fakeacp").await;
+
+    let created = rest_create(&ts, "fakeacp", "say:recovered").await;
+    let id = created["id"].as_str().unwrap().to_string();
+    let term_session = created["term_session"].as_str().unwrap().to_string();
+
+    // Let the goal turn settle (journal: user_message + agent_message + turn_end).
+    poll_chat(&ts, &id, Duration::from_secs(15), |blocks| {
+        blocks.iter().any(|b| b["kind"] == "turn_end")
+    })
+    .await;
+    let view = ts.client.get(&format!("/api/sessions/{id}")).await.unwrap();
+    assert!(
+        view["acp_session_id"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("fake-session-"),
+        "the adapter session id is stored for a later load"
+    );
+
+    // Full crash: drop the loom-side task *and* kill the relay supervisor, so the
+    // adapter is gone (the `session/load` respawn path, not a re-attach).
+    assert!(ts.state.acp.stop(&id), "a task was running");
+    backend::kill_session(&term_session).await.ok();
+
+    // The monitor notices the dead terminal and marks the row orphaned.
+    poll_view(&ts, &id, Duration::from_secs(15), |v| {
+        v["status"] == "orphaned"
+    })
+    .await;
+
+    // Adopt: respawn + `session/load`. The replayed history dedups against the
+    // existing journal, so the counts are unchanged (no duplicate blocks).
+    ts.client
+        .post(&format!("/api/sessions/{id}/adopt"), json!({}))
+        .await
+        .expect("adopt succeeds");
+    poll_view(&ts, &id, Duration::from_secs(10), |v| {
+        v["status"] == "running"
+    })
+    .await;
+
+    let chat = ts
+        .client
+        .get(&format!("/api/sessions/{id}/chat"))
+        .await
+        .unwrap();
+    let blocks = chat["blocks"].as_array().unwrap();
+    assert_eq!(
+        count_kind(blocks, "user_message"),
+        1,
+        "one user_message (no load dup)"
+    );
+    assert_eq!(
+        count_kind(blocks, "agent_message"),
+        1,
+        "one agent_message (no load dup)"
+    );
+    assert_eq!(
+        count_kind(blocks, "turn_end"),
+        1,
+        "one turn_end (no load dup)"
+    );
+
+    // The journal *continues*: a post-adopt send opens a fresh turn 1 that appends
+    // cleanly on top of the seeded cursor.
+    ts.client
+        .post(
+            &format!("/api/sessions/{id}/send"),
+            json!({ "text": "say:continued" }),
+        )
+        .await
+        .expect("post-adopt send dispatches");
+    let chat = poll_chat(&ts, &id, Duration::from_secs(15), |blocks| {
+        count_kind(blocks, "turn_end") >= 2
+    })
+    .await;
+    let blocks = chat["blocks"].as_array().unwrap();
+    assert!(
+        blocks.iter().any(|b| b["kind"] == "user_message"
+            && b["turn"] == 1
+            && b["payload"]["text"] == "say:continued"),
+        "the post-adopt send became turn 1's user_message"
+    );
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b["kind"] == "agent_message" && b["payload"]["text"] == "continued"),
+        "the continued turn ran to completion"
+    );
+}
+
+/// C. `/conversation` serves the journal as an iris log live, and archiving writes
+///    the same log to `chat.json` under the configured log dir.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conversation_is_live_and_archive_captures_it() {
+    let ts = TestServer::start().await;
+    seed_acp_agent(&ts, "fakeacp").await;
+
+    // Pin the capture log dir to a temp dir so the archive never touches ~/.iris.
+    let logs = tempfile::tempdir().unwrap();
+    loom::config::apply(
+        &ts.state.db,
+        &[(
+            "session.log_dir".to_string(),
+            Some(logs.path().to_string_lossy().into_owned()),
+        )],
+    )
+    .await
+    .unwrap();
+
+    let created = rest_create(&ts, "fakeacp", "say:archived").await;
+    let id = created["id"].as_str().unwrap().to_string();
+    poll_chat(&ts, &id, Duration::from_secs(15), |blocks| {
+        blocks.iter().any(|b| b["kind"] == "turn_end")
+    })
+    .await;
+
+    // `/conversation` maps the live journal to an iris log for the Conversation tab.
+    let log = ts
+        .client
+        .get(&format!("/api/sessions/{id}/conversation"))
+        .await
+        .expect("live conversation serves the journal");
+    assert_eq!(
+        log["source"], "acp",
+        "the journal maps to an acp-source log"
+    );
+    let messages = log["messages"].as_array().unwrap();
+    assert!(
+        messages.iter().any(|m| m["role"] == "user"
+            && m["blocks"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("say:archived")),
+        "the goal shows as the user turn: {log}"
+    );
+    assert!(
+        messages.iter().any(|m| m["role"] == "assistant"),
+        "the agent reply shows as an assistant turn"
+    );
+
+    // Archiving captures the same log to `chat.json` (from the journal, not a
+    // JSONL scrape) under the pinned log dir.
+    ts.client
+        .post(&format!("/api/sessions/{id}/archive"), json!({}))
+        .await
+        .expect("archive succeeds");
+
+    // The capture lands under `<log_dir>/<branch-slug>/chat.json`.
+    let branch_dir = std::fs::read_dir(logs.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("a captured branch dir");
+    let chat_json =
+        std::fs::read_to_string(branch_dir.join("chat.json")).expect("chat.json was written");
+    assert!(chat_json.contains("\"source\": \"acp\""), "{chat_json}");
+    assert!(
+        chat_json.contains("say:archived"),
+        "the goal survived the capture"
+    );
+}
+
+/// D. `/preview` renders the last journal blocks as compact plain text — the CLI's
+///    "what does this session look like right now" for an ACP session.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preview_renders_the_journal_tail_as_text() {
+    let ts = TestServer::start().await;
+    seed_acp_agent(&ts, "fakeacp").await;
+
+    let created = rest_create(&ts, "fakeacp", "say:previewed").await;
+    let id = created["id"].as_str().unwrap().to_string();
+    poll_chat(&ts, &id, Duration::from_secs(15), |blocks| {
+        blocks.iter().any(|b| b["kind"] == "turn_end")
+    })
+    .await;
+
+    let preview = ts
+        .client
+        .get(&format!("/api/sessions/{id}/preview"))
+        .await
+        .expect("preview renders the journal tail");
+    let screen = preview["screen"].as_str().unwrap();
+    assert!(
+        screen.contains("[you]"),
+        "the user line is rendered: {screen}"
+    );
+    assert!(
+        screen.contains("say:previewed"),
+        "the goal text is shown: {screen}"
+    );
+    assert!(
+        screen.contains("[agent]"),
+        "the agent line is rendered: {screen}"
+    );
+    assert!(
+        screen.contains("· end_turn"),
+        "the turn boundary is marked: {screen}"
+    );
 }

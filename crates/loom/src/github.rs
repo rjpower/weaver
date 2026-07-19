@@ -1197,6 +1197,7 @@ mod tests {
                 parent_branch_id: None,
                 managed_by: None,
                 created_by: None,
+                protocol: "terminal".to_string(),
             },
         )
         .await

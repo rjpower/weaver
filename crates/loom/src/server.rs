@@ -122,6 +122,13 @@ pub async fn run(addr: &str) -> Result<()> {
         Err(e) => tracing::warn!("could not serialize server state: {e}"),
     }
 
+    // Re-attach to every ACP session whose relay supervisor outlived this loom
+    // restart, unconditionally (it is resuming supervision of a *live* agent, not
+    // adopting an orphan): without it the relay keeps spooling frames loom no
+    // longer journals. A dead relay is left for the monitor to mark `orphaned`,
+    // exactly as for a terminal session.
+    reattach_acp_sessions(&state).await;
+
     // Two independent startup adopt policies. The fleet-wide one recreates every
     // recoverable *ordinary* session's terminal, gated on `server.auto_adopt`. The
     // warm one recovers engine-managed (watch) sessions so a watcher resumes
@@ -153,9 +160,44 @@ pub async fn run(addr: &str) -> Result<()> {
     result
 }
 
+/// On startup, re-attach to every `protocol='acp'` session whose relay supervisor
+/// is still alive — resuming the journal/SSE/ack task loom lost on restart. A dead
+/// relay is left untouched here; the monitor marks it `orphaned` on its next tick,
+/// and adopt (manual or auto) respawns it. Runs unconditionally, before the
+/// `server.auto_adopt` pass, so a live agent is never mistaken for an orphan.
+async fn reattach_acp_sessions(state: &AppState) {
+    let sessions = match session_mod::list(&state.db).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("acp reattach: listing sessions failed: {e}");
+            return;
+        }
+    };
+    for session in sessions {
+        if session.protocol != "acp" || session_mod::is_terminal(&session.status) {
+            continue;
+        }
+        if state.acp.is_live(&session.id) {
+            continue;
+        }
+        if !backend::has_session(&session.term_session).await {
+            continue; // dead relay — the monitor will mark it orphaned.
+        }
+        match crate::acp::attach(state, &session.id).await {
+            Ok(()) => tracing::info!("acp reattach: re-attached session {}", session.id),
+            Err(e) => tracing::warn!(
+                "acp reattach: could not re-attach session {}: {e}",
+                session.id
+            ),
+        }
+    }
+}
+
 /// On startup, adopt every recoverable *ordinary* session whose terminal is gone.
 /// Engine-managed (warm) sessions are skipped here — they have their own adopt
-/// policy in [`reconcile_managed_sessions`], gated on `watch.adopt_warm`.
+/// policy in [`reconcile_managed_sessions`], gated on `watch.adopt_warm`. A live
+/// ACP session was already re-attached by [`reattach_acp_sessions`]; a dead-relay
+/// ACP session falls through to `web::adopt`, which respawns it via `session/load`.
 async fn reconcile_sessions(state: &AppState) {
     let sessions = match session_mod::list(&state.db).await {
         Ok(s) => s,

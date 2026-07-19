@@ -13,6 +13,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
+use crate::db::Db;
+use crate::events::EventBus;
 use crate::session::{self as session_mod, Session};
 use crate::web::AppState;
 use crate::{backend, events};
@@ -137,6 +139,11 @@ pub async fn run(state: AppState) {
                 continue;
             }
 
+            // An ACP (relay) session has no vt100 screen to hash — its activity is
+            // the turn boundary, bumped by `record_acp_lifecycle`. Skip the capture.
+            if session.protocol == "acp" {
+                continue;
+            }
             // Hash the pane to detect activity and bump `last_activity_at`.
             // Inferred working→idle demotion is gone: liveness is all we can
             // know, and the agent reports the rest via `weaver status`.
@@ -266,20 +273,48 @@ fn parse_iso(ts: &str) -> Option<DateTime<Utc>> {
 /// or shell": the finished-turn hook is a good-enough idle signal, and the
 /// status watch upgrades it when warranted.
 async fn apply_hook(state: &AppState, branch_id: &str, kind: &str) -> Option<i64> {
-    // The tag mutations the hook implies: `(key, value)` where an empty value
-    // clears the tag (absence is the calm/default state). `working` returns the
-    // agent to calm (clearing both axes it might carry); the quiet signals stamp
-    // the soothing `idle` mark. `session-start` and any unknown kind return early
-    // — they neither prove liveness here nor carry a tag signal.
-    let mutations: &[(&str, &str)] = match kind {
-        "working" => &[(tags::ATTENTION_KEY, ""), (tags::IDLE_KEY, "")],
-        "waiting" | "idle" => &[(tags::IDLE_KEY, tags::IDLE_VALUE)],
-        _ => return None,
-    };
-
+    // Only the work-cycle hooks carry a status/tag signal here; `session-start`
+    // and any unknown kind return early (they neither prove liveness nor mark a
+    // tag).
+    lifecycle_mutations(kind)?;
     let session = session_mod::active_for_branch(&state.db, branch_id)
         .await
         .ok()??;
+
+    // Belt-and-braces: an ACP session's working/idle edges come from the protocol
+    // (the acp task drives them via `record_acp_lifecycle`), so a work-cycle hook
+    // a user's own `.claude/settings.local.json` might still fire must NOT move an
+    // ACP session's status or idle mark. Terminal sessions promote as before.
+    if session.protocol == "acp" {
+        return None;
+    }
+    promote_lifecycle(&state.db, &state.bus, &session, kind).await
+}
+
+/// The tag mutations a work-cycle hook implies: `(key, value)` where an empty
+/// value clears the tag (absence is the calm/default state). `working` returns
+/// the agent to calm (clearing both axes it might carry); the quiet signals stamp
+/// the soothing `idle` mark. `None` for a kind that carries no work-cycle signal.
+fn lifecycle_mutations(kind: &str) -> Option<&'static [(&'static str, &'static str)]> {
+    const WORKING: &[(&str, &str)] = &[(tags::ATTENTION_KEY, ""), (tags::IDLE_KEY, "")];
+    const RESTING: &[(&str, &str)] = &[(tags::IDLE_KEY, tags::IDLE_VALUE)];
+    match kind {
+        "working" => Some(WORKING),
+        "waiting" | "idle" => Some(RESTING),
+        _ => None,
+    }
+}
+
+/// Reflect a work-cycle lifecycle edge (`working`/`waiting`/`idle`) onto `session`
+/// and its branch: lift the status to `running` (idempotent, never overriding a
+/// terminal state) and apply the tag mutations, recording only what actually
+/// changed. Returns the new event watermark. This is the single place the
+/// status/tag promotion lives — shared by [`apply_hook`] (terminal sessions,
+/// driven from the monitor's event loop) and [`record_acp_lifecycle`] (ACP
+/// sessions, driven from the acp task's turn boundaries).
+async fn promote_lifecycle(db: &Db, bus: &EventBus, session: &Session, kind: &str) -> Option<i64> {
+    let mutations = lifecycle_mutations(kind)?;
+    let branch_id = session.branch_id.as_str();
 
     // Lifecycle: alive → running. Idempotent once running; never overrides a
     // terminal state.
@@ -292,17 +327,17 @@ async fn apply_hook(state: &AppState, branch_id: &str, kind: &str) -> Option<i64
                 id = %session.id,
                 branch = %branch_id,
                 previous_status = %session.status,
-                "session transitioning to running via hook"
+                "session transitioning to running via lifecycle edge"
             );
         }
-        let _ = session_mod::set_status(&state.db, &session.id, "running").await;
+        let _ = session_mod::set_status(db, &session.id, "running").await;
     }
-    let _ = session_mod::touch(&state.db, &session.id).await;
+    let _ = session_mod::touch(db, &session.id).await;
 
     if status_changed {
         let _ = events::record(
-            &state.db,
-            &state.bus,
+            db,
+            bus,
             branch_id,
             "status",
             json!({ "status": "running", "source": "hook" }),
@@ -311,11 +346,11 @@ async fn apply_hook(state: &AppState, branch_id: &str, kind: &str) -> Option<i64
     }
 
     // Apply each tag mutation only when it actually changes the stored value, so
-    // a repeated hook (e.g. another finished turn while already idle) is a no-op
+    // a repeated edge (e.g. another finished turn while already idle) is a no-op
     // and dashboards refresh only on a real edge. The author is `agent` — these
     // are the agent's own lifecycle marks.
     for &(key, value) in mutations {
-        let current = tags::get(&state.db, branch_id, key)
+        let current = tags::get(db, branch_id, key)
             .await
             .ok()
             .flatten()
@@ -324,19 +359,43 @@ async fn apply_hook(state: &AppState, branch_id: &str, kind: &str) -> Option<i64
         if current == value {
             continue;
         }
-        tracing::debug!(branch = %branch_id, key, value, "hook applied tag mutation");
+        tracing::debug!(branch = %branch_id, key, value, "lifecycle edge applied tag mutation");
         if value.is_empty() {
-            let _ = tags::clear(&state.db, branch_id, key).await;
+            let _ = tags::clear(db, branch_id, key).await;
         } else {
-            let _ = tags::set(&state.db, branch_id, key, value, "", "agent").await;
+            let _ = tags::set(db, branch_id, key, value, "", "agent").await;
         }
-        let _ = events::record_tag(&state.db, &state.bus, branch_id, key, value, "", "agent").await;
+        let _ = events::record_tag(db, bus, branch_id, key, value, "", "agent").await;
     }
 
     // Advance the watermark past our own freshly-recorded events so the next
     // tick doesn't reprocess them. `None` on a read error just leaves the
     // caller's watermark untouched (the consumed event is already accounted for).
-    events::max_id(&state.db).await.ok()
+    events::max_id(db).await.ok()
+}
+
+/// Drive an ACP session's status/idle from a turn boundary — the acp task calls
+/// this at turn start (`kind = "working"`) and turn end (`kind = "idle"`). It
+/// records the same `hook` event row `weaver hook --event <kind>` would (the
+/// durable audit trail), then promotes the status/tags directly through the
+/// shared [`promote_lifecycle`] path — bypassing [`apply_hook`]'s ACP filter,
+/// which exists only to ignore stray user-authored work-cycle hooks. Best-effort:
+/// a missing session or write error is logged upstream, never fatal to the turn.
+pub async fn record_acp_lifecycle(db: &Db, bus: &EventBus, session_id: &str, kind: &str) {
+    let session = match session_mod::get(db, session_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(session = %session_id, error = %e, "acp lifecycle: session lookup failed");
+            return;
+        }
+    };
+    if let Err(e) =
+        events::record_local(db, &session.branch_id, "hook", json!({ "event": kind })).await
+    {
+        tracing::warn!(session = %session_id, error = %e, "acp lifecycle: hook audit write failed");
+    }
+    let _ = promote_lifecycle(db, bus, &session, kind).await;
 }
 
 fn hash(s: &str) -> u64 {
@@ -434,5 +493,114 @@ mod tests {
         let before = "bash-5.2$ ls\nfile.txt";
         let after = "bash-5.2$ ls\nfile.txt\nother.txt";
         assert_ne!(normalize_screen(before), normalize_screen(after));
+    }
+
+    // -- apply_hook / lifecycle promotion ----------------------------------
+
+    use crate::session::{self as session_mod, NewSession};
+    use crate::web::AppState;
+    use weaver_core::branch as branch_mod;
+    use weaver_core::tags;
+
+    fn test_state(db: crate::db::Db) -> AppState {
+        AppState {
+            db: db.clone(),
+            bus: crate::events::EventBus::new(),
+            addr: "127.0.0.1:0".to_string(),
+            ide: std::sync::Arc::new(crate::ide::IdeManager::new(crate::ide::ide_home())),
+            trigger: crate::github_trigger::GithubTrigger::production(db),
+            acp: crate::acp::AcpRegistry::new(),
+        }
+    }
+
+    async fn seed_session(
+        db: &crate::db::Db,
+        id: &str,
+        branch_name: &str,
+        protocol: &str,
+    ) -> String {
+        let branch = branch_mod::upsert(db, "/r", branch_name, "main")
+            .await
+            .unwrap();
+        session_mod::insert(
+            db,
+            &NewSession {
+                id: id.to_string(),
+                branch_id: branch.id.clone(),
+                work_dir: "/w".to_string(),
+                term_session: format!("weaver-{id}"),
+                agent_kind: "claude".to_string(),
+                model: String::new(),
+                effort: String::new(),
+                // Orphaned is non-terminal, so `active_for_branch` resolves it and a
+                // lifecycle edge would lift it to `running` — a visible signal.
+                status: "orphaned".to_string(),
+                github_repo: None,
+                parent_branch_id: None,
+                managed_by: None,
+                created_by: None,
+                protocol: protocol.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        branch.id
+    }
+
+    /// The work-cycle hook path promotes a terminal session (status lift + idle
+    /// mark) but is a no-op for an ACP session — whose turn edges the protocol
+    /// owns — even though both would resolve to the same active session.
+    #[tokio::test]
+    async fn apply_hook_ignores_acp_but_promotes_terminal() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let state = test_state(db.clone());
+        let term_branch = seed_session(&db, "term1", "weaver/term", "terminal").await;
+        let acp_branch = seed_session(&db, "acp1", "weaver/acp", "acp").await;
+
+        // An `idle` edge on the terminal session: lifted to running, idle stamped.
+        super::apply_hook(&state, &term_branch, "idle").await;
+        let ts = session_mod::get(&db, "term1").await.unwrap().unwrap();
+        assert_eq!(ts.status, "running", "terminal session lifted to running");
+        assert_eq!(
+            tags::get(&db, &term_branch, tags::IDLE_KEY)
+                .await
+                .unwrap()
+                .map(|t| t.value)
+                .as_deref(),
+            Some(tags::IDLE_VALUE),
+            "terminal session's idle mark stamped"
+        );
+
+        // The same edge on the ACP session: ignored entirely.
+        super::apply_hook(&state, &acp_branch, "idle").await;
+        let as_ = session_mod::get(&db, "acp1").await.unwrap().unwrap();
+        assert_eq!(
+            as_.status, "orphaned",
+            "acp session status untouched by hook"
+        );
+        assert!(
+            tags::get(&db, &acp_branch, tags::IDLE_KEY)
+                .await
+                .unwrap()
+                .is_none(),
+            "acp session's idle mark NOT stamped by the hook path"
+        );
+
+        // The direct acp lifecycle entry DOES promote it (the acp task's path).
+        super::record_acp_lifecycle(&db, &state.bus, "acp1", "idle").await;
+        let as2 = session_mod::get(&db, "acp1").await.unwrap().unwrap();
+        assert_eq!(
+            as2.status, "running",
+            "record_acp_lifecycle lifts the acp session"
+        );
+        assert_eq!(
+            tags::get(&db, &acp_branch, tags::IDLE_KEY)
+                .await
+                .unwrap()
+                .map(|t| t.value)
+                .as_deref(),
+            Some(tags::IDLE_VALUE),
+            "record_acp_lifecycle stamps the idle mark directly"
+        );
     }
 }
