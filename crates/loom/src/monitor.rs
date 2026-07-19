@@ -308,10 +308,7 @@ fn lifecycle_mutations(kind: &str) -> Option<&'static [(&'static str, &'static s
 /// Reflect a work-cycle lifecycle edge (`working`/`waiting`/`idle`) onto `session`
 /// and its branch: lift the status to `running` (idempotent, never overriding a
 /// terminal state) and apply the tag mutations, recording only what actually
-/// changed. Returns the new event watermark. This is the single place the
-/// status/tag promotion lives — shared by [`apply_hook`] (terminal sessions,
-/// driven from the monitor's event loop) and [`record_acp_lifecycle`] (ACP
-/// sessions, driven from the acp task's turn boundaries).
+/// changed. Returns the new event watermark.
 async fn promote_lifecycle(db: &Db, bus: &EventBus, session: &Session, kind: &str) -> Option<i64> {
     let mutations = lifecycle_mutations(kind)?;
     let branch_id = session.branch_id.as_str();

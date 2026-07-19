@@ -127,7 +127,14 @@ async function runToken(tok) {
 
 async function handlePrompt(id, params) {
   cancelled = false;
-  const text = (params.prompt || []).map((b) => b.text || "").join("");
+  // The script is the prompt's first paragraph only. A real launch prompt
+  // appends orientation prose (the entrance note, which echoes the session
+  // title — i.e. the script itself) after a blank line; parsing past it would
+  // run the scripted tokens twice.
+  const text = (params.prompt || [])
+    .map((b) => b.text || "")
+    .join("")
+    .split("\n\n")[0];
   for (const tok of text.split("|")) {
     if (cancelled) break;
     if (tok.length === 0) continue;

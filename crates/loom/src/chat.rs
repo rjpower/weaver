@@ -128,15 +128,26 @@ pub async fn open_permissions(db: &Db, session_id: &str) -> Result<Vec<ChatBlock
         .collect())
 }
 
+/// The journal's knowledge of a `permission_request`, looked up by its
+/// upstream `request_id`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PermissionOutcome {
+    /// No such request journaled.
+    Unknown,
+    /// Journaled, still awaiting an answer.
+    Open,
+    /// Answered with this option id.
+    Resolved(String),
+}
+
 /// The current outcome of a `permission_request` identified by its upstream
-/// `request_id`: `None` when unknown, `Some(None)` when open (outcome is null),
-/// `Some(Some(option_id))` when resolved. Lets a replayed permission frame decide
-/// whether to re-send a stored answer.
+/// `request_id`. Lets a replayed permission frame decide whether to re-send a
+/// stored answer.
 pub async fn permission_outcome(
     db: &Db,
     session_id: &str,
     request_id: &str,
-) -> Result<Option<Option<String>>> {
+) -> Result<PermissionOutcome> {
     let rows = sqlx::query("SELECT payload FROM chat_blocks WHERE session_id = ? AND kind = ?")
         .bind(session_id)
         .bind(kind::PERMISSION_REQUEST)
@@ -146,17 +157,16 @@ pub async fn permission_outcome(
         let payload: Value =
             serde_json::from_str(&r.get::<String, _>("payload")).unwrap_or(Value::Null);
         if payload.get("request_id").and_then(Value::as_str) == Some(request_id) {
-            let outcome = payload.get("outcome");
-            return Ok(Some(match outcome {
-                Some(Value::Null) | None => None,
-                Some(o) => o
-                    .get("option_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            }));
+            return Ok(match payload.get("outcome") {
+                Some(Value::Null) | None => PermissionOutcome::Open,
+                Some(o) => match o.get("option_id").and_then(Value::as_str) {
+                    Some(id) => PermissionOutcome::Resolved(id.to_string()),
+                    None => PermissionOutcome::Open,
+                },
+            });
         }
     }
-    Ok(None)
+    Ok(PermissionOutcome::Unknown)
 }
 
 /// Resolve an open `permission_request` in place: set its `outcome` to the chosen
@@ -422,7 +432,11 @@ mod tests {
         assert_eq!(open_permissions(&db, &s).await.unwrap().len(), 1);
         assert_eq!(
             permission_outcome(&db, &s, "req-1").await.unwrap(),
-            Some(None)
+            PermissionOutcome::Open
+        );
+        assert_eq!(
+            permission_outcome(&db, &s, "req-absent").await.unwrap(),
+            PermissionOutcome::Unknown
         );
 
         let resolved = resolve_permission(&db, &s, "req-1", "allow", "alice")
@@ -440,7 +454,7 @@ mod tests {
             .is_none());
         assert_eq!(
             permission_outcome(&db, &s, "req-1").await.unwrap(),
-            Some(Some("allow".to_string()))
+            PermissionOutcome::Resolved("allow".to_string())
         );
     }
 

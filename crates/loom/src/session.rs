@@ -405,7 +405,8 @@ pub async fn append_pending_prompt(db: &Db, id: &str, text: &str) -> Result<Stri
 }
 
 /// Read the durable prompt queue (empty string when nothing is queued).
-pub async fn take_pending_prompt(db: &Db, id: &str) -> Result<String> {
+/// [`clear_pending_prompt`] empties it once the text has been dispatched.
+pub async fn read_pending_prompt(db: &Db, id: &str) -> Result<String> {
     let existing: Option<String> =
         sqlx::query_scalar("SELECT pending_prompt FROM sessions WHERE id = ?")
             .bind(id)

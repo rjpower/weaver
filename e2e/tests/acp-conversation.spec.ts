@@ -99,7 +99,9 @@ test.describe('acp conversation', () => {
     const conv = page.getByTestId('acp-conversation');
 
     // The agent's consolidated prose (two streamed chunks → one message).
-    await expect(conv.getByText('The route resolves against auth.base_url now.')).toBeVisible();
+    await expect(
+      conv.getByText('The route resolves against auth.base_url now.', { exact: true }),
+    ).toBeVisible();
     // An `edit` is consequential — a standalone card, not a census line.
     await expect(page.getByTestId('acp-card').filter({ hasText: 'Edit web.rs' })).toBeVisible();
     // The card carries the diff the adapter streamed as ±lines.
@@ -114,9 +116,11 @@ test.describe('acp conversation', () => {
 
     // The text shows (whether caught mid-stream as a shadow or after the block
     // journals) and, once the turn ends, reads as a single settled message.
-    await expect(conv.getByText('streamed reply lands here')).toBeVisible({ timeout: 15_000 });
+    await expect(conv.getByText('streamed reply lands here', { exact: true })).toBeVisible({
+      timeout: 15_000,
+    });
     await expect(page.getByTestId('acp-working')).toBeHidden({ timeout: 15_000 });
-    await expect(conv.getByText('streamed reply lands here')).toHaveCount(1);
+    await expect(conv.getByText('streamed reply lands here', { exact: true })).toHaveCount(1);
   });
 
   test('the composer sends a prompt and queues one behind a live turn', async ({ page, weaver }) => {

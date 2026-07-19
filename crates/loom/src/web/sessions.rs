@@ -1072,6 +1072,21 @@ pub(crate) async fn create_session_core(
 
     // Live the moment the agent spawns — there is no `launching` state.
     let status = agent::initial_status(&st.db, &runtime).await;
+    let new_session = NewSession {
+        id: session_id.clone(),
+        branch_id: branch.id.clone(),
+        work_dir: work_dir.display().to_string(),
+        term_session: term_session.clone(),
+        agent_kind: agent.clone(),
+        model: model.clone(),
+        effort: effort.clone(),
+        status: status.to_string(),
+        github_repo: github_repo.clone(),
+        parent_branch_id: parent.as_ref().map(|b| b.id.clone()),
+        managed_by: None,
+        created_by: created_by.clone(),
+        protocol: protocol.clone(),
+    };
     let session = if protocol == "acp" {
         // The ACP path inserts the row *first* — `acp::start` binds a relay to it
         // and reads it back — then brings up the headless adapter over the relay.
@@ -1079,25 +1094,7 @@ pub(crate) async fn create_session_core(
             session = %session_id, branch = %branch.id, runtime = %runtime,
             work_dir = %work_dir.display(), mode = %mode, "launching acp session"
         );
-        let session = session_mod::insert(
-            &st.db,
-            &NewSession {
-                id: session_id.clone(),
-                branch_id: branch.id.clone(),
-                work_dir: work_dir.display().to_string(),
-                term_session: term_session.clone(),
-                agent_kind: agent.clone(),
-                model: model.clone(),
-                effort: effort.clone(),
-                status: status.to_string(),
-                github_repo: github_repo.clone(),
-                parent_branch_id: parent.as_ref().map(|b| b.id.clone()),
-                managed_by: None,
-                created_by: created_by.clone(),
-                protocol: "acp".to_string(),
-            },
-        )
-        .await?;
+        let session = session_mod::insert(&st.db, &new_session).await?;
         // A custom acp agent supplies its own adapter command; the builtin claude
         // resolves the `claude-agent-acp` adapter.
         let custom = if agent::builtin_agent_type(&runtime).is_some() {
@@ -1171,25 +1168,7 @@ pub(crate) async fn create_session_core(
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         tracing::info!(session = %session_id, branch = %branch.id, "agent terminal launched");
-        session_mod::insert(
-            &st.db,
-            &NewSession {
-                id: session_id.clone(),
-                branch_id: branch.id.clone(),
-                work_dir: work_dir.display().to_string(),
-                term_session,
-                agent_kind: agent,
-                model,
-                effort,
-                status: status.to_string(),
-                github_repo: github_repo.clone(),
-                parent_branch_id: parent.as_ref().map(|b| b.id.clone()),
-                managed_by: None,
-                created_by,
-                protocol: "terminal".to_string(),
-            },
-        )
-        .await?
+        session_mod::insert(&st.db, &new_session).await?
     };
     tracing::debug!(session = %session.id, status = %status, "inserted session row");
 

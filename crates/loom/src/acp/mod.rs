@@ -990,7 +990,7 @@ impl Task {
         crate::monitor::record_acp_lifecycle(&self.db, &self.bus, &self.session_id, "idle").await;
 
         // Dispatch the durable queue as the next turn, if non-empty.
-        let pending = session::take_pending_prompt(&self.db, &self.session_id)
+        let pending = session::read_pending_prompt(&self.db, &self.session_id)
             .await
             .unwrap_or_default();
         if !pending.trim().is_empty() {
@@ -1047,7 +1047,7 @@ impl Task {
         self.flush_buf().await;
 
         match chat::permission_outcome(&self.db, &self.session_id, &req_key).await? {
-            Some(Some(option_id)) => {
+            chat::PermissionOutcome::Resolved(option_id) => {
                 // Already answered before a crash: re-send the stored answer.
                 let _ = self
                     .stream
@@ -1058,7 +1058,7 @@ impl Task {
                     .await;
                 return Ok(());
             }
-            Some(None) => {
+            chat::PermissionOutcome::Open => {
                 // Open block already journaled (replay): re-register the pending id.
                 self.pending_perms.insert(
                     req_key.clone(),
@@ -1068,7 +1068,7 @@ impl Task {
                     },
                 );
             }
-            None => {
+            chat::PermissionOutcome::Unknown => {
                 let options = permission_options_json(&params.options);
                 let payload = json!({
                     "request_id": req_key.clone(),
@@ -1123,7 +1123,7 @@ impl Task {
             PermAnswer::Ok
         } else {
             match chat::permission_outcome(&self.db, &self.session_id, request_id).await {
-                Ok(Some(Some(_))) => PermAnswer::AlreadyResolved,
+                Ok(chat::PermissionOutcome::Resolved(_)) => PermAnswer::AlreadyResolved,
                 _ => PermAnswer::NotFound,
             }
         }
