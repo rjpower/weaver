@@ -66,6 +66,7 @@ pub mod method {
     pub const SESSION_STEERING: &str = "_session/steering";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_SET_MODE: &str = "session/set_mode";
+    pub const SESSION_SET_CONFIG_OPTION: &str = "session/set_config_option";
     pub const SESSION_UPDATE: &str = "session/update";
     pub const SESSION_REQUEST_PERMISSION: &str = "session/request_permission";
 }
@@ -162,7 +163,19 @@ pub enum SessionUpdate {
         #[serde(default, rename = "_meta")]
         meta: SessionInfoMeta,
     },
-    /// Anything else (available_commands_update, …): ignored.
+    /// The agent-owned slash-command catalogue. Clients replace their cached
+    /// list wholesale on every update.
+    AvailableCommandsUpdate {
+        #[serde(default, rename = "availableCommands")]
+        available_commands: Vec<Value>,
+    },
+    /// The full set of live session configuration controls (model, reasoning
+    /// effort, mode, and adapter-specific options).
+    ConfigOptionUpdate {
+        #[serde(default, rename = "configOptions")]
+        config_options: Vec<Value>,
+    },
+    /// Anything else (prompt_suggestion, …): ignored.
     #[serde(other)]
     Other,
 }
@@ -311,6 +324,8 @@ pub struct NewSessionResult {
     pub session_id: String,
     #[serde(default)]
     pub modes: Option<SessionModeState>,
+    #[serde(default)]
+    pub config_options: Option<Vec<Value>>,
 }
 
 /// The `session/load` result (mode state only; history arrives as `session/update`
@@ -320,6 +335,8 @@ pub struct NewSessionResult {
 pub struct LoadSessionResult {
     #[serde(default)]
     pub modes: Option<SessionModeState>,
+    #[serde(default)]
+    pub config_options: Option<Vec<Value>>,
 }
 
 /// The active mode + available modes.
@@ -327,6 +344,18 @@ pub struct LoadSessionResult {
 #[serde(rename_all = "camelCase")]
 pub struct SessionModeState {
     pub current_mode_id: String,
+    #[serde(default)]
+    pub available_modes: Vec<Value>,
+}
+
+/// The `session/set_config_option` result. ACP returns the complete refreshed
+/// option set so the client never has to guess coupled changes (for example a
+/// model switch changing the available reasoning levels).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConfigOptionResult {
+    #[serde(default)]
+    pub config_options: Vec<Value>,
 }
 
 /// The `session/prompt` result — the turn's stop reason.
@@ -434,6 +463,13 @@ pub fn cancel_params(session_id: &str) -> Value {
 /// `session/set_mode` params.
 pub fn set_mode_params(session_id: &str, mode_id: &str) -> Value {
     serde_json::json!({ "sessionId": session_id, "modeId": mode_id })
+}
+
+/// `session/set_config_option` params. ACP configuration values are typed: most
+/// composer controls are select strings, while flags such as Codex fast mode are
+/// booleans.
+pub fn set_config_option_params(session_id: &str, config_id: &str, value: Value) -> Value {
+    serde_json::json!({ "sessionId": session_id, "configId": config_id, "value": value })
 }
 
 /// A `session/request_permission` response selecting an option.
@@ -605,9 +641,45 @@ mod tests {
             other => panic!("wrong variant: {other:?}"),
         }
 
+        let commands: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "available_commands_update",
+            "availableCommands": [{"name":"review","description":"Review changes"}],
+        }))
+        .unwrap();
+        match commands {
+            SessionUpdate::AvailableCommandsUpdate { available_commands } => {
+                assert_eq!(available_commands[0]["name"], "review");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let config: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": [{"id":"model","name":"Model","type":"select"}],
+        }))
+        .unwrap();
+        match config {
+            SessionUpdate::ConfigOptionUpdate { config_options } => {
+                assert_eq!(config_options[0]["id"], "model");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let info: SessionUpdate = serde_json::from_value(json!({
+            "sessionUpdate": "session_info_update",
+            "_meta": { "codex": { "threadStatus": { "type": "idle" } } },
+        }))
+        .unwrap();
+        match info {
+            SessionUpdate::SessionInfoUpdate { meta } => {
+                assert_eq!(meta.codex.unwrap().thread_status.unwrap().kind, "idle");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
         // An update kind loom does not model must not fail the stream.
         let other: SessionUpdate = serde_json::from_value(json!({
-            "sessionUpdate": "available_commands_update", "availableCommands": [],
+            "sessionUpdate": "prompt_suggestion", "title": "hello",
         }))
         .unwrap();
         assert!(matches!(other, SessionUpdate::Other));
@@ -635,10 +707,12 @@ mod tests {
         let ns: NewSessionResult = serde_json::from_value(json!({
             "sessionId": "acp-abc",
             "modes": { "currentModeId": "default", "availableModes": [] },
+            "configOptions": [{"id":"model","name":"Model","type":"select"}],
         }))
         .unwrap();
         assert_eq!(ns.session_id, "acp-abc");
         assert_eq!(ns.modes.unwrap().current_mode_id, "default");
+        assert_eq!(ns.config_options.unwrap()[0]["id"], "model");
 
         let pr: PromptResult = serde_json::from_value(json!({ "stopReason": "end_turn" })).unwrap();
         assert_eq!(pr.stop_reason, "end_turn");
