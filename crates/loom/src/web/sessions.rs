@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::path::{Component, PathBuf};
+use std::pin::Pin;
 
 use axum::{
     extract::{Path, Query, State},
@@ -2163,13 +2164,23 @@ pub(super) async fn send_session(
     Ok(Json(json!({ "sent": true, "submitted": req.submit })))
 }
 
-/// Send a break/interrupt — `Escape`, the keystroke Claude Code reads as "stop
-/// the current turn" — to a session's agent pane.
+/// Send a break/interrupt to a session. For an ACP session this is a
+/// `session/cancel` notification (the turn still ends via its prompt response,
+/// stop reason `cancelled`); for a terminal session it is `Escape`, the keystroke
+/// Claude Code reads as "stop the current turn".
 pub(super) async fn interrupt_session(
     State(st): State<AppState>,
     Path(key): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let (session, _) = require_session(&st.db, &key).await?;
+    if session.protocol == "acp" {
+        let handle = require_acp_task(&st, &session)?;
+        handle
+            .cancel()
+            .await
+            .map_err(|e| AppError::conflict(e.to_string()))?;
+        return Ok(Json(json!({ "interrupted": true })));
+    }
     require_live_terminal(&session).await?;
     backend::send_key(&session.term_session, "Escape")
         .await
@@ -2198,6 +2209,205 @@ pub(super) async fn preview_session(
         .await
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!({ "screen": screen })))
+}
+
+// ---------------------------------------------------------------------------
+// The ACP chat journal + drive routes (protocol='acp' sessions)
+//
+// The conversation-first surface for ACP sessions: the journaled transcript
+// (`/chat`), its live delta stream (`/chat/stream`), and the drive routes a
+// person or watch uses — a `session/prompt` queueing send (`/prompt`), a
+// permission answer (`/permissions/{request_id}`), and a mode change (`/mode`).
+// ---------------------------------------------------------------------------
+
+/// Guard: the route only applies to an ACP session; a terminal session 409s (it
+/// has no chat journal — its transcript is the JSONL scrape at `/conversation`).
+fn require_acp(session: &Session) -> ApiResult<()> {
+    if session.protocol == "acp" {
+        Ok(())
+    } else {
+        Err(AppError::conflict(format!(
+            "session '{}' is a terminal session, not an ACP conversation",
+            session.id
+        )))
+    }
+}
+
+/// The live ACP task handle for a session, or 409 when no task is running (the
+/// session is idle/orphaned — nothing to drive over the protocol right now).
+fn require_acp_task(st: &AppState, session: &Session) -> ApiResult<crate::acp::AcpHandle> {
+    st.acp.get(&session.id).ok_or_else(|| {
+        AppError::conflict(format!(
+            "session '{}' has no live ACP task to drive",
+            session.id
+        ))
+    })
+}
+
+/// The in-flight turn number from a session's persisted `acp_inflight`, or `None`.
+fn live_turn(session: &Session) -> Option<i64> {
+    session
+        .acp_inflight
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|v| v.get("turn").and_then(Value::as_i64))
+}
+
+/// The journaled conversation: `{ blocks: [...], live_turn }`. Works whether or
+/// not a task is currently running (it reads the durable journal).
+pub(super) async fn get_session_chat(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<Value>> {
+    let (session, _) = require_session(&st.db, &key).await?;
+    require_acp(&session)?;
+    let blocks = crate::chat::list(&st.db, &session.id).await?;
+    Ok(Json(
+        json!({ "blocks": blocks, "live_turn": live_turn(&session) }),
+    ))
+}
+
+/// The live SSE tail of the conversation — `block` / `delta` / `tool` / `turn`
+/// events (see [`crate::acp`]). A client fetches `/chat` first, then applies this
+/// tail. When no task is running the stream stays open but silent (keep-alive).
+pub(super) async fn chat_stream(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let (session, _) = require_session(&st.db, &key).await?;
+    require_acp(&session)?;
+    let boxed: Pin<Box<dyn Stream<Item = Result<sse::Event, Infallible>> + Send>> =
+        match st.acp.get(&session.id) {
+            Some(handle) => {
+                let stream = BroadcastStream::new(handle.subscribe()).filter_map(|r| {
+                    let ev = r.ok()?;
+                    Some(Ok(sse::Event::default()
+                        .event(ev.event)
+                        .json_data(ev.data)
+                        .unwrap_or_default()))
+                });
+                Box::pin(stream)
+            }
+            // No live task: hold the connection open (keep-alive) with no events.
+            None => Box::pin(tokio_stream::pending()),
+        };
+    Ok(Sse::new(boxed).keep_alive(KeepAlive::default()))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct PromptBody {
+    pub text: String,
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+/// Send a user message to an ACP session: dispatched as a `session/prompt` when
+/// idle, appended to the durable queue when a turn is in flight. Returns 202
+/// `{ queued, turn }`. Every send records a `nudge` event (the audit rule).
+pub(super) async fn prompt_session(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<PromptBody>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let (session, branch) = require_session(&st.db, &key).await?;
+    require_acp(&session)?;
+    let handle = require_acp_task(&st, &session)?;
+    let by = author_or_manual(req.by.as_deref());
+    let ack = handle
+        .prompt(req.text.clone(), Some(by.clone()))
+        .await
+        .map_err(|e| AppError::conflict(e.to_string()))?;
+    events::record(
+        &st.db,
+        &st.bus,
+        &branch.id,
+        "nudge",
+        json!({ "by": by, "text": req.text }),
+    )
+    .await
+    .ok();
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "queued": ack.queued, "turn": ack.turn })),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct PermissionBody {
+    pub option_id: String,
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+/// Answer a pending permission request: 200 on success, 404 for an unknown
+/// request id, 409 when it was already resolved.
+pub(super) async fn answer_permission(
+    State(st): State<AppState>,
+    Path((key, request_id)): Path<(String, String)>,
+    Json(req): Json<PermissionBody>,
+) -> ApiResult<Json<Value>> {
+    let (session, branch) = require_session(&st.db, &key).await?;
+    require_acp(&session)?;
+    let handle = require_acp_task(&st, &session)?;
+    let by = author_or_manual(req.by.as_deref());
+    match handle
+        .answer_permission(request_id.clone(), req.option_id.clone(), by.clone())
+        .await
+        .map_err(|e| AppError::conflict(e.to_string()))?
+    {
+        crate::acp::PermAnswer::Ok => {
+            events::record(
+                &st.db,
+                &st.bus,
+                &branch.id,
+                "permission",
+                json!({ "by": by, "request_id": request_id, "option_id": req.option_id }),
+            )
+            .await
+            .ok();
+            Ok(Json(
+                json!({ "resolved": true, "option_id": req.option_id }),
+            ))
+        }
+        crate::acp::PermAnswer::NotFound => Err(AppError::not_found("permission request")),
+        crate::acp::PermAnswer::AlreadyResolved => {
+            Err(AppError::conflict("permission request already resolved"))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ModeBody {
+    pub mode_id: String,
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+/// Change an ACP session's mode (`session/set_mode`), journaling a `mode_change`
+/// block. Returns `{ mode_id }`.
+pub(super) async fn set_mode(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<ModeBody>,
+) -> ApiResult<Json<Value>> {
+    let (session, branch) = require_session(&st.db, &key).await?;
+    require_acp(&session)?;
+    let handle = require_acp_task(&st, &session)?;
+    let by = author_or_manual(req.by.as_deref());
+    handle
+        .set_mode(req.mode_id.clone(), Some(by.clone()))
+        .await
+        .map_err(|e| AppError::conflict(e.to_string()))?;
+    events::record(
+        &st.db,
+        &st.bus,
+        &branch.id,
+        "nudge",
+        json!({ "by": by, "mode": req.mode_id }),
+    )
+    .await
+    .ok();
+    Ok(Json(json!({ "mode_id": req.mode_id })))
 }
 
 #[cfg(test)]
@@ -2400,6 +2610,7 @@ mod tests {
             addr: "127.0.0.1:0".to_string(),
             ide: std::sync::Arc::new(crate::ide::IdeManager::new(crate::ide::ide_home())),
             trigger: crate::github_trigger::GithubTrigger::production(db.clone()),
+            acp: crate::acp::AcpRegistry::new(),
         };
         let child = branch_mod::upsert(&db, "/r", "weaver/child", "main")
             .await

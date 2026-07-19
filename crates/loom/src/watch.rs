@@ -1482,6 +1482,7 @@ mod tests {
             bus: events::EventBus::new(),
             addr: "127.0.0.1:0".to_string(),
             ide: std::sync::Arc::new(crate::ide::IdeManager::new(crate::ide::ide_home())),
+            acp: crate::acp::AcpRegistry::new(),
         };
         let o = watch_store::create(
             &state.db,
@@ -1699,6 +1700,7 @@ rnd.finish("counted to %d" % n)
             bus: events::EventBus::new(),
             addr: "127.0.0.1:0".to_string(),
             ide: std::sync::Arc::new(crate::ide::IdeManager::new(crate::ide::ide_home())),
+            acp: crate::acp::AcpRegistry::new(),
         };
         // A reactive watch (no cron) — the scheduled half of the timer skips
         // it; only the wake half should fire it.

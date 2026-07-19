@@ -144,7 +144,27 @@ pub struct SessionView {
     /// urgency-then-recency order. Placed rows and untouched rows share one
     /// numeric axis so they interleave.
     pub sort_order: Option<f64>,
+    /// Execution backend: `"terminal"` (a PTY + interactive TUI) or `"acp"` (a
+    /// headless adapter driven over the Agent Client Protocol). Terminal-backend
+    /// and older rows read as `"terminal"`.
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
+    /// The agent's own on-disk ACP session id for an `acp` session, or `null`.
+    #[serde(default)]
+    pub acp_session_id: Option<String>,
+    /// The current ACP mode id (gating posture: `bypassPermissions`, `acceptEdits`,
+    /// `default`, `plan`), or `null` for a terminal session / before one is set.
+    #[serde(default)]
+    pub current_mode: Option<String>,
+    /// The latest context-window usage (`{used, size}`) reported by an ACP agent,
+    /// or `null`.
+    #[serde(default)]
+    pub usage: Option<serde_json::Value>,
     pub branch: BranchView,
+}
+
+fn default_protocol() -> String {
+    "terminal".to_string()
 }
 
 /// Issue as the API exposes it.

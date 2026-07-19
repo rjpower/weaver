@@ -117,6 +117,7 @@ async fn start_server() -> (TestHome, loom::client::Client, db::Db, String) {
         addr: addr.to_string(),
         ide: std::sync::Arc::new(loom::ide::IdeManager::new(loom::ide::ide_home())),
         trigger: loom::github_trigger::GithubTrigger::production(pool.clone()),
+        acp: loom::acp::AcpRegistry::new(),
     };
     tokio::spawn(server::serve(state, listener));
 

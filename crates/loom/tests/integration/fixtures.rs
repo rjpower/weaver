@@ -118,6 +118,11 @@ pub struct TestServer {
     /// proxy tests register a stub upstream on it instead of spawning a real
     /// code-server.
     pub ide: std::sync::Arc<loom::ide::IdeManager>,
+    /// A clone of the server's [`AppState`] — the DB pool, event bus, and ACP
+    /// registry are all `Arc`/pool-shared, so this handle drives the *same*
+    /// server (the ACP suite calls `loom::acp::start` on it, and the task
+    /// registers in the registry the HTTP routes read).
+    pub state: AppState,
     repo: TempDir,
     _home: TempDir,
 }
@@ -174,6 +179,7 @@ impl TestServer {
             addr: addr.to_string(),
             ide: std::sync::Arc::new(loom::ide::IdeManager::new(loom::ide::ide_home())),
             trigger,
+            acp: loom::acp::AcpRegistry::new(),
         };
         // The watch master switch ships on by default, but these tests
         // drive the engine directly and must not race the background loop that
@@ -189,9 +195,11 @@ impl TestServer {
         // execs a bare login shell and is hookless (so it comes up `running`
         // immediately, never stuck `launching`).
         seed_shell_agent(&state.db).await;
-        // Keep a handle to the editor manager before `state` moves into serve, so
-        // a test can register a stub upstream on the same instance.
+        // Keep a handle to the editor manager and a full state clone before
+        // `state` moves into serve, so a test can register a stub upstream on the
+        // same IDE manager and drive the same ACP registry.
         let ide = state.ide.clone();
+        let state_clone = state.clone();
         tokio::spawn(server::serve(state, listener));
 
         std::env::set_var("WEAVER_API", format!("http://{addr}"));
@@ -212,6 +220,7 @@ impl TestServer {
             client,
             addr,
             ide,
+            state: state_clone,
             repo,
             _home: home,
         }
