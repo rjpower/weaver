@@ -49,7 +49,6 @@ pub struct AgentMetadata {
     pub efforts: Vec<AgentChoice>,
     pub accepts_raw_model: bool,
     pub supports_hooks: bool,
-    pub supports_concierge: bool,
     /// True for the code-shipped `claude`/`codex`; false for an operator-defined
     /// custom agent (which the UI may edit or delete).
     pub builtin: bool,
@@ -500,7 +499,6 @@ impl AgentType for ClaudeAgentType {
             efforts: AgentChoice::list(EFFORT_CHOICES),
             accepts_raw_model: false,
             supports_hooks: true,
-            supports_concierge: true,
             builtin: true,
             supports_acp: true,
             // ACP is the builtin default; `--protocol terminal` keeps the PTY
@@ -533,7 +531,6 @@ impl AgentType for CodexAgentType {
             efforts: AgentChoice::list(CODEX_EFFORT_CHOICES),
             accepts_raw_model: false,
             supports_hooks: false,
-            supports_concierge: true,
             builtin: true,
             supports_acp: true,
             // ACP is the builtin default; `--protocol terminal` keeps the PTY
@@ -562,7 +559,6 @@ impl AgentType for CustomAgentType {
             efforts: Vec::new(),
             accepts_raw_model: false,
             supports_hooks: self.agent.reports_status,
-            supports_concierge: false,
             builtin: false,
             supports_acp: self.agent.protocol == "acp",
             protocol: if self.agent.protocol.is_empty() {
@@ -1890,7 +1886,6 @@ mod tests {
             efforts: Vec::new(),
             accepts_raw_model: false,
             supports_hooks: false,
-            supports_concierge: false,
             builtin,
             supports_acp: builtin || protocol == "acp",
             protocol: protocol.to_string(),

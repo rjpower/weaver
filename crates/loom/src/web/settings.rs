@@ -104,20 +104,6 @@ async fn validate_agent_settings_patch(
             agent_default: config::DEFAULT_AGENT,
             model_key: "agent.model",
             effort_key: "agent.effort",
-            require_concierge: false,
-        },
-    )
-    .await;
-    validate_agent_settings_group(
-        db,
-        changes,
-        errors,
-        AgentSettingsGroup {
-            agent_key: "concierge.runtime",
-            agent_default: config::DEFAULT_CONCIERGE_RUNTIME,
-            model_key: "concierge.model",
-            effort_key: "concierge.effort",
-            require_concierge: true,
         },
     )
     .await;
@@ -128,7 +114,6 @@ struct AgentSettingsGroup {
     agent_default: &'static str,
     model_key: &'static str,
     effort_key: &'static str,
-    require_concierge: bool,
 }
 
 async fn validate_agent_settings_group(
@@ -155,14 +140,6 @@ async fn validate_agent_settings_group(
             return;
         }
     };
-    if group.require_concierge && !metadata.supports_concierge {
-        errors.insert(
-            group.agent_key.to_string(),
-            json!(format!("agent '{agent_kind}' cannot run the concierge")),
-        );
-        return;
-    }
-
     let model = setting_after(db, changes, group.model_key, "").await;
     validate_agent_selector_setting(
         changes,

@@ -1238,65 +1238,6 @@ pub(crate) async fn create_session_core(
     Ok(view)
 }
 
-/// `GET /api/chat` — the Chat surface's concierge. Get-or-create the singleton
-/// fleet concierge: return the live one if it exists, else launch a new concierge
-/// session in the most-recently-used repo (its home — it doesn't touch the code,
-/// but the session machinery needs a worktree). 400 when there is no repo yet.
-pub(super) async fn get_chat(State(st): State<AppState>) -> ApiResult<Json<SessionView>> {
-    if let Some(session) = session_mod::active_concierge(&st.db).await? {
-        let branch = branch_mod::get(&st.db, &session.branch_id)
-            .await?
-            .ok_or_else(|| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "branch vanished"))?;
-        return Ok(Json(session_view(&st.db, &session, &branch).await?));
-    }
-    Ok(Json(create_concierge(st).await?))
-}
-
-/// Launch a fresh fleet concierge in the most-recently-used repo and return its
-/// view. The shared creation path behind [`get_chat`] (when none is live) and
-/// [`reset_chat`] (after the old one is archived). 400 when no repo has been
-/// used yet — the concierge needs a worktree to live in.
-async fn create_concierge(st: AppState) -> ApiResult<SessionView> {
-    let home = repo::recent(&st.db, 1)
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            AppError::bad_request(
-                "the concierge needs a repo to live in — open a session in a repo first",
-            )
-        })?;
-    tracing::info!(repo = %home.repo_root, "launching fleet concierge session");
-    let req = CreateReq {
-        cwd: home.repo_root,
-        agent: Some(agent::CONCIERGE_KIND.to_string()),
-        title: Some("Fleet concierge".to_string()),
-        ..Default::default()
-    };
-    // The concierge is a system singleton, not a user's workstream (and is hidden
-    // from the fleet board), so it carries no creator attribution.
-    create_session_core(st, req, None).await
-}
-
-/// `POST /api/chat/reset` — start a clean conversation with the concierge. The
-/// live concierge (if any) is archived — its terminal and worktree torn down,
-/// its transcript captured to history — and a brand-new one is launched in its
-/// place, so the operator gets a fresh agent with none of the prior context.
-/// Returns the new session view, exactly as [`get_chat`] would.
-pub(super) async fn reset_chat(State(st): State<AppState>) -> ApiResult<Json<SessionView>> {
-    tracing::info!("resetting fleet concierge chat");
-    if let Some(session) = session_mod::active_concierge(&st.db).await? {
-        if let Some(branch) = branch_mod::get(&st.db, &session.branch_id).await? {
-            // Best-effort teardown of the old concierge; a warning here must not
-            // block the fresh start the operator asked for.
-            if let Err(e) = archive(&st, &session, &branch).await {
-                tracing::warn!(session = %session.id, error = ?e, "reset: archiving old concierge failed");
-            }
-        }
-    }
-    Ok(Json(create_concierge(st).await?))
-}
-
 /// The session's launch prompt: a pointer to the goal rather than a copy of
 /// it. The goal lives once, as the `goal` artifact (`weaver summary` opens
 /// with it) — pasting it here made a second copy that drifted the moment the
@@ -1726,6 +1667,64 @@ pub(super) async fn refresh_github_session(
     github::refresh(&st, &session, &branch, false)
         .await
         .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("gh: {e}")))?;
+    let (session, branch) = require_session(&st.db, &session.id).await?;
+    Ok(Json(session_view(&st.db, &session, &branch).await?))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct GithubMappingBody {
+    pub pr_number: i64,
+}
+
+/// Pin a session's branch to an explicit PR and fetch that PR immediately. The
+/// mapping is persisted only after GitHub confirms the number, so a typo never
+/// replaces a working association with a dead one.
+pub(super) async fn set_github_session(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<GithubMappingBody>,
+) -> ApiResult<Json<SessionView>> {
+    let (session, branch) = require_session(&st.db, &key).await?;
+    if req.pr_number <= 0 {
+        return Err(AppError::bad_request("PR number must be positive"));
+    }
+    if !github::gh_available().await {
+        return Err(AppError::bad_request(
+            "the GitHub CLI (`gh`) is not available on the server",
+        ));
+    }
+    let token = crate::agent_env::get(&st.db, "GH_TOKEN").await;
+    let snap = github::fetch_pr(
+        &PathBuf::from(&branch.repo_root),
+        &req.pr_number.to_string(),
+        token.as_deref(),
+    )
+    .await
+    .map_err(|e| AppError::new(StatusCode::BAD_GATEWAY, format!("gh: {e}")))?
+    .ok_or_else(|| {
+        AppError::bad_request(format!("pull request #{} was not found", req.pr_number))
+    })?;
+    github::set_mapping(&st.db, &branch.id, req.pr_number).await?;
+    github::apply_snapshot(&st, &session, &branch, &snap, false).await?;
+    let (session, branch) = require_session(&st.db, &session.id).await?;
+    Ok(Json(session_view(&st.db, &session, &branch).await?))
+}
+
+/// Clear an explicit PR mapping and return to automatic current-open-PR
+/// discovery. The cached snapshot is cleared first so an old open PR cannot
+/// pull auto mode back to itself on the next refresh.
+pub(super) async fn clear_github_session(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+) -> ApiResult<Json<SessionView>> {
+    let (session, branch) = require_session(&st.db, &key).await?;
+    github::clear_mapping(&st.db, &branch.id).await?;
+    github::clear_status(&st.db, &branch.id).await?;
+    if github::gh_available().await {
+        if let Err(e) = github::refresh(&st, &session, &branch, false).await {
+            tracing::debug!(branch = %branch.branch, error = %e, "automatic PR refresh after clearing mapping failed");
+        }
+    }
     let (session, branch) = require_session(&st.db, &session.id).await?;
     Ok(Json(session_view(&st.db, &session, &branch).await?))
 }
@@ -2429,7 +2428,7 @@ pub(super) async fn send_session(
         let handle = require_acp_task(&st, &session)?;
         let by = author_or_manual(req.by.as_deref());
         let ack = handle
-            .prompt(req.text.clone(), Some(by.clone()))
+            .prompt(req.text.clone(), Some(by.clone()), false, Vec::new())
             .await
             .map_err(|e| AppError::conflict(e.to_string()))?;
         events::record(
@@ -2759,6 +2758,117 @@ pub(super) struct PromptBody {
     pub text: String,
     #[serde(default)]
     pub by: Option<String>,
+    #[serde(default)]
+    pub force_steer: bool,
+    /// Worktree-relative files selected by the composer. The server resolves
+    /// and validates them, then forwards ACP resource-link blocks.
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct FileSearchQuery {
+    #[serde(default)]
+    q: String,
+}
+
+/// Server-side worktree file completion for the chat composer. The browser has
+/// no filesystem access; git supplies tracked plus unignored untracked files.
+pub(super) async fn list_session_files(
+    State(st): State<AppState>,
+    Path(key): Path<String>,
+    Query(query): Query<FileSearchQuery>,
+) -> ApiResult<Json<Value>> {
+    let (session, _) = require_session(&st.db, &key).await?;
+    let out = tokio::process::Command::new("git")
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .current_dir(&session.work_dir)
+        .output()
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !out.status.success() {
+        return Err(AppError::new(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "git ls-files failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ));
+    }
+    let needle = query.q.trim().to_ascii_lowercase();
+    let mut files: Vec<String> = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|raw| !raw.is_empty())
+        .filter_map(|raw| String::from_utf8(raw.to_vec()).ok())
+        .filter(|path| needle.is_empty() || path.to_ascii_lowercase().contains(&needle))
+        .collect();
+    files.sort_by_key(|path| {
+        let lower = path.to_ascii_lowercase();
+        let name = lower.rsplit('/').next().unwrap_or(&lower);
+        (
+            !lower.starts_with(&needle),
+            !name.starts_with(&needle),
+            path.len(),
+            lower,
+        )
+    });
+    files.truncate(40);
+    Ok(Json(json!({ "files": files })))
+}
+
+async fn prompt_resources(work_dir: &str, files: &[String]) -> ApiResult<Vec<Value>> {
+    use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+    const FILE_URI_ENCODE: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'%')
+        .add(b'<')
+        .add(b'>')
+        .add(b'?')
+        .add(b'`')
+        .add(b'{')
+        .add(b'}');
+
+    let root = tokio::fs::canonicalize(work_dir).await?;
+    let mut out = Vec::new();
+    for requested in files {
+        let relative = std::path::Path::new(requested);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| matches!(part, Component::ParentDir | Component::RootDir))
+        {
+            return Err(AppError::bad_request(format!(
+                "invalid file reference '{requested}'"
+            )));
+        }
+        let canonical = tokio::fs::canonicalize(root.join(relative))
+            .await
+            .map_err(|_| AppError::bad_request(format!("file '{requested}' does not exist")))?;
+        if !canonical.starts_with(&root) || !canonical.is_file() {
+            return Err(AppError::bad_request(format!(
+                "file reference '{requested}' is outside the worktree"
+            )));
+        }
+        let uri = format!(
+            "file://{}",
+            utf8_percent_encode(&canonical.to_string_lossy(), FILE_URI_ENCODE)
+        );
+        out.push(json!({
+            "type": "resource_link",
+            "name": requested,
+            "uri": uri,
+        }));
+    }
+    Ok(out)
 }
 
 /// Send a user message to an ACP session: dispatched as a `session/prompt` when
@@ -2774,8 +2884,14 @@ pub(super) async fn prompt_session(
     require_acp(&session)?;
     let handle = require_acp_task(&st, &session)?;
     let by = author_or_manual(req.by.as_deref());
+    let resources = prompt_resources(&session.work_dir, &req.files).await?;
     let ack = handle
-        .prompt(req.text.clone(), Some(by.clone()))
+        .prompt(
+            req.text.clone(),
+            Some(by.clone()),
+            req.force_steer,
+            resources,
+        )
         .await
         .map_err(|e| AppError::conflict(e.to_string()))?;
     events::record(

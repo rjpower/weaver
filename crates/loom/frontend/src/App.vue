@@ -52,8 +52,7 @@ watch(docTitle, (t) => (document.title = t), { immediate: true });
 // Views kept alive across navigation so returning is instant — no remount, no
 // refetch flash, no entrance-animation replay. The list views return exactly as
 // left (scroll, filter, the open create form); the session detail page returns
-// to its warm terminal (scrollback intact, no reconnect). Chat is NOT cached —
-// it is cheap to remount.
+// to its warm terminal (scrollback intact, no reconnect).
 const CACHED_VIEWS = ['SessionList', 'Issues', 'Watches', 'SessionDetail'];
 
 // Cache key per cached instance. List views are singletons (keyed by their

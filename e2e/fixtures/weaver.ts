@@ -39,6 +39,8 @@ export interface Branch {
   created_at: string;
   updated_at: string;
   open_issue_count: number;
+  github_pr: number | null;
+  github: { pr_number: number; pr_url: string; pr_state: string } | null;
 }
 
 /** A session as returned by `/api/sessions[/...]`. */
@@ -88,6 +90,8 @@ export interface Issue {
   title: string;
   body: string;
   status: string;
+  github_repo: string | null;
+  github_issue: number | null;
   tags: TagView[];
 }
 

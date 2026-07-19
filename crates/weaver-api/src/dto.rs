@@ -74,6 +74,10 @@ pub struct BranchView {
     /// check rollup), or `null` when GitHub polling is off, the repo has no
     /// remote PR, or `gh` is unavailable. Maintained by the loom poll loop.
     pub github: Option<GithubStatus>,
+    /// A user-selected PR number. `null` means loom discovers the branch's
+    /// current open PR automatically; this is deliberately separate from the
+    /// cached `github` snapshot above.
+    pub github_pr: Option<i64>,
 }
 
 impl BranchView {
@@ -85,6 +89,7 @@ impl BranchView {
         tags: &[Tag],
         open_issue_count: i64,
         github: Option<GithubStatus>,
+        github_pr: Option<i64>,
     ) -> Self {
         let name = branch
             .branch
@@ -105,6 +110,7 @@ impl BranchView {
             updated_at: branch.updated_at.clone(),
             open_issue_count,
             github,
+            github_pr,
         }
     }
 }
@@ -720,6 +726,10 @@ pub struct PatchIssueReq {
     /// "open" or "closed".
     #[serde(default)]
     pub status: Option<String>,
+    /// GitHub issue mapping as `owner/name#number`. An empty string clears the
+    /// mapping; absent leaves it unchanged.
+    #[serde(default)]
+    pub github: Option<String>,
 }
 
 /// Body for `POST /api/repos/issues`: create an unclaimed repo-level backlog

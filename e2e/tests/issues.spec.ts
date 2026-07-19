@@ -72,6 +72,30 @@ test.describe('issues pane', () => {
     expect(persisted.find((i) => i.id === issue.id)?.title).toBe('new shiny title');
   });
 
+  test('changes and clears an issue GitHub mapping through the inline editor', async ({ page, weaver }) => {
+    const session = await weaver.seedSession({ goal: 'g', name: 'feature' });
+    const issue = await weaver.seedIssue(session, 'remappable');
+    await page.goto(`${weaver.baseUrl}/issues`);
+    const row = page.locator(`[data-issue-id="${issue.id}"]`);
+
+    await row.getByTestId('issue-edit').click();
+    await row.getByTestId('issue-edit-github').fill('acme/widgets#17');
+    await row.getByTestId('issue-save').click();
+    await expect(row.getByRole('link', { name: 'gh #17' })).toHaveAttribute(
+      'href',
+      'https://github.com/acme/widgets/issues/17',
+    );
+
+    await row.getByTestId('issue-edit').click();
+    await row.getByTestId('issue-edit-github').fill('');
+    await row.getByTestId('issue-save').click();
+    await expect(row.getByRole('link', { name: 'gh #17' })).toHaveCount(0);
+
+    const persisted = (await weaver.listIssues()).find((candidate) => candidate.id === issue.id)!;
+    expect(persisted.github_repo).toBeNull();
+    expect(persisted.github_issue).toBeNull();
+  });
+
   test('adds a tag through the editor', async ({ page, weaver }) => {
     const session = await weaver.seedSession({ goal: 'g', name: 'feature' });
     const issue = await weaver.seedIssue(session, 'taggable');

@@ -370,8 +370,6 @@ Notable settings:
   launch` is given no `--agent` (`claude`, `codex`, or any custom agent).
 - `agent.model` / `agent.effort` — default model and reasoning effort for new
   sessions. The Settings UI populates these from the selected agent type.
-- `concierge.runtime` / `concierge.model` / `concierge.effort` — agent, model,
-  and reasoning effort used when the Chat concierge starts or resets.
 - `server.auto_adopt` — adopt every recoverable session on daemon startup.
 - `github.poll` — poll GitHub (via `gh`) for each session's PR, review, and
   check status (on by default; a no-op without `gh` or a GitHub remote).

@@ -17,6 +17,7 @@ import {
   answerPermission,
   setSessionMode,
   setSessionConfigOption,
+  listSessionFiles,
 } from '../api';
 import type {
   Session,
@@ -243,8 +244,9 @@ const composerInput = ref<HTMLTextAreaElement | null>(null);
 const sending = ref(false);
 const sendError = ref('');
 const composerVisible = computed(() => canSend(props.session));
+const selectedFiles = ref<string[]>([]);
 
-async function submitPrompt() {
+async function submitPrompt(forceSteer = false) {
   if (!draft.value.trim() || sending.value) return;
   const local = localCommand(draft.value);
   if (local) {
@@ -259,12 +261,14 @@ async function submitPrompt() {
   optimistic.value.push(pending);
   autoFollow();
   try {
-    const ack = await promptSession(id.value, text);
+    const files = selectedFiles.value.filter((path) => text.includes(`@${path}`));
+    const ack = await promptSession(id.value, text, undefined, forceSteer, files);
     const index = optimistic.value.findIndex((o) => o.key === pending.key);
     if (index >= 0) {
       optimistic.value[index].state = ack.queued ? 'queued' : ack.steered ? 'steered' : 'sent';
     }
     draft.value = '';
+    selectedFiles.value = [];
     autoFollow();
   } catch (e) {
     const index = optimistic.value.findIndex((o) => o.key === pending.key);
@@ -305,6 +309,37 @@ const commandHint = computed(() => {
   return commands.value.find((command) => command.name === match[1])?.input?.hint ?? '';
 });
 
+// ── Server-backed @file completion ----------------------------------------
+// The browser cannot inspect a session worktree. Once the current token starts
+// with `@`, ask loom for tracked/unignored paths; a chosen path is also sent as
+// an ACP resource_link rather than relying on adapter-specific text parsing.
+const fileQuery = computed(() => draft.value.match(/(?:^|[\s|])@([^\s@]*)$/)?.[1] ?? null);
+const fileMatches = ref<string[]>([]);
+const fileIndex = ref(0);
+let fileSearchSeq = 0;
+watch(fileQuery, async (query) => {
+  fileIndex.value = 0;
+  const seq = ++fileSearchSeq;
+  if (query == null) {
+    fileMatches.value = [];
+    return;
+  }
+  try {
+    const result = await listSessionFiles(id.value, query);
+    if (seq === fileSearchSeq) fileMatches.value = result.files;
+  } catch {
+    if (seq === fileSearchSeq) fileMatches.value = [];
+  }
+});
+const activeFile = computed(() => fileMatches.value[fileIndex.value] ?? null);
+
+function chooseFile(path: string) {
+  draft.value = draft.value.replace(/@[^\s@]*$/, `@${path} `);
+  if (!selectedFiles.value.includes(path)) selectedFiles.value.push(path);
+  fileMatches.value = [];
+  nextTick(() => composerInput.value?.focus());
+}
+
 function chooseCommand(command: AcpCommand) {
   // Keep a trailing space even for argument-less commands. It closes the
   // autocomplete so the next Enter submits instead of selecting forever.
@@ -321,6 +356,19 @@ function localCommand(text: string): { name: string; args: string } | null {
   return { name: match[1], args: match[2] ?? '' };
 }
 function onComposerKeydown(e: KeyboardEvent) {
+  if (fileMatches.value.length) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const d = e.key === 'ArrowDown' ? 1 : -1;
+      fileIndex.value = (fileIndex.value + d + fileMatches.value.length) % fileMatches.value.length;
+      return;
+    }
+    if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+      e.preventDefault();
+      if (activeFile.value) chooseFile(activeFile.value);
+      return;
+    }
+  }
   if (commandMatches.value.length) {
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault();
@@ -597,6 +645,14 @@ const model = computed<{ rows: Row[]; toc: TocItem[] }>(() => {
         flushActivity();
         const text = (b.payload as unknown as AgentMessagePayload).text ?? '';
         if (!text.trim()) break;
+        const previous = rows[rows.length - 1];
+        if (previous?.type === 'agent') {
+          // Metadata updates can split one streamed answer into multiple durable
+          // blocks. They are not speaker boundaries, so keep the transcript as
+          // one readable response until a user/tool/other visible row intervenes.
+          previous.text += text;
+          break;
+        }
         rows.push({
           type: 'agent',
           key: k,
@@ -675,13 +731,19 @@ const model = computed<{ rows: Row[]; toc: TocItem[] }>(() => {
     }
     const msg = shadows.get(`${lt}:agent_message`);
     if (msg && msg.text) {
-      rows.push({
-        type: 'agent',
-        key: `shadow-${lt}-agent`,
-        time: '',
-        text: msg.text,
-        streaming: true,
-      });
+      const previous = rows[rows.length - 1];
+      if (previous?.type === 'agent') {
+        previous.text += msg.text;
+        previous.streaming = true;
+      } else {
+        rows.push({
+          type: 'agent',
+          key: `shadow-${lt}-agent`,
+          time: '',
+          text: msg.text,
+          streaming: true,
+        });
+      }
     }
   }
 
@@ -1132,7 +1194,7 @@ function goTo(anchor: string) {
       v-if="composerVisible"
       class="acp-composer"
       data-testid="acp-composer"
-      @submit.prevent="submitPrompt"
+      @submit.prevent="submitPrompt(false)"
     >
       <p v-if="sendError" class="mb-1.5 text-xs text-block" data-testid="acp-composer-error">
         {{ sendError }}
@@ -1147,6 +1209,26 @@ function goTo(anchor: string) {
         class="acp-input"
         @keydown="onComposerKeydown"
       ></textarea>
+      <ul
+        v-if="fileMatches.length"
+        class="acp-command-menu"
+        data-testid="acp-file-menu"
+        role="listbox"
+        aria-label="Worktree files"
+      >
+        <li v-for="(path, index) in fileMatches" :key="path">
+          <button
+            type="button"
+            class="acp-command-item"
+            :data-active="index === fileIndex"
+            :aria-selected="index === fileIndex"
+            role="option"
+            @click="chooseFile(path)"
+          >
+            <code>@{{ path }}</code>
+          </button>
+        </li>
+      </ul>
       <ul
         v-if="commandMatches.length"
         class="acp-command-menu"
@@ -1247,6 +1329,17 @@ function goTo(anchor: string) {
           </button>
         </div>
         <div class="acp-composer-right">
+          <button
+            v-if="turnLive"
+            type="button"
+            class="btn-secondary px-3 py-1 text-xs"
+            data-testid="acp-composer-force-steer"
+            :disabled="sending || !draft.trim()"
+            title="Inject this feedback into the running turn even if the agent did not advertise steering"
+            @click="submitPrompt(true)"
+          >
+            Steer now
+          </button>
           <button
             v-if="turnLive"
             type="button"

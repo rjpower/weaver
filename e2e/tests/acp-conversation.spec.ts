@@ -19,6 +19,7 @@ import { join } from 'path';
 //   usage:USED:SIZE      a usage_update
 //   wait:MS              sleep (keeps the turn live — for queue/interrupt tests)
 //   permission:NAME      a session/request_permission that blocks the turn
+//   resources            echo the names of ACP resource_link blocks
 //
 // The ACP *lifecycle* backend (weaver #508 — the protocol axis on agents +
 // sessions, create/adopt branching, `--mode`) is a parallel phase. Until it
@@ -60,13 +61,14 @@ async function defineFakeAcpAgent(
  *  brought it up as `protocol='acp'`, else null (the acp axis isn't wired yet). */
 async function launchAcpSession(
   weaver: WeaverFixture,
-  opts: { goal: string; mode?: string; name?: string },
+  opts: { goal: string; mode?: string; name?: string; steering?: boolean },
 ): Promise<Session | null> {
   // The fake adapter is launched by the custom agent's `launch` command. The
   // `protocol` axis marks it ACP rather than a PTY TUI (added by the lifecycle
   // phase; ignored by the current backend, which is exactly why the probe below
   // detects support).
-  await defineFakeAcpAgent(weaver, 'acp-fake', 'ACP fake', true);
+  const agent = opts.steering === false ? 'acp-fake-no-steer' : 'acp-fake';
+  await defineFakeAcpAgent(weaver, agent, 'ACP fake', opts.steering !== false);
 
   const res = await fetch(`${weaver.baseUrl}/api/sessions`, {
     method: 'POST',
@@ -74,7 +76,7 @@ async function launchAcpSession(
     body: JSON.stringify({
       goal: opts.goal,
       cwd: weaver.repoPath,
-      agent: 'acp-fake',
+      agent,
       name: opts.name ?? 'acp',
       protocol: 'acp',
       mode: opts.mode ?? 'default',
@@ -90,7 +92,7 @@ async function launchAcpSession(
 async function openAcp(
   page: Page,
   weaver: WeaverFixture,
-  opts: { goal: string; mode?: string; name?: string },
+  opts: { goal: string; mode?: string; name?: string; steering?: boolean },
 ): Promise<Session> {
   const s = await launchAcpSession(weaver, opts);
   test.skip(s === null, SKIP_MSG);
@@ -291,6 +293,81 @@ test.describe('acp conversation', () => {
     await expect(conv.getByText('streamed reply lands here', { exact: true })).toHaveCount(1);
   });
 
+  test('usage updates do not fragment one agent reply into many speaker rows', async ({ page, weaver }) => {
+    await openAcp(page, weaver, {
+      goal: 'say:The PR override is modeled independently from |usage:41000:200000|say:the cached snapshot.',
+      name: 'acp-coalesce',
+    });
+    const conv = page.getByTestId('acp-conversation');
+    await expect(page.getByTestId('acp-working')).toBeHidden({
+      timeout: 15_000,
+    });
+    await expect(
+      conv.getByText('The PR override is modeled independently from the cached snapshot.', {
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect(conv.locator('.acp-label', { hasText: 'Agent' })).toHaveCount(1);
+  });
+
+  test('stop immediately settles the live working state', async ({ page, weaver }) => {
+    await openAcp(page, weaver, {
+      goal: 'say:ready',
+      name: 'acp-stop-settles',
+    });
+    const input = page.getByTestId('acp-composer-input');
+    await input.fill('wait:5000|say:unreached');
+    await page.getByTestId('acp-composer-send').click();
+    await expect(page.getByTestId('acp-working')).toBeVisible({ timeout: 15_000 });
+
+    await page.getByTestId('acp-composer-stop').click();
+    await expect(page.getByTestId('acp-working')).toBeHidden({
+      timeout: 2_000,
+    });
+    await expect(page.getByTestId('acp-turn-rule').last()).toContainText('cancelled');
+  });
+
+  test('force steer injects feedback when the agent omitted its capability bit', async ({ page, weaver }) => {
+    await openAcp(page, weaver, {
+      goal: 'say:ready',
+      name: 'acp-force-ui',
+      steering: false,
+    });
+    const input = page.getByTestId('acp-composer-input');
+    await input.fill('wait:2500|say:first turn done');
+    await page.getByTestId('acp-composer-send').click();
+    await expect(page.getByTestId('acp-working')).toBeVisible({
+      timeout: 15_000,
+    });
+
+    await input.fill('say:feedback now');
+    await page.getByTestId('acp-composer-force-steer').click();
+    await expect(page.getByTestId('acp-steered')).toBeVisible({
+      timeout: 15_000,
+    });
+    await expect(
+      page.getByTestId('acp-conversation').getByText('feedback nowfirst turn done', { exact: true }),
+    ).toBeVisible({ timeout: 20_000 });
+  });
+
+  test('@file completion resolves server files and sends an ACP resource', async ({ page, weaver }) => {
+    await openAcp(page, weaver, {
+      goal: 'say:ready',
+      name: 'acp-file-resource',
+    });
+    const input = page.getByTestId('acp-composer-input');
+    await input.fill('resources|@READ');
+    const menu = page.getByTestId('acp-file-menu');
+    await expect(menu.getByText('@README.md', { exact: true })).toBeVisible();
+    await menu.getByText('@README.md', { exact: true }).click();
+    await expect(input).toHaveValue('resources|@README.md ');
+
+    await page.getByTestId('acp-composer-send').click();
+    await expect(page.getByTestId('acp-conversation').getByText('README.md', { exact: true })).toBeVisible({
+      timeout: 15_000,
+    });
+  });
+
   test('the composer steers a prompt into a live turn', async ({ page, weaver }) => {
     await openAcp(page, weaver, { goal: 'say:ready' });
     const input = page.getByTestId('acp-composer-input');
@@ -298,7 +375,9 @@ test.describe('acp conversation', () => {
     // A first prompt that stays in flight (the `wait`).
     await input.fill('wait:1500|say:first turn done');
     await page.getByTestId('acp-composer-send').click();
-    await expect(page.getByTestId('acp-working')).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByTestId('acp-working')).toBeVisible({
+      timeout: 15_000,
+    });
 
     // A second prompt sent mid-turn is injected into the active turn.
     await input.fill('say:second turn');
@@ -361,45 +440,6 @@ test.describe('acp conversation', () => {
     await expect(fast).toContainText('Off');
     await fast.getByRole('button').click();
     await expect(fast).toContainText('On');
-  });
-
-  test('/clear is a local Chat hook that starts with a clean transcript', async ({ page, weaver }) => {
-    const s = await launchAcpSession(weaver, { goal: 'say:old concierge context', name: 'chat-clear' });
-    test.skip(s === null, SKIP_MSG);
-    const fresh = { ...s!, id: 'fresh-concierge', term_session: 'fresh-concierge' };
-    let resetCalls = 0;
-    await page.route('**/api/chat', (route) => route.fulfill({ json: s }));
-    await page.route('**/api/chat/reset', (route) => {
-      resetCalls += 1;
-      return route.fulfill({ json: fresh });
-    });
-    await page.route('**/api/sessions/fresh-concierge/chat', (route) =>
-      route.fulfill({
-        json: {
-          blocks: [],
-          live_turn: null,
-          metadata: { commands: [], config_options: [], modes: [] },
-        },
-      }),
-    );
-    await page.route('**/api/sessions/fresh-concierge/chat/stream', (route) =>
-      route.fulfill({
-        status: 200,
-        headers: { 'content-type': 'text/event-stream' },
-        body: '',
-      }),
-    );
-
-    await page.goto(`${weaver.baseUrl}/chat`);
-    await expect(page.getByText('old concierge context', { exact: true })).toBeVisible();
-    const input = page.getByTestId('acp-composer-input');
-    await input.fill('/');
-    await page.getByTestId('acp-command-menu').getByText('/clear', { exact: true }).click();
-    await page.getByTestId('acp-composer-send').click();
-
-    await expect(page.getByTestId('acp-empty')).toBeVisible();
-    await expect(page.getByText('old concierge context', { exact: true })).toHaveCount(0);
-    expect(resetCalls).toBe(1);
   });
 
   test('a permission card answers and collapses to a receipt', async ({ page, weaver }) => {

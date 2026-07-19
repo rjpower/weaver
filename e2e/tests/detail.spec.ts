@@ -45,6 +45,28 @@ test.describe('session detail view', () => {
     await expect(page).toHaveTitle('Weaver - Sessions');
   });
 
+  test('edits the session pull request mapping from the manage menu', async ({ page, weaver }) => {
+    const s = await weaver.seedSession({ goal: 'Map my PR', name: 'pr-map' });
+    let requestBody: unknown;
+    await page.route(`**/api/sessions/${s.id}/github`, async (route) => {
+      if (route.request().method() !== 'PUT') return route.fallback();
+      requestBody = route.request().postDataJSON();
+      await route.fulfill({
+        json: { ...s, branch: { ...s.branch, github_pr: 37 } },
+      });
+    });
+
+    await page.goto(`${weaver.baseUrl}/s/${s.id}`);
+    await page.getByRole('button', { name: 'manage' }).click();
+    await page.getByTestId('action-pr-mapping').click();
+    const form = page.getByTestId('pr-mapping-form');
+    await form.getByLabel('PR number').fill('37');
+    await form.getByRole('button', { name: 'Pin PR' }).click();
+
+    await expect.poll(() => requestBody).toEqual({ pr_number: 37 });
+    await expect(form).toBeHidden();
+  });
+
   test('clearing the attention chip marks the agent’s attention calm', async ({ page, weaver }) => {
     const s = await weaver.seedSession({ goal: 'Acknowledge me', name: 'ack-task' });
     // The agent raises its attention; the human's only write here is to clear it.

@@ -102,6 +102,15 @@ CREATE TABLE IF NOT EXISTS branch_github (
     fetched_at       TEXT NOT NULL
 );
 
+-- An optional user-selected PR for a branch. Without a row, loom discovers the
+-- branch's current open PR automatically. Kept separate from branch_github: the
+-- latter is only a disposable status snapshot and must be clearable when an
+-- auto-discovered PR is no longer current.
+CREATE TABLE IF NOT EXISTS branch_github_mapping (
+    branch_id  TEXT PRIMARY KEY REFERENCES branches(id) ON DELETE CASCADE,
+    pr_number  INTEGER NOT NULL
+);
+
 -- Authentication (loom-only; the daemon-less `weaver` CLI never serves HTTP, so
 -- it has no notion of users). An *approved* operator: a row here is the
 -- allowlist. `github_login` matches the GitHub OAuth identity; `password_hash`

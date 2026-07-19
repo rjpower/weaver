@@ -142,40 +142,6 @@ pub const REGISTRY: &[SettingSpec] = &[
         options: &[],
     },
     SettingSpec {
-        key: "concierge.runtime",
-        label: "Concierge agent",
-        description: "Which agent backs the fleet Chat concierge. `claude` runs \
-            the Claude Code TUI with full weaver status hooks. `codex` runs Codex: \
-            its conversation still renders in the Chat view, but Codex does not \
-            fire weaver's lifecycle hooks, so the concierge shows no live \
-            working/idle status and the Chat view won't auto-refresh on each \
-            reply (use the Refresh button).",
-        kind: SettingKind::String,
-        default: DEFAULT_CONCIERGE_RUNTIME,
-        group: "Agents",
-        options: &[],
-    },
-    SettingSpec {
-        key: "concierge.model",
-        label: "Concierge model",
-        description: "Model selector used when Chat starts or resets the fleet \
-            concierge.",
-        kind: SettingKind::String,
-        default: DEFAULT_CONCIERGE_MODEL,
-        group: "Agents",
-        options: &[],
-    },
-    SettingSpec {
-        key: "concierge.effort",
-        label: "Concierge effort",
-        description: "Reasoning effort used when Chat starts or resets the \
-            fleet concierge.",
-        kind: SettingKind::String,
-        default: DEFAULT_CONCIERGE_EFFORT,
-        group: "Agents",
-        options: &[],
-    },
-    SettingSpec {
         key: "server.auto_adopt",
         label: "Auto-adopt on startup",
         description: "When enabled, the server recreates the terminal session for \

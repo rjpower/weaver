@@ -44,6 +44,8 @@ export interface Branch {
    *  polling is off, there's no PR, or `gh` is unavailable. Maintained
    *  server-side by loom's poll loop. */
   github: GithubStatus | null;
+  /** Explicit PR override. null means automatic current-open-PR discovery. */
+  github_pr: number | null;
 }
 
 /** A point-in-time GitHub snapshot of a branch's pull request: its link plus
@@ -324,7 +326,6 @@ export interface AgentMetadata {
   efforts: AgentChoice[];
   accepts_raw_model: boolean;
   supports_hooks: boolean;
-  supports_concierge: boolean;
   /** True for the builtin `claude`/`codex`; false for an operator-defined custom
    *  agent (which the UI may edit or delete). */
   builtin: boolean;

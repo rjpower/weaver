@@ -5,6 +5,7 @@
 //! is `Arc`-shared), so `loom::acp::start`/`attach` register into the very
 //! registry the routes read.
 
+use std::path::Path;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -750,6 +751,75 @@ async fn prompt_steers_a_live_turn_when_advertised() {
     }));
 }
 
+/// A person can explicitly try the steering extension even when an adapter did
+/// not advertise it. This covers adapters that implement the extension but
+/// omit the capability bit; the ordinary Send path still queues for them.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_force_steers_without_advertised_capability() {
+    let ts = TestServer::start().await;
+    start_new(&ts, "acp-force-steer", None, None).await;
+
+    ts.client
+        .post(
+            "/api/sessions/acp-force-steer/prompt",
+            json!({ "text": "wait:1200|say:first" }),
+        )
+        .await
+        .unwrap();
+    let steered = ts
+        .client
+        .post(
+            "/api/sessions/acp-force-steer/prompt",
+            json!({ "text": "say:feedback", "force_steer": true }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(steered["queued"], false);
+    assert_eq!(steered["steered"], true, "response: {steered}");
+
+    let session = session_mod::get(&ts.state.db, "acp-force-steer")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(session.pending_prompt.as_deref().unwrap_or("").is_empty());
+}
+
+/// Composer-selected files are resolved inside the worktree and forwarded as
+/// ACP resource_link blocks, not left as adapter-specific `@file` prose.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_forwards_validated_file_resources() {
+    let ts = TestServer::start().await;
+    start_new(&ts, "acp-resources", None, None).await;
+    let session = session_mod::get(&ts.state.db, "acp-resources")
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::fs::write(Path::new(&session.work_dir).join("context.txt"), "context")
+        .await
+        .unwrap();
+
+    let sent = ts
+        .client
+        .post(
+            "/api/sessions/acp-resources/prompt",
+            json!({ "text": "resources", "files": ["context.txt"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent["queued"], false);
+    let chat = poll_chat(&ts, "acp-resources", Duration::from_secs(10), |blocks| {
+        blocks
+            .iter()
+            .any(|b| b["kind"] == "agent_message" && b["payload"]["text"] == "context.txt")
+    })
+    .await;
+    assert!(chat["blocks"].as_array().unwrap().iter().any(|b| {
+        b["kind"] == "user_message" && b["payload"]["resources"][0]["name"] == "context.txt"
+    }));
+}
+
 /// 4c. If a turn ends during injection, codex-acp starts the message itself and
 /// reports `startedNewTurn`; loom adopts and closes that adapter-owned turn.
 #[serial]
@@ -970,6 +1040,11 @@ async fn interrupt_cancels_the_turn() {
         .find(|b| b["kind"] == "turn_end")
         .expect("a turn_end block");
     assert_eq!(turn_end["payload"]["stop_reason"], "cancelled");
+    assert_eq!(
+        chat["live_turn"],
+        Value::Null,
+        "cancel clears live turn state"
+    );
 }
 
 /// The `/chat` routes reject a terminal-backend session with 409.

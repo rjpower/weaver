@@ -163,12 +163,20 @@ impl AcpHandle {
     /// Send a user message: dispatched as a `session/prompt` when idle, steered
     /// into a live turn when the adapter advertises support, or appended to the
     /// durable queue otherwise.
-    pub async fn prompt(&self, text: String, by: Option<String>) -> Result<PromptAck> {
+    pub async fn prompt(
+        &self,
+        text: String,
+        by: Option<String>,
+        force_steer: bool,
+        resources: Vec<Value>,
+    ) -> Result<PromptAck> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Prompt {
                 text,
                 by,
+                force_steer,
+                resources,
                 reply: tx,
             })
             .await
@@ -422,6 +430,8 @@ enum Command {
     Prompt {
         text: String,
         by: Option<String>,
+        force_steer: bool,
+        resources: Vec<Value>,
         reply: oneshot::Sender<Result<PromptAck>>,
     },
     Cancel {
@@ -592,6 +602,8 @@ struct PendingSteer {
     text: String,
     by: Option<String>,
     turn: i64,
+    forced: bool,
+    resources: Vec<Value>,
     reply: oneshot::Sender<Result<PromptAck>>,
 }
 
@@ -925,7 +937,7 @@ impl Task {
         if let Some(goal) = &launch.goal {
             match handoff {
                 Some(payload) => self.start_handoff_turn(goal.clone(), payload).await?,
-                None => self.start_turn(goal.clone(), None).await?,
+                None => self.start_turn(goal.clone(), None, Vec::new()).await?,
             }
         }
         Ok(())
@@ -1084,7 +1096,8 @@ impl Task {
                 }
             }
             SessionUpdate::UsageUpdate { used, size } => {
-                self.flush_buf().await;
+                // Usage is metadata, not a prose boundary. Flushing here split
+                // replies into tiny blocks when an adapter reported it often.
                 self.journal_block(kind::USAGE, json!({ "used": used, "size": size }))
                     .await;
             }
@@ -1303,7 +1316,7 @@ impl Task {
             .unwrap_or_default();
         if !pending.trim().is_empty() {
             let _ = session::clear_pending_prompt(&self.db, &self.session_id).await;
-            let _ = self.start_turn(pending, None).await;
+            let _ = self.start_turn(pending, None, Vec::new()).await;
         }
     }
 
@@ -1326,7 +1339,12 @@ impl Task {
                 let by = pending.by.map(Value::from).unwrap_or(Value::Null);
                 self.journal_block(
                     kind::USER_MESSAGE,
-                    json!({ "text": pending.text, "by": by, "steered": true }),
+                    json!({
+                        "text": pending.text,
+                        "by": by,
+                        "steered": true,
+                        "resources": pending.resources,
+                    }),
                 )
                 .await;
                 let _ = pending.reply.send(Ok(PromptAck {
@@ -1353,24 +1371,45 @@ impl Task {
                     session = %self.session_id,
                     ?outcome,
                     ?error,
-                    "steering failed; falling back to ordinary prompt handling"
+                    "steering failed"
                 );
-                self.fallback_prompt(pending).await;
+                if pending.forced {
+                    let detail = error
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| format!("adapter returned {outcome:?}"));
+                    let _ = pending
+                        .reply
+                        .send(Err(anyhow!("adapter rejected forced steer: {detail}")));
+                } else {
+                    self.fallback_prompt(pending).await;
+                }
             }
         }
     }
 
     async fn fallback_prompt(&mut self, pending: PendingSteer) {
         let ack = if self.turn_live {
-            self.queue_prompt(&pending.text).await
+            self.queue_prompt(&pending.text, &pending.resources).await
         } else {
-            self.start_prompt(pending.text, pending.by).await
+            self.start_prompt(pending.text, pending.by, pending.resources)
+                .await
         };
         let _ = pending.reply.send(ack);
     }
 
-    async fn queue_prompt(&self, text: &str) -> Result<PromptAck> {
-        session::append_pending_prompt(&self.db, &self.session_id, text).await?;
+    async fn queue_prompt(&self, text: &str, resources: &[Value]) -> Result<PromptAck> {
+        let mut queued = text.to_string();
+        if !resources.is_empty() {
+            queued.push_str("\n\nReferenced files:\n");
+            for resource in resources {
+                if let Some(uri) = resource.get("uri").and_then(Value::as_str) {
+                    queued.push_str("- ");
+                    queued.push_str(uri);
+                    queued.push('\n');
+                }
+            }
+        }
+        session::append_pending_prompt(&self.db, &self.session_id, &queued).await?;
         Ok(PromptAck {
             queued: true,
             steered: false,
@@ -1378,8 +1417,13 @@ impl Task {
         })
     }
 
-    async fn start_prompt(&mut self, text: String, by: Option<String>) -> Result<PromptAck> {
-        self.start_turn(text, by).await?;
+    async fn start_prompt(
+        &mut self,
+        text: String,
+        by: Option<String>,
+        resources: Vec<Value>,
+    ) -> Result<PromptAck> {
+        self.start_turn(text, by, resources).await?;
         Ok(PromptAck {
             queued: false,
             steered: false,
@@ -1411,7 +1455,12 @@ impl Task {
         let by = pending.by.map(Value::from).unwrap_or(Value::Null);
         self.journal_block(
             kind::USER_MESSAGE,
-            json!({ "text": pending.text, "by": by, "steered": false }),
+            json!({
+                "text": pending.text,
+                "by": by,
+                "steered": false,
+                "resources": pending.resources,
+            }),
         )
         .await;
         crate::monitor::record_acp_lifecycle(&self.db, &self.bus, &self.session_id, "working")
@@ -1423,24 +1472,31 @@ impl Task {
         }));
     }
 
-    async fn start_turn(&mut self, text: String, by: Option<String>) -> Result<()> {
+    async fn start_turn(
+        &mut self,
+        text: String,
+        by: Option<String>,
+        resources: Vec<Value>,
+    ) -> Result<()> {
         let by_v = by.map(Value::from).unwrap_or(Value::Null);
         self.start_turn_with_block(
             text.clone(),
+            resources.clone(),
             kind::USER_MESSAGE,
-            json!({ "text": text, "by": by_v }),
+            json!({ "text": text, "by": by_v, "resources": resources }),
         )
         .await
     }
 
     async fn start_handoff_turn(&mut self, text: String, payload: Value) -> Result<()> {
-        self.start_turn_with_block(text, kind::HANDOFF, payload)
+        self.start_turn_with_block(text, Vec::new(), kind::HANDOFF, payload)
             .await
     }
 
     async fn start_turn_with_block(
         &mut self,
         text: String,
+        resources: Vec<Value>,
         opening_kind: &str,
         opening_payload: Value,
     ) -> Result<()> {
@@ -1465,7 +1521,7 @@ impl Task {
             .write(&wire::request_line(
                 id,
                 method::SESSION_PROMPT,
-                wire::prompt_params(&self.acp_session_id, &text),
+                wire::prompt_params(&self.acp_session_id, &text, &resources),
             ))
             .await?;
         // Turn start ⇒ the `working` lifecycle edge: status `running`, the calm
@@ -1572,9 +1628,15 @@ impl Task {
 
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
-            Command::Prompt { text, by, reply } => {
+            Command::Prompt {
+                text,
+                by,
+                force_steer,
+                resources,
+                reply,
+            } => {
                 if self.turn_live {
-                    if self.steering_cap
+                    if (self.steering_cap || force_steer)
                         && self.pending_steers.is_empty()
                         && self.pending_external.is_none()
                     {
@@ -1582,7 +1644,7 @@ impl Task {
                         let request = wire::request_line(
                             id,
                             method::SESSION_STEERING,
-                            wire::steering_params(&self.acp_session_id, &text),
+                            wire::steering_params(&self.acp_session_id, &text, &resources),
                         );
                         match self.stream.write(&request).await {
                             Ok(()) => {
@@ -1592,6 +1654,8 @@ impl Task {
                                         text,
                                         by,
                                         turn: self.current_turn,
+                                        forced: force_steer,
+                                        resources,
                                         reply,
                                     },
                                 );
@@ -1600,14 +1664,18 @@ impl Task {
                                 let _ = reply.send(Err(e));
                             }
                         }
+                    } else if force_steer {
+                        let _ = reply.send(Err(anyhow!(
+                            "another steer is still pending; retry when it settles"
+                        )));
                     } else {
                         // A failed queue write must surface — a 202 that silently
                         // dropped the prompt would be worse than an error.
-                        let ack = self.queue_prompt(&text).await;
+                        let ack = self.queue_prompt(&text, &resources).await;
                         let _ = reply.send(ack);
                     }
                 } else {
-                    let ack = self.start_prompt(text, by).await;
+                    let ack = self.start_prompt(text, by, resources).await;
                     let _ = reply.send(ack);
                 }
             }
@@ -1619,6 +1687,17 @@ impl Task {
                         wire::cancel_params(&self.acp_session_id),
                     ))
                     .await;
+                if r.is_ok() && self.turn_live {
+                    // Cancellation is a client-owned boundary. Some adapters do
+                    // not answer the cancelled prompt, so settle loom's journal
+                    // and lifecycle immediately after the notification lands.
+                    self.on_turn_end(
+                        self.current_turn,
+                        Some(json!({ "stopReason": "cancelled" })),
+                        None,
+                    )
+                    .await;
+                }
                 // ACP requires the client to answer every pending permission
                 // request with the `cancelled` outcome when it cancels a turn.
                 for (_, pp) in self.pending_perms.drain() {

@@ -179,7 +179,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="space-y-4">
+  <div class="space-y-4" data-testid="appearance-panel">
     <p v-if="notice" class="text-xs text-accent">{{ notice }}</p>
     <p v-if="error" class="text-xs text-block">{{ error }}</p>
 

@@ -7,8 +7,8 @@ test.describe('settings · tokens', () => {
   test('creates, lists, and revokes an API token', async ({ page, weaver }) => {
     await page.goto(`${weaver.baseUrl}/settings`);
 
-    // Switch to the Tokens tab.
-    await page.getByTestId('settings-tab-tokens').click();
+    // Tokens and account management share the consolidated Access screen.
+    await page.getByTestId('settings-tab-access').click();
     await expect(page.getByTestId('token-row')).toHaveCount(0);
 
     // Create a token — the one-time secret banner appears with a `loom_` value.
@@ -30,9 +30,9 @@ test.describe('settings · tokens', () => {
     await expect(page.getByTestId('token-row')).toHaveCount(0);
   });
 
-  test('the Account tab shows the loopback identity', async ({ page, weaver }) => {
+  test('the Access screen shows the loopback identity', async ({ page, weaver }) => {
     await page.goto(`${weaver.baseUrl}/settings`);
-    await page.getByTestId('settings-tab-account').click();
+    await page.getByTestId('settings-tab-access').click();
     await expect(page.getByText('Signed in')).toBeVisible();
     // The seeded owner, authenticated via loopback trust.
     await expect(page.getByText('via loopback')).toBeVisible();

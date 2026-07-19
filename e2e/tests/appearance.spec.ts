@@ -2,7 +2,8 @@ import { test, expect } from '../fixtures/weaver';
 
 test.describe('settings · terminal appearance', () => {
   test('live preview, save, persist, and reset', async ({ page, weaver }) => {
-    await page.goto(`${weaver.baseUrl}/settings?tab=appearance`);
+    await page.goto(`${weaver.baseUrl}/settings?tab=workspace`);
+    const panel = page.getByTestId('appearance-panel');
 
     // The live preview is a real xterm instance — the same renderer a session
     // terminal uses — so it proves the config resolves end to end.
@@ -19,8 +20,8 @@ test.describe('settings · terminal appearance', () => {
     await page.getByTestId('font-jetbrains').click();
     await page.getByTestId('font-size-input').fill('16');
     await expect(page.getByTestId('theme-light')).toHaveAttribute('aria-pressed', 'true');
-    await page.getByRole('button', { name: 'Save' }).click();
-    await expect(page.getByText('Saved terminal appearance.')).toBeVisible();
+    await panel.getByRole('button', { name: 'Save' }).click();
+    await expect(panel.getByText('Saved terminal appearance.')).toBeVisible();
 
     // The server is the source of truth — the API reflects the new values.
     const settings = (await page.evaluate(async () => {
@@ -39,8 +40,8 @@ test.describe('settings · terminal appearance', () => {
     await expect(page.getByTestId('font-size-input')).toHaveValue('16');
 
     // Reset returns all three to their registry defaults.
-    await page.getByRole('button', { name: 'Reset to defaults' }).click();
-    await expect(page.getByText('Reset terminal appearance to defaults.')).toBeVisible();
+    await panel.getByRole('button', { name: 'Reset to defaults' }).click();
+    await expect(panel.getByText('Reset terminal appearance to defaults.')).toBeVisible();
     await expect(page.getByTestId('theme-dark')).toHaveAttribute('aria-pressed', 'true');
     await expect(page.getByTestId('font-plex')).toHaveAttribute('aria-pressed', 'true');
     await expect(page.getByTestId('font-size-input')).toHaveValue('13');

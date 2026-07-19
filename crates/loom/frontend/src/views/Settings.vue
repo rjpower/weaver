@@ -25,19 +25,16 @@ type Category =
   | 'agents'
   | 'sessions'
   | 'github'
-  | 'authentication'
   | 'watches'
-  | 'editor'
-  | 'appearance'
-  | 'env'
-  | 'tokens'
-  | 'account'
-  | 'logs';
+  | 'workspace'
+  | 'environment'
+  | 'access'
+  | 'diagnostics';
 
 interface CategoryItem {
   id: Category;
   label: string;
-  group?: string;
+  groups?: string[];
   summary: string;
 }
 
@@ -45,77 +42,56 @@ const categories: CategoryItem[] = [
   {
     id: 'agents',
     label: 'Agents',
-    group: 'Agents',
-    summary: 'Default runtime profiles for new work sessions and the fleet concierge.',
+    groups: ['Agents'],
+    summary: 'Default runtime profiles and custom agents for new work sessions.',
   },
   {
     id: 'sessions',
     label: 'Sessions',
-    group: 'Sessions',
-    summary: 'Launch-time behavior, setup budgets, and archived conversation logs.',
+    groups: ['Server', 'Sessions'],
+    summary: 'Server recovery, launch-time behavior, setup budgets, and conversation logs.',
   },
   {
     id: 'github',
     label: 'GitHub',
-    group: 'GitHub',
+    groups: ['GitHub'],
     summary: 'Pull request polling, merge archiving, and issue-comment launch triggers.',
-  },
-  {
-    id: 'authentication',
-    label: 'Authentication',
-    group: 'Authentication',
-    summary: 'Browser and API authentication behavior for this loom server.',
   },
   {
     id: 'watches',
     label: 'Watches',
-    group: 'Watch',
+    groups: ['Watch'],
     summary: 'Fleet watcher defaults and engine-level safety controls.',
   },
   {
-    id: 'editor',
-    label: 'Editor',
-    group: 'Editor',
-    summary: 'Embedded code-server availability and lifecycle.',
+    id: 'workspace',
+    label: 'Workspace',
+    groups: ['Editor'],
+    summary: 'Embedded editor behavior plus terminal appearance and typography.',
   },
   {
-    id: 'appearance',
-    label: 'Appearance',
-    group: 'Appearance',
-    summary: 'Theme, font, and size for the in-browser terminal, with a live preview.',
-  },
-  {
-    id: 'env',
+    id: 'environment',
     label: 'Environment',
     summary: 'Environment variables exported into future agent sessions.',
   },
   {
-    id: 'tokens',
-    label: 'Tokens',
-    summary: 'Bearer tokens for automation and remote CLIs.',
+    id: 'access',
+    label: 'Access',
+    groups: ['Authentication'],
+    summary: 'Identity, approved users, browser authentication, GitHub App, and API tokens.',
   },
   {
-    id: 'account',
-    label: 'Account',
-    summary: 'Signed-in identity, approved users, and GitHub App configuration.',
-  },
-  {
-    id: 'logs',
-    label: 'Debug',
+    id: 'diagnostics',
+    label: 'Diagnostics',
     summary:
       'Background tasks, live server logs, and build status for debugging this loom deployment.',
   },
 ];
 
-type AgentSettingGroup = 'session' | 'concierge';
+type AgentSettingGroup = 'session';
 
 const agentGroups: Record<AgentSettingGroup, { agent: string; model: string; effort: string }> = {
   session: { agent: 'agent.default', model: 'agent.model', effort: 'agent.effort' },
-  concierge: {
-    agent: 'concierge.runtime',
-    model: 'concierge.model',
-    effort: 'concierge.effort',
-  },
 };
 
 const agentProfiles: {
@@ -127,11 +103,6 @@ const agentProfiles: {
     id: 'session',
     title: 'Session default runtime',
     note: 'Used when a new work session does not specify an agent.',
-  },
-  {
-    id: 'concierge',
-    title: 'Fleet concierge runtime',
-    note: 'Used by Chat when it starts or resets the fleet concierge.',
   },
 ];
 
@@ -175,9 +146,10 @@ const groupedSettings = computed(() => {
 });
 
 const currentSettings = computed(() => {
-  const group = currentCategory.value.group;
-  if (!group || group === 'Agents') return [];
-  return groupedSettings.value.get(group) ?? [];
+  const groups = currentCategory.value.groups ?? [];
+  return groups
+    .flatMap((group) => groupedSettings.value.get(group) ?? [])
+    .sort((a, b) => a.label.localeCompare(b.label));
 });
 
 function setting(key: string): SettingView | undefined {
@@ -201,9 +173,7 @@ function defaultText(value: string): string {
 }
 
 function agentsForGroup(group: AgentSettingGroup): AgentMetadata[] {
-  return group === 'concierge'
-    ? agents.value.filter((agent) => agent.supports_concierge)
-    : agents.value;
+  return agents.value;
 }
 
 function selectedAgent(group: AgentSettingGroup): AgentMetadata | undefined {
@@ -238,7 +208,6 @@ function sanitizeAgentDraft(group: AgentSettingGroup) {
 
 function sanitizeAgentDrafts() {
   sanitizeAgentDraft('session');
-  sanitizeAgentDraft('concierge');
 }
 
 async function load() {
@@ -359,10 +328,7 @@ function durationOptions(s: SettingView): { label: string; value: string }[] {
   ];
 }
 
-watch(
-  () => [drafts.value['agent.default'], drafts.value['concierge.runtime'], agents.value.length],
-  sanitizeAgentDrafts,
-);
+watch(() => [drafts.value['agent.default'], agents.value.length], sanitizeAgentDrafts);
 
 onMounted(load);
 </script>
@@ -383,13 +349,11 @@ onMounted(load);
             :key="item.id"
             type="button"
             :data-testid="
-              item.id === 'env'
+              item.id === 'environment'
                 ? 'settings-tab-env'
-                : item.id === 'tokens'
-                  ? 'settings-tab-tokens'
-                  : item.id === 'account'
-                    ? 'settings-tab-account'
-                    : `settings-category-${item.id}`
+                : item.id === 'access'
+                  ? 'settings-tab-access'
+                  : `settings-category-${item.id}`
             "
             class="flex w-full items-center gap-2 border-b border-line border-l-2 px-3 py-2 text-left text-sm last:border-b-0"
             :class="
@@ -409,20 +373,17 @@ onMounted(load);
           <div class="flex items-center gap-2">
             <h2 class="text-base font-semibold tracking-tight">{{ currentCategory.label }}</h2>
             <span
-              v-if="currentCategory.group"
+              v-if="currentCategory.groups?.length"
               class="rounded bg-input px-1.5 py-0.5 font-mono text-2xs text-faint"
             >
-              {{ currentCategory.group }}
+              {{ currentCategory.groups?.join(' + ') }}
             </span>
           </div>
           <p class="mt-0.5 text-xs text-muted">{{ currentCategory.summary }}</p>
         </header>
 
-        <EnvPanel v-if="category === 'env'" />
-        <TokensPanel v-else-if="category === 'tokens'" />
-        <AccountPanel v-else-if="category === 'account'" />
-        <LogsPanel v-else-if="category === 'logs'" />
-        <AppearancePanel v-else-if="category === 'appearance'" />
+        <EnvPanel v-if="category === 'environment'" />
+        <LogsPanel v-else-if="category === 'diagnostics'" />
 
         <div v-else-if="category === 'agents'" class="space-y-4">
           <AgentProfileEditor
@@ -448,7 +409,14 @@ onMounted(load);
         </div>
 
         <div v-else class="space-y-3">
-          <section class="overflow-hidden rounded-md border border-line bg-surface">
+          <AccountPanel v-if="category === 'access'" />
+          <TokensPanel v-if="category === 'access'" />
+          <AppearancePanel v-if="category === 'workspace'" />
+
+          <section
+            v-if="currentSettings.length"
+            class="overflow-hidden rounded-md border border-line bg-surface"
+          >
             <SettingFieldRow
               v-for="s in currentSettings"
               :key="s.key"
@@ -517,7 +485,14 @@ onMounted(load);
             </SettingFieldRow>
           </section>
 
-          <p v-if="!currentSettings.length && !error" class="text-sm text-muted">Loading…</p>
+          <p
+            v-if="
+              !currentSettings.length && !error && category !== 'access' && category !== 'workspace'
+            "
+            class="text-sm text-muted"
+          >
+            Loading…
+          </p>
         </div>
       </main>
     </div>
