@@ -62,6 +62,7 @@ impl Env {
             addr: addr.to_string(),
             ide: std::sync::Arc::new(loom::ide::IdeManager::new(loom::ide::ide_home())),
             trigger,
+            acp: loom::acp::AcpRegistry::new(),
         };
         tokio::spawn(server::serve(state, listener));
 

@@ -9,6 +9,7 @@
 
 mod fixtures;
 
+mod acp;
 mod archive;
 mod auth;
 mod branches;

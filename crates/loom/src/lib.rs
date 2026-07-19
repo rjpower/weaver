@@ -5,11 +5,13 @@
 //! bookkeeping. The agent-facing `weaver` CLI does not depend on loom; running
 //! loom is purely additive.
 
+pub mod acp;
 pub mod agent;
 pub mod agent_env;
 pub mod auth;
 pub mod backend;
 pub mod builtins;
+pub mod chat;
 pub mod chatlog;
 pub mod client;
 pub mod custom_agents;

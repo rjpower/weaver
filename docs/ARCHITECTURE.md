@@ -55,9 +55,11 @@ other `weaver` subcommand.
 | `crates/loom/src/agent.rs` | launching agents into per-session terminals + installing `.claude/settings.local.json` hooks + the one-shot headless agent behind `POST /api/agent/oneshot` |
 | `crates/loom/src/session.rs` | `Session` row + sqlx queries |
 | `crates/loom/src/chatlog.rs` | conversation log: capture at archive (write the iris `chat.json` + rendered `chat.md` under `session.log_dir`) and serve it for the Conversation tab (`conversation()` — live transcript, else the capture) |
-| `crates/loom/src/backend.rs` | the terminal-management seam: every programmatic terminal op (create/has/capture/send/kill/list) drives the session's `tapestry` supervisor |
-| `crates/tapestry/` | the terminal backend: a per-session detached PTY supervisor (PTY + vt100 screen emulator + unix control socket) that outlives loom and streams raw PTY bytes, so an attached xterm owns its own scrollback/search |
+| `crates/loom/src/backend.rs` | the terminal-management seam: every programmatic terminal op (create/has/capture/send/kill/list) drives the session's `tapestry` supervisor. Also the ACP transport seam — `new_relay_session`/`subscribe_relay`/`relay_write`/`relay_ack` drive a session's tapestry **relay** supervisor (a durable JSON-RPC frame spool) |
+| `crates/tapestry/` | the per-session detached supervisor that outlives loom. Two modes: a **terminal** (PTY + vt100 screen emulator + unix control socket, streaming raw PTY bytes so an attached xterm owns its own scrollback/search), and a **relay** (a headless stdio subprocess whose stdout is split into newline-delimited frames, spooled with monotonic seqs, and replayed to a subscriber from any cursor — the durable transport under `loom::acp`) |
 | `crates/loom/src/terminal.rs` | WebSocket ⇄ live-terminal bridge: xterm.js ⇄ the tapestry session socket |
+| `crates/loom/src/acp/` | the [Agent Client Protocol](https://agentclientprotocol.com) client: one `tokio` task per `protocol='acp'` session drives a headless adapter subprocess (under a tapestry relay) over JSON-RPC 2.0 — consolidating streaming `session/update`s into journal blocks, block-boundary acking the relay spool, running the turn state machine, and answering permission requests. `start`/`attach` register a task into the `AppState.acp` registry the `/chat`, `/prompt`, `/permissions`, `/mode`, `/interrupt` routes drive. `acp/wire.rs` holds the JSON-RPC line codec + serde types |
+| `crates/loom/src/chat.rs` | the ACP **chat journal**: the durable, block-structured (`chat_blocks`, one row per `(session_id, turn, seq)`) conversation record `loom::acp` writes idempotently and the `/chat` routes read |
 | `crates/loom/src/github.rs` | `gh` CLI shell-out: issue seeding, PR opening, and the PR-status poll loop (snapshots each branch's PR; archives on merge) |
 | `crates/loom/src/client.rs` | HTTP client used by the `loom` CLI to talk to its own daemon |
 | `crates/loom/src/bin/loom.rs` | the orchestrator CLI (`server`, `session`, `ps`, `attach`, …) |
@@ -149,10 +151,14 @@ PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 npm test
   concurrency among loom's own connections.
   - Core tables: `branches`, `issues`, `events`, `settings`.
   - Loom tables (`crates/loom/src/db.rs`): `sessions`, `recent_repos`,
-    `branch_github` (per-branch PR snapshot), and the auth tables `users`
-    (the approved-operator allowlist, seeded with the owner), `api_tokens`
-    (hashed bearer tokens), and `auth_sessions` (hashed login cookies). See
-    [Authentication](#authentication).
+    `branch_github` (per-branch PR snapshot), `chat_blocks` (the ACP
+    [chat journal](#rest-api): one row per `(session_id, turn, seq)` block),
+    and the auth tables `users` (the approved-operator allowlist, seeded with
+    the owner), `api_tokens` (hashed bearer tokens), and `auth_sessions`
+    (hashed login cookies). See [Authentication](#authentication). Loom-owned
+    tables migrate via `add_column_if_missing` / `CREATE ... IF NOT EXISTS` in
+    `migrate_loom`, not the numbered core migrations below (those run before
+    loom creates its tables).
   - **Schema migrations** (`weaver-core/src/migrations.rs`): ordered SQL files
     under `crates/weaver-core/migrations/` (`NNNN_name.sql`, embedded with
     `include_str!`), applied at startup and recorded in a `schema_migrations`
@@ -203,8 +209,13 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `GET /api/sessions/{id}/conversation` | the agent conversation as a normalized iris log (live transcript, else the archive capture); 404 when there is none — backs the Conversation tab |
 | `GET /api/sessions/{id}/terminal` | WebSocket: xterm.js ⇄ the session's tapestry PTY (the interaction surface) |
 | `POST /api/sessions/{id}/send` | type `{text}` into the agent's terminal; `submit` (default true) follows it with Enter to trigger a round |
-| `POST /api/sessions/{id}/interrupt` | send a break (Escape) to the terminal — stop the current turn |
+| `POST /api/sessions/{id}/interrupt` | stop the current turn — a break (Escape) to the terminal for a `terminal` session, `session/cancel` for an `acp` one |
 | `GET /api/sessions/{id}/preview?lines=N` | capture the screen as `{screen}`; `lines` adds scrollback above the visible screen |
+| `GET /api/sessions/{id}/chat` | `{blocks: [ChatBlockView], live_turn}` — the ACP session's journal snapshot (per-block conversation record) plus the in-flight turn, if any |
+| `GET /api/sessions/{id}/chat/stream` | SSE tail of the live journal: `block` (a committed block), `delta` (a streaming message/thought chunk), `tool` (a live tool-call update), `turn` (started / ended) |
+| `POST /api/sessions/{id}/prompt` | `{text}` → 202 `{queued, turn}` — dispatch a user message as a `session/prompt`, or append it to the durable queue when a turn is already in flight |
+| `POST /api/sessions/{id}/permissions/{request_id}` | `{option_id}` → answer an open permission request (200 / 404 unknown / 409 already resolved) |
+| `PUT /api/sessions/{id}/mode` | `{mode_id}` → change the ACP session's permission mode (`session/set_mode`), journaled as a `mode_change` |
 | `GET /api/branches` / `GET PATCH /api/branches/{id}` | list / inspect / edit tracked branches |
 | `GET POST /api/branches/{id}/issues` | issues claimed by the branch / create one |
 | `GET /api/issues?all=…` | the cross-repo issue board (every repo's issues; `all=true` includes closed) — what the loom Issues pane reads |
@@ -228,7 +239,9 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 `SessionView` (`/api/sessions[/...]`) returns session-specific fields
 top-level (`id`, `status`, `work_dir`, `term_session`, `agent_kind`, `model`,
 `effort`, `pending_prompt`, `github_repo`, `last_activity_at`,
-`created_at`, `updated_at`, `parent_id`, and — on the create response only —
+`created_at`, `updated_at`, `parent_id`, `protocol` (`terminal` or `acp`),
+`acp_session_id`, `current_mode`, `usage` (`{used, size}` context window, from
+the journal's latest `usage` block), and — on the create response only —
 `tracking_issue`) plus a nested `branch: BranchView`
 (`id`, `name`, `title`, `goal`, `description`, `tags`,
 `repo_root`, `branch`, `base_branch`, `created_at`, `updated_at`,

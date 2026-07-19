@@ -101,6 +101,7 @@ pub async fn run(addr: &str) -> Result<()> {
         addr: actual.to_string(),
         ide: std::sync::Arc::new(crate::ide::IdeManager::new(crate::ide::ide_home())),
         trigger,
+        acp: crate::acp::AcpRegistry::new(),
     };
 
     let server_state = ServerState {
