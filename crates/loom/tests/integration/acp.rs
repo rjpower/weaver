@@ -1130,8 +1130,10 @@ async fn codex_acp_launch_maps_the_adapter_contract() {
     .await
     .unwrap();
     assert_eq!(
-        launch.adapter_cmd, "npx --yes @agentclientprotocol/codex-acp",
-        "the pinned npm default resolves when neither env nor config names one"
+        launch.adapter_cmd,
+        "command -v codex-acp >/dev/null 2>&1 && exec codex-acp; \
+         exec npx --yes @agentclientprotocol/codex-acp",
+        "the npm default (installed bin, else npx) resolves when neither env nor config names one"
     );
     assert_eq!(
         env_of(&launch, "DEFAULT_AUTH_REQUEST"),
@@ -1168,4 +1170,64 @@ async fn codex_acp_launch_maps_the_adapter_contract() {
     .unwrap();
     assert_eq!(env_of(&launch, "CODEX_CONFIG"), vec![r#"{"model":"mine"}"#]);
     assert_eq!(launch.goal.as_deref(), Some("orient first"));
+}
+
+/// K. Phase 7, adopt-after-the-flip: an orphaned *terminal* session whose
+///    builtin runtime now declares acp is adopted into acp — the relay respawns
+///    the adapter (the fake here, via `acp.claude_cmd`), and the handshake
+///    stamps the row `protocol='acp'` with the adapter's session id. With no
+///    on-disk claude conversation recorded for the worktree, the reopen is a
+///    fresh `session/new`.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopt_converts_a_terminal_builtin_session_to_acp() {
+    let ts = TestServer::start().await;
+    loom::config::apply(
+        &ts.state.db,
+        &[("acp.claude_cmd".to_string(), Some(agent_cmd()))],
+    )
+    .await
+    .unwrap();
+
+    let branch = loom::branch::upsert(&ts.state.db, &ts.cwd(), "weaver/acp-convert", "main")
+        .await
+        .unwrap();
+    session_mod::insert(
+        &ts.state.db,
+        &NewSession {
+            id: "acp-convert".to_string(),
+            branch_id: branch.id,
+            work_dir: ts.cwd(),
+            term_session: "weaver-acp-convert".to_string(),
+            agent_kind: "claude".to_string(),
+            model: String::new(),
+            effort: String::new(),
+            status: "orphaned".to_string(),
+            github_repo: None,
+            parent_branch_id: None,
+            managed_by: None,
+            created_by: None,
+            protocol: "terminal".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+
+    ts.client
+        .post("/api/sessions/acp-convert/adopt", json!({}))
+        .await
+        .expect("the terminal session adopts");
+
+    let view = poll_view(&ts, "acp-convert", Duration::from_secs(15), |v| {
+        v["protocol"] == "acp"
+    })
+    .await;
+    assert!(
+        view["acp_session_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("fake-session-"),
+        "the handshake stamped the adapter's session id: {view}"
+    );
+    assert_eq!(view["status"], "running");
 }

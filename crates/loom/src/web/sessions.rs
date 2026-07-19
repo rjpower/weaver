@@ -1886,7 +1886,105 @@ pub(crate) async fn adopt(
         )));
     }
     tracing::debug!(session = %session.id, work_dir = %work_dir.display(), "adopt preflight checks passed");
+    // The post-flip conversion: a terminal session whose builtin runtime now
+    // declares acp is adopted *into* acp rather than back onto a PTY. Claude
+    // reopens its own on-disk conversation (the adapter's session ids are
+    // claude's ids); codex — which never had a scoped terminal resume — starts
+    // fresh from the goal file. Custom agents and any runtime still declaring
+    // terminal keep the PTY relaunch.
+    let runtime = launch_runtime(&st.db, &session.agent_kind).await;
+    let declares_acp = matches!(
+        agent::metadata_for(&st.db, &runtime).await?,
+        Some(meta) if meta.builtin && meta.protocol == "acp"
+    );
+    if declares_acp {
+        return adopt_terminal_into_acp(st, session, branch, &runtime).await;
+    }
     resume_agent(st, session, branch, "session adopted").await
+}
+
+/// Convert an orphaned terminal session to ACP on adopt: respawn as a relay +
+/// adapter, reopening claude's own on-disk conversation via `session/load` when
+/// one is recorded for the worktree (else a fresh session re-oriented from the
+/// goal file). The chat journal starts empty either way — a load replay is
+/// suppressed, and the terminal era lives in the captured transcript — but the
+/// agent-side context survives in full. The acp task's handshake stamps the row
+/// (`protocol='acp'` + the adapter session id) once the reopen acks.
+async fn adopt_terminal_into_acp(
+    st: &AppState,
+    session: &Session,
+    branch: &Branch,
+    runtime: &str,
+) -> Result<(), AppError> {
+    tracing::info!(session = %session.id, branch = %branch.id, runtime = %runtime,
+        "adopting terminal session into acp");
+    let work_dir = PathBuf::from(&session.work_dir);
+    let repo_root = PathBuf::from(&branch.repo_root);
+    let repo_cfg = repo_cfg_or_default(&repo_root);
+    let extra_env = launch_env(&st.db, &repo_root, &repo_cfg).await;
+    let run_dir = db::run_dir(&session.id);
+    let primer_file = {
+        let f = run_dir.join("primer.txt");
+        f.exists().then_some(f)
+    };
+    let goal_file = {
+        let f = run_dir.join("goal.txt");
+        f.exists().then_some(f)
+    };
+    // A fresh relay: no spool cursor, no in-flight turn.
+    session_mod::set_ack_seq(&st.db, &session.id, 0).await.ok();
+    session_mod::set_inflight(&st.db, &session.id, None)
+        .await
+        .ok();
+    let open = if runtime == "claude" {
+        match agent::claude_projects_dir()
+            .and_then(|d| agent::latest_claude_session_id(&d, &work_dir))
+        {
+            Some(id) => {
+                tracing::info!(session = %session.id, claude_session = %id,
+                    "reopening claude's on-disk conversation");
+                agent::AcpOpen::Load(id)
+            }
+            None => agent::AcpOpen::Fresh,
+        }
+    } else {
+        agent::AcpOpen::Fresh
+    };
+    let launch = agent::build_acp_launch(
+        &st.db,
+        &agent::AcpLaunchSpec {
+            branch_id: &branch.id,
+            runtime,
+            work_dir: &work_dir,
+            server_addr: &st.addr,
+            model: &session.model,
+            effort: &session.effort,
+            goal_file: goal_file.as_deref(),
+            primer_file: primer_file.as_deref(),
+            extra_env: &extra_env,
+            // Terminal rows carry no mode; the seeded-gates posture they ran
+            // under matches the acp default.
+            mode: agent::DEFAULT_ACP_MODE,
+            custom: None,
+        },
+        open,
+    )
+    .await
+    .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::acp::start(st, &session.id, launch)
+        .await
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    session_mod::set_status(&st.db, &session.id, "running").await?;
+    events::record(
+        &st.db,
+        &st.bus,
+        &branch.id,
+        "status",
+        json!({ "status": "running", "reason": "session adopted into acp" }),
+    )
+    .await
+    .ok();
+    Ok(())
 }
 
 /// Adopt an ACP session: respawn its relay + adapter and reopen the conversation.

@@ -1,6 +1,6 @@
 ---
 plan: acp
-status: proposal
+status: active
 ---
 
 # Migrating session execution to the Agent Client Protocol
@@ -538,10 +538,16 @@ throughout:
    retiring the hookless-lifecycle carve-outs.
 7. **Flip the builtin default** (#512) to ACP; keep `--protocol terminal` as the
    documented fallback; deploy installs both adapters from npm, pinned,
-   beside the CLIs. Existing terminal sessions keep their PTY until
-   archived; **adopt after the flip converts** — the adapter's session ids
-   are the agent's own on-disk ids, so an orphaned terminal session can be
-   adopted straight into an ACP session over the same history.
+   beside the CLIs (the launch default prefers the installed bin, falling
+   back to `npx`). Live terminal sessions keep their PTY until archived;
+   **adopt after the flip converts** — the adapter's session ids are
+   claude's own on-disk ids (`~/.claude/projects/<munged-cwd>/*.jsonl`), so
+   an orphaned terminal claude session adopts into an ACP session over the
+   same agent-side history via `session/load` (codex, which never had a
+   scoped terminal resume, reopens fresh from the goal file). The chat
+   journal starts empty on conversion — the load replay is suppressed, the
+   terminal era stays in the captured transcript — but the agent's context
+   survives in full.
 
 ## Risks & open questions
 

@@ -393,8 +393,9 @@ impl AgentType for ClaudeAgentType {
             supports_hooks: true,
             supports_concierge: true,
             builtin: true,
-            // Terminal by default; a create request may opt claude into `acp`.
-            protocol: "terminal".to_string(),
+            // ACP is the builtin default; `--protocol terminal` keeps the PTY
+            // fallback.
+            protocol: "acp".to_string(),
         }
     }
 
@@ -424,9 +425,9 @@ impl AgentType for CodexAgentType {
             supports_hooks: false,
             supports_concierge: true,
             builtin: true,
-            // The declared default; an explicit `protocol: acp` on the create
-            // request opts a launch into the codex-acp adapter.
-            protocol: "terminal".to_string(),
+            // ACP is the builtin default; `--protocol terminal` keeps the PTY
+            // fallback.
+            protocol: "acp".to_string(),
         }
     }
 
@@ -885,8 +886,52 @@ fn push_env_default(env: &mut Vec<(String, String)>, key: &str, value: &str) {
     }
 }
 
+/// Where the claude CLI records its conversations (`~/.claude/projects`).
+pub fn claude_projects_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join("projects"))
+}
+
+/// The newest claude conversation recorded for `work_dir` under `projects_dir`:
+/// claude munges the cwd into a directory name (every non-alphanumeric byte
+/// becomes `-`) holding one `<session-id>.jsonl` per conversation. These are
+/// the sessions `claude --continue` resumes, and the ACP adapter loads the same
+/// ids — which is what lets an orphaned terminal session adopt into ACP over
+/// its own history. `None` when nothing is recorded for that directory.
+pub fn latest_claude_session_id(projects_dir: &Path, work_dir: &Path) -> Option<String> {
+    let munged: String = work_dir
+        .display()
+        .to_string()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in std::fs::read_dir(projects_dir.join(munged)).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
+            newest = Some((modified, stem.to_string()));
+        }
+    }
+    newest.map(|(_, id)| id)
+}
+
+/// The default command for an npm-distributed ACP adapter: the installed bin
+/// when present (the deploy pins exact versions onto PATH), else `npx` fetching
+/// the package at launch (the dev-machine path).
+fn npm_adapter_cmd(bin: &str, package: &str) -> String {
+    format!("command -v {bin} >/dev/null 2>&1 && exec {bin}; exec npx --yes {package}")
+}
+
 /// The `claude-agent-acp` adapter command: `WEAVER_CLAUDE_ACP_CMD` (env) wins,
-/// then the `acp.claude_cmd` setting, else the pinned npm default.
+/// then the `acp.claude_cmd` setting, else the npm default.
 async fn claude_acp_cmd(db: &Db) -> String {
     if let Ok(cmd) = std::env::var("WEAVER_CLAUDE_ACP_CMD") {
         let cmd = cmd.trim();
@@ -901,11 +946,11 @@ async fn claude_acp_cmd(db: &Db) -> String {
     {
         return cmd;
     }
-    "npx --yes @agentclientprotocol/claude-agent-acp".to_string()
+    npm_adapter_cmd("claude-agent-acp", "@agentclientprotocol/claude-agent-acp")
 }
 
 /// The `codex-acp` adapter command: `WEAVER_CODEX_ACP_CMD` (env) wins, then the
-/// `acp.codex_cmd` setting, else the pinned npm default (which bundles a
+/// `acp.codex_cmd` setting, else the npm default (the package bundles a
 /// compatible `@openai/codex`).
 async fn codex_acp_cmd(db: &Db) -> String {
     if let Ok(cmd) = std::env::var("WEAVER_CODEX_ACP_CMD") {
@@ -921,7 +966,7 @@ async fn codex_acp_cmd(db: &Db) -> String {
     {
         return cmd;
     }
-    "npx --yes @agentclientprotocol/codex-acp".to_string()
+    npm_adapter_cmd("codex-acp", "@agentclientprotocol/codex-acp")
 }
 
 /// The `CODEX_CONFIG` JSON for the codex adapter (merged into the Codex session
@@ -1729,6 +1774,35 @@ mod tests {
 
         // An unknown protocol name is rejected.
         assert!(resolve_protocol(&claude, Some("grpc")).is_err());
+    }
+
+    #[test]
+    fn latest_claude_session_id_picks_the_newest_recorded_conversation() {
+        let projects = tempfile::tempdir().unwrap();
+        let work_dir = Path::new("/w/repo/.worktrees/fix_things");
+        // claude's munge: every non-alphanumeric byte becomes '-'.
+        let munged = projects.path().join("-w-repo--worktrees-fix-things");
+        std::fs::create_dir_all(&munged).unwrap();
+
+        assert_eq!(
+            latest_claude_session_id(projects.path(), work_dir),
+            None,
+            "an empty project dir records no conversation"
+        );
+        assert_eq!(
+            latest_claude_session_id(projects.path(), Path::new("/elsewhere")),
+            None,
+            "a directory claude never saw records nothing"
+        );
+
+        std::fs::write(munged.join("older.jsonl"), "{}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(munged.join("newer.jsonl"), "{}").unwrap();
+        std::fs::write(munged.join("not-a-session.txt"), "").unwrap();
+        assert_eq!(
+            latest_claude_session_id(projects.path(), work_dir).as_deref(),
+            Some("newer")
+        );
     }
 
     #[test]
