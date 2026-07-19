@@ -959,8 +959,8 @@ function goTo(anchor: string) {
 <style scoped>
 /* Flatten MarkdownView's card into tight, left-aligned serif prose on the
    canvas — the transcript reads as printed dialogue, not stacked cards. The
-   document defaults (1.7 leading, 1em block gaps, deep list indents) are cut
-   for a printed page; a conversation reads denser, so they tighten here. */
+   denser chat rhythm (leading, block gaps, list indents) is the shared
+   `chat-prose` layer in markdown.css; only this surface's geometry lives here. */
 .acp-scroll :deep(div:has(> .markdown-body)) {
   background: transparent;
   overflow: visible;
@@ -969,29 +969,6 @@ function goTo(anchor: string) {
   max-width: 46rem;
   margin: 0;
   padding: 0.125rem 0;
-  line-height: 1.55;
-}
-.acp-scroll :deep(.markdown-body p),
-.acp-scroll :deep(.markdown-body blockquote),
-.acp-scroll :deep(.markdown-body ul),
-.acp-scroll :deep(.markdown-body ol),
-.acp-scroll :deep(.markdown-body dl),
-.acp-scroll :deep(.markdown-body table),
-.acp-scroll :deep(.markdown-body pre),
-.acp-scroll :deep(.markdown-body details) {
-  margin-bottom: 0.6em;
-}
-.acp-scroll :deep(.markdown-body h1),
-.acp-scroll :deep(.markdown-body h2),
-.acp-scroll :deep(.markdown-body h3),
-.acp-scroll :deep(.markdown-body h4),
-.acp-scroll :deep(.markdown-body h5),
-.acp-scroll :deep(.markdown-body h6) {
-  margin: 1em 0 0.4em;
-}
-.acp-scroll :deep(.markdown-body ul),
-.acp-scroll :deep(.markdown-body ol) {
-  padding-left: 1.5em;
 }
 
 /* Speaker block: a hairline rule + micro-caps label + mono time, serif beneath. */

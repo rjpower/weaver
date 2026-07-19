@@ -562,7 +562,7 @@ const groupHasError = (g: ToolGroup) => g.items.some((it) => it.result?.is_error
       <div
         ref="convScroll"
         data-testid="conversation"
-        class="conv-scroll min-h-0 flex-1 overflow-auto pb-6 pr-1"
+        class="conv-scroll chat-prose min-h-0 flex-1 overflow-auto pb-6 pr-1"
         @scroll.passive="onScroll"
       >
         <div ref="convBody" class="space-y-2">
@@ -812,7 +812,9 @@ const groupHasError = (g: ToolGroup) => g.items.some((it) => it.result?.is_error
 /* The shared MarkdownView wraps prose in a padded, centred surface card — right
    for a standalone document, too heavy for a chat line. Inside the conversation
    we flatten it to tight, left-aligned prose directly on the canvas so the agent's
-   replies read as conversation, not as a stack of cards. */
+   replies read as conversation, not as a stack of cards. The denser chat rhythm
+   (leading, block gaps, list indents) is the shared `chat-prose` layer in
+   markdown.css; only this surface's geometry lives here. */
 .conv-scroll :deep(div:has(> .markdown-body)) {
   background: transparent;
   overflow: visible;
@@ -821,29 +823,6 @@ const groupHasError = (g: ToolGroup) => g.items.some((it) => it.result?.is_error
   max-width: none;
   margin: 0;
   padding: 0.125rem 0;
-  line-height: 1.55;
-}
-.conv-scroll :deep(.markdown-body p),
-.conv-scroll :deep(.markdown-body blockquote),
-.conv-scroll :deep(.markdown-body ul),
-.conv-scroll :deep(.markdown-body ol),
-.conv-scroll :deep(.markdown-body dl),
-.conv-scroll :deep(.markdown-body table),
-.conv-scroll :deep(.markdown-body pre),
-.conv-scroll :deep(.markdown-body details) {
-  margin-bottom: 0.6em;
-}
-.conv-scroll :deep(.markdown-body h1),
-.conv-scroll :deep(.markdown-body h2),
-.conv-scroll :deep(.markdown-body h3),
-.conv-scroll :deep(.markdown-body h4),
-.conv-scroll :deep(.markdown-body h5),
-.conv-scroll :deep(.markdown-body h6) {
-  margin: 1em 0 0.4em;
-}
-.conv-scroll :deep(.markdown-body ul),
-.conv-scroll :deep(.markdown-body ol) {
-  padding-left: 1.5em;
 }
 
 /* The clickable header of any fold (context, thinking, a tool group). */
