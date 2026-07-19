@@ -136,6 +136,20 @@ async fn poll_chat(
     timeout: Duration,
     pred: impl Fn(&[Value]) -> bool,
 ) -> Value {
+    poll_chat_state(ts, id, timeout, |chat| {
+        let empty = vec![];
+        pred(chat["blocks"].as_array().unwrap_or(&empty))
+    })
+    .await
+}
+
+/// Poll `GET /chat` until `pred` accepts the whole snapshot.
+async fn poll_chat_state(
+    ts: &TestServer,
+    id: &str,
+    timeout: Duration,
+    pred: impl Fn(&Value) -> bool,
+) -> Value {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let chat = ts
@@ -143,9 +157,7 @@ async fn poll_chat(
             .get(&format!("/api/sessions/{id}/chat"))
             .await
             .unwrap();
-        let empty = vec![];
-        let blocks = chat["blocks"].as_array().unwrap_or(&empty);
-        if pred(blocks) {
+        if pred(&chat) {
             return chat;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -508,8 +520,8 @@ async fn prompt_queues_during_a_live_turn() {
     assert_eq!(first["queued"], false);
     assert_eq!(first["turn"], 0);
 
-    // Give the first turn a moment to be in flight, then send again.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The first 202 arrives after loom marks the turn live, so this send
+    // deterministically takes the unsupported-adapter queue path.
     let second = ts
         .client
         .post(
@@ -580,7 +592,8 @@ async fn prompt_steers_a_live_turn_when_advertised() {
     assert_eq!(first["queued"], false);
     assert_eq!(first["steered"], false);
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Relay writes are ordered: the fake marks the first prompt active before
+    // it receives this steering request.
     let second = ts
         .client
         .post(
@@ -647,7 +660,8 @@ async fn prompt_adopts_a_turn_started_by_steering() {
         )
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Relay writes are ordered, so the forced steering race is deterministic
+    // without a wall-clock delay.
     let second = ts
         .client
         .post(
@@ -660,8 +674,9 @@ async fn prompt_adopts_a_turn_started_by_steering() {
     assert_eq!(second["steered"], false);
     assert_eq!(second["turn"], 1);
 
-    let chat = poll_chat(&ts, "acp-steer-race", Duration::from_secs(10), |blocks| {
-        count_kind(blocks, "turn_end") == 2
+    let chat = poll_chat_state(&ts, "acp-steer-race", Duration::from_secs(10), |chat| {
+        chat["live_turn"].is_null()
+            && count_kind(chat["blocks"].as_array().unwrap(), "turn_end") == 2
     })
     .await;
     assert_eq!(chat["live_turn"], Value::Null);

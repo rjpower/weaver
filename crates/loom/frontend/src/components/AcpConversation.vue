@@ -727,7 +727,7 @@ function goTo(anchor: string) {
             >
               <header class="acp-rule">
                 <span class="acp-label text-accent">You</span>
-                <span v-if="row.steered" class="acp-queued" data-testid="acp-steered"
+                <span v-if="row.steered" class="acp-prompt-state" data-testid="acp-steered"
                   >steered turn {{ row.turn + 1 }}</span
                 >
                 <span class="acp-time">{{ row.time }}</span>
@@ -889,10 +889,13 @@ function goTo(anchor: string) {
           >
             <header class="acp-rule">
               <span class="acp-label text-accent">You</span>
-              <span v-if="o.state === 'queued'" class="acp-queued" data-testid="acp-queued"
+              <span v-if="o.state === 'queued'" class="acp-prompt-state" data-testid="acp-queued"
                 >queued for next turn</span
               >
-              <span v-else-if="o.state === 'steered'" class="acp-queued" data-testid="acp-steered"
+              <span
+                v-else-if="o.state === 'steered'"
+                class="acp-prompt-state"
+                data-testid="acp-steered"
                 >steering current turn</span
               >
             </header>
@@ -1073,7 +1076,7 @@ function goTo(anchor: string) {
   color: var(--faint);
   font-variant-numeric: tabular-nums;
 }
-.acp-queued {
+.acp-prompt-state {
   font-family: var(--font-mono);
   font-size: 0.6875rem;
   color: var(--attn);

@@ -422,10 +422,8 @@ pub fn prompt_params(session_id: &str, text: &str) -> Value {
 
 /// codex-acp `_session/steering` params carrying a single text block.
 pub fn steering_params(session_id: &str, text: &str) -> Value {
-    serde_json::json!({
-        "sessionId": session_id,
-        "prompt": [ { "type": "text", "text": text } ],
-    })
+    // The extension deliberately uses ACP's ordinary text-prompt shape.
+    prompt_params(session_id, text)
 }
 
 /// `session/cancel` notification params.

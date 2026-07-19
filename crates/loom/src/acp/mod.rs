@@ -1179,31 +1179,43 @@ impl Task {
                     self.begin_external_turn(pending).await;
                 }
             }
-            _ => self.fallback_prompt(pending).await,
+            (outcome, error) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    ?outcome,
+                    ?error,
+                    "steering failed; falling back to ordinary prompt handling"
+                );
+                self.fallback_prompt(pending).await;
+            }
         }
     }
 
     async fn fallback_prompt(&mut self, pending: PendingSteer) {
-        if self.turn_live {
-            let ack = session::append_pending_prompt(&self.db, &self.session_id, &pending.text)
-                .await
-                .map(|_| PromptAck {
-                    queued: true,
-                    steered: false,
-                    turn: Some(self.current_turn),
-                });
-            let _ = pending.reply.send(ack);
+        let ack = if self.turn_live {
+            self.queue_prompt(&pending.text).await
         } else {
-            let ack = self
-                .start_turn(pending.text, pending.by)
-                .await
-                .map(|_| PromptAck {
-                    queued: false,
-                    steered: false,
-                    turn: Some(self.current_turn),
-                });
-            let _ = pending.reply.send(ack);
-        }
+            self.start_prompt(pending.text, pending.by).await
+        };
+        let _ = pending.reply.send(ack);
+    }
+
+    async fn queue_prompt(&self, text: &str) -> Result<PromptAck> {
+        session::append_pending_prompt(&self.db, &self.session_id, text).await?;
+        Ok(PromptAck {
+            queued: true,
+            steered: false,
+            turn: Some(self.current_turn),
+        })
+    }
+
+    async fn start_prompt(&mut self, text: String, by: Option<String>) -> Result<PromptAck> {
+        self.start_turn(text, by).await?;
+        Ok(PromptAck {
+            queued: false,
+            steered: false,
+            turn: Some(self.current_turn),
+        })
     }
 
     async fn begin_external_turn(&mut self, pending: PendingSteer) {
@@ -1422,21 +1434,11 @@ impl Task {
                     } else {
                         // A failed queue write must surface — a 202 that silently
                         // dropped the prompt would be worse than an error.
-                        let ack = session::append_pending_prompt(&self.db, &self.session_id, &text)
-                            .await
-                            .map(|_| PromptAck {
-                                queued: true,
-                                steered: false,
-                                turn: Some(self.current_turn),
-                            });
+                        let ack = self.queue_prompt(&text).await;
                         let _ = reply.send(ack);
                     }
                 } else {
-                    let ack = self.start_turn(text, by).await.map(|_| PromptAck {
-                        queued: false,
-                        steered: false,
-                        turn: Some(self.current_turn),
-                    });
+                    let ack = self.start_prompt(text, by).await;
                     let _ = reply.send(ack);
                 }
             }
