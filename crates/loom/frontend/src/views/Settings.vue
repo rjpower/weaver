@@ -172,22 +172,22 @@ function defaultText(value: string): string {
   return value || '(empty)';
 }
 
-function agentsForGroup(group: AgentSettingGroup): AgentMetadata[] {
+function availableAgents(): AgentMetadata[] {
   return agents.value;
 }
 
 function selectedAgent(group: AgentSettingGroup): AgentMetadata | undefined {
   const keys = agentGroups[group];
   const kind = drafts.value[keys.agent];
-  return agentsForGroup(group).find((agent) => agent.kind === kind);
+  return availableAgents().find((agent) => agent.kind === kind);
 }
 
 function sanitizeAgentDraft(group: AgentSettingGroup) {
   const keys = agentGroups[group];
-  const availableAgents = agentsForGroup(group);
-  if (!availableAgents.length) return;
-  if (!availableAgents.some((agent) => agent.kind === drafts.value[keys.agent])) {
-    drafts.value[keys.agent] = availableAgents[0].kind;
+  const choices = availableAgents();
+  if (!choices.length) return;
+  if (!choices.some((agent) => agent.kind === drafts.value[keys.agent])) {
+    drafts.value[keys.agent] = choices[0].kind;
   }
   const agent = selectedAgent(group);
   if (!agent) return;
@@ -392,7 +392,7 @@ onMounted(load);
             :title="profile.title"
             :note="profile.note"
             :keys="agentGroups[profile.id]"
-            :agents="agentsForGroup(profile.id)"
+            :agents="availableAgents()"
             :agent-kind="drafts[agentGroups[profile.id].agent] ?? ''"
             :model="drafts[agentGroups[profile.id].model] ?? ''"
             :effort="drafts[agentGroups[profile.id].effort] ?? ''"
