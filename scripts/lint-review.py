@@ -60,6 +60,13 @@ INSTRUCTIONS = (
 # Markers of the *calling* Claude Code session. Stripped before exec so the
 # sub-agent runs as a fresh, isolated session on subscription auth — not nested
 # in our transcript, not billed via the metered API key.
+#
+# WEAVER_BRANCH is stripped for a different reason: the sub-agent still reads the
+# worktree's .claude/settings.local.json and fires weaver's lifecycle hooks. Left
+# in its env, $WEAVER_BRANCH would make each hook stamp an idle/working event on
+# the *parent* branch mid-review, corrupting the dashboard and `loom session wait`
+# signal. Stripping it makes `weaver hook` a no-op. (Mirrors the Rust STRIPPED_ENV
+# in crates/loom/src/agent.rs.)
 STRIPPED_ENV = (
     "ANTHROPIC_API_KEY",
     "CLAUDECODE",
@@ -67,6 +74,7 @@ STRIPPED_ENV = (
     "CLAUDE_CODE_EXECPATH",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_CODE_SSE_PORT",
+    "WEAVER_BRANCH",
 )
 
 # Catalog "Output format":  <path>:<line>: <code> (<confidence>) <message>
