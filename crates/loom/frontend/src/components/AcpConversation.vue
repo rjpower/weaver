@@ -35,6 +35,7 @@ import type {
   TurnEndPayload,
 } from '../types';
 import { canSend } from '../lib/sessionState';
+import { useFollowFoot } from '../lib/followFoot';
 import MarkdownView from './MarkdownView.vue';
 
 // The Conversation surface for an *ACP* session (`protocol='acp'`): typeset
@@ -82,8 +83,12 @@ const errorMsg = ref('');
 let loadSeq = 0;
 async function load({ preserve = false }: { preserve?: boolean } = {}) {
   const seq = ++loadSeq;
-  if (!preserve) state.value = 'loading';
-  const stick = preserve && nearBottom();
+  // A fresh load (mount / session switch) re-pins the view to the foot — a chat
+  // opens at its newest exchange; a preserved refresh keeps the reader's pin.
+  if (!preserve) {
+    state.value = 'loading';
+    pinned.value = true;
+  }
   try {
     const snap = await getSessionChat(id.value);
     if (seq !== loadSeq) return;
@@ -104,7 +109,7 @@ async function load({ preserve = false }: { preserve?: boolean } = {}) {
   }
   await nextTick();
   if (seq !== loadSeq) return;
-  if (stick || !preserve) scrollToBottom();
+  if (pinned.value) scrollToBottom();
   updateActive();
 }
 
@@ -160,8 +165,12 @@ function onTurn(ev: SseTurn) {
 let source: EventSource | null = null;
 function openStream() {
   source = new EventSource(`/api/sessions/${id.value}/chat/stream`);
-  source.addEventListener('block', (e) => onBlock(JSON.parse((e as MessageEvent).data) as ChatBlock));
-  source.addEventListener('delta', (e) => onDelta(JSON.parse((e as MessageEvent).data) as SseDelta));
+  source.addEventListener('block', (e) =>
+    onBlock(JSON.parse((e as MessageEvent).data) as ChatBlock),
+  );
+  source.addEventListener('delta', (e) =>
+    onDelta(JSON.parse((e as MessageEvent).data) as SseDelta),
+  );
   source.addEventListener('tool', (e) => onTool(JSON.parse((e as MessageEvent).data) as SseTool));
   source.addEventListener('turn', (e) => onTurn(JSON.parse((e as MessageEvent).data) as SseTurn));
 }
@@ -302,7 +311,12 @@ interface TocItem {
 }
 
 function firstLine(s: string): string {
-  return s.split('\n').map((l) => l.trim()).find(Boolean) ?? '';
+  return (
+    s
+      .split('\n')
+      .map((l) => l.trim())
+      .find(Boolean) ?? ''
+  );
 }
 function titleOf(text: string): string {
   const f = firstLine(text) || '(no text)';
@@ -393,7 +407,11 @@ const model = computed<{ rows: Row[]; toc: TocItem[] }>(() => {
         break;
       case 'mode_change':
         flushActivity();
-        rows.push({ type: 'mode', key: k, mode: (b.payload as { mode_id?: string }).mode_id ?? '' });
+        rows.push({
+          type: 'mode',
+          key: k,
+          mode: (b.payload as { mode_id?: string }).mode_id ?? '',
+        });
         break;
       case 'turn_end': {
         flushActivity();
@@ -420,11 +438,22 @@ const model = computed<{ rows: Row[]; toc: TocItem[] }>(() => {
   if (lt != null) {
     const thought = shadows.get(`${lt}:thought`);
     if (thought && thought.text) {
-      rows.push({ type: 'thought', key: `shadow-${lt}-thought`, text: thought.text, streaming: true });
+      rows.push({
+        type: 'thought',
+        key: `shadow-${lt}-thought`,
+        text: thought.text,
+        streaming: true,
+      });
     }
     const msg = shadows.get(`${lt}:agent_message`);
     if (msg && msg.text) {
-      rows.push({ type: 'agent', key: `shadow-${lt}-agent`, time: '', text: msg.text, streaming: true });
+      rows.push({
+        type: 'agent',
+        key: `shadow-${lt}-agent`,
+        time: '',
+        text: msg.text,
+        streaming: true,
+      });
     }
   }
 
@@ -434,7 +463,11 @@ const model = computed<{ rows: Row[]; toc: TocItem[] }>(() => {
 // The empty conversation, styled on purpose — a fresh session has no journal
 // yet, and a bare canvas reads as breakage.
 const isEmpty = computed(
-  () => state.value === 'ready' && !model.value.rows.length && !optimistic.value.length && !turnLive.value,
+  () =>
+    state.value === 'ready' &&
+    !model.value.rows.length &&
+    !optimistic.value.length &&
+    !turnLive.value,
 );
 
 // ── Live status line ─────────────────────────────────────────────────────────
@@ -456,11 +489,19 @@ const statusLabel = computed(() => {
 // ── Presentational helpers ───────────────────────────────────────────────────
 function toolGlyph(kind: string): string {
   return (
-    { edit: '✎', execute: '⌗', delete: '✕', move: '⇄', read: '❏', search: '⌕', fetch: '⤓', think: '✳' } as Record<
-      string,
-      string
-    >
-  )[kind] ?? '•';
+    (
+      {
+        edit: '✎',
+        execute: '⌗',
+        delete: '✕',
+        move: '⇄',
+        read: '❏',
+        search: '⌕',
+        fetch: '⤓',
+        think: '✳',
+      } as Record<string, string>
+    )[kind] ?? '•'
+  );
 }
 // The kind census on a collapsed group: `7 read · 2 search`, commonest first.
 function activityBreakdown(items: ActivityItem[]): string {
@@ -496,7 +537,11 @@ function planGlyph(status: string): string {
   return status === 'completed' ? '✓' : status === 'in_progress' ? '▸' : '○';
 }
 function planTone(status: string): string {
-  return status === 'completed' ? 'text-ok' : status === 'in_progress' ? 'text-agent' : 'text-faint';
+  return status === 'completed'
+    ? 'text-ok'
+    : status === 'in_progress'
+      ? 'text-agent'
+      : 'text-faint';
 }
 function isAllow(kind: string): boolean {
   return kind.startsWith('allow');
@@ -537,21 +582,17 @@ const elapsedLabel = computed(() => {
   return `${m}:${String(s).padStart(2, '0')}`;
 });
 
-// ── Jump-list scroll-spy ─────────────────────────────────────────────────────
+// ── Follow-the-foot scroll (lib/followFoot.ts): pinned-at-the-newest-exchange. ──
 const convScroll = ref<HTMLElement | null>(null);
+const convBody = ref<HTMLElement | null>(null);
+const { pinned, scrollToBottom, autoFollow, trackPin } = useFollowFoot(convScroll, convBody);
+function onScroll() {
+  trackPin();
+  updateActive();
+}
+
+// ── Jump-list scroll-spy ─────────────────────────────────────────────────────
 const activeAnchor = ref('');
-function nearBottom(): boolean {
-  const el = convScroll.value;
-  if (!el) return true;
-  return el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-}
-function scrollToBottom() {
-  const el = convScroll.value;
-  if (el) el.scrollTop = el.scrollHeight;
-}
-function autoFollow() {
-  if (nearBottom()) nextTick(scrollToBottom);
-}
 function updateActive() {
   const root = convScroll.value;
   if (!root) return;
@@ -586,179 +627,219 @@ function goTo(anchor: string) {
       <div
         ref="convScroll"
         data-testid="acp-conversation"
-        class="acp-scroll min-h-0 flex-1 overflow-auto pb-8 pr-1"
-        @scroll.passive="updateActive"
+        class="acp-scroll min-h-0 flex-1 overflow-auto pb-6 pr-1"
+        @scroll.passive="onScroll"
       >
-        <!-- A fresh session: say so, instead of a blank canvas. -->
-        <div v-if="isEmpty" class="acp-empty" data-testid="acp-empty">
-          <p class="acp-empty-lede">No conversation yet</p>
-          <p class="acp-empty-hint">
-            {{
-              composerVisible
-                ? 'The transcript appears when the agent takes its first turn — or start one with a message below.'
-                : 'The transcript appears when the agent takes its first turn.'
-            }}
-          </p>
-        </div>
-
-        <template v-for="row in model.rows" :key="row.key">
-          <!-- Turn rule — dashed hairline between turns. -->
-          <div
-            v-if="row.type === 'turnRule'"
-            class="acp-turn-rule"
-            :class="{ loud: row.loud }"
-            data-testid="acp-turn-rule"
-          >
-            <span
-              >turn {{ row.turn + 1 }} · {{ row.stop
-              }}<template v-if="row.ctx != null"> · {{ Math.round(row.ctx / 1000) }}k ctx</template></span
-            >
+        <div ref="convBody">
+          <!-- A fresh session: say so, instead of a blank canvas. -->
+          <div v-if="isEmpty" class="acp-empty" data-testid="acp-empty">
+            <p class="acp-empty-lede">No conversation yet</p>
+            <p class="acp-empty-hint">
+              {{
+                composerVisible
+                  ? 'The transcript appears when the agent takes its first turn — or start one with a message below.'
+                  : 'The transcript appears when the agent takes its first turn.'
+              }}
+            </p>
           </div>
 
-          <!-- YOU — the human turn. -->
+          <template v-for="row in model.rows" :key="row.key">
+            <!-- Turn rule — dashed hairline between turns. -->
+            <div
+              v-if="row.type === 'turnRule'"
+              class="acp-turn-rule"
+              :class="{ loud: row.loud }"
+              data-testid="acp-turn-rule"
+            >
+              <span
+                >turn {{ row.turn + 1 }} · {{ row.stop
+                }}<template v-if="row.ctx != null">
+                  · {{ Math.round(row.ctx / 1000) }}k ctx</template
+                ></span
+              >
+            </div>
+
+            <!-- YOU — the human turn. -->
+            <section
+              v-else-if="row.type === 'user'"
+              :id="row.anchor"
+              :data-anchor="row.anchor"
+              class="acp-speaker"
+            >
+              <header class="acp-rule">
+                <span class="acp-label text-accent">You</span>
+                <span class="acp-time">{{ row.time }}</span>
+              </header>
+              <MarkdownView :id="id" path="" :source="row.text" />
+            </section>
+
+            <!-- AGENT — the model's prose. -->
+            <section v-else-if="row.type === 'agent'" class="acp-speaker">
+              <header class="acp-rule">
+                <span class="acp-label">Agent</span>
+                <span v-if="row.time" class="acp-time">{{ row.time }}</span>
+              </header>
+              <MarkdownView :id="id" path="" :source="row.text" />
+            </section>
+
+            <!-- Thinking — streaming shows its live tail (the status line below
+                 names it); settled folds away. -->
+            <div v-else-if="row.type === 'thought'" class="acp-thought" data-testid="acp-thought">
+              <template v-if="row.streaming">
+                <div class="acp-thought-live-clip">
+                  <p class="acp-thought-body">{{ row.text }}</p>
+                </div>
+              </template>
+              <template v-else>
+                <button type="button" class="acp-fold-head" @click="toggleFold(row.key)">
+                  <span class="chev" :class="{ open: foldOpen(row.key) }">▸</span>
+                  <span>thinking</span>
+                </button>
+                <p v-if="foldOpen(row.key)" class="acp-thought-body">{{ row.text }}</p>
+              </template>
+            </div>
+
+            <!-- Apparatus: one folded activity line per run of tool calls. -->
+            <div
+              v-else-if="row.type === 'activity'"
+              class="acp-activity"
+              data-testid="acp-activity"
+            >
+              <button
+                type="button"
+                class="acp-fold-head"
+                data-testid="acp-activity-head"
+                @click="toggleFold(row.key, row.failures > 0)"
+              >
+                <span class="chev" :class="{ open: foldOpen(row.key, row.failures > 0) }">▸</span>
+                <span v-if="row.items.length === 1" class="acp-activity-solo">
+                  <span class="acp-tool-glyph">{{ toolGlyph(row.items[0].tool.tool_kind) }}</span>
+                  <span class="truncate">{{
+                    row.items[0].tool.title || row.items[0].tool.tool_kind
+                  }}</span>
+                </span>
+                <span v-else
+                  >{{ row.items.length }} steps — {{ activityBreakdown(row.items) }}</span
+                >
+                <span
+                  v-if="row.failures"
+                  class="acp-activity-failbadge"
+                  data-testid="acp-activity-failed"
+                  >{{ row.failures }} failed</span
+                >
+              </button>
+              <ul v-if="foldOpen(row.key, row.failures > 0)" class="acp-activity-list">
+                <li
+                  v-for="it in row.items"
+                  :key="it.tool.tool_call_id"
+                  data-testid="acp-activity-item"
+                >
+                  <button
+                    type="button"
+                    class="acp-activity-line"
+                    :disabled="!hasDetail(it.tool)"
+                    @click="toggleFold(`tool-${it.tool.tool_call_id}`, it.failed)"
+                  >
+                    <span class="acp-tool-glyph">{{ toolGlyph(it.tool.tool_kind) }}</span>
+                    <span class="truncate">{{ it.tool.title || it.tool.tool_kind }}</span>
+                    <span v-if="it.failed" class="acp-activity-status text-block">failed</span>
+                    <span
+                      v-else-if="hasDetail(it.tool)"
+                      class="chev sm"
+                      :class="{ open: foldOpen(`tool-${it.tool.tool_call_id}`, it.failed) }"
+                      >▸</span
+                    >
+                  </button>
+                  <div
+                    v-if="hasDetail(it.tool) && foldOpen(`tool-${it.tool.tool_call_id}`, it.failed)"
+                    class="acp-detail"
+                    data-testid="acp-detail"
+                  >
+                    <template v-for="(c, ci) in it.tool.content" :key="ci">
+                      <!-- A diff renders as real ±diff lines. -->
+                      <pre v-if="c.type === 'diff'" class="acp-diff" data-testid="acp-diff"><code
+                        v-for="(l, li) in diffLines(c)"
+                        :key="li"
+                        class="acp-diff-line"
+                        :class="l.sign === '-' ? 'acp-diff-del' : 'acp-diff-add'"
+                      >{{ l.sign }} {{ l.text }}
+  </code></pre>
+                      <!-- Text / command output on the recessed panel tone. -->
+                      <pre v-else-if="c.type === 'text' && c.text" class="acp-payload">{{
+                        c.text
+                      }}</pre>
+                    </template>
+                  </div>
+                </li>
+              </ul>
+            </div>
+
+            <!-- Permission — the one interactive block. -->
+            <div
+              v-else-if="row.type === 'permission'"
+              class="acp-perm"
+              data-testid="acp-permission"
+            >
+              <div class="acp-perm-label">Permission</div>
+              <p class="acp-perm-title">{{ row.perm.title }}</p>
+              <div
+                v-if="row.perm.outcome"
+                class="acp-perm-receipt"
+                data-testid="acp-permission-receipt"
+              >
+                {{ row.perm.outcome.option_id }} · {{ shortTime(row.perm.outcome.at) }}
+              </div>
+              <div v-else class="acp-perm-options">
+                <button
+                  v-for="opt in row.perm.options"
+                  :key="opt.option_id"
+                  type="button"
+                  :class="isAllow(opt.kind) ? 'btn-primary' : 'btn-secondary'"
+                  class="px-2.5 py-1 text-xs"
+                  :disabled="answering.has(row.perm.request_id)"
+                  data-testid="acp-permission-option"
+                  @click="answer(row.perm, opt.option_id)"
+                >
+                  {{ opt.name }}
+                </button>
+              </div>
+            </div>
+
+            <!-- Mode change — a quiet centred marker. -->
+            <div v-else-if="row.type === 'mode'" class="acp-mode-note">
+              mode → {{ modeLabel(row.mode) }}
+            </div>
+          </template>
+
+          <!-- Optimistic (in-flight / queued) user messages. -->
           <section
-            v-else-if="row.type === 'user'"
-            :id="row.anchor"
-            :data-anchor="row.anchor"
+            v-for="(o, i) in optimistic"
+            :key="`opt-${i}`"
             class="acp-speaker"
+            data-testid="acp-optimistic"
           >
             <header class="acp-rule">
               <span class="acp-label text-accent">You</span>
-              <span class="acp-time">{{ row.time }}</span>
+              <span v-if="o.queued" class="acp-queued" data-testid="acp-queued"
+                >queued for next turn</span
+              >
             </header>
-            <MarkdownView :id="id" path="" :source="row.text" />
+            <MarkdownView :id="id" path="" :source="o.text" />
           </section>
 
-          <!-- AGENT — the model's prose. -->
-          <section v-else-if="row.type === 'agent'" class="acp-speaker">
-            <header class="acp-rule">
-              <span class="acp-label">Agent</span>
-              <span v-if="row.time" class="acp-time">{{ row.time }}</span>
-            </header>
-            <MarkdownView :id="id" path="" :source="row.text" />
-          </section>
-
-          <!-- Thinking — streaming shows its live tail (the status line below
-               names it); settled folds away. -->
-          <div v-else-if="row.type === 'thought'" class="acp-thought" data-testid="acp-thought">
-            <template v-if="row.streaming">
-              <div class="acp-thought-live-clip">
-                <p class="acp-thought-body">{{ row.text }}</p>
-              </div>
-            </template>
-            <template v-else>
-              <button type="button" class="acp-fold-head" @click="toggleFold(row.key)">
-                <span class="chev" :class="{ open: foldOpen(row.key) }">▸</span>
-                <span>thinking</span>
-              </button>
-              <p v-if="foldOpen(row.key)" class="acp-thought-body">{{ row.text }}</p>
-            </template>
-          </div>
-
-          <!-- Apparatus: one folded activity line per run of tool calls. -->
-          <div v-else-if="row.type === 'activity'" class="acp-activity" data-testid="acp-activity">
-            <button
-              type="button"
-              class="acp-fold-head"
-              data-testid="acp-activity-head"
-              @click="toggleFold(row.key, row.failures > 0)"
-            >
-              <span class="chev" :class="{ open: foldOpen(row.key, row.failures > 0) }">▸</span>
-              <span v-if="row.items.length === 1" class="acp-activity-solo">
-                <span class="acp-tool-glyph">{{ toolGlyph(row.items[0].tool.tool_kind) }}</span>
-                <span class="truncate">{{ row.items[0].tool.title || row.items[0].tool.tool_kind }}</span>
-              </span>
-              <span v-else
-                >{{ row.items.length }} steps — {{ activityBreakdown(row.items) }}</span
-              >
-              <span v-if="row.failures" class="acp-activity-failbadge" data-testid="acp-activity-failed"
-                >{{ row.failures }} failed</span
-              >
-            </button>
-            <ul v-if="foldOpen(row.key, row.failures > 0)" class="acp-activity-list">
-              <li v-for="it in row.items" :key="it.tool.tool_call_id" data-testid="acp-activity-item">
-                <button
-                  type="button"
-                  class="acp-activity-line"
-                  :disabled="!hasDetail(it.tool)"
-                  @click="toggleFold(`tool-${it.tool.tool_call_id}`, it.failed)"
-                >
-                  <span class="acp-tool-glyph">{{ toolGlyph(it.tool.tool_kind) }}</span>
-                  <span class="truncate">{{ it.tool.title || it.tool.tool_kind }}</span>
-                  <span v-if="it.failed" class="acp-activity-status text-block">failed</span>
-                  <span v-else-if="hasDetail(it.tool)" class="chev sm" :class="{ open: foldOpen(`tool-${it.tool.tool_call_id}`, it.failed) }"
-                    >▸</span
-                  >
-                </button>
-                <div
-                  v-if="hasDetail(it.tool) && foldOpen(`tool-${it.tool.tool_call_id}`, it.failed)"
-                  class="acp-detail"
-                  data-testid="acp-detail"
-                >
-                  <template v-for="(c, ci) in it.tool.content" :key="ci">
-                    <!-- A diff renders as real ±diff lines. -->
-                    <pre v-if="c.type === 'diff'" class="acp-diff" data-testid="acp-diff"><code
-                      v-for="(l, li) in diffLines(c)"
-                      :key="li"
-                      class="acp-diff-line"
-                      :class="l.sign === '-' ? 'acp-diff-del' : 'acp-diff-add'"
-                    >{{ l.sign }} {{ l.text }}
-</code></pre>
-                    <!-- Text / command output on the recessed panel tone. -->
-                    <pre v-else-if="c.type === 'text' && c.text" class="acp-payload">{{ c.text }}</pre>
-                  </template>
-                </div>
-              </li>
-            </ul>
-          </div>
-
-          <!-- Permission — the one interactive block. -->
-          <div v-else-if="row.type === 'permission'" class="acp-perm" data-testid="acp-permission">
-            <div class="acp-perm-label">Permission</div>
-            <p class="acp-perm-title">{{ row.perm.title }}</p>
-            <div v-if="row.perm.outcome" class="acp-perm-receipt" data-testid="acp-permission-receipt">
-              {{ row.perm.outcome.option_id }} · {{ shortTime(row.perm.outcome.at) }}
-            </div>
-            <div v-else class="acp-perm-options">
-              <button
-                v-for="opt in row.perm.options"
-                :key="opt.option_id"
-                type="button"
-                :class="isAllow(opt.kind) ? 'btn-primary' : 'btn-secondary'"
-                class="px-2.5 py-1 text-xs"
-                :disabled="answering.has(row.perm.request_id)"
-                data-testid="acp-permission-option"
-                @click="answer(row.perm, opt.option_id)"
-              >
-                {{ opt.name }}
-              </button>
-            </div>
-          </div>
-
-          <!-- Mode change — a quiet centred marker. -->
-          <div v-else-if="row.type === 'mode'" class="acp-mode-note">mode → {{ modeLabel(row.mode) }}</div>
-        </template>
-
-        <!-- Optimistic (in-flight / queued) user messages. -->
-        <section
-          v-for="(o, i) in optimistic"
-          :key="`opt-${i}`"
-          class="acp-speaker"
-          data-testid="acp-optimistic"
-        >
-          <header class="acp-rule">
-            <span class="acp-label text-accent">You</span>
-            <span v-if="o.queued" class="acp-queued" data-testid="acp-queued">queued for next turn</span>
-          </header>
-          <MarkdownView :id="id" path="" :source="o.text" />
-        </section>
-
-        <!-- Live status — what the agent is doing right now, at the tail. -->
-        <div v-if="turnLive" class="acp-status" data-testid="acp-working" role="status" aria-live="polite">
-          <span class="acp-live-label">{{ statusLabel }}…</span>
-          <span class="acp-status-meta"
-            >turn {{ (liveTurnNo ?? 0) + 1 }} · {{ elapsedLabel }}</span
+          <!-- Live status — what the agent is doing right now, at the tail. -->
+          <div
+            v-if="turnLive"
+            class="acp-status"
+            data-testid="acp-working"
+            role="status"
+            aria-live="polite"
           >
+            <span class="acp-live-label">{{ statusLabel }}…</span>
+            <span class="acp-status-meta"
+              >turn {{ (liveTurnNo ?? 0) + 1 }} · {{ elapsedLabel }}</span
+            >
+          </div>
         </div>
       </div>
 
@@ -790,8 +871,12 @@ function goTo(anchor: string) {
           <p class="acp-rail-head">Plan</p>
           <ul class="space-y-1" data-testid="acp-plan">
             <li v-for="(e, i) in latestPlan" :key="i" class="acp-plan-item">
-              <span class="acp-plan-glyph" :class="planTone(e.status)">{{ planGlyph(e.status) }}</span>
-              <span :class="e.status === 'pending' ? 'text-faint' : 'text-muted'">{{ e.content }}</span>
+              <span class="acp-plan-glyph" :class="planTone(e.status)">{{
+                planGlyph(e.status)
+              }}</span>
+              <span :class="e.status === 'pending' ? 'text-faint' : 'text-muted'">{{
+                e.content
+              }}</span>
             </li>
           </ul>
         </template>
@@ -805,7 +890,9 @@ function goTo(anchor: string) {
       data-testid="acp-composer"
       @submit.prevent="submitPrompt"
     >
-      <p v-if="sendError" class="mb-1.5 text-xs text-block" data-testid="acp-composer-error">{{ sendError }}</p>
+      <p v-if="sendError" class="mb-1.5 text-xs text-block" data-testid="acp-composer-error">
+        {{ sendError }}
+      </p>
       <textarea
         v-model="draft"
         rows="2"
@@ -826,7 +913,8 @@ function goTo(anchor: string) {
               :disabled="!modeInteractive"
               @click.stop="modeOpen = !modeOpen"
             >
-              {{ modeLabel(currentMode) }}<span v-if="modeInteractive" class="acp-mode-caret">▾</span>
+              {{ modeLabel(currentMode)
+              }}<span v-if="modeInteractive" class="acp-mode-caret">▾</span>
             </button>
             <ul v-if="modeOpen" class="acp-mode-menu" data-testid="acp-mode-menu">
               <li v-for="m in modeOptions" :key="m">
@@ -870,7 +958,9 @@ function goTo(anchor: string) {
 
 <style scoped>
 /* Flatten MarkdownView's card into tight, left-aligned serif prose on the
-   canvas — the transcript reads as printed dialogue, not stacked cards. */
+   canvas — the transcript reads as printed dialogue, not stacked cards. The
+   denser chat rhythm (leading, block gaps, list indents) is the shared
+   `chat-prose` layer in markdown.css; only this surface's geometry lives here. */
 .acp-scroll :deep(div:has(> .markdown-body)) {
   background: transparent;
   overflow: visible;
@@ -884,7 +974,7 @@ function goTo(anchor: string) {
 /* Speaker block: a hairline rule + micro-caps label + mono time, serif beneath. */
 .acp-speaker {
   scroll-margin-top: 0.5rem;
-  margin-top: 1.5rem;
+  margin-top: 1rem;
 }
 .acp-speaker:first-child {
   margin-top: 0.25rem;
@@ -895,7 +985,7 @@ function goTo(anchor: string) {
   gap: 0.625rem;
   border-top: 1px solid var(--line);
   padding-top: 0.375rem;
-  margin-bottom: 0.5rem;
+  margin-bottom: 0.375rem;
 }
 .acp-label {
   font-family: var(--font-sans);
@@ -941,7 +1031,7 @@ function goTo(anchor: string) {
 /* Fold heads — one quiet mono voice for thinking + activity. */
 .acp-thought,
 .acp-activity {
-  margin-top: 0.625rem;
+  margin-top: 0.5rem;
   max-width: 46rem;
 }
 .acp-fold-head {
@@ -1139,7 +1229,7 @@ function goTo(anchor: string) {
   display: flex;
   align-items: center;
   justify-content: center;
-  margin: 1.5rem 0 0.25rem;
+  margin: 1rem 0 0.25rem;
   max-width: 46rem;
   border-top: 1px dashed var(--line);
   padding-top: 0.55rem;
@@ -1159,7 +1249,7 @@ function goTo(anchor: string) {
 /* Live status — the one animated element: a soft shimmer naming the agent's
    current activity while a turn runs. */
 .acp-status {
-  margin-top: 1rem;
+  margin-top: 0.75rem;
   display: flex;
   align-items: baseline;
   gap: 0.6rem;
@@ -1201,9 +1291,9 @@ function goTo(anchor: string) {
 
 /* Composer. */
 .acp-composer {
-  margin-top: 0.75rem;
+  margin-top: 0.5rem;
   border-top: 1px solid var(--line);
-  padding-top: 0.75rem;
+  padding-top: 0.625rem;
 }
 .acp-input {
   width: 100%;

@@ -173,6 +173,36 @@
   background: var(--surface);
 }
 
+/* Chat density — a conversation surface (`chat-prose` on its scroll root)
+   reads denser than a document page: tighter leading, smaller block gaps,
+   shallower list indents. The printed-page defaults above stay untouched for
+   the document surfaces (artifacts, previews, goals). */
+.chat-prose .markdown-body {
+  line-height: 1.55;
+}
+.chat-prose .markdown-body p,
+.chat-prose .markdown-body blockquote,
+.chat-prose .markdown-body ul,
+.chat-prose .markdown-body ol,
+.chat-prose .markdown-body dl,
+.chat-prose .markdown-body table,
+.chat-prose .markdown-body pre,
+.chat-prose .markdown-body details {
+  margin-bottom: 0.6em;
+}
+.chat-prose .markdown-body h1,
+.chat-prose .markdown-body h2,
+.chat-prose .markdown-body h3,
+.chat-prose .markdown-body h4,
+.chat-prose .markdown-body h5,
+.chat-prose .markdown-body h6 {
+  margin: 1em 0 0.4em;
+}
+.chat-prose .markdown-body ul,
+.chat-prose .markdown-body ol {
+  padding-left: 1.5em;
+}
+
 /* Heading anchors injected by markdown-it-anchor. */
 .markdown-body .header-anchor {
   color: var(--faint);
