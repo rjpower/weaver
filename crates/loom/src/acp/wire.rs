@@ -441,18 +441,19 @@ pub fn load_session_params(session_id: &str, cwd: &str) -> Value {
     serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] })
 }
 
-/// `session/prompt` params carrying a single text block.
-pub fn prompt_params(session_id: &str, text: &str) -> Value {
+/// `session/prompt` params carrying text plus validated resource-link blocks.
+pub fn prompt_params(session_id: &str, text: &str, resources: &[Value]) -> Value {
+    let mut prompt = vec![serde_json::json!({ "type": "text", "text": text })];
+    prompt.extend(resources.iter().cloned());
     serde_json::json!({
         "sessionId": session_id,
-        "prompt": [ { "type": "text", "text": text } ],
+        "prompt": prompt,
     })
 }
 
-/// codex-acp `_session/steering` params carrying a single text block.
-pub fn steering_params(session_id: &str, text: &str) -> Value {
-    // The extension deliberately uses ACP's ordinary text-prompt shape.
-    prompt_params(session_id, text)
+/// codex-acp `_session/steering` params using ACP's ordinary prompt shape.
+pub fn steering_params(session_id: &str, text: &str, resources: &[Value]) -> Value {
+    prompt_params(session_id, text, resources)
 }
 
 /// `session/cancel` notification params.
@@ -742,12 +743,21 @@ mod tests {
         let steer = request_line(
             2,
             method::SESSION_STEERING,
-            steering_params("sess-1", "pivot"),
+            steering_params("sess-1", "pivot", &[]),
         );
         let v: Value = serde_json::from_slice(&steer[..steer.len() - 1]).unwrap();
         assert_eq!(v["method"], "_session/steering");
         assert_eq!(v["params"]["sessionId"], "sess-1");
         assert_eq!(v["params"]["prompt"][0]["text"], "pivot");
+
+        let resource = json!({
+            "type": "resource_link",
+            "name": "src/main.rs",
+            "uri": "file:///repo/src/main.rs",
+        });
+        let params = prompt_params("sess-1", "review this", &[resource]);
+        assert_eq!(params["prompt"][1]["type"], "resource_link");
+        assert_eq!(params["prompt"][1]["name"], "src/main.rs");
 
         let resp = response_line(&json!(7), permission_selected("allow-once"));
         let v: Value = serde_json::from_slice(&resp[..resp.len() - 1]).unwrap();

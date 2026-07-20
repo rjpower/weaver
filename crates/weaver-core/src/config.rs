@@ -16,11 +16,6 @@ use crate::db::{now_iso, Db};
 pub const DEFAULT_AGENT: &str = "claude";
 pub const DEFAULT_AGENT_MODEL: &str = "";
 pub const DEFAULT_AGENT_EFFORT: &str = "";
-/// The agent that backs the fleet Chat concierge when `concierge.runtime` is
-/// unset. Claude is the default because only it fires weaver's lifecycle hooks.
-pub const DEFAULT_CONCIERGE_RUNTIME: &str = "claude";
-pub const DEFAULT_CONCIERGE_MODEL: &str = "";
-pub const DEFAULT_CONCIERGE_EFFORT: &str = "";
 /// Whether the server adopts orphaned sessions on startup. Off by default:
 /// the operator opts in via `weaver config set server.auto_adopt true`.
 pub const DEFAULT_AUTO_ADOPT: bool = false;
@@ -138,40 +133,6 @@ pub const REGISTRY: &[SettingSpec] = &[
             requests do not specify one.",
         kind: SettingKind::String,
         default: DEFAULT_AGENT_EFFORT,
-        group: "Agents",
-        options: &[],
-    },
-    SettingSpec {
-        key: "concierge.runtime",
-        label: "Concierge agent",
-        description: "Which agent backs the fleet Chat concierge. `claude` runs \
-            the Claude Code TUI with full weaver status hooks. `codex` runs Codex: \
-            its conversation still renders in the Chat view, but Codex does not \
-            fire weaver's lifecycle hooks, so the concierge shows no live \
-            working/idle status and the Chat view won't auto-refresh on each \
-            reply (use the Refresh button).",
-        kind: SettingKind::String,
-        default: DEFAULT_CONCIERGE_RUNTIME,
-        group: "Agents",
-        options: &[],
-    },
-    SettingSpec {
-        key: "concierge.model",
-        label: "Concierge model",
-        description: "Model selector used when Chat starts or resets the fleet \
-            concierge.",
-        kind: SettingKind::String,
-        default: DEFAULT_CONCIERGE_MODEL,
-        group: "Agents",
-        options: &[],
-    },
-    SettingSpec {
-        key: "concierge.effort",
-        label: "Concierge effort",
-        description: "Reasoning effort used when Chat starts or resets the \
-            fleet concierge.",
-        kind: SettingKind::String,
-        default: DEFAULT_CONCIERGE_EFFORT,
         group: "Agents",
         options: &[],
     },

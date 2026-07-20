@@ -44,6 +44,8 @@ export interface Branch {
    *  polling is off, there's no PR, or `gh` is unavailable. Maintained
    *  server-side by loom's poll loop. */
   github: GithubStatus | null;
+  /** Explicit PR override. null means automatic current-open-PR discovery. */
+  github_pr: number | null;
 }
 
 /** A point-in-time GitHub snapshot of a branch's pull request: its link plus
@@ -87,8 +89,8 @@ export interface Session {
    *  renders at the top level. Stamped on the session row at launch. */
   parent_id: string | null;
   /** The principal (username) that launched this session — attribution for the
-   *  shared team board. null for engine-created sessions (the concierge, warm
-   *  watch sessions) and rows predating the column. A tracking/UX field, not
+   *  shared team board. null for engine-created warm watch sessions and rows
+   *  predating the column. A tracking/UX field, not
    *  a security boundary: the fleet stays co-owned by everyone authenticated. */
   created_by: string | null;
   /** The tracking issue opened for this session's task at launch (the handle
@@ -162,6 +164,7 @@ export interface ChatBlock {
 export interface ChatSnapshot {
   blocks: ChatBlock[];
   live_turn: number | null;
+  pending_prompt: string | null;
   metadata: AcpMetadata;
 }
 
@@ -324,7 +327,6 @@ export interface AgentMetadata {
   efforts: AgentChoice[];
   accepts_raw_model: boolean;
   supports_hooks: boolean;
-  supports_concierge: boolean;
   /** True for the builtin `claude`/`codex`; false for an operator-defined custom
    *  agent (which the UI may edit or delete). */
   builtin: boolean;

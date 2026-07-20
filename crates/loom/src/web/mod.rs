@@ -266,7 +266,10 @@ pub(crate) async fn branch_view(db: &Db, branch: &Branch) -> ApiResult<BranchVie
         .unwrap_or(0);
     // Best-effort: a missing/erroring snapshot just renders as no GitHub info.
     let github = github::get_status(db, &branch.id).await.ok().flatten();
-    Ok(BranchView::from_parts(branch, &tags, open, github))
+    let github_pr = github::get_mapping(db, &branch.id).await.ok().flatten();
+    Ok(BranchView::from_parts(
+        branch, &tags, open, github, github_pr,
+    ))
 }
 
 /// Build a [`SessionView`] for a session + its branch. `tracking_issue` is left
@@ -444,27 +447,32 @@ async fn api_etag_middleware(request: Request<axum::body::Body>, next: Next) -> 
 /// - Content-hashed assets (filename contains an 8-hex-char segment, e.g.
 ///   `app.a1b2c3d4.js`) get `max-age=31536000, immutable` — the hash guarantees
 ///   the content never changes for that URL.
-/// - Everything else (`index.html`, fonts, etc.) gets `no-cache` so browsers
-///   always revalidate; `ServeDir` provides `ETag`/`Last-Modified` for fast 304s.
+/// - Everything else (`index.html`, icons, etc.) gets `no-store`. In particular,
+///   the SPA shell must never 304 against a rapid rebuild and keep pointing at
+///   an obsolete JS/CSS hash.
 async fn static_cache_middleware(request: Request<axum::body::Body>, next: Next) -> Response {
     let path = request.uri().path().to_owned();
     let response = next.run(request).await;
 
-    if response.status() != StatusCode::OK {
+    // API responses have their own ETag/no-cache policy. This layer is mounted
+    // on the whole application router, so leave that policy intact.
+    if path == "/api"
+        || path.starts_with("/api/")
+        || !matches!(response.status(), StatusCode::OK | StatusCode::NOT_MODIFIED)
+    {
         return response;
     }
 
     let cache_control = if is_immutable_asset(&path) {
         "max-age=31536000, immutable"
     } else {
-        "no-cache"
+        "no-store, max-age=0"
     };
 
     let (mut parts, body) = response.into_parts();
     parts
         .headers
-        .entry(header::CACHE_CONTROL)
-        .or_insert_with(|| cache_control.parse().unwrap());
+        .insert(header::CACHE_CONTROL, cache_control.parse().unwrap());
     Response::from_parts(parts, body)
 }
 
@@ -527,8 +535,6 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         // Sessions
         .route("/sessions", get(list_sessions).post(create_session))
-        .route("/chat", get(get_chat))
-        .route("/chat/reset", post(reset_chat))
         .route(
             "/sessions/{id}",
             get(get_session).patch(patch_session).delete(delete_session),
@@ -539,7 +545,12 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/adopt", post(adopt_session))
         .route("/sessions/{id}/handoff", post(handoff_session))
         .route("/sessions/{id}/recover", post(recover_session))
-        .route("/sessions/{id}/github", post(refresh_github_session))
+        .route(
+            "/sessions/{id}/github",
+            post(refresh_github_session)
+                .put(set_github_session)
+                .delete(clear_github_session),
+        )
         .route("/sessions/{id}/raw", get(raw_session))
         // Embedded VS Code (code-server), reverse-proxied per session. `ide-info`
         // is the UI's availability probe; the `ide`/`ide/`/`ide/*` routes serve
@@ -582,6 +593,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/sessions/{id}/log", get(log_session))
         .route("/sessions/{id}/conversation", get(conversation_session))
+        .route("/sessions/{id}/files", get(list_session_files))
         .route("/sessions/{id}/events", get(events_sse))
         .route("/sessions/{id}/terminal", get(crate::terminal::terminal_ws))
         // Per-session worktree debug shells: `shells` lists the live ones (so the

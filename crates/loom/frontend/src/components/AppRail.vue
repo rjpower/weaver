@@ -42,17 +42,6 @@ const MAIN: RailItem[] = [
     paths: ['M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Z', 'M12 11a1 1 0 1 0 0 2 1 1 0 0 0 0-2Z'],
   },
   {
-    to: '/chat',
-    label: 'Chat',
-    title: 'Chat — ask the concierge about your fleet and steer it',
-    match: (p) => p.startsWith('/chat'),
-    // messages-square — a conversation about the looms.
-    paths: [
-      'M14 9a2 2 0 0 1-2 2H6l-4 4V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2Z',
-      'M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1',
-    ],
-  },
-  {
     to: '/watches',
     label: 'Watch',
     title: 'Watches — watch agents over the fleet',

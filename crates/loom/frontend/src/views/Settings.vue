@@ -25,19 +25,16 @@ type Category =
   | 'agents'
   | 'sessions'
   | 'github'
-  | 'authentication'
   | 'watches'
-  | 'editor'
-  | 'appearance'
-  | 'env'
-  | 'tokens'
-  | 'account'
-  | 'logs';
+  | 'workspace'
+  | 'environment'
+  | 'access'
+  | 'diagnostics';
 
 interface CategoryItem {
   id: Category;
   label: string;
-  group?: string;
+  groups?: string[];
   summary: string;
 }
 
@@ -45,95 +42,54 @@ const categories: CategoryItem[] = [
   {
     id: 'agents',
     label: 'Agents',
-    group: 'Agents',
-    summary: 'Default runtime profiles for new work sessions and the fleet concierge.',
+    groups: ['Agents'],
+    summary: 'Default runtime profiles and custom agents for new work sessions.',
   },
   {
     id: 'sessions',
     label: 'Sessions',
-    group: 'Sessions',
-    summary: 'Launch-time behavior, setup budgets, and archived conversation logs.',
+    groups: ['Server', 'Sessions'],
+    summary: 'Server recovery, launch-time behavior, setup budgets, and conversation logs.',
   },
   {
     id: 'github',
     label: 'GitHub',
-    group: 'GitHub',
+    groups: ['GitHub'],
     summary: 'Pull request polling, merge archiving, and issue-comment launch triggers.',
-  },
-  {
-    id: 'authentication',
-    label: 'Authentication',
-    group: 'Authentication',
-    summary: 'Browser and API authentication behavior for this loom server.',
   },
   {
     id: 'watches',
     label: 'Watches',
-    group: 'Watch',
+    groups: ['Watch'],
     summary: 'Fleet watcher defaults and engine-level safety controls.',
   },
   {
-    id: 'editor',
-    label: 'Editor',
-    group: 'Editor',
-    summary: 'Embedded code-server availability and lifecycle.',
+    id: 'workspace',
+    label: 'Workspace',
+    groups: ['Editor'],
+    summary: 'Embedded editor behavior plus terminal appearance and typography.',
   },
   {
-    id: 'appearance',
-    label: 'Appearance',
-    group: 'Appearance',
-    summary: 'Theme, font, and size for the in-browser terminal, with a live preview.',
-  },
-  {
-    id: 'env',
+    id: 'environment',
     label: 'Environment',
     summary: 'Environment variables exported into future agent sessions.',
   },
   {
-    id: 'tokens',
-    label: 'Tokens',
-    summary: 'Bearer tokens for automation and remote CLIs.',
+    id: 'access',
+    label: 'Access',
+    groups: ['Authentication'],
+    summary: 'Identity, approved users, browser authentication, GitHub App, and API tokens.',
   },
   {
-    id: 'account',
-    label: 'Account',
-    summary: 'Signed-in identity, approved users, and GitHub App configuration.',
-  },
-  {
-    id: 'logs',
-    label: 'Debug',
+    id: 'diagnostics',
+    label: 'Diagnostics',
     summary:
       'Background tasks, live server logs, and build status for debugging this loom deployment.',
   },
 ];
 
-type AgentSettingGroup = 'session' | 'concierge';
-
-const agentGroups: Record<AgentSettingGroup, { agent: string; model: string; effort: string }> = {
-  session: { agent: 'agent.default', model: 'agent.model', effort: 'agent.effort' },
-  concierge: {
-    agent: 'concierge.runtime',
-    model: 'concierge.model',
-    effort: 'concierge.effort',
-  },
-};
-
-const agentProfiles: {
-  id: AgentSettingGroup;
-  title: string;
-  note: string;
-}[] = [
-  {
-    id: 'session',
-    title: 'Session default runtime',
-    note: 'Used when a new work session does not specify an agent.',
-  },
-  {
-    id: 'concierge',
-    title: 'Fleet concierge runtime',
-    note: 'Used by Chat when it starts or resets the fleet concierge.',
-  },
-];
+const agentKeys = { agent: 'agent.default', model: 'agent.model', effort: 'agent.effort' };
+const agentProfileTitle = 'Session default runtime';
 
 function categoryFromQuery(q: unknown): Category {
   return categories.some((item) => item.id === q) ? (q as Category) : 'agents';
@@ -175,9 +131,10 @@ const groupedSettings = computed(() => {
 });
 
 const currentSettings = computed(() => {
-  const group = currentCategory.value.group;
-  if (!group || group === 'Agents') return [];
-  return groupedSettings.value.get(group) ?? [];
+  const groups = currentCategory.value.groups ?? [];
+  return groups
+    .flatMap((group) => groupedSettings.value.get(group) ?? [])
+    .sort((a, b) => a.label.localeCompare(b.label));
 });
 
 function setting(key: string): SettingView | undefined {
@@ -200,45 +157,36 @@ function defaultText(value: string): string {
   return value || '(empty)';
 }
 
-function agentsForGroup(group: AgentSettingGroup): AgentMetadata[] {
-  return group === 'concierge'
-    ? agents.value.filter((agent) => agent.supports_concierge)
-    : agents.value;
+function availableAgents(): AgentMetadata[] {
+  return agents.value;
 }
 
-function selectedAgent(group: AgentSettingGroup): AgentMetadata | undefined {
-  const keys = agentGroups[group];
-  const kind = drafts.value[keys.agent];
-  return agentsForGroup(group).find((agent) => agent.kind === kind);
+function selectedAgent(): AgentMetadata | undefined {
+  const kind = drafts.value[agentKeys.agent];
+  return availableAgents().find((agent) => agent.kind === kind);
 }
 
-function sanitizeAgentDraft(group: AgentSettingGroup) {
-  const keys = agentGroups[group];
-  const availableAgents = agentsForGroup(group);
-  if (!availableAgents.length) return;
-  if (!availableAgents.some((agent) => agent.kind === drafts.value[keys.agent])) {
-    drafts.value[keys.agent] = availableAgents[0].kind;
+function sanitizeAgentDraft() {
+  const choices = availableAgents();
+  if (!choices.length) return;
+  if (!choices.some((agent) => agent.kind === drafts.value[agentKeys.agent])) {
+    drafts.value[agentKeys.agent] = choices[0].kind;
   }
-  const agent = selectedAgent(group);
+  const agent = selectedAgent();
   if (!agent) return;
   if (
-    drafts.value[keys.model] &&
+    drafts.value[agentKeys.model] &&
     !agent.accepts_raw_model &&
-    !agent.models.some((choice) => choice.id === drafts.value[keys.model])
+    !agent.models.some((choice) => choice.id === drafts.value[agentKeys.model])
   ) {
-    drafts.value[keys.model] = '';
+    drafts.value[agentKeys.model] = '';
   }
   if (
-    drafts.value[keys.effort] &&
-    !agent.efforts.some((choice) => choice.id === drafts.value[keys.effort])
+    drafts.value[agentKeys.effort] &&
+    !agent.efforts.some((choice) => choice.id === drafts.value[agentKeys.effort])
   ) {
-    drafts.value[keys.effort] = '';
+    drafts.value[agentKeys.effort] = '';
   }
-}
-
-function sanitizeAgentDrafts() {
-  sanitizeAgentDraft('session');
-  sanitizeAgentDraft('concierge');
 }
 
 async function load() {
@@ -254,7 +202,7 @@ async function load() {
     agents.value = agentRes.agents;
     customAgents.value = agentRes.custom;
     drafts.value = Object.fromEntries(res.settings.map((s) => [s.key, s.value]));
-    sanitizeAgentDrafts();
+    sanitizeAgentDraft();
     error.value = '';
   } catch (e) {
     settings.value = [];
@@ -270,7 +218,7 @@ async function reloadAgents() {
     const res = await listAgents();
     agents.value = res.agents;
     customAgents.value = res.custom;
-    sanitizeAgentDrafts();
+    sanitizeAgentDraft();
   } catch (e) {
     error.value = (e as Error).message;
   }
@@ -295,7 +243,7 @@ function adopt(res: SettingsEnvelope, changedKeys: string[]) {
     const changed = res.settings.find((s) => s.key === changedKey);
     if (changed) drafts.value[changedKey] = changed.value;
   }
-  sanitizeAgentDrafts();
+  sanitizeAgentDraft();
 }
 
 function patchBody(keys: string[], reset = false): Record<string, string | null> {
@@ -323,22 +271,22 @@ async function resetKeys(keys: string[], label: string) {
 const saveSetting = (s: SettingView) => saveKeys([s.key], s.label);
 const resetSetting = (s: SettingView) => resetKeys([s.key], s.label);
 
-function profileKeys(group: AgentSettingGroup): string[] {
-  return Object.values(agentGroups[group]);
+function profileKeys(): string[] {
+  return Object.values(agentKeys);
 }
 
-function setAgent(group: AgentSettingGroup, kind: string) {
-  drafts.value[agentGroups[group].agent] = kind;
-  sanitizeAgentDraft(group);
+function setAgent(kind: string) {
+  drafts.value[agentKeys.agent] = kind;
+  sanitizeAgentDraft();
 }
 
-function setProfileChoice(group: AgentSettingGroup, key: 'model' | 'effort', value: string) {
-  drafts.value[agentGroups[group][key]] = value;
-  sanitizeAgentDraft(group);
+function setProfileChoice(key: 'model' | 'effort', value: string) {
+  drafts.value[agentKeys[key]] = value;
+  sanitizeAgentDraft();
 }
 
-function profileIsDefault(group: AgentSettingGroup): boolean {
-  return profileKeys(group).every((key) => setting(key)?.is_default);
+function profileIsDefault(): boolean {
+  return profileKeys().every((key) => setting(key)?.is_default);
 }
 
 function durationOptions(s: SettingView): { label: string; value: string }[] {
@@ -359,10 +307,7 @@ function durationOptions(s: SettingView): { label: string; value: string }[] {
   ];
 }
 
-watch(
-  () => [drafts.value['agent.default'], drafts.value['concierge.runtime'], agents.value.length],
-  sanitizeAgentDrafts,
-);
+watch(() => [drafts.value['agent.default'], agents.value.length], sanitizeAgentDraft);
 
 onMounted(load);
 </script>
@@ -383,13 +328,11 @@ onMounted(load);
             :key="item.id"
             type="button"
             :data-testid="
-              item.id === 'env'
+              item.id === 'environment'
                 ? 'settings-tab-env'
-                : item.id === 'tokens'
-                  ? 'settings-tab-tokens'
-                  : item.id === 'account'
-                    ? 'settings-tab-account'
-                    : `settings-category-${item.id}`
+                : item.id === 'access'
+                  ? 'settings-tab-access'
+                  : `settings-category-${item.id}`
             "
             class="flex w-full items-center gap-2 border-b border-line border-l-2 px-3 py-2 text-left text-sm last:border-b-0"
             :class="
@@ -409,46 +352,48 @@ onMounted(load);
           <div class="flex items-center gap-2">
             <h2 class="text-base font-semibold tracking-tight">{{ currentCategory.label }}</h2>
             <span
-              v-if="currentCategory.group"
+              v-if="currentCategory.groups?.length"
               class="rounded bg-input px-1.5 py-0.5 font-mono text-2xs text-faint"
             >
-              {{ currentCategory.group }}
+              {{ currentCategory.groups?.join(' + ') }}
             </span>
           </div>
           <p class="mt-0.5 text-xs text-muted">{{ currentCategory.summary }}</p>
         </header>
 
-        <EnvPanel v-if="category === 'env'" />
-        <TokensPanel v-else-if="category === 'tokens'" />
-        <AccountPanel v-else-if="category === 'account'" />
-        <LogsPanel v-else-if="category === 'logs'" />
-        <AppearancePanel v-else-if="category === 'appearance'" />
+        <EnvPanel v-if="category === 'environment'" />
+        <LogsPanel v-else-if="category === 'diagnostics'" />
 
         <div v-else-if="category === 'agents'" class="space-y-4">
           <AgentProfileEditor
-            v-for="profile in agentProfiles"
-            :key="profile.id"
-            :title="profile.title"
-            :note="profile.note"
-            :keys="agentGroups[profile.id]"
-            :agents="agentsForGroup(profile.id)"
-            :agent-kind="drafts[agentGroups[profile.id].agent] ?? ''"
-            :model="drafts[agentGroups[profile.id].model] ?? ''"
-            :effort="drafts[agentGroups[profile.id].effort] ?? ''"
-            :dirty="dirtyKeys(profileKeys(profile.id)).length > 0"
-            :is-default="profileIsDefault(profile.id)"
-            :busy="busy === profile.title"
-            @update-agent="(kind) => setAgent(profile.id, kind)"
-            @update-model="(value) => setProfileChoice(profile.id, 'model', value)"
-            @update-effort="(value) => setProfileChoice(profile.id, 'effort', value)"
-            @save="saveKeys(profileKeys(profile.id), profile.title)"
-            @reset="resetKeys(profileKeys(profile.id), profile.title)"
+            :title="agentProfileTitle"
+            note="Used when a new work session does not specify an agent."
+            :keys="agentKeys"
+            :agents="availableAgents()"
+            :agent-kind="drafts[agentKeys.agent] ?? ''"
+            :model="drafts[agentKeys.model] ?? ''"
+            :effort="drafts[agentKeys.effort] ?? ''"
+            :dirty="dirtyKeys(profileKeys()).length > 0"
+            :is-default="profileIsDefault()"
+            :busy="busy === agentProfileTitle"
+            @update-agent="setAgent"
+            @update-model="(value) => setProfileChoice('model', value)"
+            @update-effort="(value) => setProfileChoice('effort', value)"
+            @save="saveKeys(profileKeys(), agentProfileTitle)"
+            @reset="resetKeys(profileKeys(), agentProfileTitle)"
           />
           <CustomAgentsPanel :agents="customAgents" @reload="reloadAgents" />
         </div>
 
         <div v-else class="space-y-3">
-          <section class="overflow-hidden rounded-md border border-line bg-surface">
+          <AccountPanel v-if="category === 'access'" />
+          <TokensPanel v-if="category === 'access'" />
+          <AppearancePanel v-if="category === 'workspace'" />
+
+          <section
+            v-if="currentSettings.length"
+            class="overflow-hidden rounded-md border border-line bg-surface"
+          >
             <SettingFieldRow
               v-for="s in currentSettings"
               :key="s.key"
@@ -517,7 +462,14 @@ onMounted(load);
             </SettingFieldRow>
           </section>
 
-          <p v-if="!currentSettings.length && !error" class="text-sm text-muted">Loading…</p>
+          <p
+            v-if="
+              !currentSettings.length && !error && category !== 'access' && category !== 'workspace'
+            "
+            class="text-sm text-muted"
+          >
+            Loading…
+          </p>
         </div>
       </main>
     </div>

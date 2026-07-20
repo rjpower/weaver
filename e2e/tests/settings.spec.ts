@@ -11,9 +11,6 @@ test.describe('settings · agent defaults', () => {
     const session = page.locator('section').filter({
       has: page.getByRole('heading', { name: 'Session default runtime' }),
     });
-    const concierge = page.locator('section').filter({
-      has: page.getByRole('heading', { name: 'Fleet concierge runtime' }),
-    });
 
     await expect(session.getByRole('radio', { name: /Claude/ })).toBeVisible();
     await expect(session.getByRole('radio', { name: /Codex/ })).toBeVisible();
@@ -35,16 +32,18 @@ test.describe('settings · agent defaults', () => {
     await expect(session.getByRole('button', { name: 'Fable' })).toBeVisible();
     await expect(session.getByRole('button', { name: 'Max' })).toBeVisible();
 
-    await expect(concierge.getByRole('radio', { name: /Claude/ })).toBeVisible();
-    await expect(concierge.getByRole('radio', { name: /Codex/ })).toBeVisible();
-    await expect(concierge.getByRole('radio', { name: /Shell/ })).toHaveCount(0);
+    await expect(page.getByText('Fleet concierge runtime', { exact: true })).toHaveCount(0);
+  });
 
-    await concierge.getByRole('radio', { name: /Codex/ }).click();
-    for (const model of codex.models) {
-      await expect(concierge.getByRole('button', { name: model.label, exact: true })).toBeVisible();
-    }
-    for (const effort of codex.efforts) {
-      await expect(concierge.getByRole('button', { name: effort.label, exact: true })).toBeVisible();
-    }
+  test('overlapping settings are consolidated into workspace and access', async ({ page, weaver }) => {
+    await page.goto(`${weaver.baseUrl}/settings`);
+    await expect(page.getByRole('button', { name: 'Workspace', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Access', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Editor', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Appearance', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Authentication', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Tokens', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Account', exact: true })).toHaveCount(0);
+    await expect(page.locator('[data-rail="chat"]')).toHaveCount(0);
   });
 });

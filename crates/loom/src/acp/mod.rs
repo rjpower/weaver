@@ -163,14 +163,36 @@ impl AcpHandle {
     /// Send a user message: dispatched as a `session/prompt` when idle, steered
     /// into a live turn when the adapter advertises support, or appended to the
     /// durable queue otherwise.
-    pub async fn prompt(&self, text: String, by: Option<String>) -> Result<PromptAck> {
+    pub async fn prompt(
+        &self,
+        text: String,
+        by: Option<String>,
+        force_steer: bool,
+        resources: Vec<Value>,
+    ) -> Result<PromptAck> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Prompt {
                 text,
                 by,
+                force_steer,
+                resources,
                 reply: tx,
             })
+            .await
+            .map_err(|_| anyhow!("acp task is gone"))?;
+        rx.await
+            .map_err(|_| anyhow!("acp task dropped the reply"))?
+    }
+
+    /// Send the current durable next-turn queue now: promote it into a live turn,
+    /// or start it as a normal turn when the session is idle after cancellation.
+    /// The task reads the queue itself so the browser cannot accidentally send
+    /// stale or partial text.
+    pub async fn force_pending(&self, by: Option<String>) -> Result<PromptAck> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::ForcePending { by, reply: tx })
             .await
             .map_err(|_| anyhow!("acp task is gone"))?;
         rx.await
@@ -422,6 +444,12 @@ enum Command {
     Prompt {
         text: String,
         by: Option<String>,
+        force_steer: bool,
+        resources: Vec<Value>,
+        reply: oneshot::Sender<Result<PromptAck>>,
+    },
+    ForcePending {
+        by: Option<String>,
         reply: oneshot::Sender<Result<PromptAck>>,
     },
     Cancel {
@@ -592,6 +620,11 @@ struct PendingSteer {
     text: String,
     by: Option<String>,
     turn: i64,
+    forced: bool,
+    /// Exact durable queue prefix promoted by this request. Consumed only after
+    /// the adapter accepts steering, preserving messages appended behind it.
+    promoted_queue: Option<String>,
+    resources: Vec<Value>,
     reply: oneshot::Sender<Result<PromptAck>>,
 }
 
@@ -925,7 +958,7 @@ impl Task {
         if let Some(goal) = &launch.goal {
             match handoff {
                 Some(payload) => self.start_handoff_turn(goal.clone(), payload).await?,
-                None => self.start_turn(goal.clone(), None).await?,
+                None => self.start_turn(goal.clone(), None, Vec::new()).await?,
             }
         }
         Ok(())
@@ -1084,7 +1117,8 @@ impl Task {
                 }
             }
             SessionUpdate::UsageUpdate { used, size } => {
-                self.flush_buf().await;
+                // Usage is metadata, not a prose boundary. Flushing here split
+                // replies into tiny blocks when an adapter reported it often.
                 self.journal_block(kind::USAGE, json!({ "used": used, "size": size }))
                     .await;
             }
@@ -1278,6 +1312,13 @@ impl Task {
         // "resting, no one needed" state). Mirrors the terminal path's `Stop` hook.
         crate::monitor::record_acp_lifecycle(&self.db, &self.bus, &self.session_id, "idle").await;
 
+        // Stop is a user-owned boundary. In particular, do not immediately
+        // turn feedback they have not seen acknowledged into another running
+        // turn; leave the durable queue visible until they explicitly send it.
+        if stop == "cancelled" {
+            return;
+        }
+
         // The steering extension may have raced this boundary and started the
         // user's message as a fresh adapter-owned turn. Adopt it before the
         // ordinary durable queue so prompts retain their arrival order.
@@ -1303,7 +1344,7 @@ impl Task {
             .unwrap_or_default();
         if !pending.trim().is_empty() {
             let _ = session::clear_pending_prompt(&self.db, &self.session_id).await;
-            let _ = self.start_turn(pending, None).await;
+            let _ = self.start_turn(pending, None, Vec::new()).await;
         }
     }
 
@@ -1318,6 +1359,7 @@ impl Task {
             .map(|r| r.outcome);
         match (outcome, error) {
             (Some(wire::SteeringOutcome::Injected), None) => {
+                self.consume_promoted_queue(&pending).await;
                 // A steer belongs to the live turn rather than opening another
                 // item in the turn index. Journal it only after the adapter has
                 // accepted it; a rejected extension falls back without leaving
@@ -1326,7 +1368,12 @@ impl Task {
                 let by = pending.by.map(Value::from).unwrap_or(Value::Null);
                 self.journal_block(
                     kind::USER_MESSAGE,
-                    json!({ "text": pending.text, "by": by, "steered": true }),
+                    json!({
+                        "text": pending.text,
+                        "by": by,
+                        "steered": true,
+                        "resources": pending.resources,
+                    }),
                 )
                 .await;
                 let _ = pending.reply.send(Ok(PromptAck {
@@ -1339,6 +1386,7 @@ impl Task {
                 }
             }
             (Some(wire::SteeringOutcome::StartedNewTurn), None) => {
+                self.consume_promoted_queue(&pending).await;
                 if self.turn_live {
                     // codex-acp waits for its old prompt to settle before taking
                     // this branch. Keep the request until loom consumes that
@@ -1353,24 +1401,53 @@ impl Task {
                     session = %self.session_id,
                     ?outcome,
                     ?error,
-                    "steering failed; falling back to ordinary prompt handling"
+                    "steering failed"
                 );
-                self.fallback_prompt(pending).await;
+                if pending.forced {
+                    let detail = error
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| format!("adapter returned {outcome:?}"));
+                    let _ = pending
+                        .reply
+                        .send(Err(anyhow!("adapter rejected forced steer: {detail}")));
+                } else {
+                    self.fallback_prompt(pending).await;
+                }
             }
+        }
+    }
+
+    async fn consume_promoted_queue(&self, pending: &PendingSteer) {
+        let Some(promoted) = pending.promoted_queue.as_deref() else {
+            return;
+        };
+        if let Err(error) =
+            session::consume_pending_prompt(&self.db, &self.session_id, promoted).await
+        {
+            // The adapter has already accepted the feedback, so continue the
+            // turn and make the durability failure loud. A healthy database
+            // preserves any messages appended behind the promoted prefix.
+            tracing::error!(
+                session = %self.session_id,
+                %error,
+                "steered queued feedback but could not consume its durable copy"
+            );
         }
     }
 
     async fn fallback_prompt(&mut self, pending: PendingSteer) {
         let ack = if self.turn_live {
-            self.queue_prompt(&pending.text).await
+            self.queue_prompt(&pending.text, &pending.resources).await
         } else {
-            self.start_prompt(pending.text, pending.by).await
+            self.start_prompt(pending.text, pending.by, pending.resources)
+                .await
         };
         let _ = pending.reply.send(ack);
     }
 
-    async fn queue_prompt(&self, text: &str) -> Result<PromptAck> {
-        session::append_pending_prompt(&self.db, &self.session_id, text).await?;
+    async fn queue_prompt(&self, text: &str, resources: &[Value]) -> Result<PromptAck> {
+        let queued = queued_prompt_text(text, resources);
+        session::append_pending_prompt(&self.db, &self.session_id, &queued).await?;
         Ok(PromptAck {
             queued: true,
             steered: false,
@@ -1378,8 +1455,13 @@ impl Task {
         })
     }
 
-    async fn start_prompt(&mut self, text: String, by: Option<String>) -> Result<PromptAck> {
-        self.start_turn(text, by).await?;
+    async fn start_prompt(
+        &mut self,
+        text: String,
+        by: Option<String>,
+        resources: Vec<Value>,
+    ) -> Result<PromptAck> {
+        self.start_turn(text, by, resources).await?;
         Ok(PromptAck {
             queued: false,
             steered: false,
@@ -1411,7 +1493,12 @@ impl Task {
         let by = pending.by.map(Value::from).unwrap_or(Value::Null);
         self.journal_block(
             kind::USER_MESSAGE,
-            json!({ "text": pending.text, "by": by, "steered": false }),
+            json!({
+                "text": pending.text,
+                "by": by,
+                "steered": false,
+                "resources": pending.resources,
+            }),
         )
         .await;
         crate::monitor::record_acp_lifecycle(&self.db, &self.bus, &self.session_id, "working")
@@ -1423,24 +1510,31 @@ impl Task {
         }));
     }
 
-    async fn start_turn(&mut self, text: String, by: Option<String>) -> Result<()> {
+    async fn start_turn(
+        &mut self,
+        text: String,
+        by: Option<String>,
+        resources: Vec<Value>,
+    ) -> Result<()> {
         let by_v = by.map(Value::from).unwrap_or(Value::Null);
         self.start_turn_with_block(
             text.clone(),
+            resources.clone(),
             kind::USER_MESSAGE,
-            json!({ "text": text, "by": by_v }),
+            json!({ "text": text, "by": by_v, "resources": resources }),
         )
         .await
     }
 
     async fn start_handoff_turn(&mut self, text: String, payload: Value) -> Result<()> {
-        self.start_turn_with_block(text, kind::HANDOFF, payload)
+        self.start_turn_with_block(text, Vec::new(), kind::HANDOFF, payload)
             .await
     }
 
     async fn start_turn_with_block(
         &mut self,
         text: String,
+        resources: Vec<Value>,
         opening_kind: &str,
         opening_payload: Value,
     ) -> Result<()> {
@@ -1465,7 +1559,7 @@ impl Task {
             .write(&wire::request_line(
                 id,
                 method::SESSION_PROMPT,
-                wire::prompt_params(&self.acp_session_id, &text),
+                wire::prompt_params(&self.acp_session_id, &text, &resources),
             ))
             .await?;
         // Turn start ⇒ the `working` lifecycle edge: status `running`, the calm
@@ -1572,9 +1666,15 @@ impl Task {
 
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
-            Command::Prompt { text, by, reply } => {
+            Command::Prompt {
+                text,
+                by,
+                force_steer,
+                resources,
+                reply,
+            } => {
                 if self.turn_live {
-                    if self.steering_cap
+                    if (self.steering_cap || force_steer)
                         && self.pending_steers.is_empty()
                         && self.pending_external.is_none()
                     {
@@ -1582,7 +1682,7 @@ impl Task {
                         let request = wire::request_line(
                             id,
                             method::SESSION_STEERING,
-                            wire::steering_params(&self.acp_session_id, &text),
+                            wire::steering_params(&self.acp_session_id, &text, &resources),
                         );
                         match self.stream.write(&request).await {
                             Ok(()) => {
@@ -1592,6 +1692,9 @@ impl Task {
                                         text,
                                         by,
                                         turn: self.current_turn,
+                                        forced: force_steer,
+                                        promoted_queue: None,
+                                        resources,
                                         reply,
                                     },
                                 );
@@ -1600,15 +1703,71 @@ impl Task {
                                 let _ = reply.send(Err(e));
                             }
                         }
+                    } else if force_steer {
+                        let _ = reply.send(Err(anyhow!(
+                            "another steer is still pending; retry when it settles"
+                        )));
                     } else {
                         // A failed queue write must surface — a 202 that silently
                         // dropped the prompt would be worse than an error.
-                        let ack = self.queue_prompt(&text).await;
+                        let ack = self.queue_prompt(&text, &resources).await;
                         let _ = reply.send(ack);
                     }
                 } else {
-                    let ack = self.start_prompt(text, by).await;
+                    let ack = self.start_prompt(text, by, resources).await;
                     let _ = reply.send(ack);
+                }
+            }
+            Command::ForcePending { by, reply } => {
+                if !self.pending_steers.is_empty() || self.pending_external.is_some() {
+                    let _ = reply.send(Err(anyhow!(
+                        "another steer is still pending; retry when it settles"
+                    )));
+                } else {
+                    let queued =
+                        match session::read_pending_prompt(&self.db, &self.session_id).await {
+                            Ok(queued) => queued,
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                                return;
+                            }
+                        };
+                    if queued.trim().is_empty() {
+                        let _ = reply.send(Err(anyhow!("there is no queued feedback to send")));
+                    } else if !self.turn_live {
+                        let result =
+                            match session::clear_pending_prompt(&self.db, &self.session_id).await {
+                                Ok(()) => self.start_prompt(queued.clone(), by, Vec::new()).await,
+                                Err(error) => Err(error),
+                            };
+                        let _ = reply.send(result);
+                    } else {
+                        let id = self.next_id();
+                        let request = wire::request_line(
+                            id,
+                            method::SESSION_STEERING,
+                            wire::steering_params(&self.acp_session_id, &queued, &[]),
+                        );
+                        match self.stream.write(&request).await {
+                            Ok(()) => {
+                                self.pending_steers.insert(
+                                    id,
+                                    PendingSteer {
+                                        text: queued.clone(),
+                                        by,
+                                        turn: self.current_turn,
+                                        forced: true,
+                                        promoted_queue: Some(queued),
+                                        resources: Vec::new(),
+                                        reply,
+                                    },
+                                );
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                            }
+                        }
+                    }
                 }
             }
             Command::Cancel { reply } => {
@@ -1619,6 +1778,23 @@ impl Task {
                         wire::cancel_params(&self.acp_session_id),
                     ))
                     .await;
+                if r.is_ok() && self.turn_live {
+                    for (_, pending) in self.pending_steers.drain() {
+                        let _ = pending.reply.send(Err(anyhow!("turn was cancelled")));
+                    }
+                    if let Some(pending) = self.pending_external.take() {
+                        let _ = pending.reply.send(Err(anyhow!("turn was cancelled")));
+                    }
+                    // Cancellation is a client-owned boundary. Some adapters do
+                    // not answer the cancelled prompt, so settle loom's journal
+                    // and lifecycle immediately after the notification lands.
+                    self.on_turn_end(
+                        self.current_turn,
+                        Some(json!({ "stopReason": "cancelled" })),
+                        None,
+                    )
+                    .await;
+                }
                 // ACP requires the client to answer every pending permission
                 // request with the `cancelled` outcome when it cancels a turn.
                 for (_, pp) in self.pending_perms.drain() {
@@ -1826,5 +2002,51 @@ fn id_key(id: &Value) -> String {
     match id {
         Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+/// Render ACP resources into the durable text-only pending queue. Prefer the
+/// worktree-relative display name so queued prompts stay readable and do not
+/// expose the server's absolute filesystem layout.
+fn queued_prompt_text(text: &str, resources: &[Value]) -> String {
+    let references: Vec<&str> = resources
+        .iter()
+        .filter_map(|resource| {
+            resource
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .or_else(|| resource.get("uri").and_then(Value::as_str))
+        })
+        .collect();
+    if references.is_empty() {
+        return text.to_string();
+    }
+
+    let mut queued = format!("{text}\n\nReferenced files:\n");
+    for reference in references {
+        queued.push_str("- ");
+        queued.push_str(reference);
+        queued.push('\n');
+    }
+    queued
+}
+
+#[cfg(test)]
+mod tests {
+    use super::queued_prompt_text;
+    use serde_json::json;
+
+    #[test]
+    fn queued_resources_prefer_relative_names_over_server_uris() {
+        let resources = [
+            json!({"name": "src/main.rs", "uri": "file:///server/worktree/src/main.rs"}),
+            json!({"uri": "https://example.test/context"}),
+        ];
+
+        assert_eq!(
+            queued_prompt_text("review", &resources),
+            "review\n\nReferenced files:\n- src/main.rs\n- https://example.test/context\n"
+        );
     }
 }

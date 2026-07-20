@@ -592,16 +592,16 @@ pub async fn gh_available() -> bool {
         .await
 }
 
-/// Fetch the pull request for `branch` (its remote head ref) from `repo_root`.
-/// `Ok(None)` means there is simply no PR for the branch yet; `Err` is a real
-/// failure (no GitHub remote, auth, `gh` missing) the caller logs and skips.
+/// Fetch one pull request by number (or another exact `gh pr view` selector).
+/// This is used for a user-selected mapping and to follow an already-open PR
+/// through its terminal transition.
 pub async fn fetch_pr(
     repo_root: &Path,
-    branch: &str,
+    selector: &str,
     token: Option<&str>,
 ) -> Result<Option<GithubStatus>> {
     let mut cmd = Command::new("gh");
-    cmd.args(["pr", "view", branch, "--json", PR_FIELDS])
+    cmd.args(["pr", "view", selector, "--json", PR_FIELDS])
         .current_dir(repo_root);
     // The poll loop runs in the loom process, which carries no ambient `gh` auth
     // (the operator's `GH_TOKEN` is session-scoped, not the server's). Without a
@@ -622,11 +622,42 @@ pub async fn fetch_pr(
         {
             return Ok(None);
         }
-        bail!("gh pr view {branch} failed: {}", stderr.trim());
+        bail!("gh pr view {selector} failed: {}", stderr.trim());
     }
     let raw: PrJson = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
         .context("parsing gh pr JSON")?;
     Ok(Some(raw.into_status()))
+}
+
+/// Discover the branch's current open PR. `gh pr view <branch>` may keep
+/// returning an old closed/merged PR forever; the list query makes "current"
+/// explicit and returns no result once the branch has no open PR.
+pub async fn fetch_open_pr(
+    repo_root: &Path,
+    branch: &str,
+    token: Option<&str>,
+) -> Result<Option<GithubStatus>> {
+    let mut cmd = Command::new("gh");
+    cmd.args([
+        "pr", "list", "--head", branch, "--state", "open", "--limit", "1", "--json", PR_FIELDS,
+    ])
+    .current_dir(repo_root);
+    if let Some(token) = token {
+        cmd.env("GH_TOKEN", token);
+    }
+    let out = cmd
+        .output()
+        .await
+        .context("failed to spawn gh (is the GitHub CLI installed?)")?;
+    if !out.status.success() {
+        bail!(
+            "gh pr list --head {branch} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let mut rows: Vec<PrJson> =
+        serde_json::from_slice(&out.stdout).context("parsing gh pr list JSON")?;
+    Ok(rows.pop().map(PrJson::into_status))
 }
 
 /// The stored snapshot for a branch, if one has been fetched.
@@ -640,6 +671,49 @@ pub async fn get_status(db: &Db, branch_id: &str) -> Result<Option<GithubStatus>
     .fetch_optional(db)
     .await?;
     Ok(row)
+}
+
+/// The user-selected PR number for a branch. `None` keeps automatic discovery.
+pub async fn get_mapping(db: &Db, branch_id: &str) -> Result<Option<i64>> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT pr_number FROM branch_github_mapping WHERE branch_id = ?")
+            .bind(branch_id)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.map(|(number,)| number))
+}
+
+/// Pin a branch to one PR until the mapping is explicitly cleared or changed.
+pub async fn set_mapping(db: &Db, branch_id: &str, number: i64) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO branch_github_mapping (branch_id, pr_number) VALUES (?, ?)
+         ON CONFLICT(branch_id) DO UPDATE SET pr_number = excluded.pr_number",
+    )
+    .bind(branch_id)
+    .bind(number)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Return a branch to automatic current-PR discovery.
+pub async fn clear_mapping(db: &Db, branch_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM branch_github_mapping WHERE branch_id = ?")
+        .bind(branch_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Forget a cached snapshot when automatic discovery says there is no current
+/// PR. Leaving the row behind would make every view and watch consume stale PR
+/// state indefinitely.
+pub async fn clear_status(db: &Db, branch_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM branch_github WHERE branch_id = ?")
+        .bind(branch_id)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 /// Persist (replacing) the snapshot for a branch.
@@ -686,15 +760,43 @@ pub async fn refresh(
     // loom's own token for `gh` — the operator's `GH_TOKEN` from Settings →
     // Environment (the server process has no ambient GitHub auth of its own).
     let token = crate::agent_env::get(&state.db, "GH_TOKEN").await;
-    let snap = match fetch_pr(
-        &PathBuf::from(&branch.repo_root),
-        &branch.branch,
-        token.as_deref(),
-    )
-    .await?
-    {
+    let repo_root = PathBuf::from(&branch.repo_root);
+    let previous = get_status(&state.db, &branch.id).await?;
+    let mapping = get_mapping(&state.db, &branch.id).await?;
+    let fetched = if let Some(number) = mapping {
+        fetch_pr(&repo_root, &number.to_string(), token.as_deref()).await?
+    } else {
+        // Automatic mode always asks GitHub which open PR is current instead of
+        // treating yesterday's cached number as authoritative. Only when the
+        // branch has no open PR do we revisit the previous number once, to
+        // preserve its close/merge transition before the snapshot is cleared.
+        let current = fetch_open_pr(&repo_root, &branch.branch, token.as_deref()).await?;
+        if current.is_some() {
+            current
+        } else if previous.as_ref().is_some_and(|pr| pr.pr_state == "OPEN") {
+            let number = previous.as_ref().expect("checked above").pr_number;
+            fetch_pr(&repo_root, &number.to_string(), token.as_deref()).await?
+        } else {
+            None
+        }
+    };
+    let snap = match fetched {
         Some(s) => s,
-        None => return Ok(None),
+        None => {
+            if previous.is_some() {
+                clear_status(&state.db, &branch.id).await?;
+                events::record(
+                    &state.db,
+                    &state.bus,
+                    &branch.id,
+                    "github",
+                    json!({ "pr": null, "state": null }),
+                )
+                .await
+                .ok();
+            }
+            return Ok(None);
+        }
     };
     apply_snapshot(state, session, branch, &snap, archive_on_merge).await?;
     Ok(Some(snap))
@@ -705,7 +807,7 @@ pub async fn refresh(
 /// session whose PR has merged and close the weaver issues that session claimed.
 /// Split from [`refresh`] so the storage and merge-archive behaviour is testable
 /// without invoking `gh`.
-async fn apply_snapshot(
+pub(crate) async fn apply_snapshot(
     state: &AppState,
     session: &Session,
     branch: &Branch,
@@ -1242,6 +1344,32 @@ mod tests {
             .unwrap();
         assert_eq!(session.status, "running");
         assert!(f.work_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn explicit_mapping_and_cached_status_clear_independently() {
+        let f = fixture().await;
+        upsert_status(&f.state.db, &f.branch.id, &snapshot("OPEN"))
+            .await
+            .unwrap();
+        set_mapping(&f.state.db, &f.branch.id, 42).await.unwrap();
+        assert_eq!(
+            get_mapping(&f.state.db, &f.branch.id).await.unwrap(),
+            Some(42)
+        );
+
+        clear_status(&f.state.db, &f.branch.id).await.unwrap();
+        assert!(get_status(&f.state.db, &f.branch.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            get_mapping(&f.state.db, &f.branch.id).await.unwrap(),
+            Some(42)
+        );
+
+        clear_mapping(&f.state.db, &f.branch.id).await.unwrap();
+        assert_eq!(get_mapping(&f.state.db, &f.branch.id).await.unwrap(), None);
     }
 
     #[tokio::test]

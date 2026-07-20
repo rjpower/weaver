@@ -68,12 +68,6 @@ function updateRawModel(e: Event) {
             hooks
           </span>
           <span
-            v-if="agentOption.supports_concierge"
-            class="rounded bg-info-soft px-1.5 py-0.5 text-2xs text-info"
-          >
-            concierge
-          </span>
-          <span
             v-if="agentOption.accepts_raw_model"
             class="rounded bg-input px-1.5 py-0.5 text-2xs text-faint"
           >

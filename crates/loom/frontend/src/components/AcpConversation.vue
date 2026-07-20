@@ -13,10 +13,12 @@ import {
 import {
   getSessionChat,
   promptSession,
+  forceQueuedSession,
   interruptSession,
   answerPermission,
   setSessionMode,
   setSessionConfigOption,
+  listSessionFiles,
 } from '../api';
 import type {
   Session,
@@ -78,6 +80,12 @@ const liveTools = reactive(new Map<string, SseTool>());
 const turnLive = ref(false);
 const liveTurnNo = ref<number | null>(null);
 const optimistic = ref<{ key: number; text: string; state: 'sent' | 'steered' | 'queued' }[]>([]);
+const forceQueueKey = computed(() => {
+  for (let index = optimistic.value.length - 1; index >= 0; index -= 1) {
+    if (optimistic.value[index].state === 'queued') return optimistic.value[index].key;
+  }
+  return null;
+});
 let nextOptimisticKey = 0;
 const metadata = ref<AcpMetadata>({ commands: [], config_options: [], modes: [] });
 
@@ -115,6 +123,14 @@ async function load({ preserve = false }: { preserve?: boolean } = {}) {
     liveTools.clear();
     liveTurnNo.value = snap.live_turn;
     turnLive.value = snap.live_turn != null;
+    optimistic.value = optimistic.value.filter((item) => item.state !== 'queued');
+    if (snap.pending_prompt?.trim()) {
+      optimistic.value.push({
+        key: nextOptimisticKey++,
+        text: snap.pending_prompt,
+        state: 'queued',
+      });
+    }
     metadata.value = snap.metadata ?? { commands: [], config_options: [], modes: [] };
     state.value = 'ready';
   } catch (e) {
@@ -243,8 +259,9 @@ const composerInput = ref<HTMLTextAreaElement | null>(null);
 const sending = ref(false);
 const sendError = ref('');
 const composerVisible = computed(() => canSend(props.session));
+const selectedFiles = ref<string[]>([]);
 
-async function submitPrompt() {
+async function submitPrompt(forceSteer = false) {
   if (!draft.value.trim() || sending.value) return;
   const local = localCommand(draft.value);
   if (local) {
@@ -259,12 +276,14 @@ async function submitPrompt() {
   optimistic.value.push(pending);
   autoFollow();
   try {
-    const ack = await promptSession(id.value, text);
+    const files = selectedFiles.value.filter((path) => text.includes(`@${path}`));
+    const ack = await promptSession(id.value, text, undefined, forceSteer, files);
     const index = optimistic.value.findIndex((o) => o.key === pending.key);
     if (index >= 0) {
       optimistic.value[index].state = ack.queued ? 'queued' : ack.steered ? 'steered' : 'sent';
     }
     draft.value = '';
+    selectedFiles.value = [];
     autoFollow();
   } catch (e) {
     const index = optimistic.value.findIndex((o) => o.key === pending.key);
@@ -275,9 +294,24 @@ async function submitPrompt() {
   }
 }
 
+async function forceQueued() {
+  if (sending.value) return;
+  sending.value = true;
+  sendError.value = '';
+  try {
+    await forceQueuedSession(id.value);
+    optimistic.value = optimistic.value.filter((item) => item.state !== 'queued');
+    autoFollow();
+  } catch (e) {
+    sendError.value = (e as Error).message ?? 'Failed to steer queued feedback';
+  } finally {
+    sending.value = false;
+  }
+}
+
 // ── Agent-owned slash commands ---------------------------------------------
 // The adapter replaces its command catalogue at runtime. Local surface hooks
-// win on a duplicate name (`/clear` in fleet Chat), then the remainder is
+// win on a duplicate name, then the remainder is
 // filtered as the user types. Selecting a command with input leaves a trailing
 // space and exposes the adapter's hint in the composer placeholder.
 const commands = computed<AcpCommand[]>(() => {
@@ -305,6 +339,48 @@ const commandHint = computed(() => {
   return commands.value.find((command) => command.name === match[1])?.input?.hint ?? '';
 });
 
+// ── Server-backed @file completion ----------------------------------------
+// The browser cannot inspect a session worktree. Once the current token starts
+// with `@`, ask loom for tracked/unignored paths; a chosen path is also sent as
+// an ACP resource_link rather than relying on adapter-specific text parsing.
+const fileQuery = computed(() => draft.value.match(/(?:^|[\s|])@([^\s@]*)$/)?.[1] ?? null);
+const fileMatches = ref<string[]>([]);
+const fileIndex = ref(0);
+let fileSearchSeq = 0;
+let fileSearchTimer: ReturnType<typeof setTimeout> | null = null;
+watch(fileQuery, (query) => {
+  fileIndex.value = 0;
+  const seq = ++fileSearchSeq;
+  if (fileSearchTimer) {
+    clearTimeout(fileSearchTimer);
+    fileSearchTimer = null;
+  }
+  if (query == null) {
+    fileMatches.value = [];
+    return;
+  }
+  fileSearchTimer = setTimeout(async () => {
+    fileSearchTimer = null;
+    try {
+      const result = await listSessionFiles(id.value, query);
+      if (seq === fileSearchSeq) fileMatches.value = result.files;
+    } catch {
+      if (seq === fileSearchSeq) fileMatches.value = [];
+    }
+  }, 150);
+});
+onUnmounted(() => {
+  if (fileSearchTimer) clearTimeout(fileSearchTimer);
+});
+const activeFile = computed(() => fileMatches.value[fileIndex.value] ?? null);
+
+function chooseFile(path: string) {
+  draft.value = draft.value.replace(/@[^\s@]*$/, `@${path} `);
+  if (!selectedFiles.value.includes(path)) selectedFiles.value.push(path);
+  fileMatches.value = [];
+  nextTick(() => composerInput.value?.focus());
+}
+
 function chooseCommand(command: AcpCommand) {
   // Keep a trailing space even for argument-less commands. It closes the
   // autocomplete so the next Enter submits instead of selecting forever.
@@ -321,6 +397,19 @@ function localCommand(text: string): { name: string; args: string } | null {
   return { name: match[1], args: match[2] ?? '' };
 }
 function onComposerKeydown(e: KeyboardEvent) {
+  if (fileMatches.value.length) {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const d = e.key === 'ArrowDown' ? 1 : -1;
+      fileIndex.value = (fileIndex.value + d + fileMatches.value.length) % fileMatches.value.length;
+      return;
+    }
+    if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+      e.preventDefault();
+      if (activeFile.value) chooseFile(activeFile.value);
+      return;
+    }
+  }
   if (commandMatches.value.length) {
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault();
@@ -597,6 +686,14 @@ const model = computed<{ rows: Row[]; toc: TocItem[] }>(() => {
         flushActivity();
         const text = (b.payload as unknown as AgentMessagePayload).text ?? '';
         if (!text.trim()) break;
+        const previous = rows[rows.length - 1];
+        if (previous?.type === 'agent') {
+          // Metadata updates can split one streamed answer into multiple durable
+          // blocks. They are not speaker boundaries, so keep the transcript as
+          // one readable response until a user/tool/other visible row intervenes.
+          previous.text += text;
+          break;
+        }
         rows.push({
           type: 'agent',
           key: k,
@@ -675,13 +772,19 @@ const model = computed<{ rows: Row[]; toc: TocItem[] }>(() => {
     }
     const msg = shadows.get(`${lt}:agent_message`);
     if (msg && msg.text) {
-      rows.push({
-        type: 'agent',
-        key: `shadow-${lt}-agent`,
-        time: '',
-        text: msg.text,
-        streaming: true,
-      });
+      const previous = rows[rows.length - 1];
+      if (previous?.type === 'agent') {
+        previous.text += msg.text;
+        previous.streaming = true;
+      } else {
+        rows.push({
+          type: 'agent',
+          key: `shadow-${lt}-agent`,
+          time: '',
+          text: msg.text,
+          streaming: true,
+        });
+      }
     }
   }
 
@@ -1058,9 +1161,26 @@ function goTo(anchor: string) {
           >
             <header class="acp-rule">
               <span class="acp-label text-accent">You</span>
-              <span v-if="o.state === 'queued'" class="acp-prompt-state" data-testid="acp-queued"
-                >queued for next turn</span
-              >
+              <template v-if="o.state === 'queued'">
+                <span class="acp-prompt-state" data-testid="acp-queued"
+                  >queued · agent hasn’t seen this yet</span
+                >
+                <button
+                  v-if="o.key === forceQueueKey"
+                  type="button"
+                  class="acp-prompt-action"
+                  data-testid="acp-force-queued"
+                  :disabled="sending"
+                  :title="
+                    turnLive
+                      ? 'Inject all queued feedback into the running turn now'
+                      : 'Start a new turn with all queued feedback'
+                  "
+                  @click="forceQueued"
+                >
+                  {{ turnLive ? 'Force now' : 'Send now' }}
+                </button>
+              </template>
               <span
                 v-else-if="o.state === 'steered'"
                 class="acp-prompt-state"
@@ -1132,7 +1252,7 @@ function goTo(anchor: string) {
       v-if="composerVisible"
       class="acp-composer"
       data-testid="acp-composer"
-      @submit.prevent="submitPrompt"
+      @submit.prevent="submitPrompt(false)"
     >
       <p v-if="sendError" class="mb-1.5 text-xs text-block" data-testid="acp-composer-error">
         {{ sendError }}
@@ -1147,6 +1267,26 @@ function goTo(anchor: string) {
         class="acp-input"
         @keydown="onComposerKeydown"
       ></textarea>
+      <ul
+        v-if="fileMatches.length"
+        class="acp-command-menu"
+        data-testid="acp-file-menu"
+        role="listbox"
+        aria-label="Worktree files"
+      >
+        <li v-for="(path, index) in fileMatches" :key="path">
+          <button
+            type="button"
+            class="acp-command-item"
+            :data-active="index === fileIndex"
+            :aria-selected="index === fileIndex"
+            role="option"
+            @click="chooseFile(path)"
+          >
+            <code>@{{ path }}</code>
+          </button>
+        </li>
+      </ul>
       <ul
         v-if="commandMatches.length"
         class="acp-command-menu"
@@ -1251,6 +1391,17 @@ function goTo(anchor: string) {
             v-if="turnLive"
             type="button"
             class="btn-secondary px-3 py-1 text-xs"
+            data-testid="acp-composer-force-steer"
+            :disabled="sending || !draft.trim()"
+            title="Inject this feedback into the running turn even if the agent did not advertise steering"
+            @click="submitPrompt(true)"
+          >
+            Force steer
+          </button>
+          <button
+            v-if="turnLive"
+            type="button"
+            class="btn-secondary px-3 py-1 text-xs"
             data-testid="acp-composer-stop"
             :disabled="stopping"
             @click="stopTurn"
@@ -1320,6 +1471,16 @@ function goTo(anchor: string) {
   font-family: var(--font-mono);
   font-size: 0.6875rem;
   color: var(--attn);
+}
+.acp-prompt-action {
+  border-bottom: 1px solid currentColor;
+  color: var(--accent);
+  font-family: var(--font-sans);
+  font-size: 0.6875rem;
+}
+.acp-prompt-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 /* Empty state — a dashed card, not a bare void. */

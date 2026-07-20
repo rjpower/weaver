@@ -184,9 +184,18 @@ export const launchSessionForIssue = (repoRoot: string, issueId: number) =>
 export const createRepoIssue = (repoRoot: string, title: string, body = '') =>
   post('/repos/issues', { repo_root: repoRoot, title, body }) as Promise<Issue>;
 
-/** Patch an issue's title, body, and/or status ("open" | "closed"). */
-export const patchIssue = (id: number, body: Partial<Pick<Issue, 'title' | 'body' | 'status'>>) =>
-  patch(`/issues/${id}`, body) as Promise<Issue>;
+/** Patch an issue's editable fields. `github` is `owner/name#number`; blank clears it. */
+export const patchIssue = (
+  id: number,
+  body: Partial<Pick<Issue, 'title' | 'body' | 'status'>> & { github?: string },
+) => patch(`/issues/${id}`, body) as Promise<Issue>;
+
+/** Refresh, pin, or clear a session's PR association. */
+export const refreshSessionGithub = (id: string) =>
+  post(`/sessions/${id}/github`, {}) as Promise<Session>;
+export const setSessionGithub = (id: string, prNumber: number) =>
+  put(`/sessions/${id}/github`, { pr_number: prNumber }) as Promise<Session>;
+export const clearSessionGithub = (id: string) => del(`/sessions/${id}/github`) as Promise<Session>;
 
 /** Delete an issue outright. */
 export const deleteIssue = (id: number) => del(`/issues/${id}`);
@@ -275,8 +284,34 @@ export const getSessionChat = (id: string) => get(`/sessions/${id}/chat`) as Pro
 /** Send a user message to an ACP session. Returns 202 with
  *  `{ queued, steered, turn }`: a live turn is steered when the adapter supports
  *  it, with the durable next-turn queue retained as the fallback. */
-export const promptSession = (id: string, text: string, by?: string) =>
-  post(`/sessions/${id}/prompt`, { text, by }) as Promise<PromptAck>;
+export const promptSession = (
+  id: string,
+  text: string,
+  by?: string,
+  forceSteer = false,
+  files: string[] = [],
+) =>
+  post(`/sessions/${id}/prompt`, {
+    text,
+    by,
+    force_steer: forceSteer,
+    files,
+  }) as Promise<PromptAck>;
+
+/** Send all durable next-turn feedback now, steering a live turn or starting an
+ * idle session after cancellation. */
+export const forceQueuedSession = (id: string, by?: string) =>
+  post(`/sessions/${id}/prompt`, {
+    text: '',
+    by,
+    force_steer: true,
+    force_queued: true,
+    files: [],
+  }) as Promise<PromptAck>;
+
+/** Worktree-backed completion for `@file` mentions in the ACP composer. */
+export const listSessionFiles = (id: string, query: string) =>
+  get(`/sessions/${id}/files?q=${encodeURIComponent(query)}`) as Promise<{ files: string[] }>;
 
 /** Interrupt the in-flight turn: `session/cancel` for an ACP session, an Escape
  *  keystroke for a terminal one. */
@@ -313,17 +348,6 @@ export const setSessionPark = (id: string, park: 'parked' | 'active' | 'auto') =
 /** Set a session's manual sort key (the drag-reorder midpoint). */
 export const setSessionOrder = (id: string, sort_order: number) =>
   patch(`/sessions/${id}`, { sort_order }) as Promise<Session>;
-
-// --- Chat (the fleet concierge) --------------------------------------------
-
-/** Get-or-create the singleton fleet concierge and return its session view —
- *  what the Chat surface mounts its conversation against. 400s when no repo has
- *  been used yet (the concierge needs one to live in). */
-export const getChat = () => get('/chat') as Promise<Session>;
-
-/** Start a clean conversation: archive the current concierge (capturing its
- *  transcript) and launch a fresh one. Returns the new session view. */
-export const resetChat = () => post('/chat/reset') as Promise<Session>;
 
 // --- Agent environment variables -------------------------------------------
 

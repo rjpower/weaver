@@ -8,7 +8,7 @@ use serial_test::serial;
 
 use loom::backend;
 
-use crate::fixtures::{pin_fake_acp_adapters, sh, HomeGuard, TestServer};
+use crate::fixtures::{sh, TestServer};
 
 struct EnvVarGuard {
     name: &'static str,
@@ -186,128 +186,6 @@ async fn launch_forks_from_fresh_origin_default() {
     client.delete(&format!("/api/sessions/{id}")).await.unwrap();
 }
 
-/// The Chat surface's concierge (`GET /api/chat`) is get-or-created as a
-/// singleton, hidden from the fleet list, and needs a repo to live in.
-#[serial]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chat_get_or_creates_a_hidden_singleton_concierge() {
-    let ts = TestServer::start().await;
-    pin_fake_acp_adapters(&ts).await;
-    let client = &ts.client;
-    // The concierge runs the Claude launch path (hooks + first-run gates), which
-    // writes under $HOME — isolate it so the test can't touch the real home.
-    let home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(home.path());
-
-    // With no repo used yet, there is nowhere for the concierge to live.
-    assert!(
-        client.get("/api/chat").await.is_err(),
-        "no repo yet ⇒ GET /api/chat should fail"
-    );
-
-    // Record a repo by launching an ordinary session.
-    let work = client
-        .post(
-            "/api/sessions",
-            json!({ "goal": "ordinary work", "cwd": ts.cwd(), "agent": "shell" }),
-        )
-        .await
-        .unwrap();
-    let work_id = work["id"].as_str().unwrap().to_string();
-
-    // First GET creates the concierge — a `concierge`-kind session, no tracking
-    // issue (it has no deliverable to track).
-    let chat = client.get("/api/chat").await.unwrap();
-    let chat_id = chat["id"].as_str().unwrap().to_string();
-    assert_eq!(chat["agent_kind"], "concierge");
-    assert_eq!(
-        chat["status"], "running",
-        "every runtime is live on launch — there is no `launching` state"
-    );
-    // It boots primed-but-idle (no positional prompt ⇒ no turn ⇒ no `Stop` hook),
-    // so creation seeds the soothing `idle` mark itself — otherwise the chat would
-    // read "Working…" forever though the agent is doing nothing.
-    let tags = chat["branch"]["tags"].as_array().unwrap();
-    assert!(
-        tags.iter()
-            .any(|t| t["key"] == "idle" && t["value"] == "idle"),
-        "a freshly booted concierge carries the idle mark so it reads Idle, not Working: {tags:?}"
-    );
-    assert!(
-        chat["tracking_issue"].is_null(),
-        "concierge has no tracking issue"
-    );
-    assert_ne!(chat_id, work_id);
-
-    // Second GET returns the *same* session — a singleton, not a fresh one.
-    let again = client.get("/api/chat").await.unwrap();
-    assert_eq!(
-        again["id"].as_str().unwrap(),
-        chat_id,
-        "the concierge is a singleton"
-    );
-
-    // It is hidden from the fleet list — only the ordinary session shows.
-    let list = client.get("/api/sessions").await.unwrap();
-    let list = list.as_array().unwrap();
-    assert_eq!(list.len(), 1, "concierge must not appear in the fleet list");
-    assert_eq!(list[0]["id"].as_str().unwrap(), work_id);
-
-    client
-        .delete(&format!("/api/sessions/{chat_id}"))
-        .await
-        .unwrap();
-    client
-        .delete(&format!("/api/sessions/{work_id}"))
-        .await
-        .unwrap();
-}
-
-/// `concierge.runtime = codex` points the concierge at the hookless Codex
-/// runtime, so it launches `running` immediately (no weaver hook will promote it)
-/// while keeping the `concierge` role.
-#[serial]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concierge_runtime_codex_launches_hookless() {
-    let ts = TestServer::start().await;
-    pin_fake_acp_adapters(&ts).await;
-    let client = &ts.client;
-    let home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(home.path());
-
-    let work = client
-        .post(
-            "/api/sessions",
-            json!({ "goal": "ordinary work", "cwd": ts.cwd(), "agent": "shell" }),
-        )
-        .await
-        .unwrap();
-    let work_id = work["id"].as_str().unwrap().to_string();
-
-    // Point the concierge at codex.
-    client
-        .patch("/api/settings", json!({ "concierge.runtime": "codex" }))
-        .await
-        .unwrap();
-
-    let chat = client.get("/api/chat").await.unwrap();
-    assert_eq!(chat["agent_kind"], "concierge", "still the concierge role");
-    assert_eq!(
-        chat["status"], "running",
-        "a hookless (codex) runtime is live on launch, not stuck launching"
-    );
-
-    let chat_id = chat["id"].as_str().unwrap().to_string();
-    client
-        .delete(&format!("/api/sessions/{chat_id}"))
-        .await
-        .unwrap();
-    client
-        .delete(&format!("/api/sessions/{work_id}"))
-        .await
-        .unwrap();
-}
-
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settings_validate_agent_model_effort_against_registry() {
@@ -324,16 +202,6 @@ async fn settings_validate_agent_model_effort_against_registry() {
         .to_string();
     assert!(
         err.contains("unknown model 'haiku' for codex"),
-        "unexpected error: {err}"
-    );
-
-    let err = client
-        .patch("/api/settings", json!({ "concierge.runtime": "shell" }))
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("agent 'shell' cannot run the concierge"),
         "unexpected error: {err}"
     );
 }
@@ -437,71 +305,6 @@ async fn list_hides_archived_by_default_and_searches() {
         .unwrap();
     client
         .delete(&format!("/api/sessions/{beta_id}"))
-        .await
-        .unwrap();
-}
-
-/// `POST /api/chat/reset` archives the live concierge (capturing its transcript
-/// to history) and launches a fresh one in its place — a new session id, the old
-/// one terminal/`archived`, and the singleton now resolving to the new one.
-#[serial]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chat_reset_archives_and_starts_fresh() {
-    let ts = TestServer::start().await;
-    pin_fake_acp_adapters(&ts).await;
-    let client = &ts.client;
-    // The concierge runs the Claude launch path (writes under $HOME) — isolate it.
-    let home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(home.path());
-
-    // A repo for the concierge to live in.
-    let work = client
-        .post(
-            "/api/sessions",
-            json!({ "goal": "ordinary work", "cwd": ts.cwd(), "agent": "shell" }),
-        )
-        .await
-        .unwrap();
-    let work_id = work["id"].as_str().unwrap().to_string();
-
-    // The first concierge.
-    let chat = client.get("/api/chat").await.unwrap();
-    let chat_id = chat["id"].as_str().unwrap().to_string();
-    assert_eq!(chat["agent_kind"], "concierge");
-
-    // Reset: a brand-new concierge, with a different id.
-    let fresh = client.post("/api/chat/reset", json!({})).await.unwrap();
-    let fresh_id = fresh["id"].as_str().unwrap().to_string();
-    assert_eq!(
-        fresh["agent_kind"], "concierge",
-        "the fresh one is a concierge"
-    );
-    assert_ne!(fresh_id, chat_id, "reset launches a new concierge");
-
-    // The old concierge is archived — kept as history, not deleted.
-    let old = client
-        .get(&format!("/api/sessions/{chat_id}"))
-        .await
-        .unwrap();
-    assert_eq!(
-        old["status"], "archived",
-        "reset archives the old concierge"
-    );
-
-    // get-or-create now resolves to the fresh one (a singleton again).
-    let again = client.get("/api/chat").await.unwrap();
-    assert_eq!(
-        again["id"].as_str().unwrap(),
-        fresh_id,
-        "the fresh concierge is the live singleton"
-    );
-
-    client
-        .delete(&format!("/api/sessions/{fresh_id}"))
-        .await
-        .unwrap();
-    client
-        .delete(&format!("/api/sessions/{work_id}"))
         .await
         .unwrap();
 }

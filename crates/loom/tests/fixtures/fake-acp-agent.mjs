@@ -20,6 +20,7 @@
 //   wait:MS              sleep MS ms (cancellable) — for queueing/interrupt/crash tests
 //   permission:NAME      a session/request_permission that BLOCKS the turn until the
 //                        client answers (exercises both auto-answer and REST-answer)
+//   resources            echo the names of supplied resource_link blocks
 //
 // The turn ends with stop reason `end_turn`, or `cancelled` if a `session/cancel`
 // arrived (or a pending permission was answered `cancelled`) while it ran.
@@ -33,6 +34,7 @@ let cancelled = false;
 const steeringSupported = process.env.FAKE_ACP_STEERING === "1";
 const forceSteeringNewTurn = process.env.FAKE_ACP_STEERING_FORCE_NEW_TURN === "1";
 let promptActive = false;
+let promptResources = [];
 const steeringQueue = [];
 let deferredSteering = null;
 const pending = new Map(); // our request id -> resolver awaiting the client's response
@@ -209,12 +211,18 @@ async function runToken(tok) {
     if (!outcome || !outcome.outcome || outcome.outcome.outcome === "cancelled") {
       cancelled = true;
     }
+  } else if (tok === "resources") {
+    notify({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: promptResources.map((r) => r.name).join(",") },
+    });
   }
 }
 
 async function handlePrompt(id, params) {
   cancelled = false;
   promptActive = true;
+  promptResources = (params.prompt || []).filter((b) => b.type === "resource_link");
   if (steeringSupported) {
     notify({
       sessionUpdate: "session_info_update",

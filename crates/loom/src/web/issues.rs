@@ -188,6 +188,31 @@ pub(super) async fn patch_issue(
             .await?;
         tracing::info!(issue = id, "issue updated");
     }
+    if let Some(mapping) = req.github.as_deref() {
+        let mapping = mapping.trim();
+        let parsed = if mapping.is_empty() {
+            None
+        } else {
+            Some(crate::github::parse_wiring(mapping).ok_or_else(|| {
+                AppError::bad_request(format!(
+                    "invalid GitHub issue mapping '{mapping}' — expected owner/name#number"
+                ))
+            })?)
+        };
+        let (repo, number) = parsed
+            .map(|(repo, number)| (Some(repo), Some(number)))
+            .unwrap_or((None, None));
+        sqlx::query(
+            "UPDATE issues SET github_repo = ?, github_issue = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(repo)
+        .bind(number)
+        .bind(weaver_core::db::now_iso())
+        .bind(id)
+        .execute(&st.db)
+        .await?;
+        tracing::info!(issue = id, github = mapping, "issue GitHub mapping changed");
+    }
     let issue = weaver_core::issue::get(&st.db, id)
         .await?
         .ok_or_else(|| AppError::not_found("issue"))?;
@@ -422,5 +447,49 @@ mod tests {
         let events = events::history(&db, &branch.id, 10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "issue_added");
+    }
+
+    #[tokio::test]
+    async fn patch_issue_changes_and_clears_github_mapping() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let st = test_state(db.clone());
+        let issue = weaver_core::issue::add(
+            &db,
+            &weaver_core::issue::NewIssue {
+                repo_root: "/r".to_string(),
+                title: "mapped".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mapped = patch_issue(
+            State(st.clone()),
+            Path(issue.id),
+            Json(PatchIssueReq {
+                github: Some("acme/widgets#17".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(mapped.github_repo.as_deref(), Some("acme/widgets"));
+        assert_eq!(mapped.github_issue, Some(17));
+
+        let cleared = patch_issue(
+            State(st),
+            Path(issue.id),
+            Json(PatchIssueReq {
+                github: Some(String::new()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(cleared.github_repo, None);
+        assert_eq!(cleared.github_issue, None);
     }
 }

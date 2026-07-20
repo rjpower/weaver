@@ -46,7 +46,11 @@ const repoFilter = ref('');
 // Per-issue UI state: which row's editor is open, the edit draft, the per-row
 // new-tag input, and a busy flag that disables a row's controls mid-call.
 const editing = ref<number | null>(null);
-const draft = reactive<{ title: string; body: string }>({ title: '', body: '' });
+const draft = reactive<{ title: string; body: string; github: string }>({
+  title: '',
+  body: '',
+  github: '',
+});
 const newTag = reactive<Record<number, string>>({});
 const busy = reactive<Record<number, boolean>>({});
 
@@ -297,6 +301,7 @@ function startEdit(i: Issue) {
   editing.value = i.id;
   draft.title = i.title;
   draft.body = i.body;
+  draft.github = i.github_repo && i.github_issue ? `${i.github_repo}#${i.github_issue}` : '';
 }
 
 async function saveEdit(i: Issue) {
@@ -306,7 +311,9 @@ async function saveEdit(i: Issue) {
     return;
   }
   await withBusy(i.id, async () => {
-    replaceIssue((await patchIssue(i.id, { title, body: draft.body })) as Issue);
+    replaceIssue(
+      (await patchIssue(i.id, { title, body: draft.body, github: draft.github.trim() })) as Issue,
+    );
     editing.value = null;
   });
 }
@@ -695,6 +702,16 @@ async function removeTag(i: Issue, key: string) {
               data-testid="issue-edit-body"
               class="w-full rounded border border-line bg-input px-2 py-1 font-mono text-xs text-fg focus:border-accent focus:outline-none"
             ></textarea>
+          </label>
+          <label class="block">
+            <span class="mb-1 block text-xs text-muted">GitHub issue</span>
+            <input
+              v-model="draft.github"
+              type="text"
+              placeholder="owner/name#123 — blank to unlink"
+              data-testid="issue-edit-github"
+              class="w-full rounded border border-line bg-input px-2 py-1 font-mono text-xs text-fg focus:border-accent focus:outline-none"
+            />
           </label>
 
           <div>
