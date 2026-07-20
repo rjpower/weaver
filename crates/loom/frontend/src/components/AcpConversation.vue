@@ -1029,16 +1029,11 @@ function durationLabel(seconds: number): string {
   const s = seconds % 60;
   return `${m}:${String(s).padStart(2, '0')}`;
 }
-const elapsedSeconds = computed(() =>
-  turnStartedAt.value == null
-    ? 0
-    : Math.max(0, Math.floor((clock.value - turnStartedAt.value) / 1000)),
-);
-const progressAgeSeconds = computed(() =>
-  lastProgressAt.value == null
-    ? 0
-    : Math.max(0, Math.floor((clock.value - lastProgressAt.value) / 1000)),
-);
+function secondsSince(timestamp: number | null): number {
+  return timestamp == null ? 0 : Math.max(0, Math.floor((clock.value - timestamp) / 1000));
+}
+const elapsedSeconds = computed(() => secondsSince(turnStartedAt.value));
+const progressAgeSeconds = computed(() => secondsSince(lastProgressAt.value));
 const elapsedLabel = computed(() => durationLabel(elapsedSeconds.value));
 // A quiet turn is not necessarily stuck (the model may be reasoning without
 // streaming), so the UI reports the observable fact and lets the operator judge.
