@@ -128,7 +128,7 @@ export interface Session {
 // ── ACP conversation surface ────────────────────────────────────────────────
 // The chat journal + live SSE tail an `acp` session's Conversation renders from.
 // These hand-mirror loom's `chat.rs` / `acp/mod.rs` serde shapes: the block
-// contract (`GET /sessions/{id}/chat`) and the four `/chat/stream` SSE events.
+// contract (`GET /sessions/{id}/chat`) and the `/chat/stream` SSE events.
 
 /** Context-window usage `{used, size}` (tokens). */
 export interface AcpUsage {
@@ -202,6 +202,8 @@ export interface AcpMetadata {
   commands: AcpCommand[];
   config_options: AcpConfigOption[];
   modes: AcpMode[];
+  /** Adapter-advertised support for the private steering extension. */
+  steering_supported: boolean;
 }
 
 // -- block payloads (by kind) --
@@ -305,6 +307,11 @@ export interface SseTurn {
   turn: number;
   state: 'started' | 'ended';
   stop_reason?: string;
+}
+
+/** `queue` — the complete durable next-turn prompt after a queue mutation. */
+export interface SseQueue {
+  pending_prompt: string | null;
 }
 
 /** `POST /sessions/{id}/prompt` 202 body: whether the message steered the live

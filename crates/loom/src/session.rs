@@ -415,7 +415,7 @@ pub async fn append_pending_prompt(db: &Db, id: &str, text: &str) -> Result<Stri
 }
 
 /// Read the durable prompt queue (empty string when nothing is queued).
-/// [`clear_pending_prompt`] empties it once the text has been dispatched.
+/// [`take_pending_prompt`] consumes it before the text is dispatched.
 pub async fn read_pending_prompt(db: &Db, id: &str) -> Result<String> {
     let existing: Option<String> =
         sqlx::query_scalar("SELECT pending_prompt FROM sessions WHERE id = ?")
@@ -426,13 +426,37 @@ pub async fn read_pending_prompt(db: &Db, id: &str) -> Result<String> {
     Ok(existing.unwrap_or_default())
 }
 
-/// Clear the durable prompt queue (called once it has been dispatched as a prompt).
-pub async fn clear_pending_prompt(db: &Db, id: &str) -> Result<()> {
-    sqlx::query("UPDATE sessions SET pending_prompt = NULL WHERE id = ?")
-        .bind(id)
-        .execute(db)
-        .await?;
-    Ok(())
+/// Atomically remove and return the durable prompt queue. A caller may dispatch
+/// only a returned value: if the update fails, the transaction rolls back and
+/// the prompt stays visibly queued instead of becoming eligible for replay at
+/// every later turn boundary.
+pub async fn take_pending_prompt(db: &Db, id: &str) -> Result<Option<String>> {
+    let mut tx = db.begin().await?;
+    let pending: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT pending_prompt FROM sessions WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten()
+            .filter(|text| !text.trim().is_empty());
+    let Some(pending) = pending else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+
+    let result = sqlx::query(
+        "UPDATE sessions SET pending_prompt = NULL
+         WHERE id = ? AND pending_prompt = ?",
+    )
+    .bind(id)
+    .bind(&pending)
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        bail!("queued prompt changed while it was being consumed");
+    }
+    tx.commit().await?;
+    Ok(Some(pending))
 }
 
 /// Remove a promoted prefix from the durable queue without dropping messages

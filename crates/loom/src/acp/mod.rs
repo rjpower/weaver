@@ -121,7 +121,7 @@ pub enum PermAnswer {
 }
 
 /// One SSE event the `/chat/stream` route emits: an event name (`block`, `delta`,
-/// `tool`, `turn`, `metadata`) and its JSON data.
+/// `tool`, `turn`, `queue`, `metadata`) and its JSON data.
 #[derive(Debug, Clone, Serialize)]
 pub struct SseEvent {
     pub event: String,
@@ -137,6 +137,10 @@ pub struct AcpMetadata {
     pub commands: Vec<Value>,
     pub config_options: Vec<Value>,
     pub modes: Vec<Value>,
+    /// Whether the adapter advertised the codex-acp steering extension during
+    /// initialize. The browser uses this observed capability instead of
+    /// optimistically probing a private method that may not exist.
+    pub steering_supported: bool,
 }
 
 /// A live session's control surface, held in the [`AcpRegistry`]: send commands
@@ -185,8 +189,8 @@ impl AcpHandle {
             .map_err(|_| anyhow!("acp task dropped the reply"))?
     }
 
-    /// Send the current durable next-turn queue now: promote it into a live turn,
-    /// or start it as a normal turn when the session is idle after cancellation.
+    /// Send the current durable next-turn queue now: promote it when the adapter
+    /// advertises steering, otherwise cancel the live turn and start it normally.
     /// The task reads the queue itself so the browser cannot accidentally send
     /// stale or partial text.
     pub async fn force_pending(&self, by: Option<String>) -> Result<PromptAck> {
@@ -814,6 +818,10 @@ impl Task {
         });
     }
 
+    fn emit_queue(&self, pending_prompt: Option<&str>) {
+        self.emit("queue", json!({ "pending_prompt": pending_prompt }));
+    }
+
     fn emit_metadata(&self) {
         let metadata = self.metadata.lock().unwrap().clone();
         self.emit(
@@ -870,6 +878,7 @@ impl Task {
         if let Ok(init) = serde_json::from_value::<wire::InitializeResult>(res) {
             self.load_session_cap = init.agent_capabilities.load_session;
             self.steering_cap = init.meta.steering.supported;
+            self.metadata.lock().unwrap().steering_supported = self.steering_cap;
         }
 
         match &launch.new_or_load {
@@ -1338,13 +1347,28 @@ impl Task {
     }
 
     async fn dispatch_pending_prompt(&mut self) {
-        // Dispatch the durable queue as the next turn, if non-empty.
-        let pending = session::read_pending_prompt(&self.db, &self.session_id)
-            .await
-            .unwrap_or_default();
-        if !pending.trim().is_empty() {
-            let _ = session::clear_pending_prompt(&self.db, &self.session_id).await;
-            let _ = self.start_turn(pending, None, Vec::new()).await;
+        // Consuming the durable copy is a precondition for dispatch. Starting a
+        // turn after a failed clear leaves the same text eligible at every later
+        // boundary and turns one SQLite error into an unbounded replay loop.
+        match session::take_pending_prompt(&self.db, &self.session_id).await {
+            Ok(Some(pending)) => {
+                self.emit_queue(None);
+                if let Err(error) = self.start_turn(pending, None, Vec::new()).await {
+                    tracing::error!(
+                        session = %self.session_id,
+                        %error,
+                        "consumed queued prompt but could not start its turn"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(
+                    session = %self.session_id,
+                    %error,
+                    "could not consume queued prompt; leaving it idle"
+                );
+            }
         }
     }
 
@@ -1432,6 +1456,11 @@ impl Task {
                 %error,
                 "steered queued feedback but could not consume its durable copy"
             );
+        } else {
+            let remaining = session::read_pending_prompt(&self.db, &self.session_id)
+                .await
+                .unwrap_or_default();
+            self.emit_queue((!remaining.trim().is_empty()).then_some(remaining.as_str()));
         }
     }
 
@@ -1447,7 +1476,8 @@ impl Task {
 
     async fn queue_prompt(&self, text: &str, resources: &[Value]) -> Result<PromptAck> {
         let queued = queued_prompt_text(text, resources);
-        session::append_pending_prompt(&self.db, &self.session_id, &queued).await?;
+        let pending = session::append_pending_prompt(&self.db, &self.session_id, &queued).await?;
+        self.emit_queue(Some(&pending));
         Ok(PromptAck {
             queued: true,
             steered: false,
@@ -1664,6 +1694,45 @@ impl Task {
 
     // -- commands -----------------------------------------------------------
 
+    async fn cancel_live_turn(&mut self) -> Result<()> {
+        let result = self
+            .stream
+            .write(&wire::notification_line(
+                method::SESSION_CANCEL,
+                wire::cancel_params(&self.acp_session_id),
+            ))
+            .await;
+        if result.is_ok() && self.turn_live {
+            for (_, pending) in self.pending_steers.drain() {
+                let _ = pending.reply.send(Err(anyhow!("turn was cancelled")));
+            }
+            if let Some(pending) = self.pending_external.take() {
+                let _ = pending.reply.send(Err(anyhow!("turn was cancelled")));
+            }
+            // Cancellation is a client-owned boundary. Some adapters do not
+            // answer the cancelled prompt, so settle loom's journal and
+            // lifecycle immediately after the notification lands.
+            self.on_turn_end(
+                self.current_turn,
+                Some(json!({ "stopReason": "cancelled" })),
+                None,
+            )
+            .await;
+        }
+        // ACP requires the client to answer every pending permission request
+        // with the `cancelled` outcome when it cancels a turn.
+        for (_, pp) in self.pending_perms.drain() {
+            let _ = self
+                .stream
+                .write(&wire::response_line(
+                    &pp.jsonrpc_id,
+                    wire::permission_cancelled(),
+                ))
+                .await;
+        }
+        result
+    }
+
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
             Command::Prompt {
@@ -1674,7 +1743,7 @@ impl Task {
                 reply,
             } => {
                 if self.turn_live {
-                    if (self.steering_cap || force_steer)
+                    if self.steering_cap
                         && self.pending_steers.is_empty()
                         && self.pending_external.is_none()
                     {
@@ -1704,9 +1773,12 @@ impl Task {
                             }
                         }
                     } else if force_steer {
-                        let _ = reply.send(Err(anyhow!(
+                        let message = if self.steering_cap {
                             "another steer is still pending; retry when it settles"
-                        )));
+                        } else {
+                            "this agent does not support steering; queue the feedback or stop and send it"
+                        };
+                        let _ = reply.send(Err(anyhow!(message)));
                     } else {
                         // A failed queue write must surface — a 202 that silently
                         // dropped the prompt would be worse than an error.
@@ -1736,10 +1808,30 @@ impl Task {
                         let _ = reply.send(Err(anyhow!("there is no queued feedback to send")));
                     } else if !self.turn_live {
                         let result =
-                            match session::clear_pending_prompt(&self.db, &self.session_id).await {
-                                Ok(()) => self.start_prompt(queued.clone(), by, Vec::new()).await,
+                            match session::take_pending_prompt(&self.db, &self.session_id).await {
+                                Ok(Some(pending)) => {
+                                    self.emit_queue(None);
+                                    self.start_prompt(pending, by, Vec::new()).await
+                                }
+                                Ok(None) => Err(anyhow!("there is no queued feedback to send")),
                                 Err(error) => Err(error),
                             };
+                        let _ = reply.send(result);
+                    } else if !self.steering_cap {
+                        let result = match self.cancel_live_turn().await {
+                            Ok(()) => {
+                                match session::take_pending_prompt(&self.db, &self.session_id).await
+                                {
+                                    Ok(Some(pending)) => {
+                                        self.emit_queue(None);
+                                        self.start_prompt(pending, by, Vec::new()).await
+                                    }
+                                    Ok(None) => Err(anyhow!("there is no queued feedback to send")),
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            Err(error) => Err(error),
+                        };
                         let _ = reply.send(result);
                     } else {
                         let id = self.next_id();
@@ -1771,42 +1863,7 @@ impl Task {
                 }
             }
             Command::Cancel { reply } => {
-                let r = self
-                    .stream
-                    .write(&wire::notification_line(
-                        method::SESSION_CANCEL,
-                        wire::cancel_params(&self.acp_session_id),
-                    ))
-                    .await;
-                if r.is_ok() && self.turn_live {
-                    for (_, pending) in self.pending_steers.drain() {
-                        let _ = pending.reply.send(Err(anyhow!("turn was cancelled")));
-                    }
-                    if let Some(pending) = self.pending_external.take() {
-                        let _ = pending.reply.send(Err(anyhow!("turn was cancelled")));
-                    }
-                    // Cancellation is a client-owned boundary. Some adapters do
-                    // not answer the cancelled prompt, so settle loom's journal
-                    // and lifecycle immediately after the notification lands.
-                    self.on_turn_end(
-                        self.current_turn,
-                        Some(json!({ "stopReason": "cancelled" })),
-                        None,
-                    )
-                    .await;
-                }
-                // ACP requires the client to answer every pending permission
-                // request with the `cancelled` outcome when it cancels a turn.
-                for (_, pp) in self.pending_perms.drain() {
-                    let _ = self
-                        .stream
-                        .write(&wire::response_line(
-                            &pp.jsonrpc_id,
-                            wire::permission_cancelled(),
-                        ))
-                        .await;
-                }
-                let _ = reply.send(r);
+                let _ = reply.send(self.cancel_live_turn().await);
             }
             Command::AnswerPermission {
                 request_id,

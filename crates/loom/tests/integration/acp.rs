@@ -211,6 +211,7 @@ async fn composer_metadata_and_config_options_round_trip() {
     start_new(&ts, "acp-meta", None, None).await;
 
     let metadata = poll_metadata(&ts, "acp-meta", Duration::from_secs(5)).await;
+    assert_eq!(metadata["steering_supported"], false);
     let commands = metadata["commands"].as_array().unwrap();
     assert!(commands.iter().any(|command| command["name"] == "resume"));
     assert!(commands.iter().any(|command| {
@@ -627,6 +628,12 @@ async fn permission_answered_over_rest() {
 async fn prompt_queues_during_a_live_turn() {
     let ts = TestServer::start().await;
     start_new(&ts, "acp-queue", None, None).await;
+    let mut rx = ts
+        .state
+        .acp
+        .get("acp-queue")
+        .expect("task registered")
+        .subscribe();
 
     let first = ts
         .client
@@ -651,18 +658,32 @@ async fn prompt_queues_during_a_live_turn() {
         .unwrap();
     assert_eq!(second["queued"], true, "a send during a turn queues");
     assert_eq!(second["turn"], 0, "queued against the live turn");
+    let third = ts
+        .client
+        .post(
+            "/api/sessions/acp-queue/prompt",
+            json!({ "text": "say:third" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(third["queued"], true);
+
+    let queue_events = drain_events(&mut rx, Duration::from_secs(5), |event| {
+        event.event == "queue" && event.data["pending_prompt"] == "say:second\n\nsay:third"
+    })
+    .await;
+    assert!(queue_events
+        .iter()
+        .any(|event| { event.event == "queue" && event.data["pending_prompt"] == "say:second" }));
 
     let session = session_mod::get(&ts.state.db, "acp-queue")
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        session
-            .pending_prompt
-            .as_deref()
-            .unwrap_or("")
-            .contains("say:second"),
-        "the queue is persisted"
+    assert_eq!(
+        session.pending_prompt.as_deref(),
+        Some("say:second\n\nsay:third"),
+        "multiple sends coalesce into one durable next-turn prompt"
     );
 
     // The queued prompt dispatches as turn 1 once turn 0 ends.
@@ -674,14 +695,80 @@ async fn prompt_queues_during_a_live_turn() {
     assert!(
         blocks.iter().any(|b| b["kind"] == "user_message"
             && b["turn"] == 1
-            && b["payload"]["text"] == "say:second"),
-        "the queued text became turn 1's user_message"
+            && b["payload"]["text"] == "say:second\n\nsay:third"),
+        "the coalesced queue became one turn 1 user_message"
     );
     assert!(
         blocks
             .iter()
             .any(|b| b["kind"] == "agent_message" && b["payload"]["text"] == "second"),
         "the queued turn ran"
+    );
+}
+
+/// A queued prompt must not be dispatched unless removing its durable copy
+/// succeeds. Otherwise every turn boundary can dispatch the same still-pending
+/// text again, growing the journal until the session is stopped.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_consume_failure_does_not_dispatch_or_replay() {
+    let ts = TestServer::start().await;
+    start_new(&ts, "acp-queue-failure", None, None).await;
+
+    ts.client
+        .post(
+            "/api/sessions/acp-queue-failure/prompt",
+            json!({ "text": "wait:300|say:first" }),
+        )
+        .await
+        .unwrap();
+    let queued = ts
+        .client
+        .post(
+            "/api/sessions/acp-queue-failure/prompt",
+            json!({ "text": "say:must-stay-queued" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued["queued"], true);
+
+    // Reproduce a failed queue-consumption write. The production incident's
+    // error was discarded, so its exact SQLite cause is unavailable; the
+    // invariant is that a failed consume must keep loom from dispatching.
+    sqlx::query(
+        "CREATE TRIGGER reject_queue_consume
+         BEFORE UPDATE OF pending_prompt ON sessions
+         WHEN OLD.id = 'acp-queue-failure'
+              AND OLD.pending_prompt IS NOT NULL
+              AND NEW.pending_prompt IS NULL
+         BEGIN
+             SELECT RAISE(FAIL, 'injected queue consume failure');
+         END",
+    )
+    .execute(&ts.state.db)
+    .await
+    .unwrap();
+
+    poll_chat(
+        &ts,
+        "acp-queue-failure",
+        Duration::from_secs(10),
+        |blocks| count_kind(blocks, "turn_end") >= 1,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    ts.state.acp.stop("acp-queue-failure");
+
+    let chat = ts
+        .client
+        .get("/api/sessions/acp-queue-failure/chat")
+        .await
+        .unwrap();
+    assert_eq!(chat["pending_prompt"], "say:must-stay-queued");
+    assert_eq!(
+        count_kind(chat["blocks"].as_array().unwrap(), "user_message"),
+        1,
+        "a prompt whose durable copy could not be consumed must stay unseen"
     );
 }
 
@@ -699,6 +786,9 @@ async fn prompt_steers_a_live_turn_when_advertised() {
         vec![("FAKE_ACP_STEERING".to_string(), "1".to_string())],
     )
     .await;
+
+    let initial = ts.client.get("/api/sessions/acp-steer/chat").await.unwrap();
+    assert_eq!(initial["metadata"]["steering_supported"], true);
 
     let first = ts
         .client
@@ -751,12 +841,12 @@ async fn prompt_steers_a_live_turn_when_advertised() {
     }));
 }
 
-/// A person can promote already-queued feedback into the running turn even when
-/// an adapter did not advertise steering. The durable copy is consumed only
-/// after the adapter accepts it, so it cannot replay as another turn.
+/// An adapter that does not advertise steering must never be probed with the
+/// private extension. Sending its durable queue now cancels the current turn
+/// and starts one normal prompt with the combined feedback.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prompt_promotes_queued_feedback_without_advertised_capability() {
+async fn prompt_stops_and_sends_queue_without_steering_capability() {
     let ts = TestServer::start().await;
     start_new(&ts, "acp-force-steer", None, None).await;
 
@@ -777,7 +867,7 @@ async fn prompt_promotes_queued_feedback_without_advertised_capability() {
         .unwrap();
     assert_eq!(queued["queued"], true, "response: {queued}");
 
-    let steered = ts
+    let sent = ts
         .client
         .post(
             "/api/sessions/acp-force-steer/prompt",
@@ -785,14 +875,24 @@ async fn prompt_promotes_queued_feedback_without_advertised_capability() {
         )
         .await
         .unwrap();
-    assert_eq!(steered["queued"], false);
-    assert_eq!(steered["steered"], true, "response: {steered}");
+    assert_eq!(sent["queued"], false);
+    assert_eq!(sent["steered"], false, "response: {sent}");
 
     let session = session_mod::get(&ts.state.db, "acp-force-steer")
         .await
         .unwrap()
         .unwrap();
     assert!(session.pending_prompt.as_deref().unwrap_or("").is_empty());
+
+    let chat = poll_chat(&ts, "acp-force-steer", Duration::from_secs(10), |blocks| {
+        blocks
+            .iter()
+            .any(|block| block["kind"] == "agent_message" && block["payload"]["text"] == "feedback")
+    })
+    .await;
+    assert!(chat["blocks"].as_array().unwrap().iter().any(|block| {
+        block["kind"] == "turn_end" && block["payload"]["stop_reason"] == "cancelled"
+    }));
 }
 
 /// Composer-selected files are resolved inside the worktree and forwarded as

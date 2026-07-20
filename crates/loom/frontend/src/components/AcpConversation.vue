@@ -26,6 +26,7 @@ import type {
   SseDelta,
   SseTool,
   SseTurn,
+  SseQueue,
   UserMessagePayload,
   AgentMessagePayload,
   ThoughtPayload,
@@ -56,7 +57,8 @@ import MarkdownView from './MarkdownView.vue';
 // Its data source is the durable chat journal: it paints the `GET /chat`
 // snapshot, then applies the `/chat/stream` SSE tail in place — `block` upserts
 // by (turn, seq), `delta` streams into a shadow message/thought, `tool` tracks
-// live tool state (feeding the status line), `turn` drives the live-turn state.
+// live tool state (feeding the status line), `turn` drives the live-turn state,
+// and `queue` carries the complete durable next-turn prompt.
 // The composer posts to `/prompt`; Stop posts `/interrupt`; permission cards
 // answer via `/permissions/{id}`; the mode chip drives `/mode`.
 const props = withDefaults(
@@ -79,15 +81,20 @@ const shadows = reactive(
 const liveTools = reactive(new Map<string, SseTool>());
 const turnLive = ref(false);
 const liveTurnNo = ref<number | null>(null);
-const optimistic = ref<{ key: number; text: string; state: 'sent' | 'steered' | 'queued' }[]>([]);
-const forceQueueKey = computed(() => {
-  for (let index = optimistic.value.length - 1; index >= 0; index -= 1) {
-    if (optimistic.value[index].state === 'queued') return optimistic.value[index].key;
-  }
-  return null;
-});
+// Optimistic rows exist only while an HTTP send is unresolved. Delivery state
+// comes from the durable queue snapshot/SSE, never from the click that initiated
+// the request.
+const optimistic = ref<{ key: number; text: string }[]>([]);
+const pendingPrompt = ref<string | null>(null);
 let nextOptimisticKey = 0;
-const metadata = ref<AcpMetadata>({ commands: [], config_options: [], modes: [] });
+const emptyMetadata = (): AcpMetadata => ({
+  commands: [],
+  config_options: [],
+  modes: [],
+  steering_supported: false,
+});
+const metadata = ref<AcpMetadata>(emptyMetadata());
+const steeringSupported = computed(() => metadata.value.steering_supported);
 
 // The live mode, seeded from the session and advanced by `mode_change` blocks or
 // a local set — so the composer chip reads true without a refetch.
@@ -98,6 +105,14 @@ watch(
     if (m) currentMode.value = m;
   },
 );
+
+function applyMetadata(next: AcpMetadata) {
+  metadata.value = next;
+  // Config options are the state acknowledged or pushed by the adapter. Keep
+  // the permissions chip aligned even when the agent changes it unsolicited.
+  const mode = next.config_options.find(isModeOption)?.currentValue;
+  if (typeof mode === 'string') currentMode.value = mode;
+}
 
 const blockKey = (turn: number, seq: number) => `${turn}:${seq}`;
 
@@ -123,15 +138,8 @@ async function load({ preserve = false }: { preserve?: boolean } = {}) {
     liveTools.clear();
     liveTurnNo.value = snap.live_turn;
     turnLive.value = snap.live_turn != null;
-    optimistic.value = optimistic.value.filter((item) => item.state !== 'queued');
-    if (snap.pending_prompt?.trim()) {
-      optimistic.value.push({
-        key: nextOptimisticKey++,
-        text: snap.pending_prompt,
-        state: 'queued',
-      });
-    }
-    metadata.value = snap.metadata ?? { commands: [], config_options: [], modes: [] };
+    pendingPrompt.value = snap.pending_prompt?.trim() ? snap.pending_prompt : null;
+    applyMetadata(snap.metadata ?? emptyMetadata());
     state.value = 'ready';
   } catch (e) {
     if (seq !== loadSeq) return;
@@ -191,8 +199,12 @@ function onTurn(ev: SseTurn) {
   } else {
     turnLive.value = false;
     liveTurnNo.value = null;
-    optimistic.value = optimistic.value.filter((o) => o.state === 'queued');
   }
+}
+
+function onQueue(ev: SseQueue) {
+  pendingPrompt.value = ev.pending_prompt?.trim() ? ev.pending_prompt : null;
+  autoFollow();
 }
 
 // ── SSE lifecycle (kept-alive discipline) ────────────────────────────────────
@@ -209,8 +221,11 @@ function openStream() {
   );
   stream.addEventListener('tool', (e) => onTool(JSON.parse((e as MessageEvent).data) as SseTool));
   stream.addEventListener('turn', (e) => onTurn(JSON.parse((e as MessageEvent).data) as SseTurn));
+  stream.addEventListener('queue', (e) =>
+    onQueue(JSON.parse((e as MessageEvent).data) as SseQueue),
+  );
   stream.addEventListener('metadata', (e) => {
-    metadata.value = JSON.parse((e as MessageEvent).data) as AcpMetadata;
+    applyMetadata(JSON.parse((e as MessageEvent).data) as AcpMetadata);
   });
   // Once the server has installed the subscription, reconcile from the durable
   // journal. Subscribing first avoids a snapshot-to-stream gap during handoff.
@@ -272,18 +287,19 @@ async function submitPrompt(forceSteer = false) {
   sending.value = true;
   sendError.value = '';
   const text = draft.value;
-  const pending = { key: nextOptimisticKey++, text, state: 'sent' as const };
+  const pending = { key: nextOptimisticKey++, text };
   optimistic.value.push(pending);
   autoFollow();
   try {
     const files = selectedFiles.value.filter((path) => text.includes(`@${path}`));
-    const ack = await promptSession(id.value, text, undefined, forceSteer, files);
+    await promptSession(id.value, text, undefined, forceSteer, files);
     const index = optimistic.value.findIndex((o) => o.key === pending.key);
-    if (index >= 0) {
-      optimistic.value[index].state = ack.queued ? 'queued' : ack.steered ? 'steered' : 'sent';
-    }
+    if (index >= 0) optimistic.value.splice(index, 1);
     draft.value = '';
     selectedFiles.value = [];
+    // Reconcile against the journal + durable queue that produced the ack. SSE
+    // covers other clients; this closes the request/event race for this client.
+    await load({ preserve: true });
     autoFollow();
   } catch (e) {
     const index = optimistic.value.findIndex((o) => o.key === pending.key);
@@ -300,10 +316,10 @@ async function forceQueued() {
   sendError.value = '';
   try {
     await forceQueuedSession(id.value);
-    optimistic.value = optimistic.value.filter((item) => item.state !== 'queued');
+    await load({ preserve: true });
     autoFollow();
   } catch (e) {
-    sendError.value = (e as Error).message ?? 'Failed to steer queued feedback';
+    sendError.value = (e as Error).message ?? 'Failed to send queued feedback';
   } finally {
     sending.value = false;
   }
@@ -798,6 +814,7 @@ const isEmpty = computed(
     state.value === 'ready' &&
     !model.value.rows.length &&
     !optimistic.value.length &&
+    !pendingPrompt.value &&
     !turnLive.value,
 );
 
@@ -1152,7 +1169,34 @@ function goTo(anchor: string) {
             </div>
           </template>
 
-          <!-- Optimistic (in-flight / queued) user messages. -->
+          <!-- The server-owned durable queue is one coalesced next-turn prompt. -->
+          <section v-if="pendingPrompt" class="acp-speaker" data-testid="acp-pending">
+            <header class="acp-rule">
+              <span class="acp-label text-accent">You</span>
+              <span class="acp-prompt-state" data-testid="acp-queued"
+                >queued · agent hasn’t seen this yet</span
+              >
+              <button
+                type="button"
+                class="acp-prompt-action"
+                data-testid="acp-force-queued"
+                :disabled="sending"
+                :title="
+                  turnLive
+                    ? steeringSupported
+                      ? 'Inject all queued feedback into the running turn now'
+                      : 'Stop the running turn and send all queued feedback as the next turn'
+                    : 'Start a new turn with all queued feedback'
+                "
+                @click="forceQueued"
+              >
+                {{ turnLive ? (steeringSupported ? 'Force now' : 'Stop & send') : 'Send now' }}
+              </button>
+            </header>
+            <MarkdownView :id="id" path="" :source="pendingPrompt" />
+          </section>
+
+          <!-- A local send remains unclassified only until the server answers. -->
           <section
             v-for="o in optimistic"
             :key="`opt-${o.key}`"
@@ -1161,32 +1205,6 @@ function goTo(anchor: string) {
           >
             <header class="acp-rule">
               <span class="acp-label text-accent">You</span>
-              <template v-if="o.state === 'queued'">
-                <span class="acp-prompt-state" data-testid="acp-queued"
-                  >queued · agent hasn’t seen this yet</span
-                >
-                <button
-                  v-if="o.key === forceQueueKey"
-                  type="button"
-                  class="acp-prompt-action"
-                  data-testid="acp-force-queued"
-                  :disabled="sending"
-                  :title="
-                    turnLive
-                      ? 'Inject all queued feedback into the running turn now'
-                      : 'Start a new turn with all queued feedback'
-                  "
-                  @click="forceQueued"
-                >
-                  {{ turnLive ? 'Force now' : 'Send now' }}
-                </button>
-              </template>
-              <span
-                v-else-if="o.state === 'steered'"
-                class="acp-prompt-state"
-                data-testid="acp-steered"
-                >steering current turn</span
-              >
             </header>
             <MarkdownView :id="id" path="" :source="o.text" />
           </section>
@@ -1388,12 +1406,12 @@ function goTo(anchor: string) {
         </div>
         <div class="acp-composer-right">
           <button
-            v-if="turnLive"
+            v-if="turnLive && steeringSupported"
             type="button"
             class="btn-secondary px-3 py-1 text-xs"
             data-testid="acp-composer-force-steer"
             :disabled="sending || !draft.trim()"
-            title="Inject this feedback into the running turn even if the agent did not advertise steering"
+            title="Inject this feedback into the running turn"
             @click="submitPrompt(true)"
           >
             Force steer
