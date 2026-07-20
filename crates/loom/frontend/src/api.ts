@@ -310,7 +310,8 @@ export const forceQueuedSession = (id: string, by?: string) =>
   }) as Promise<PromptAck>;
 
 /** Atomically pull unseen next-turn feedback out of the server queue so it can
- * be edited in the composer. A 409 means dispatch/steering won the race. */
+ * be edited in the composer. A 409 means the current ACP state has no queue
+ * available to retract. */
 export const retractQueuedSession = (id: string) =>
   del(`/sessions/${id}/prompt`) as Promise<{ text: string }>;
 
