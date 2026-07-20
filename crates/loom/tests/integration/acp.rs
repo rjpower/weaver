@@ -714,6 +714,12 @@ async fn prompt_queues_during_a_live_turn() {
 async fn queue_consume_failure_does_not_dispatch_or_replay() {
     let ts = TestServer::start().await;
     start_new(&ts, "acp-queue-failure", None, None).await;
+    let mut rx = ts
+        .state
+        .acp
+        .get("acp-queue-failure")
+        .expect("task registered")
+        .subscribe();
 
     ts.client
         .post(
@@ -749,14 +755,23 @@ async fn queue_consume_failure_does_not_dispatch_or_replay() {
     .await
     .unwrap();
 
-    poll_chat(
-        &ts,
-        "acp-queue-failure",
-        Duration::from_secs(10),
-        |blocks| count_kind(blocks, "turn_end") >= 1,
-    )
+    drain_events(&mut rx, Duration::from_secs(10), |event| {
+        event.event == "turn" && event.data["state"] == "ended"
+    })
     .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let replay = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let event = rx.recv().await.expect("ACP event stream remains open");
+            if event.event == "block" && event.data["kind"] == "user_message" {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        replay.is_err(),
+        "the queued prompt was unexpectedly replayed"
+    );
     ts.state.acp.stop("acp-queue-failure");
 
     let chat = ts

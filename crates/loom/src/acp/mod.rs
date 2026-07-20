@@ -1457,10 +1457,16 @@ impl Task {
                 "steered queued feedback but could not consume its durable copy"
             );
         } else {
-            let remaining = session::read_pending_prompt(&self.db, &self.session_id)
-                .await
-                .unwrap_or_default();
-            self.emit_queue((!remaining.trim().is_empty()).then_some(remaining.as_str()));
+            match session::read_pending_prompt(&self.db, &self.session_id).await {
+                Ok(remaining) => {
+                    self.emit_queue((!remaining.trim().is_empty()).then_some(remaining.as_str()));
+                }
+                Err(error) => tracing::error!(
+                    session = %self.session_id,
+                    %error,
+                    "consumed steered feedback but could not refresh the queue view"
+                ),
+            }
         }
     }
 
@@ -1483,6 +1489,14 @@ impl Task {
             steered: false,
             turn: Some(self.current_turn),
         })
+    }
+
+    async fn start_pending_prompt(&mut self, by: Option<String>) -> Result<PromptAck> {
+        let pending = session::take_pending_prompt(&self.db, &self.session_id)
+            .await?
+            .ok_or_else(|| anyhow!("there is no queued feedback to send"))?;
+        self.emit_queue(None);
+        self.start_prompt(pending, by, Vec::new()).await
     }
 
     async fn start_prompt(
@@ -1807,29 +1821,11 @@ impl Task {
                     if queued.trim().is_empty() {
                         let _ = reply.send(Err(anyhow!("there is no queued feedback to send")));
                     } else if !self.turn_live {
-                        let result =
-                            match session::take_pending_prompt(&self.db, &self.session_id).await {
-                                Ok(Some(pending)) => {
-                                    self.emit_queue(None);
-                                    self.start_prompt(pending, by, Vec::new()).await
-                                }
-                                Ok(None) => Err(anyhow!("there is no queued feedback to send")),
-                                Err(error) => Err(error),
-                            };
+                        let result = self.start_pending_prompt(by).await;
                         let _ = reply.send(result);
                     } else if !self.steering_cap {
                         let result = match self.cancel_live_turn().await {
-                            Ok(()) => {
-                                match session::take_pending_prompt(&self.db, &self.session_id).await
-                                {
-                                    Ok(Some(pending)) => {
-                                        self.emit_queue(None);
-                                        self.start_prompt(pending, by, Vec::new()).await
-                                    }
-                                    Ok(None) => Err(anyhow!("there is no queued feedback to send")),
-                                    Err(error) => Err(error),
-                                }
-                            }
+                            Ok(()) => self.start_pending_prompt(by).await,
                             Err(error) => Err(error),
                         };
                         let _ = reply.send(result);
