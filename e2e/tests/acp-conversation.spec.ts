@@ -342,7 +342,7 @@ test.describe('acp conversation', () => {
     await expect(page.getByText('after stop', { exact: true })).toBeVisible({ timeout: 15_000 });
   });
 
-  test('force steer injects feedback when the agent omitted its capability bit', async ({ page, weaver }) => {
+  test('force steer is offered only when the agent advertises it', async ({ page, weaver }) => {
     await openAcp(page, weaver, {
       goal: 'say:ready',
       name: 'acp-force-ui',
@@ -356,13 +356,7 @@ test.describe('acp conversation', () => {
     });
 
     await input.fill('say:feedback now');
-    await page.getByTestId('acp-composer-force-steer').click();
-    await expect(page.getByTestId('acp-steered')).toBeVisible({
-      timeout: 15_000,
-    });
-    await expect(
-      page.getByTestId('acp-conversation').getByText('feedback nowfirst turn done', { exact: true }),
-    ).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByTestId('acp-composer-force-steer')).toBeHidden();
   });
 
   test('ordinary feedback says when the running agent has not seen it yet', async ({ page, weaver }) => {
@@ -381,21 +375,29 @@ test.describe('acp conversation', () => {
     await expect(page.getByTestId('acp-queued')).toHaveText(
       'queued · agent hasn’t seen this yet',
     );
+    await input.fill('say:and another thought');
+    await page.getByTestId('acp-composer-send').click();
+    await expect(page.getByTestId('acp-pending')).toHaveCount(1);
+    await expect(page.getByTestId('acp-pending')).toContainText('queued feedback');
+    await expect(page.getByTestId('acp-pending')).toContainText('and another thought');
     await page.reload();
     await expect(page.getByTestId('acp-queued')).toHaveText(
       'queued · agent hasn’t seen this yet',
     );
     const forceNow = page.getByTestId('acp-force-queued').last();
     await expect(forceNow).toBeEnabled();
+    await expect(forceNow).toHaveText('Stop & send');
     await page.screenshot({ path: test.info().outputPath('acp-queued-feedback.png') });
     await forceNow.click();
 
     await expect(page.getByTestId('acp-queued')).toBeHidden();
-    await expect(page.getByTestId('acp-steered')).toBeVisible({ timeout: 15_000 });
     await expect(
       page
         .getByTestId('acp-conversation')
-        .getByText('queued feedbackfirst turn done', { exact: true }),
+        .getByText('queued feedback', { exact: true }),
+    ).toBeVisible({ timeout: 20_000 });
+    await expect(
+      page.getByTestId('acp-conversation').getByText('say:and another thought', { exact: true }),
     ).toBeVisible({ timeout: 20_000 });
   });
 
@@ -427,6 +429,7 @@ test.describe('acp conversation', () => {
     await expect(page.getByTestId('acp-working')).toBeVisible({
       timeout: 15_000,
     });
+    await expect(page.getByTestId('acp-composer-force-steer')).toBeVisible();
 
     // A second prompt sent mid-turn is injected into the active turn.
     await input.fill('say:second turn');

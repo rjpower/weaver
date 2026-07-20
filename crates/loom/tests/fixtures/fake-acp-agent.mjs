@@ -45,6 +45,13 @@ function send(obj) {
 function respond(id, result) {
   send({ jsonrpc: JSONRPC, id, result });
 }
+function rejectMethod(id, method) {
+  send({
+    jsonrpc: JSONRPC,
+    id,
+    error: { code: -32601, message: `Method not found: ${method}`, data: { method } },
+  });
+}
 function notify(update) {
   send({ jsonrpc: JSONRPC, method: "session/update", params: { sessionId, update } });
 }
@@ -334,7 +341,8 @@ function handleMessage(msg) {
       void handlePrompt(msg.id, msg.params);
       break;
     case "_session/steering":
-      handleSteering(msg.id, msg.params);
+      if (steeringSupported) handleSteering(msg.id, msg.params);
+      else rejectMethod(msg.id, msg.method);
       break;
     case "session/cancel":
       cancelled = true;

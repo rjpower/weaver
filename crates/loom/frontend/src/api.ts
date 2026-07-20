@@ -298,8 +298,8 @@ export const promptSession = (
     files,
   }) as Promise<PromptAck>;
 
-/** Send all durable next-turn feedback now, steering a live turn or starting an
- * idle session after cancellation. */
+/** Send all durable next-turn feedback now: steer when the adapter advertises
+ * support, otherwise stop the live turn and start one normal queued turn. */
 export const forceQueuedSession = (id: string, by?: string) =>
   post(`/sessions/${id}/prompt`, {
     text: '',
