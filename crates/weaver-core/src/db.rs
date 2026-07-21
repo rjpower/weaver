@@ -191,6 +191,8 @@ async fn migrate(pool: &Db) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::task::Poll;
 
     /// Regression: the on-disk pool must serve a fully-migrated schema on every
     /// connection. A schema-changing migration once left some pooled connections
@@ -255,17 +257,30 @@ mod tests {
     async fn waiting_writers_do_not_starve_reads() {
         let dir = tempfile::tempdir().unwrap();
         let db = connect(&dir.path().join("weaver.db")).await.unwrap();
+
+        // Pre-open the whole pool so polling each waiter once gets as far as
+        // the writer lock rather than pausing to establish a connection.
+        let mut connections = Vec::new();
+        for _ in 0..5 {
+            connections.push(db.acquire().await.unwrap());
+        }
+        drop(connections);
+
         let writer = begin_immediate(&db).await.unwrap();
 
-        let mut waiters = Vec::new();
-        for _ in 0..4 {
-            let db = db.clone();
-            waiters.push(tokio::spawn(async move {
-                let tx = begin_immediate(&db).await.unwrap();
-                tx.commit().await.unwrap();
-            }));
+        let mut waiters = (0..4)
+            .map(|_| Box::pin(begin_immediate(&db)))
+            .collect::<Vec<_>>();
+        for waiter in &mut waiters {
+            std::future::poll_fn(|cx| {
+                assert!(
+                    waiter.as_mut().poll(cx).is_pending(),
+                    "writer unexpectedly acquired SQLite's lock"
+                );
+                Poll::Ready(())
+            })
+            .await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let read = tokio::time::timeout(
             std::time::Duration::from_millis(250),
@@ -275,7 +290,7 @@ mod tests {
 
         writer.commit().await.unwrap();
         for waiter in waiters {
-            waiter.await.unwrap();
+            waiter.await.unwrap().commit().await.unwrap();
         }
         assert!(
             read.is_ok(),
