@@ -1266,21 +1266,12 @@ function goTo(anchor: string) {
               <MarkdownView :id="id" path="" :source="row.text" />
             </section>
 
-            <!-- A live thought shows its tail. Settled thoughts are folded into
-                 the surrounding activity run below. -->
+            <!-- Only a live thought remains a standalone row; settled thoughts
+                 are folded into the surrounding activity run below. -->
             <div v-else-if="row.type === 'thought'" class="acp-thought" data-testid="acp-thought">
-              <template v-if="row.streaming">
-                <div class="acp-thought-live-clip">
-                  <p class="acp-thought-body">{{ row.text }}</p>
-                </div>
-              </template>
-              <template v-else>
-                <button type="button" class="acp-fold-head" @click="toggleFold(row.key)">
-                  <span class="chev" :class="{ open: foldOpen(row.key) }">▸</span>
-                  <span>thinking</span>
-                </button>
-                <p v-if="foldOpen(row.key)" class="acp-thought-body">{{ row.text }}</p>
-              </template>
+              <div class="acp-thought-live-clip">
+                <p class="acp-thought-body">{{ row.text }}</p>
+              </div>
             </div>
 
             <!-- Apparatus: one folded activity line per continuous run of
