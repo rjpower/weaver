@@ -1,10 +1,52 @@
 use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use tokio::sync::{Mutex, MutexGuard};
 
 pub type Db = SqlitePool;
+
+// SQLite permits one writer at a time. Coordinate multi-statement writers
+// before they check out a pooled connection: relying on SQLite's busy handler
+// lets every contender occupy a connection while it waits, which can exhaust
+// the pool and make unrelated dashboard reads look hung.
+static WRITE_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// A SQLite write transaction holding the process-wide writer permit.
+///
+/// The permit is released after the transaction is committed, rolled back, or
+/// dropped. Dereferencing exposes the connection so existing sqlx query calls
+/// can execute with `&mut *tx`.
+pub struct ImmediateTransaction<'a> {
+    tx: Transaction<'a, Sqlite>,
+    _writer: MutexGuard<'static, ()>,
+}
+
+impl Deref for ImmediateTransaction<'_> {
+    type Target = SqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tx
+    }
+}
+
+impl DerefMut for ImmediateTransaction<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tx
+    }
+}
+
+impl ImmediateTransaction<'_> {
+    pub async fn commit(self) -> sqlx::Result<()> {
+        self.tx.commit().await
+    }
+
+    pub async fn rollback(self) -> sqlx::Result<()> {
+        self.tx.rollback().await
+    }
+}
 
 /// Root directory for all weaver state on this machine.
 pub fn weaver_home() -> PathBuf {
@@ -127,10 +169,17 @@ pub async fn connect_in_memory() -> Result<Db> {
 /// Open a write transaction that takes SQLite's write lock up front
 /// (`BEGIN IMMEDIATE`). A default deferred transaction starts as a reader and
 /// upgrades on its first write — and an upgrade that loses the race fails with
-/// SQLITE_BUSY *immediately*, bypassing the connection's `busy_timeout`. Every
-/// multi-statement write path begins here so it waits its turn instead.
-pub async fn begin_immediate(db: &Db) -> sqlx::Result<sqlx::Transaction<'_, sqlx::Sqlite>> {
-    db.begin_with("BEGIN IMMEDIATE").await
+/// SQLITE_BUSY *immediately*, bypassing the connection's `busy_timeout`.
+///
+/// Contenders queue on [`WRITE_LOCK`] before acquiring a pool connection. This
+/// preserves read capacity while writes wait for SQLite's single writer slot.
+pub async fn begin_immediate(db: &Db) -> sqlx::Result<ImmediateTransaction<'static>> {
+    let writer = WRITE_LOCK.lock().await;
+    let tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    Ok(ImmediateTransaction {
+        tx,
+        _writer: writer,
+    })
 }
 
 /// Apply pending schema migrations. The migration framework (ordered SQL files
@@ -198,5 +247,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// Waiting for SQLite's single writer must not consume every pooled
+    /// connection. Dashboard reads should remain available while writes queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn waiting_writers_do_not_starve_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = connect(&dir.path().join("weaver.db")).await.unwrap();
+        let writer = begin_immediate(&db).await.unwrap();
+
+        let mut waiters = Vec::new();
+        for _ in 0..4 {
+            let db = db.clone();
+            waiters.push(tokio::spawn(async move {
+                let tx = begin_immediate(&db).await.unwrap();
+                tx.commit().await.unwrap();
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&db),
+        )
+        .await;
+
+        writer.commit().await.unwrap();
+        for waiter in waiters {
+            waiter.await.unwrap();
+        }
+        assert!(
+            read.is_ok(),
+            "writer contention exhausted the pool and blocked an unrelated read"
+        );
     }
 }
