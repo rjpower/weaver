@@ -366,9 +366,26 @@ pub async fn set_current_mode(db: &Db, id: &str, mode_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Clear state owned by one ACP adapter process after setup fails. The stable
+/// loom session, journal, runtime profile, and durable human prompt queue stay
+/// intact so the failed session can be inspected or handed off.
+pub async fn clear_acp_state(db: &Db, id: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE sessions
+         SET acp_session_id = NULL, acp_ack_seq = 0, acp_inflight = NULL,
+             current_mode = NULL
+         WHERE id = ?",
+    )
+    .bind(id)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// Replace an ACP session's runtime profile and clear every piece of
-/// provider-private relay/session state. The journal is deliberately untouched:
-/// it is keyed by loom's stable session id and continues across the handoff.
+/// provider-private relay/session state. The journal and durable prompt queue
+/// are deliberately untouched: both belong to loom's stable session and must
+/// continue across a disconnected handoff.
 pub async fn prepare_handoff(
     db: &Db,
     id: &str,
@@ -381,7 +398,7 @@ pub async fn prepare_handoff(
         "UPDATE sessions
          SET agent_kind = ?, model = ?, effort = ?, status = ?,
              acp_session_id = NULL, acp_ack_seq = 0, acp_inflight = NULL,
-             current_mode = NULL, pending_prompt = ''
+             current_mode = NULL
          WHERE id = ?",
     )
     .bind(agent_kind)
@@ -617,10 +634,7 @@ mod tests {
         assert_eq!(session.acp_ack_seq, 0);
         assert!(session.acp_inflight.is_none());
         assert!(session.current_mode.is_none());
-        assert!(
-            session.pending_prompt.as_deref().unwrap_or("").is_empty(),
-            "handoff clears the queue to empty, never NULL"
-        );
+        assert_eq!(session.pending_prompt.as_deref(), Some("queued"));
     }
 
     /// Regression: the queue clears to `''`, never NULL. `sessions.pending_prompt`

@@ -15,7 +15,7 @@
 
 use anyhow::Result;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::db::{now_iso, Db};
@@ -312,6 +312,53 @@ pub async fn has_turn_end(db: &Db, session_id: &str, turn: i64) -> Result<bool> 
     Ok(n > 0)
 }
 
+/// Close a turn abandoned by a vanished ACP task. The opening user block is
+/// already durable before `acp_inflight` is written; this supplies the missing
+/// terminal boundary before a replacement provider starts.
+pub async fn close_abandoned_turn(db: &Db, session_id: &str, turn: i64) -> Result<()> {
+    if has_turn_end(db, session_id, turn).await? {
+        return Ok(());
+    }
+    let seq: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(seq), -1) + 1 FROM chat_blocks
+         WHERE session_id = ? AND turn = ?",
+    )
+    .bind(session_id)
+    .bind(turn)
+    .fetch_one(db)
+    .await?;
+    insert(
+        db,
+        session_id,
+        turn,
+        seq,
+        kind::TURN_END,
+        &json!({ "stop_reason": "error" }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Append an internal context-usage reset at the journal tail. Handoff keeps
+/// historical usage blocks, but current usage must read as unknown until the
+/// replacement provider reports its own context window.
+pub async fn reset_usage(db: &Db, session_id: &str) -> Result<()> {
+    let (turn, seq) = match max_turn_seq(db, session_id).await? {
+        Some((turn, seq)) => (turn, seq + 1),
+        None => (0, 0),
+    };
+    insert(
+        db,
+        session_id,
+        turn,
+        seq,
+        kind::USAGE,
+        &json!({ "used": null, "size": null, "reset": true }),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Render the last `last_n` journal blocks as compact plain text — the ACP
 /// analogue of the terminal `preview` screen (`[who] text` lines for prose, a
 /// one-liner for the machine's apparatus). CLI convenience only.
@@ -377,9 +424,11 @@ fn preview_line(b: &ChatBlockView) -> String {
     }
 }
 
-/// The latest `usage` block's payload for a session (`{used, size}`), or `None`.
+/// The latest `usage` block's payload for a session, or `None`. A provider
+/// handoff appends a null marker, which intentionally parses as `None` until the
+/// replacement reports its own context.
 /// A cheap query feeding [`SessionView::usage`](weaver_api::SessionView).
-pub async fn latest_usage(db: &Db, session_id: &str) -> Result<Option<Value>> {
+pub async fn latest_usage(db: &Db, session_id: &str) -> Result<Option<weaver_api::AcpUsage>> {
     let row = sqlx::query(
         "SELECT payload FROM chat_blocks WHERE session_id = ? AND kind = ?
          ORDER BY turn DESC, seq DESC LIMIT 1",
@@ -562,7 +611,37 @@ mod tests {
         insert(&db, &s, 1, 4, kind::USAGE, &json!({"used":150,"size":200}))
             .await
             .unwrap();
-        assert_eq!(latest_usage(&db, &s).await.unwrap().unwrap()["used"], 150);
+        assert_eq!(latest_usage(&db, &s).await.unwrap().unwrap().used, 150);
+        reset_usage(&db, &s).await.unwrap();
+        assert_eq!(latest_usage(&db, &s).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn close_abandoned_turn_is_idempotent() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let s = seed_session(&db).await;
+        insert(
+            &db,
+            &s,
+            2,
+            0,
+            kind::USER_MESSAGE,
+            &json!({"text":"unfinished"}),
+        )
+        .await
+        .unwrap();
+        close_abandoned_turn(&db, &s, 2).await.unwrap();
+        close_abandoned_turn(&db, &s, 2).await.unwrap();
+        assert!(has_turn_end(&db, &s, 2).await.unwrap());
+        assert_eq!(
+            list(&db, &s)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|block| block.kind == kind::TURN_END)
+                .count(),
+            1
+        );
     }
 
     #[test]

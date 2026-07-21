@@ -7,6 +7,19 @@ export function setUnauthorizedHandler(fn: () => void): void {
   onUnauthorized = fn;
 }
 
+/** HTTP failure with the server's structured body preserved. Create failures
+ * use `body.session_id` to route the browser to the durable error session. */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly body: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 async function request(path: string, opts: RequestInit = {}): Promise<unknown> {
   const res = await fetch('/api' + path, {
     headers: { 'content-type': 'application/json' },
@@ -17,13 +30,15 @@ async function request(path: string, opts: RequestInit = {}): Promise<unknown> {
   }
   if (!res.ok) {
     let message = res.statusText;
+    let body: Record<string, unknown> = {};
     try {
-      const body = await res.json();
-      if (body && typeof body.error === 'string') message = body.error;
+      const parsed: unknown = await res.json();
+      if (parsed && typeof parsed === 'object') body = parsed as Record<string, unknown>;
+      if (typeof body.error === 'string') message = body.error;
     } catch {
       /* keep statusText */
     }
-    throw new Error(message);
+    throw new ApiError(message, res.status, body);
   }
   if (res.status === 204) return null;
   const text = await res.text();
@@ -36,13 +51,15 @@ async function rawBody(method: string, path: string, body: BodyInit): Promise<un
   const res = await fetch('/api' + path, { method, body });
   if (!res.ok) {
     let message = res.statusText;
+    let failure: Record<string, unknown> = {};
     try {
-      const b = await res.json();
-      if (b && typeof b.error === 'string') message = b.error;
+      const parsed: unknown = await res.json();
+      if (parsed && typeof parsed === 'object') failure = parsed as Record<string, unknown>;
+      if (typeof failure.error === 'string') message = failure.error;
     } catch {
       /* keep statusText */
     }
-    throw new Error(message);
+    throw new ApiError(message, res.status, failure);
   }
   if (res.status === 204) return null;
   const text = await res.text();
@@ -58,6 +75,12 @@ export const put = (path: string, body?: unknown) =>
 export const patch = (path: string, body: unknown) =>
   request(path, { method: 'PATCH', body: JSON.stringify(body) });
 export const del = (path: string) => request(path, { method: 'DELETE' });
+
+/** Upload one prompt/reference attachment into the session-owned scratch dir. */
+export const uploadSessionScratch = (id: string, file: File) =>
+  upload(`/sessions/${id}/scratch?name=${encodeURIComponent(file.name)}`, file) as Promise<
+    ScratchFile & { path: string }
+  >;
 
 // --- Issues ----------------------------------------------------------------
 
@@ -77,6 +100,7 @@ import type {
   Comment,
   NewCommentBody,
   RepoEnvVar,
+  ScratchFile,
 } from './types';
 
 // --- Managed repos ---------------------------------------------------------
