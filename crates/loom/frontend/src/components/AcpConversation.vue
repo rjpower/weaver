@@ -821,18 +821,6 @@ function usageFromPayload(payload: UsagePayload): AcpUsage | null {
     : null;
 }
 
-const latestUsage = computed<AcpUsage | null>(() => {
-  let usage: AcpUsage | null = null;
-  const sorted = [...blocks.values()].sort((a, b) => a.turn - b.turn || a.seq - b.seq);
-  for (const block of sorted) {
-    if (block.kind === 'handoff') usage = null;
-    if (block.kind === 'usage') {
-      usage = usageFromPayload(block.payload as unknown as UsagePayload);
-    }
-  }
-  return usage;
-});
-
 // The latest plan block feeds the right rail, not the transcript flow.
 const latestPlan = computed<PlanEntry[]>(() => {
   let entries: PlanEntry[] = [];
@@ -842,7 +830,7 @@ const latestPlan = computed<PlanEntry[]>(() => {
   return entries;
 });
 
-const model = computed<{ rows: Row[]; toc: TocItem[] }>(() => {
+const model = computed<{ rows: Row[]; toc: TocItem[]; usage: AcpUsage | null }>(() => {
   const rows: Row[] = [];
   const toc: TocItem[] = [];
   let n = 0;
@@ -997,7 +985,7 @@ const model = computed<{ rows: Row[]; toc: TocItem[] }>(() => {
     }
   }
 
-  return { rows, toc };
+  return { rows, toc, usage: currentUsage };
 });
 
 // The empty conversation, styled on purpose — a fresh session has no journal
@@ -1697,7 +1685,7 @@ function goTo(anchor: string) {
           </button>
         </div>
         <div class="acp-composer-right">
-          <AgentUsage v-if="latestUsage" :usage="latestUsage" />
+          <AgentUsage v-if="model.usage" :usage="model.usage" />
           <span class="acp-send-hint">Enter to send · Shift+Enter for a new line</span>
           <button
             v-if="turnLive && steeringSupported"
