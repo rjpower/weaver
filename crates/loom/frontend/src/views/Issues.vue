@@ -224,14 +224,20 @@ const sessionsByBranch = computed(() => {
   return m;
 });
 
-// An issue is automation-claimed when the session working it (`claimed_branch`)
-// is an automation-class session — a background agent/watch/trigger, not a
-// person. Mirrors the server's own default-hide rule (`GET /api/issues`).
+// An issue is automation-claimed when the session *currently* working its
+// branch (`claimed_branch`) is automation-class — the branch's active session
+// if one exists, else its most recently created. Archiving frees the branch
+// slot, so an archived automation run must not hide an issue a person has
+// since picked up on the re-let branch. Mirrors the server's own default-hide
+// rule (`GET /api/issues`).
 function isAutomationClaimed(i: Issue): boolean {
   if (!i.claimed_branch) return false;
-  return (sessionsByBranch.value.get(`${i.repo_root}\0${i.claimed_branch}`) ?? []).some(
-    (s) => s.class === 'automation',
-  );
+  const held = sessionsByBranch.value.get(`${i.repo_root}\0${i.claimed_branch}`) ?? [];
+  const active = (s: Session) => !['done', 'error', 'archived'].includes(s.status);
+  const holder = [...held].sort(
+    (a, b) => Number(active(b)) - Number(active(a)) || b.created_at.localeCompare(a.created_at),
+  )[0];
+  return holder?.class === 'automation';
 }
 
 // Sessions that reference an issue: the branch working it (claimed) and the

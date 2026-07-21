@@ -1365,7 +1365,7 @@ async fn insert_managed_session(
             created_by: None,
             protocol: "terminal".to_string(),
             origin: "watch".to_string(),
-            class: "interactive".to_string(),
+            class: "automation".to_string(),
             tracking_issue_id: None,
         },
     )

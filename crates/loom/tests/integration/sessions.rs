@@ -751,3 +751,82 @@ async fn archive_frees_the_branch_for_a_new_session() {
         .await
         .unwrap();
 }
+
+/// The issue board hides an issue only while its branch's *current* claim-holder
+/// is automation-class. An archived automation run with no successor keeps its
+/// issue off the default board, but once a person re-lets the branch with an
+/// interactive session (archiving freed the slot), the issue surfaces again —
+/// historical automation tenancy must not hide live interactive work.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_hiding_follows_the_branch_current_claim_holder() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    let auto = client
+        .post(
+            "/api/sessions",
+            json!({
+                "goal": "background run",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "name": "relet",
+                "class": "automation",
+            }),
+        )
+        .await
+        .unwrap();
+    let auto_id = auto["id"].as_str().unwrap().to_string();
+    let branch_ref = auto["branch"]["branch"].as_str().unwrap().to_string();
+    let issue = auto["tracking_issue"].as_i64().unwrap();
+
+    let on_board = |board: serde_json::Value| {
+        board
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["id"].as_i64() == Some(issue))
+    };
+
+    let board = client.get("/api/issues").await.unwrap();
+    assert!(
+        !on_board(board),
+        "an issue claimed by a live automation session is hidden by default"
+    );
+
+    client
+        .post(&format!("/api/sessions/{auto_id}/archive"), json!({}))
+        .await
+        .unwrap();
+    let board = client.get("/api/issues").await.unwrap();
+    assert!(
+        !on_board(board),
+        "an archived automation run with no successor keeps its issue hidden"
+    );
+
+    // A person picks the branch back up: the freed slot is re-let interactively.
+    let human = client
+        .post(
+            "/api/sessions",
+            json!({
+                "goal": "picked up by hand",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "existing_branch": branch_ref,
+            }),
+        )
+        .await
+        .unwrap();
+    let human_id = human["id"].as_str().unwrap().to_string();
+
+    let board = client.get("/api/issues").await.unwrap();
+    assert!(
+        on_board(board),
+        "an interactive re-let surfaces the branch's issues on the default board"
+    );
+
+    client
+        .delete(&format!("/api/sessions/{human_id}"))
+        .await
+        .unwrap();
+}
