@@ -406,11 +406,13 @@ fn preview_line(b: &ChatBlockView) -> String {
             format!("[permission] {title} ({outcome})")
         }
         kind::MODE_CHANGE => format!("[mode] {}", text("mode_id")),
-        kind::USAGE => {
-            let used = p.get("used").and_then(Value::as_i64).unwrap_or(0);
-            let size = p.get("size").and_then(Value::as_i64).unwrap_or(0);
-            format!("[usage] {used}/{size}")
-        }
+        kind::USAGE => match (
+            p.get("used").and_then(Value::as_u64),
+            p.get("size").and_then(Value::as_u64),
+        ) {
+            (Some(used), Some(size)) => format!("[usage] {used}/{size}"),
+            _ => String::new(),
+        },
         kind::TURN_END => {
             let reason = p.get("stop_reason").and_then(Value::as_str).unwrap_or("");
             format!("— turn {} · {reason} —", b.turn)
@@ -599,6 +601,24 @@ mod tests {
         let tail = preview_text(&blocks, 1);
         assert!(tail.contains("end_turn"));
         assert!(!tail.contains("[you]"), "only the last block: {tail}");
+    }
+
+    #[test]
+    fn preview_text_skips_usage_resets_and_malformed_usage() {
+        let usage = |payload: Value| ChatBlockView {
+            turn: 0,
+            seq: 0,
+            kind: kind::USAGE.to_string(),
+            payload,
+            created_at: String::new(),
+        };
+        let blocks = vec![
+            usage(json!({"used":10,"size":100})),
+            usage(json!({"used":null,"size":null,"reset":true})),
+            usage(json!({"used":"unknown","size":100})),
+        ];
+
+        assert_eq!(preview_text(&blocks, blocks.len()), "[usage] 10/100\n");
     }
 
     #[tokio::test]

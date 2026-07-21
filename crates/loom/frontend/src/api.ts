@@ -16,6 +16,7 @@ export class ApiError extends Error {
     public readonly body: Record<string, unknown>,
   ) {
     super(message);
+    Object.setPrototypeOf(this, new.target.prototype);
     this.name = 'ApiError';
   }
 }
