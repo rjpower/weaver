@@ -61,6 +61,11 @@ pub(super) struct ListSessionsQuery {
     /// its own "show archived" toggle, opts in with `?archived=true`.
     #[serde(default)]
     archived: bool,
+    /// Include automation-class sessions (watch/ops machinery). Defaults to
+    /// `false` — the fleet listing shows interactive work; a machinery view
+    /// opts in with `?automation=true`, symmetric with `archived`.
+    #[serde(default)]
+    automation: bool,
     /// Case-insensitive substring filter over a session's title, branch name,
     /// and goal (`loom session ls --search auth`). Absent/blank matches everything.
     #[serde(default)]
@@ -97,6 +102,10 @@ pub(super) async fn list_sessions(
         }
         // Archived sessions are torn down — hidden unless the caller opts in.
         if !q.archived && s.status == "archived" {
+            continue;
+        }
+        // Automation-class sessions are machinery — hidden unless asked.
+        if !q.automation && s.class == "automation" {
             continue;
         }
         if let Some(branch) = branch_mod::get(&st.db, &s.branch_id).await? {
@@ -160,8 +169,22 @@ pub(super) async fn create_session(
     // (cookie/token) → their username; a loopback/local-token call → the owner;
     // a future webhook → its bot principal. Read from the `Principal`, never
     // hardcoded and never client-supplied.
+    //
+    // A launch that names a parent branch is an agent delegating work; a plain
+    // launch is the human's own. The GitHub/Slack trigger paths stamp their own
+    // origin at their call sites.
+    let origin = if req
+        .parent_branch
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+    {
+        "agent"
+    } else {
+        "user"
+    };
     Ok(Json(
-        create_session_core(st, req, Some(principal.username)).await?,
+        create_session_core(st, req, Some(principal.username), origin).await?,
     ))
 }
 
@@ -495,18 +518,42 @@ fn tail_chars(s: &str, max: usize) -> String {
 /// the view directly so each caller can shape its own response.
 ///
 /// `created_by` is the launching principal's username (attribution for the shared
-/// board), or `None` for a system launch with no user behind it.
+/// board), or `None` for a system launch with no user behind it. `origin`
+/// records how the launch came to be (`user` / `agent` / `github` / `slack`);
+/// it derives the session's default class.
 pub(crate) async fn create_session_core(
     st: AppState,
     req: CreateReq,
     created_by: Option<String>,
+    origin: &str,
 ) -> ApiResult<SessionView> {
     tracing::info!(
         repo = ?req.repo,
         agent = ?req.agent,
         created_by = ?created_by,
+        origin,
         "create_session_core: starting session creation"
     );
+    // The session's class — automation machinery vs interactive fleet work. An
+    // explicit request value wins (validated); otherwise derived from the origin.
+    let class = match req
+        .class
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some("interactive") => "interactive".to_string(),
+        Some("automation") => "automation".to_string(),
+        Some(other) => {
+            return Err(AppError::bad_request(format!(
+                "invalid class '{other}' (expected 'interactive' or 'automation')"
+            )))
+        }
+        None => match origin {
+            "watch" | "actions" | "ops" => "automation".to_string(),
+            _ => "interactive".to_string(),
+        },
+    };
     // Resolve the repo root. An explicit managed `repo` (a slug/URL) is
     // allowlist-checked and cloned-if-absent into the managed store, then used
     // directly; otherwise fork from `cwd`'s repo (the default). The traversal /
@@ -971,6 +1018,9 @@ pub(crate) async fn create_session_core(
                         managed_by: None,
                         created_by: created_by.clone(),
                         protocol: protocol.clone(),
+                        origin: origin.to_string(),
+                        class: class.clone(),
+                        tracking_issue_id: tracking_issue,
                     },
                 )
                 .await?;
@@ -1012,9 +1062,7 @@ pub(crate) async fn create_session_core(
                 )
                 .await
                 .ok();
-                let mut view = session_view(&st.db, &session, &branch).await?;
-                view.tracking_issue = tracking_issue;
-                return Ok(view);
+                return session_view(&st.db, &session, &branch).await;
             }
         } else {
             tracing::info!(repo = %repo_root.display(),
@@ -1047,6 +1095,9 @@ pub(crate) async fn create_session_core(
         managed_by: None,
         created_by: created_by.clone(),
         protocol: protocol.clone(),
+        origin: origin.to_string(),
+        class: class.clone(),
+        tracking_issue_id: tracking_issue,
     };
     let session = if protocol == "acp" {
         // The ACP path inserts the row *first* — `acp::start` binds a relay to it
@@ -1180,9 +1231,7 @@ pub(crate) async fn create_session_core(
         "session created"
     );
 
-    let mut view = session_view(&st.db, &session, &branch).await?;
-    view.tracking_issue = tracking_issue;
-    Ok(view)
+    session_view(&st.db, &session, &branch).await
 }
 
 /// The session's launch prompt: a pointer to the goal rather than a copy of
@@ -1794,6 +1843,11 @@ pub(crate) async fn create_warm_session(
             // drives the judge by typing into its PTY, a flow the acp prompt
             // queue does not replace yet.
             protocol: "terminal".to_string(),
+            // Engine infrastructure: automation-class, so even a warm session
+            // that loses its `managed_by` stamp stays out of the fleet listing.
+            origin: "watch".to_string(),
+            class: "automation".to_string(),
+            tracking_issue_id: None,
         },
     )
     .await?;
@@ -1807,6 +1861,27 @@ pub(crate) async fn create_warm_session(
     Ok(session)
 }
 
+/// Guard for [`adopt`] and [`recover`]: 409 when a *different* session on the
+/// same branch is still active. Archived no longer occupies the branch slot, so
+/// the slot may have been re-let since this session left the fleet — resuming it
+/// then would collide on the worktree path and the one-active-session-per-branch
+/// index.
+async fn require_branch_slot_free(
+    st: &AppState,
+    session: &Session,
+    branch: &Branch,
+) -> Result<(), AppError> {
+    if let Some(other) = session_mod::active_for_branch(&st.db, &branch.id).await? {
+        if other.id != session.id {
+            return Err(AppError::conflict(format!(
+                "branch '{}' already has an active session ({})",
+                branch.branch, other.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Recreate an orphaned session's terminal and resume its agent. The worktree is
 /// expected to still be on disk (an orphaned session only lost its terminal); a
 /// missing worktree is an error here — recovering a *torn-down* (archived)
@@ -1816,6 +1891,7 @@ pub(crate) async fn adopt(
     session: &Session,
     branch: &Branch,
 ) -> Result<(), AppError> {
+    require_branch_slot_free(st, session, branch).await?;
     if session.protocol == "acp" {
         return adopt_acp(st, session, branch, "session adopted").await;
     }
@@ -2144,6 +2220,7 @@ pub(super) async fn adopt_session(
 /// [`adopt`] does). The session rejoins the active fleet.
 async fn recover(st: &AppState, session: &Session, branch: &Branch) -> Result<(), AppError> {
     tracing::info!(session = %session.id, branch = %branch.id, "recovering archived session");
+    require_branch_slot_free(st, session, branch).await?;
     if backend::has_session(&session.term_session).await {
         return Err(AppError::conflict(
             "session already has a running terminal process",

@@ -608,3 +608,146 @@ async fn session_url_resolves_by_key_and_honours_the_public_base() {
 
     client.delete(&format!("/api/sessions/{id}")).await.unwrap();
 }
+
+/// A hand-launched session is stamped `origin: user` / `class: interactive`, and
+/// its tracking issue lives on the session row — so a plain get-by-id carries
+/// it, not just the create response.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_records_origin_class_and_tracking_issue() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    let ws = client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "stamped provenance", "cwd": ts.cwd(), "agent": "shell" }),
+        )
+        .await
+        .unwrap();
+    let id = ws["id"].as_str().unwrap().to_string();
+    assert_eq!(ws["origin"], "user", "a plain HTTP launch is origin 'user'");
+    assert_eq!(ws["class"], "interactive");
+    let issue = ws["tracking_issue"]
+        .as_i64()
+        .expect("launch returns a tracking issue id");
+
+    // Stored, not recomputed: the same identity comes back on a get-by-id.
+    let got = client.get(&format!("/api/sessions/{id}")).await.unwrap();
+    assert_eq!(got["origin"], "user");
+    assert_eq!(got["class"], "interactive");
+    assert_eq!(
+        got["tracking_issue"].as_i64(),
+        Some(issue),
+        "the tracking issue persists past the create response"
+    );
+
+    client.delete(&format!("/api/sessions/{id}")).await.unwrap();
+}
+
+/// An automation-class session is machinery: absent from the default fleet
+/// listing, present with `?automation=true` — symmetric with `archived`.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automation_class_hidden_from_the_default_listing() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    let auto = client
+        .post(
+            "/api/sessions",
+            json!({
+                "goal": "background machinery",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "class": "automation",
+            }),
+        )
+        .await
+        .unwrap();
+    let auto_id = auto["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        auto["class"], "automation",
+        "the request's class override sticks"
+    );
+
+    let list = client.get("/api/sessions").await.unwrap();
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["id"] != auto_id.as_str()),
+        "automation-class sessions are hidden by default: {list}"
+    );
+
+    let shown = client.get("/api/sessions?automation=true").await.unwrap();
+    assert!(
+        shown
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == auto_id.as_str()),
+        "?automation=true includes the automation session: {shown}"
+    );
+
+    client
+        .delete(&format!("/api/sessions/{auto_id}"))
+        .await
+        .unwrap();
+}
+
+/// Archiving a session frees its branch slot: a fresh session can attach to the
+/// same branch via `existing_branch`, where the archived tenant used to make the
+/// create 409 as busy. The branch key then resolves to the live tenant.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_frees_the_branch_for_a_new_session() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    let first = client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "first tenant", "cwd": ts.cwd(), "agent": "shell", "name": "slot" }),
+        )
+        .await
+        .unwrap();
+    let first_id = first["id"].as_str().unwrap().to_string();
+    let branch_ref = first["branch"]["branch"].as_str().unwrap().to_string();
+
+    client
+        .post(&format!("/api/sessions/{first_id}/archive"), json!({}))
+        .await
+        .unwrap();
+
+    // The archived session no longer occupies the slot: a fresh session attaches
+    // to the kept branch (re-provisioning its worktree).
+    let second = client
+        .post(
+            "/api/sessions",
+            json!({
+                "goal": "second tenant",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "existing_branch": branch_ref,
+            }),
+        )
+        .await
+        .unwrap();
+    let second_id = second["id"].as_str().unwrap().to_string();
+    assert_eq!(second["branch"]["branch"], branch_ref.as_str());
+    assert_ne!(second_id, first_id, "a new session, not a resume");
+
+    // The branch key resolves to the live tenant, not the archived one.
+    let branch_id = second["branch"]["id"].as_str().unwrap().to_string();
+    let got = client
+        .get(&format!("/api/sessions/{branch_id}"))
+        .await
+        .unwrap();
+    assert_eq!(got["id"], second_id.as_str());
+
+    client
+        .delete(&format!("/api/sessions/{second_id}"))
+        .await
+        .unwrap();
+}
