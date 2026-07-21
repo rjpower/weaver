@@ -267,12 +267,15 @@ function onQueue(ev: SseQueue) {
 // ── SSE lifecycle (kept-alive discipline) ────────────────────────────────────
 let source: EventSource | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-function rebindAfterHandoff(event: Event) {
-  const handedOffId = (event as CustomEvent<{ id?: string }>).detail?.id;
-  if (handedOffId !== id.value) return;
+function rebindStream() {
   closeStream();
   openStream();
   load({ preserve: true });
+}
+function rebindAfterHandoff(event: Event) {
+  const handedOffId = (event as CustomEvent<{ id?: string }>).detail?.id;
+  if (handedOffId !== id.value) return;
+  rebindStream();
 }
 function openStream() {
   const stream = new EventSource(`/api/sessions/${id.value}/chat/stream`);
@@ -342,9 +345,7 @@ watch(
     // A handoff replaces the task and its broadcast channel without replacing
     // loom's stable session id. Rebind deterministically when the header reloads
     // the new provider; clean SSE EOF is not reported consistently by browsers.
-    closeStream();
-    openStream();
-    load({ preserve: true });
+    rebindStream();
   },
 );
 
