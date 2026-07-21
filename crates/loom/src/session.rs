@@ -460,7 +460,12 @@ pub async fn read_pending_prompt(db: &Db, id: &str) -> Result<String> {
 /// the prompt stays visibly queued instead of becoming eligible for replay at
 /// every later turn boundary.
 pub async fn take_pending_prompt(db: &Db, id: &str) -> Result<Option<String>> {
-    let mut tx = db.begin().await?;
+    // Take the writer lock before reading. A deferred transaction can read while
+    // another writer holds WAL's reserved lock, then fail its read -> write
+    // upgrade immediately with SQLITE_BUSY instead of honoring busy_timeout.
+    // Stop-and-send reaches this just after persisting its cancellation boundary,
+    // so that race used to leak "database is locked" to the composer.
+    let mut tx = weaver_core::db::begin_immediate(db).await?;
     let pending: Option<String> =
         sqlx::query_scalar::<_, Option<String>>("SELECT pending_prompt FROM sessions WHERE id = ?")
             .bind(id)
@@ -686,5 +691,39 @@ mod tests {
         append_pending_prompt(&db, "drain", "again").await.unwrap();
         consume_pending_prompt(&db, "drain", "again").await.unwrap();
         assert_eq!(read_pending_prompt(&db, "drain").await.unwrap(), "");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn take_pending_prompt_waits_for_a_concurrent_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::connect(&dir.path().join("weaver.db"))
+            .await
+            .unwrap();
+        let branch = branch_id(&db, "weaver/busy-queue").await;
+        insert(&db, &new_session("busy-queue", &branch, None))
+            .await
+            .unwrap();
+        append_pending_prompt(&db, "busy-queue", "send after stop")
+            .await
+            .unwrap();
+
+        let writer = weaver_core::db::begin_immediate(&db).await.unwrap();
+        let contender_db = db.clone();
+        let take =
+            tokio::spawn(async move { take_pending_prompt(&contender_db, "busy-queue").await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !take.is_finished(),
+            "queue consumption should wait for the writer instead of returning SQLITE_BUSY"
+        );
+        writer.commit().await.unwrap();
+
+        let taken = tokio::time::timeout(std::time::Duration::from_secs(1), take)
+            .await
+            .expect("queue consumption resumes once the writer commits")
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.as_deref(), Some("send after stop"));
     }
 }
