@@ -98,7 +98,9 @@ async function loadSnapshot() {
     const [snap, st, diag] = await Promise.all([
       api.getLogs(2000),
       api.getServerStatus(),
-      api.getDiagnostics(),
+      // Diagnostics require the admin grant. Keep the operator-visible log and
+      // status snapshot useful when that optional request is forbidden or down.
+      api.getDiagnostics().catch(() => null),
     ]);
     lines.value = snap;
     status.value = st;

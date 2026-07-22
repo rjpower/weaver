@@ -193,6 +193,7 @@ async fn health_readiness_and_metrics_are_public_and_label_safe() {
     assert!(metrics.contains("runner_pool=\"local\""));
     assert!(metrics.contains("loom_profile_capacity{profile=\"default\",state=\"available\"} 1"));
     assert!(metrics.contains("loom_automation_runs_current{"));
+    assert!(!metrics.contains("loom_automation_runs_total"));
     assert!(metrics.contains("loom_migration_ready{stream=\"loom\"} 1"));
     assert!(metrics.ends_with("# EOF\n"));
     for forbidden in [

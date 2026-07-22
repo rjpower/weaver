@@ -553,12 +553,6 @@ async fn render_metrics(db: &Db, view: &DiagnosticsView) -> Result<String> {
         "Durable automation runs by status, source, service, and profile.",
         "gauge",
     );
-    append_help(
-        &mut output,
-        "loom_automation_runs_total",
-        "Durable automation runs by source, service, profile, and outcome.",
-        "counter",
-    );
     for run in &view.automation_runs.counts {
         writeln!(
             output,
@@ -567,16 +561,6 @@ async fn render_metrics(db: &Db, view: &DiagnosticsView) -> Result<String> {
             label_value(&run.source),
             label_value(&run.service_tag),
             label_value(&run.profile),
-            run.count
-        )
-        .expect("writing a String cannot fail");
-        writeln!(
-            output,
-            "loom_automation_runs_total{{source=\"{}\",service=\"{}\",profile=\"{}\",outcome=\"{}\"}} {}",
-            label_value(&run.source),
-            label_value(&run.service_tag),
-            label_value(&run.profile),
-            label_value(&run.status),
             run.count
         )
         .expect("writing a String cannot fail");
