@@ -819,7 +819,7 @@ def create_infrastructure(config: DeploymentConfig) -> Infrastructure:
             },
             sort_keys=True,
         ),
-        opts=api_options,
+        opts=pulumi.ResourceOptions(depends_on=[instance]),
     )
 
     pulumi.export("address", address.address)
