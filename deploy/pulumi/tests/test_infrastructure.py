@@ -149,7 +149,7 @@ def test_profile_manifest_round_trips_restricted_policy() -> None:
                 "restricted": True,
                 "allowedTools": [
                     "Read(./**)",
-                    "mcp__loom_github__issue_view",
+                    "mcp/github/comment",
                 ],
             }
         }
@@ -159,7 +159,7 @@ def test_profile_manifest_round_trips_restricted_policy() -> None:
     assert profile["restricted"] is True
     assert profile["allowed_tools"] == [
         "Read(./**)",
-        "mcp__loom_github__issue_view",
+        "mcp/github/comment",
     ]
 
     malformed, _ = _profile_manifest(

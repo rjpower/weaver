@@ -57,6 +57,12 @@ impl Profile {
         serde_json::from_str(&self.allowed_tools).context("invalid profile allowed tools")
     }
 
+    /// Exact rules to stamp onto a session. Profiles retain concise built-in
+    /// MCP set names, but launched sessions are immutable and auditable.
+    pub fn effective_allowed_tool_rules(&self) -> Result<Vec<String>> {
+        crate::mcp::expand_tool_sets(&self.allowed_tool_rules()?)
+    }
+
     pub fn as_input(&self) -> Result<ProfileInput> {
         Ok(ProfileInput {
             name: self.name.clone(),
@@ -142,8 +148,8 @@ pub(crate) fn allowed_tool_name(rule: &str) -> Option<&str> {
     Some(name)
 }
 
-fn is_restricted_mcp_tool(rule: &str) -> bool {
-    crate::restricted_mcp::is_permission_rule(rule)
+fn is_restricted_mcp_tool_set(rule: &str) -> bool {
+    crate::mcp::is_tool_set(rule)
 }
 
 /// Restricted filesystem rules must stay below the session worktree. Claude's
@@ -226,7 +232,7 @@ async fn validate_input(db: &Db, input: &ProfileInput) -> Result<(String, String
                 || !(matches!(
                     allowed_tool_name(rule),
                     Some("Read" | "Glob" | "Grep" | "Bash" | "WebFetch" | "WebSearch")
-                ) || is_restricted_mcp_tool(rule))
+                ) || is_restricted_mcp_tool_set(rule))
         })
     {
         bail!("invalid profile allowed tool rule");
@@ -265,10 +271,10 @@ async fn validate_input(db: &Db, input: &ProfileInput) -> Result<(String, String
             || input
                 .allowed_tools
                 .iter()
-                .any(|rule| !is_restricted_mcp_tool(rule) && !is_restricted_read_rule(rule))
+                .any(|rule| !is_restricted_mcp_tool_set(rule) && !is_restricted_read_rule(rule))
             || !input.ambient_allowlist.is_empty())
     {
-        bail!("restricted profiles must be strict env-cleared Claude ACP automation profiles with prelude 'none', mode 'default', no ambient allowlist, repository-scoped read rules, and/or fixed Loom GitHub MCP tools");
+        bail!("restricted profiles must be strict env-cleared Claude ACP automation profiles with prelude 'none', mode 'default', no ambient allowlist, repository-scoped read rules, and/or reviewed built-in MCP tool sets");
     }
     Ok((protocol, mode))
 }
@@ -328,17 +334,18 @@ pub async fn upsert(db: &Db, input: &ProfileInput) -> Result<Profile> {
         if existing.as_input()? == normalized {
             return Ok(existing);
         }
+        let widens_restricted_tools = existing.restricted
+            && widens_allowlist(
+                &existing.effective_allowed_tool_rules()?,
+                &crate::mcp::expand_tool_sets(&normalized.allowed_tools)?,
+            );
         if existing.is_automation_safe()
             && has_automation_sessions(db, name).await?
             && (!normalized.strict
                 || !normalized.env_clear
                 || normalized.class != "automation"
                 || (existing.restricted && !normalized.restricted)
-                || (existing.restricted
-                    && widens_allowlist(
-                        &existing.allowed_tool_rules()?,
-                        &normalized.allowed_tools,
-                    ))
+                || widens_restricted_tools
                 || widens_allowlist(&existing.ambient_names()?, &normalized.ambient_allowlist))
         {
             bail!("cannot weaken a profile referenced by automation sessions");
@@ -688,8 +695,8 @@ mod tests {
         assert_eq!(allowed_tool_name("Bash"), Some("Bash"));
         assert_eq!(allowed_tool_name("Bash(gh issue view:*"), None);
         assert_eq!(allowed_tool_name(" Bash(gh issue view:*)"), None);
-        assert!(is_restricted_mcp_tool("mcp__loom_github__issue_edit"));
-        assert!(!is_restricted_mcp_tool("mcp__other__issue_edit"));
+        assert!(is_restricted_mcp_tool_set("mcp/github/comment"));
+        assert!(!is_restricted_mcp_tool_set("mcp/github/admin"));
     }
 
     #[tokio::test]
@@ -701,6 +708,9 @@ mod tests {
         assert!(upsert(&db, &input).await.is_err());
 
         input.allowed_tools = vec!["Read(./**)".to_string()];
+        assert!(upsert(&db, &input).await.is_ok());
+
+        input.allowed_tools = vec!["mcp/github/comment".to_string()];
         assert!(upsert(&db, &input).await.is_ok());
 
         input.allowed_tools = vec!["Read(../**)".to_string()];

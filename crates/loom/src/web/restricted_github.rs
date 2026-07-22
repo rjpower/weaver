@@ -172,7 +172,7 @@ pub(super) async fn restricted_github_tool(
             "session is not restricted",
         ));
     }
-    let rule = crate::restricted_mcp::permission_rule(&tool)
+    let rule = crate::mcp::github::permission_rule(&tool)
         .ok_or_else(|| AppError::not_found("restricted GitHub tool"))?;
     let allowed: Vec<String> = serde_json::from_str(&session.policy_allowed_tools)
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
@@ -237,10 +237,10 @@ mod tests {
     #[test]
     fn only_the_fixed_mcp_tools_map_to_permissions() {
         assert_eq!(
-            crate::restricted_mcp::permission_rule("issue_edit").as_deref(),
+            crate::mcp::github::permission_rule("issue_edit").as_deref(),
             Some("mcp__loom_github__issue_edit")
         );
-        assert!(crate::restricted_mcp::permission_rule("repository_delete").is_none());
+        assert!(crate::mcp::github::permission_rule("repository_delete").is_none());
     }
 
     #[test]

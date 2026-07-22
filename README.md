@@ -385,8 +385,12 @@ Notable settings:
 - Restricted profiles are Claude ACP automation envelopes for caller-supplied
   prompts. They suppress the Weaver prelude and repository setup/config, clear
   Claude setting sources, expose repository-scoped read tools plus fixed
-  server-side GitHub tools, and have Loom reject every unmatched permission
-  request. The GitHub credential never enters the agent process. The stock
+  server-side GitHub tools selected by the built-in `mcp/github/comment`
+  capability set, and have Loom reject every unmatched permission request.
+  Loom expands profile capability sets into exact permissions when it stamps a
+  session and derives adapter processes from its trusted MCP registry; profiles
+  never supply executable MCP configuration. The GitHub credential never enters
+  the agent process. The stock
   `github_comment` profile is seeded from its reviewed declarative manifest and
   remains operator-editable after the first seed. It is ready for
   GitHub-originated editorial/comment tasks after an operator adds its

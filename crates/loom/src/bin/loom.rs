@@ -26,9 +26,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Internal stdio MCP bridge used by restricted GitHub sessions.
+    /// Run one built-in stdio MCP adapter.
     #[command(hide = true)]
-    RestrictedGithubMcp,
+    Mcp { adapter: String },
     /// Manage the loom server daemon: run, start, stop, restart, status.
     ///
     /// `loom server run` runs the server in the foreground (REST API + Vue UI +
@@ -821,7 +821,7 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::RestrictedGithubMcp => loom::restricted_mcp::serve_github().await,
+        Cmd::Mcp { adapter } => loom::mcp::serve(&adapter).await,
         Cmd::Server { cmd } => run_server(cmd).await,
         Cmd::Session { cmd } => run_session(cmd).await,
         Cmd::Issue { cmd } => run_issue(cmd).await,

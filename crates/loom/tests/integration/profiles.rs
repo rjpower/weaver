@@ -44,7 +44,7 @@ async fn stock_github_comment_profile_round_trips_restricted_policy() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|rule| rule == "mcp__loom_github__issue_edit"));
+        .any(|rule| rule == "mcp/github/comment"));
     assert!(profile["env"].as_array().unwrap().is_empty());
 }
 
@@ -175,6 +175,15 @@ async fn restricted_github_tool_uses_the_server_side_token_and_fixed_repo() {
         .await
         .unwrap();
     let id = session["id"].as_str().unwrap();
+    let stamped: String =
+        sqlx::query_scalar("SELECT policy_allowed_tools FROM sessions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&ts.state.db)
+            .await
+            .unwrap();
+    let stamped: Vec<String> = serde_json::from_str(&stamped).unwrap();
+    assert!(stamped.contains(&"mcp__loom_github__issue_edit".to_string()));
+    assert!(!stamped.contains(&"mcp/github/comment".to_string()));
     let tracking = weaver_core::issue::add(
         &ts.state.db,
         &weaver_core::issue::NewIssue {

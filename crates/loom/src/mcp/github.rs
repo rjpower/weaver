@@ -1,4 +1,4 @@
-//! Minimal MCP bridge for restricted GitHub sessions.
+//! Built-in MCP adapter for restricted GitHub sessions.
 //!
 //! Claude sees these fixed tools instead of `Bash`. The bridge carries only the
 //! session-scoped Loom token and forwards each call to Loom's REST API; the
@@ -9,8 +9,11 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-pub(crate) const SERVER_NAME: &str = "loom_github";
-pub(crate) const GITHUB_TOOL_NAMES: [&str; 6] = [
+use super::{Adapter, ServeFuture};
+
+const SERVER_NAME: &str = "loom_github";
+const COMMENT_TOOL_SET: &str = "mcp/github/comment";
+const GITHUB_TOOL_NAMES: [&str; 6] = [
     "issue_view",
     "issue_comment",
     "issue_edit",
@@ -19,16 +22,46 @@ pub(crate) const GITHUB_TOOL_NAMES: [&str; 6] = [
     "pr_edit",
 ];
 
+pub(super) const ADAPTER: Adapter = Adapter {
+    name: "github",
+    server_name: SERVER_NAME,
+    expand_tool_set,
+    is_permission_rule,
+    server_config,
+    serve: serve_boxed,
+};
+
 pub(crate) fn permission_rule(tool: &str) -> Option<String> {
     GITHUB_TOOL_NAMES
         .contains(&tool)
         .then(|| format!("mcp__{SERVER_NAME}__{tool}"))
 }
 
-pub(crate) fn is_permission_rule(rule: &str) -> bool {
+fn is_permission_rule(rule: &str) -> bool {
     rule.strip_prefix("mcp__")
         .and_then(|suffix| suffix.split_once("__"))
         .is_some_and(|(server, tool)| server == SERVER_NAME && GITHUB_TOOL_NAMES.contains(&tool))
+}
+
+fn expand_tool_set(name: &str) -> Option<Vec<String>> {
+    (name == COMMENT_TOOL_SET).then(|| {
+        GITHUB_TOOL_NAMES
+            .iter()
+            .map(|tool| permission_rule(tool).expect("registered GitHub tool"))
+            .collect()
+    })
+}
+
+fn server_config() -> Value {
+    json!({
+        "type": "stdio",
+        "command": "loom",
+        "args": ["mcp", ADAPTER.name]
+    })
+}
+
+fn serve_boxed() -> ServeFuture {
+    Box::pin(serve())
 }
 
 fn tools() -> Value {
@@ -173,7 +206,7 @@ async fn dispatch(request: Value) -> Option<Value> {
 
 /// Serve newline-delimited MCP JSON-RPC on stdin/stdout until the adapter
 /// closes the pipe. Notifications deliberately receive no response.
-pub async fn serve_github() -> Result<()> {
+async fn serve() -> Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
     while let Some(line) = lines.next_line().await? {
@@ -195,7 +228,7 @@ pub async fn serve_github() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{tools, GITHUB_TOOL_NAMES};
+    use super::{expand_tool_set, permission_rule, server_config, tools, GITHUB_TOOL_NAMES};
 
     #[test]
     fn surface_contains_only_fixed_github_operations() {
@@ -207,5 +240,19 @@ mod tests {
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, GITHUB_TOOL_NAMES);
+    }
+
+    #[test]
+    fn comment_set_expands_to_the_fixed_surface() {
+        let expanded = expand_tool_set("mcp/github/comment").unwrap();
+        assert_eq!(expanded.len(), GITHUB_TOOL_NAMES.len());
+        assert_eq!(expanded[0], permission_rule(GITHUB_TOOL_NAMES[0]).unwrap());
+        assert!(expand_tool_set("mcp/github/admin").is_none());
+    }
+
+    #[test]
+    fn registry_launches_the_generic_adapter_command() {
+        let config = server_config();
+        assert_eq!(config["args"], serde_json::json!(["mcp", "github"]));
     }
 }

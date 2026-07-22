@@ -1004,6 +1004,12 @@ pub(crate) async fn provision_session(
     } else {
         (0, 0)
     };
+    let stamped_allowed_tools = serde_json::to_string(
+        &launch_profile
+            .effective_allowed_tool_rules()
+            .map_err(|error| AppError::bad_request(error.to_string()))?,
+    )
+    .map_err(|error| AppError::bad_request(error.to_string()))?;
     let (creator_kind, creator_subject) = actor.creator_identity();
     let launch_policy = session_mod::SessionLaunchPolicy {
         profile: profile_name.clone(),
@@ -1015,7 +1021,7 @@ pub(crate) async fn provision_session(
         turn_budget: launch_profile.turn_budget.unwrap_or(inherited_turn_budget),
         prelude: launch_profile.prelude.clone(),
         restricted: launch_profile.restricted,
-        allowed_tools: launch_profile.allowed_tools.clone(),
+        allowed_tools: stamped_allowed_tools.clone(),
         creator_kind: creator_kind.to_string(),
         creator_subject,
         parent_session_id,
@@ -1272,7 +1278,7 @@ pub(crate) async fn provision_session(
                 mode: &mode,
                 prelude: &launch_profile.prelude,
                 restricted: launch_profile.restricted,
-                allowed_tools: &launch_profile.allowed_tools,
+                allowed_tools: &stamped_allowed_tools,
                 custom: custom.as_ref(),
             },
             agent::AcpOpen::Fresh,
@@ -2018,6 +2024,12 @@ pub(crate) async fn create_warm_session(
     // a transient authentication failure during startup.
     let status = agent::initial_status(&st.db, &agent).await;
     let (inherited_idle, inherited_turn_budget) = automation_policy_defaults(&st.db).await;
+    let stamped_allowed_tools = serde_json::to_string(
+        &launch_profile
+            .effective_allowed_tool_rules()
+            .map_err(|error| AppError::bad_request(error.to_string()))?,
+    )
+    .map_err(|error| AppError::bad_request(error.to_string()))?;
     let session = session_mod::insert_with_policy(
         &st.db,
         &NewSession {
@@ -2048,7 +2060,7 @@ pub(crate) async fn create_warm_session(
             turn_budget: launch_profile.turn_budget.unwrap_or(inherited_turn_budget),
             prelude: launch_profile.prelude.clone(),
             restricted: launch_profile.restricted,
-            allowed_tools: launch_profile.allowed_tools.clone(),
+            allowed_tools: stamped_allowed_tools,
             creator_kind: "system".to_string(),
             creator_subject: format!("watch:{}", watch.id),
             parent_session_id: None,

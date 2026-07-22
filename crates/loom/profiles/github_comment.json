@@ -17,11 +17,6 @@
   "restricted": true,
   "allowed_tools": [
     "Read(./**)",
-    "mcp__loom_github__issue_view",
-    "mcp__loom_github__issue_comment",
-    "mcp__loom_github__issue_edit",
-    "mcp__loom_github__pr_view",
-    "mcp__loom_github__pr_comment",
-    "mcp__loom_github__pr_edit"
+    "mcp/github/comment"
   ]
 }

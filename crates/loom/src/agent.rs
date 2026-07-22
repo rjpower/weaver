@@ -1203,16 +1203,10 @@ fn claude_acp_meta(
         options.insert("tools".to_string(), json!(tools));
         options.insert("settingSources".to_string(), json!([]));
         options.insert("strictMcpConfig".to_string(), json!(true));
-        let mut mcp_servers = Map::new();
-        mcp_servers.insert(
-            crate::restricted_mcp::SERVER_NAME.to_string(),
-            json!({
-                "type": "stdio",
-                "command": "loom",
-                "args": ["restricted-github-mcp"]
-            }),
-        );
-        options.insert("mcpServers".to_string(), Value::Object(mcp_servers));
+        let mcp_servers = crate::mcp::server_configs(&allowed_tools);
+        if !mcp_servers.is_empty() {
+            options.insert("mcpServers".to_string(), Value::Object(mcp_servers));
+        }
     }
     if options.is_empty() {
         return None;
@@ -2125,6 +2119,10 @@ mod tests {
             ])
         );
         assert_eq!(restricted["mcpServers"]["loom_github"]["command"], "loom");
+        assert_eq!(
+            restricted["mcpServers"]["loom_github"]["args"],
+            json!(["mcp", "github"])
+        );
         assert_eq!(opts2["permissionMode"], "plan");
     }
 
