@@ -34,6 +34,8 @@ let cancelled = false;
 const steeringSupported = process.env.FAKE_ACP_STEERING === "1";
 const forceSteeringNewTurn = process.env.FAKE_ACP_STEERING_FORCE_NEW_TURN === "1";
 const steeringDelayMs = Number(process.env.FAKE_ACP_STEERING_DELAY_MS || "0");
+const loadPermission = process.env.FAKE_ACP_LOAD_PERMISSION || "";
+const fixedPermissionId = Number(process.env.FAKE_ACP_PERMISSION_ID || "0");
 let promptActive = false;
 let promptResources = [];
 const steeringQueue = [];
@@ -140,7 +142,7 @@ function advertiseCommands() {
 }
 
 function askPermission(name) {
-  const reqId = 10000 + pending.size + Math.floor(Math.random() * 1000);
+  const reqId = fixedPermissionId || 10000 + pending.size + Math.floor(Math.random() * 1000);
   const toolCallId = "perm-tool-" + reqId;
   const toolCall = { toolCallId, title: "Edit " + name, kind: "edit", status: "pending" };
   const options = [
@@ -156,6 +158,21 @@ function askPermission(name) {
     params: { sessionId, toolCall, options },
   });
   return p;
+}
+
+async function handleLoad(id, params) {
+  sessionId = params.sessionId;
+  // Replay a tiny scripted history as the spec's load notifications.
+  notify({ sessionUpdate: "user_message_chunk", content: { type: "text", text: "earlier question" } });
+  notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "earlier answer" } });
+  // Some adapters replay an unanswered request and cannot complete load until
+  // the client answers it. Tests opt into that setup-time handshake shape.
+  if (loadPermission) await askPermission(loadPermission);
+  respond(id, {
+    modes: { currentModeId: currentMode, availableModes: MODES },
+    configOptions: configOptions(),
+  });
+  advertiseCommands();
 }
 
 async function runToken(tok) {
@@ -322,15 +339,7 @@ function handleMessage(msg) {
       advertiseCommands();
       break;
     case "session/load":
-      sessionId = msg.params.sessionId;
-      // Replay a tiny scripted history as the spec's load notifications.
-      notify({ sessionUpdate: "user_message_chunk", content: { type: "text", text: "earlier question" } });
-      notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "earlier answer" } });
-      respond(msg.id, {
-        modes: { currentModeId: currentMode, availableModes: MODES },
-        configOptions: configOptions(),
-      });
-      advertiseCommands();
+      void handleLoad(msg.id, msg.params);
       break;
     case "session/set_mode":
       currentMode = msg.params.modeId;
