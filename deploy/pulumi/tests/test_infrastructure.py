@@ -247,7 +247,7 @@ def test_wif_is_repository_and_main_bound_with_least_privilege_iam():
         condition = field(
             provider.inputs, "attribute_condition", "attributeCondition"
         )
-        assert "rjpower/weaver" in condition
+        assert "marin-community/loom" in condition
         assert "refs/heads/main" in condition
 
         repository = by_name("loom-images")

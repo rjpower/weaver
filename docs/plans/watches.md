@@ -6,7 +6,7 @@ status: active
 # The Watch — periodic, triggered watch agents
 
 A weaver [plan](../structured-projects.md) (issue
-[#61](https://github.com/rjpower/weaver/issues/61)): the design surface and the
+[#61](https://github.com/marin-community/loom/issues/61)): the design surface and the
 task breakdown for one large effort. This file owns the *structure* — the
 problem, the architecture, the tasks and their dependencies; the issue ledger
 owns the *state* (which task is open / in-flight / done). Nothing here ships

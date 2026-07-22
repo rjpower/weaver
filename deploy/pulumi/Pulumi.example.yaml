@@ -15,7 +15,7 @@ config:
   # Name of an existing, already-delegated Cloud DNS managed zone. Omit this
   # field when DNS is hosted elsewhere and create the exported A record there.
   loom-gcp:dnsManagedZone: example-com
-  loom-gcp:githubRepository: rjpower/weaver
+  loom-gcp:githubRepository: marin-community/loom
   loom-gcp:githubRef: refs/heads/main
   # Build locally on the VM for the first deployment. After the image workflow
   # has published an image, change to pull and add imageTag with its commit SHA.
@@ -74,7 +74,7 @@ config:
   loom-gcp:githubFederations:
     - name: weaver-issues
       repositoryId: "123456789"
-      workflowRef: rjpower/weaver/.github/workflows/loom-issue.yml@refs/heads/main
+      workflowRef: marin-community/loom/.github/workflows/loom-issue.yml@refs/heads/main
       event: issues
       ref: refs/heads/main
       serviceTag: weaver-actions
