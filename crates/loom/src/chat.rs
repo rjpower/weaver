@@ -202,6 +202,8 @@ pub enum PermissionOutcome {
     Open,
     /// Answered with this option id.
     Resolved(String),
+    /// Cancelled without selecting one of the presented options.
+    Cancelled,
 }
 
 /// The current outcome of a `permission_request` identified by its upstream
@@ -223,6 +225,9 @@ pub async fn permission_outcome(
         if payload.get("request_id").and_then(Value::as_str) == Some(request_id) {
             return Ok(match payload.get("outcome") {
                 Some(Value::Null) | None => PermissionOutcome::Open,
+                Some(o) if o.get("cancelled").and_then(Value::as_bool) == Some(true) => {
+                    PermissionOutcome::Cancelled
+                }
                 Some(o) => match o.get("option_id").and_then(Value::as_str) {
                     Some(id) => PermissionOutcome::Resolved(id.to_string()),
                     None => PermissionOutcome::Open,
@@ -244,6 +249,38 @@ pub async fn resolve_permission(
     request_id: &str,
     option_id: &str,
     by: &str,
+) -> Result<Option<ChatBlockView>> {
+    set_permission_outcome(
+        db,
+        session_id,
+        request_id,
+        serde_json::json!({ "option_id": option_id, "by": by, "at": now_iso() }),
+    )
+    .await
+}
+
+/// Cancel an open permission request without inventing an option id that was
+/// never presented by the adapter.
+pub async fn cancel_permission(
+    db: &Db,
+    session_id: &str,
+    request_id: &str,
+    by: &str,
+) -> Result<Option<ChatBlockView>> {
+    set_permission_outcome(
+        db,
+        session_id,
+        request_id,
+        serde_json::json!({ "cancelled": true, "by": by, "at": now_iso() }),
+    )
+    .await
+}
+
+async fn set_permission_outcome(
+    db: &Db,
+    session_id: &str,
+    request_id: &str,
+    outcome: Value,
 ) -> Result<Option<ChatBlockView>> {
     let rows = sqlx::query_as::<_, ChatBlockRow>(
         "SELECT turn, seq, kind, payload, created_at FROM chat_blocks
@@ -268,10 +305,7 @@ pub async fn resolve_permission(
             return Ok(None);
         }
         if let Value::Object(map) = &mut view.payload {
-            map.insert(
-                "outcome".to_string(),
-                serde_json::json!({ "option_id": option_id, "by": by, "at": now_iso() }),
-            );
+            map.insert("outcome".to_string(), outcome);
         }
         sqlx::query(
             "UPDATE chat_blocks SET payload = ? WHERE session_id = ? AND turn = ? AND seq = ?",
@@ -410,11 +444,18 @@ fn preview_line(b: &ChatBlockView) -> String {
         }
         kind::PERMISSION_REQUEST => {
             let title = p.get("title").and_then(Value::as_str).unwrap_or("");
-            let outcome = p
-                .get("outcome")
-                .and_then(|o| o.get("option_id"))
-                .and_then(Value::as_str)
-                .unwrap_or("pending");
+            let outcome = match p.get("outcome") {
+                Some(outcome)
+                    if outcome.get("cancelled").and_then(Value::as_bool) == Some(true) =>
+                {
+                    "cancelled"
+                }
+                Some(outcome) => outcome
+                    .get("option_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pending"),
+                None => "pending",
+            };
             format!("[permission] {title} ({outcome})")
         }
         kind::MODE_CHANGE => format!("[mode] {}", text("mode_id")),
@@ -578,6 +619,27 @@ mod tests {
         assert_eq!(
             permission_outcome(&db, &s, "req-1").await.unwrap(),
             PermissionOutcome::Resolved("allow".to_string())
+        );
+
+        insert(
+            &db,
+            &s,
+            0,
+            2,
+            kind::PERMISSION_REQUEST,
+            &json!({ "request_id": "req-2", "options": [], "outcome": null }),
+        )
+        .await
+        .unwrap();
+        let cancelled = cancel_permission(&db, &s, "req-2", "policy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.payload["outcome"]["cancelled"], true);
+        assert!(cancelled.payload["outcome"].get("option_id").is_none());
+        assert_eq!(
+            permission_outcome(&db, &s, "req-2").await.unwrap(),
+            PermissionOutcome::Cancelled
         );
     }
 

@@ -87,7 +87,7 @@ def _profile_manifest(
             "turn_budget": raw.get("turnBudget"),
             "prelude": str(raw.get("prelude", "weaver")),
             "restricted": bool(raw.get("restricted", False)),
-            "allowed_tools": list(raw.get("allowedTools", [])),
+            "allowed_tools": raw.get("allowedTools", []),
         }
         env = []
         for env_name, env_value in sorted(dict(raw.get("env", {})).items()):

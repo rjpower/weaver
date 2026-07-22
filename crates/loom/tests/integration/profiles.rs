@@ -208,6 +208,12 @@ async fn restricted_github_tool_uses_the_server_side_token_and_fixed_repo() {
     assert!(text.contains("requester:issue edit 7 --repo octo/fixed --body clean body"));
     assert!(!text.contains("server-only-token"));
     assert!(!text.contains("requester-token"));
+    let config_mode = std::fs::metadata(loom::db::run_dir(id).join("restricted-gh-config"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(config_mode, 0o700);
 
     loom::user_token::remove(&ts.state.db, "rjpower")
         .await

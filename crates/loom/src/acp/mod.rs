@@ -67,8 +67,6 @@ use wire::{
     SessionUpdate, ToolCall, ToolCallContent, ToolCallLocation,
 };
 
-const RESTRICTED_CANCELLED_OPTION: &str = "__loom_restricted_cancelled__";
-
 // ---------------------------------------------------------------------------
 // Public surface
 // ---------------------------------------------------------------------------
@@ -1952,14 +1950,22 @@ impl Task {
         match chat::permission_outcome(&self.db, &self.session_id, &req_key).await? {
             chat::PermissionOutcome::Resolved(option_id) => {
                 // Already answered before a crash: re-send the stored answer.
-                let outcome = if option_id == RESTRICTED_CANCELLED_OPTION {
-                    wire::permission_cancelled()
-                } else {
-                    wire::permission_selected(&option_id)
-                };
                 let _ = self
                     .stream
-                    .write(&wire::response_line(&jsonrpc_id, outcome))
+                    .write(&wire::response_line(
+                        &jsonrpc_id,
+                        wire::permission_selected(&option_id),
+                    ))
+                    .await;
+                return Ok(());
+            }
+            chat::PermissionOutcome::Cancelled => {
+                let _ = self
+                    .stream
+                    .write(&wire::response_line(
+                        &jsonrpc_id,
+                        wire::permission_cancelled(),
+                    ))
                     .await;
                 return Ok(());
             }
@@ -2010,11 +2016,10 @@ impl Task {
                         wire::permission_cancelled(),
                     ))
                     .await;
-                if let Ok(Some(view)) = chat::resolve_permission(
+                if let Ok(Some(view)) = chat::cancel_permission(
                     &self.db,
                     &self.session_id,
                     &req_key,
-                    RESTRICTED_CANCELLED_OPTION,
                     "restricted-profile",
                 )
                 .await

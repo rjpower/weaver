@@ -1380,7 +1380,8 @@ function goTo(anchor: string) {
                 class="acp-perm-receipt"
                 data-testid="acp-permission-receipt"
               >
-                {{ row.perm.outcome.option_id }} · {{ shortTime(row.perm.outcome.at) }}
+                {{ row.perm.outcome.cancelled ? 'cancelled' : row.perm.outcome.option_id }} ·
+                {{ shortTime(row.perm.outcome.at) }}
               </div>
               <div v-else class="acp-perm-options">
                 <button

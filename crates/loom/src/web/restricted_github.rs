@@ -213,6 +213,18 @@ pub(super) async fn restricted_github_tool(
                 format!("creating restricted GitHub config directory: {error}"),
             )
         })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|error| {
+                AppError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("securing restricted GitHub config directory: {error}"),
+                )
+            })?;
+    }
     let text = invoke_gh(&repo, &tool, &arguments, &token, &config_dir).await?;
     Ok(Json(RestrictedGithubToolView { text }))
 }

@@ -279,7 +279,8 @@ export interface PermissionOption {
   kind: string;
 }
 export interface PermissionOutcome {
-  option_id: string;
+  option_id?: string;
+  cancelled?: boolean;
   by: string;
   at: string;
 }

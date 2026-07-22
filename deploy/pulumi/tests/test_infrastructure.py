@@ -162,6 +162,11 @@ def test_profile_manifest_round_trips_restricted_policy() -> None:
         "mcp__loom_github__issue_view",
     ]
 
+    malformed, _ = _profile_manifest(
+        {"github_comment": {"agent": "claude", "allowedTools": "Read(./**)"}}
+    )
+    assert malformed[0]["profile"]["allowed_tools"] == "Read(./**)"
+
 
 def test_google_mapping_binds_numeric_subject_email_and_profile() -> None:
     workload = WorkloadIdentityConfig.parse(
