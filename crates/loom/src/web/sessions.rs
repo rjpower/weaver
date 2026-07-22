@@ -295,6 +295,18 @@ async fn launch_env_for_profile(
     env
 }
 
+async fn automation_policy_defaults(db: &Db) -> (i64, i64) {
+    let idle = config::get(db, "automation.idle_archive_secs")
+        .await
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(config::DEFAULT_AUTOMATION_IDLE_ARCHIVE_SECS);
+    let turns = config::get(db, "automation.turn_cap")
+        .await
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(config::DEFAULT_AUTOMATION_TURN_CAP);
+    (idle, turns)
+}
+
 /// Build the explicit ambient baseline used when Tapestry clears inheritance.
 /// Profile/repo values win over baseline and allowlisted ambient values; loom's
 /// own session variables are injected later by `agent::session_env`.
@@ -542,13 +554,10 @@ fn tail_chars(s: &str, max: usize) -> String {
     format!("…(truncated)\n{tail}")
 }
 
-/// The session-creation core shared by interactive and webhook launches. Returns
-/// the view directly so each caller can shape its own response.
-///
-/// `created_by` is the launching principal's username (attribution for the shared
-/// board), or `None` for a system launch with no user behind it. `origin`
-/// records how the launch came to be (`user` / `agent` / `github` / `slack`);
-/// it derives the session's default class.
+/// The session-creation core shared by every producer. The actor supplies trusted
+/// attribution, origin, ancestry, and profile bounds; request fields cannot
+/// impersonate those properties. Returns the view directly so each caller can
+/// shape its own response.
 pub(crate) async fn provision_session(
     st: AppState,
     req: CreateReq,
@@ -750,7 +759,7 @@ pub(crate) async fn provision_session(
         None => return Err(AppError::bad_request(format!("unknown agent '{runtime}'"))),
     };
     // The ACP launch permission posture (ignored for a terminal launch): an
-    // explicit request wins, then the workspace's `agent.mode` default.
+    // explicit request wins, then the selected profile's mode.
     let mode = req
         .mode
         .as_deref()
@@ -976,21 +985,10 @@ pub(crate) async fn provision_session(
             .map(|session| session.id),
         None => None,
     };
-    let inherited_idle = if class == "automation" {
-        config::get(&st.db, "automation.idle_archive_secs")
-            .await
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(config::DEFAULT_AUTOMATION_IDLE_ARCHIVE_SECS)
+    let (inherited_idle, inherited_turn_budget) = if class == "automation" {
+        automation_policy_defaults(&st.db).await
     } else {
-        0
-    };
-    let inherited_turn_budget = if class == "automation" {
-        config::get(&st.db, "automation.turn_cap")
-            .await
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(config::DEFAULT_AUTOMATION_TURN_CAP)
-    } else {
-        0
+        (0, 0)
     };
     let (creator_kind, creator_subject) = actor.creator_identity();
     let launch_policy = session_mod::SessionLaunchPolicy {
@@ -1977,14 +1975,7 @@ pub(crate) async fn create_warm_session(
     // deliberately requires a live bound session, so an eager agent cannot hit
     // a transient authentication failure during startup.
     let status = agent::initial_status(&st.db, &agent).await;
-    let inherited_idle = config::get(&st.db, "automation.idle_archive_secs")
-        .await
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(config::DEFAULT_AUTOMATION_IDLE_ARCHIVE_SECS);
-    let inherited_turn_budget = config::get(&st.db, "automation.turn_cap")
-        .await
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(config::DEFAULT_AUTOMATION_TURN_CAP);
+    let (inherited_idle, inherited_turn_budget) = automation_policy_defaults(&st.db).await;
     let session = session_mod::insert_with_policy(
         &st.db,
         &NewSession {
