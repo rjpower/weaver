@@ -245,11 +245,15 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 
 | Method + path | What it does |
 |---|---|
-| `GET /api/health` | liveness probe |
+| `GET /api/health` / `GET /api/health/live` | public, process-only liveness probes (`/api/health` is the compatibility alias) |
+| `GET /api/ready` | public structured readiness: database access plus core and loom migration versions; optional future remote runner degradation will be reported without failing the whole API |
+| `GET /metrics` | public OpenMetrics scrape derived from durable session/profile/run/migration state; labels are bounded operational dimensions and never contain session/branch/path/user/token/error values (deployments normally restrict this at the public edge) |
+| `GET /api/diagnostics` | admin-only redacted counts, profile capacity, automation failures/staleness, orphan/error inventory, migration state, and non-secret federation metadata; backs Settings → Diagnostics |
 | `GET /api/sessions` / `POST /api/sessions` | list / create sessions (list takes `archived` — default `false` — and `automation` — default `false`; create resolves `profile` or `default`, permits launch selectors only when the profile is non-strict, stamps the resolved profile revision/policy, opens a tracking issue, and returns its id as `tracking_issue`) |
 | `GET POST /api/profiles`; `GET PUT DELETE /api/profiles/{name}` | named launch-policy CRUD; profile secret values are never returned |
-| `PUT DELETE /api/profiles/{profile}/env/{name}` | write-only profile environment management |
-| `POST /api/auth/federate` | exchange a mapped, verified OIDC identity for a short-lived Ed25519-signed Loom automation token |
+| `PUT DELETE /api/profiles/{profile}/env/{name}` | write-only profile environment management; a write supplies exactly one literal `value` or a full GCP Secret Manager `secret_ref`, and reads expose only source/reference metadata |
+| `POST /api/deployment/reconcile` | admin-only idempotent reconciliation of deployment-managed profiles, environment references, and federation mappings; pruning never touches operator-managed rows |
+| `POST /api/auth/federate` | exchange an exact mapped, signature-verified GitHub or Google OIDC identity for a ten-minute Ed25519-signed, profile-scoped Loom automation token |
 | `GET POST /api/runs`; `GET /api/runs/{id}` | durable, subject-scoped automation runs with idempotency reservation |
 | `GET PATCH DELETE /api/sessions/{id}` | session CRUD (status, title, goal, description) |
 | `PUT DELETE /api/sessions/{id}/tags/{key}` | set (upsert) / clear a branch tag — the well-known `attention` and `triage` keys plus any free-form key |
@@ -628,9 +632,14 @@ while gating who may drive the fleet. The core (crypto, the tables, the
 GitHub OAuth calls) lives in `crate::auth`, deliberately `axum`-free; the HTTP
 glue (the middleware, cookie handling, route handlers) lives in `crate::web`.
 
-Every `/api` route except the public login surface (`/api/health`,
-`/api/auth/me`, `/api/auth/login`, `/api/auth/logout`, `/api/auth/github/*`) and
-the static SPA passes through the `require_auth` middleware, which resolves the
+Every `/api` route except the public health surface (`/api/health`,
+`/api/health/live`, `/api/health/ready`, `/api/ready`), the public login surface
+(`/api/auth/me`, `/api/auth/login`, `/api/auth/logout`, `/api/auth/github/*`),
+the OIDC-authenticated `/api/auth/federate`, and the HMAC-authenticated GitHub
+webhook passes through the `require_auth` middleware. The root `/metrics`
+aggregate scrape is also public (and intended
+to be restricted to the host metrics agent at the deployment edge). The static
+SPA needs no API principal. Protected requests resolve the
 request to a `Principal` three ways, in order:
 
 - **API token** — an `Authorization: Bearer loom_…` header. This is the
@@ -676,6 +685,22 @@ behind a **same-host reverse proxy** (where forwarded requests look like
 loopback and so trust must be off) local automation still authenticates via this
 token, while remote callers must present their own. The local token is hidden
 from the token list and is not revocable from the UI.
+
+**Workload federation.** An admin-managed federation mapping fixes the provider,
+issuer, exact audience, identity, service tag, and allowed strict automation
+profiles. GitHub mappings bind the numeric repository id plus exact workflow
+ref, with optional event/ref restrictions. Google mappings bind both the
+service account's immutable numeric `sub` and exact `email`; the verified token
+must also carry `email_verified = true`. Loom selects a candidate mapping only
+to discover its configured JWKS endpoint, then verifies signature, issuer,
+audience, algorithm, and all identity claims before minting. Google and the
+production GitHub issuer require RS256. The resulting token has only the
+`automation` grant and mapped profiles, carries non-secret provider/service-tag
+audit context, and expires after ten minutes. A caller obtains a new Google ID
+token and exchanges again; no refresh token or service-account key is stored by
+Loom. Automation run records and metrics persist the mapping's bounded service
+tag, so operators can distinguish Marin, Grafana, and Actions traffic without
+using the workload subject as an observability label.
 
 **Cookies** are `HttpOnly; SameSite=Lax; Path=/`; the `Secure` attribute is
 added when `auth.cookie_secure` is on (set it when loom is reached over HTTPS).

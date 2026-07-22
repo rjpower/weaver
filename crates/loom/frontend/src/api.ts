@@ -509,6 +509,9 @@ export const getLogs = (limit = 500) =>
 /** Build version, pid, and start time of the running server. */
 export const getServerStatus = () => get('/status') as Promise<import('./types').ServerStatus>;
 
+/** Redacted durable-state and capacity snapshot for approved operators. */
+export const getDiagnostics = () => get('/diagnostics') as Promise<import('./types').Diagnostics>;
+
 /** Recent detached background tasks (the `@loom` webhook launches that run off the
  *  request), newest first. Operator-only, like the log endpoints. */
 export const getTasks = () => get('/tasks') as Promise<import('./types').TaskRecord[]>;

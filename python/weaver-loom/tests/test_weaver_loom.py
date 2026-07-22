@@ -9,7 +9,10 @@ builtin scripts against a real loom.
 """
 
 import json
+import io
 import subprocess
+import urllib.error
+import urllib.request
 
 import pytest
 from weaver_loom import (
@@ -18,10 +21,80 @@ from weaver_loom import (
     Client,
     Round,
     WeaverError,
+    WorkloadCredentials,
     gh_json,
     parse_judgement,
     parse_tag_recommendations,
 )
+
+
+class Response:
+    def __init__(self, body):
+        self.body = body.encode() if isinstance(body, str) else body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self):
+        return self.body
+
+
+def test_workload_credentials_exchange_once_and_cache(monkeypatch):
+    requests = []
+
+    def urlopen(request, timeout=None):
+        requests.append(request)
+        if "metadata" in request.full_url:
+            return Response("header.payload.signature")
+        return Response('{"token":"loom-jwt","expires_at":2000}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    credentials = WorkloadCredentials(
+        "https://loom.example.com", clock=lambda: 1000
+    )
+    assert credentials.token() == "loom-jwt"
+    assert credentials.token() == "loom-jwt"
+    assert len(requests) == 2
+    assert "audience=https%3A%2F%2Floom.example.com" in requests[0].full_url
+    assert requests[0].headers["Metadata-flavor"] == "Google"
+    assert json.loads(requests[1].data) == {"token": "header.payload.signature"}
+
+
+def test_client_retries_one_unauthorized_request_with_refreshed_workload_token(
+    monkeypatch,
+):
+    class Credentials:
+        def __init__(self):
+            self.generation = 1
+            self.invalidations = 0
+
+        def token(self):
+            return f"token-{self.generation}"
+
+        def invalidate(self):
+            self.invalidations += 1
+            self.generation += 1
+
+    credentials = Credentials()
+    requests = []
+
+    def urlopen(request):
+        requests.append(request)
+        if len(requests) == 1:
+            raise urllib.error.HTTPError(
+                request.full_url, 401, "expired", {}, io.BytesIO(b"")
+            )
+        return Response("[]")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    client = Client(base="https://loom.example.com", credentials=credentials)
+    assert client.sessions() == []
+    assert credentials.invalidations == 1
+    assert requests[0].headers["Authorization"] == "Bearer token-1"
+    assert requests[1].headers["Authorization"] == "Bearer token-2"
 
 
 class StubClient(Client):
@@ -35,6 +108,32 @@ class StubClient(Client):
     def _request(self, method, path, body=None):
         self.requests.append((method, path, body))
         return self.replies.get(path)
+
+
+def test_profile_scoped_run_is_capability_gated_and_preserves_idempotency():
+    session_request = {
+        "repo": "marin-community/marin",
+        "goal": "investigate the alert",
+    }
+    client = StubClient(capabilities=["launch"], replies={"/runs": {"id": "r1"}})
+
+    assert client.run("ops", "alert-1842", session_request, source="ops") == {
+        "id": "r1"
+    }
+    assert client.requests == [
+        (
+            "POST",
+            "/runs",
+            {
+                "profile": "ops",
+                "idempotency_key": "alert-1842",
+                "source": "ops",
+                "session": session_request,
+            },
+        )
+    ]
+    with pytest.raises(CapabilityDenied):
+        StubClient().run("ops", "alert-1842", session_request)
 
 
 def session(id, status="running", tags=None, repo_root="/repo"):

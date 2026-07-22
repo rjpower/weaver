@@ -279,7 +279,10 @@ grant). Set `LOOM_GITHUB_WEBHOOK_SECRET` and point a repo/org webhook at
 
 Loom serves a JSON API under `/api`; the Vue SPA is the primary consumer.
 
-- `GET /api/health`
+- `GET /api/health`, `GET /api/health/live` (process liveness), and
+  `GET /api/ready` (database + migration readiness)
+- `GET /metrics` (bounded-label OpenMetrics) and `GET /api/diagnostics`
+  (admin-only operational inventory used by Settings → Diagnostics)
 - `GET POST /api/sessions`, `GET PATCH DELETE /api/sessions/{id}`,
   `POST /api/sessions/{id}/{note,archive,adopt,github}`,
   `GET /api/sessions/{id}/{diff,log,events}`,

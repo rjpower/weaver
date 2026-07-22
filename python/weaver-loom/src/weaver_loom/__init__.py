@@ -48,7 +48,10 @@ from the weaver repo with ``uv pip install -e python/weaver-loom``.
 
 import json
 import os
+import random
 import subprocess
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -165,6 +168,98 @@ class CapabilityDenied(WeaverError):
     """A mutating call attempted without the capability it requires."""
 
 
+class WorkloadCredentials:
+    """Renewable Loom credentials backed by a Google workload identity.
+
+    The Google token is audience-bound and exchanged immediately; neither it
+    nor the short-lived Loom JWT is logged or persisted. This stdlib-only helper
+    works in Cloud Run, GCE, and any workload with the Compute metadata server.
+    """
+
+    METADATA_IDENTITY_URL = (
+        "http://metadata.google.internal/computeMetadata/v1/instance/"
+        "service-accounts/default/identity"
+    )
+
+    def __init__(
+        self,
+        loom_url,
+        audience=None,
+        refresh_margin=90,
+        clock=time.time,
+        metadata_url=None,
+    ):
+        self.loom_url = _base_url(loom_url)
+        self.audience = (audience or self.loom_url).rstrip("/")
+        self.refresh_margin = refresh_margin
+        self._clock = clock
+        self._metadata_url = metadata_url or self.METADATA_IDENTITY_URL
+        self._token = None
+        self._expires_at = 0
+        self._refresh_jitter = 0
+        self._lock = threading.Lock()
+
+    def invalidate(self):
+        """Force the next request to perform a fresh identity exchange."""
+        with self._lock:
+            self._token = None
+            self._expires_at = 0
+
+    def token(self):
+        """Return a cached Loom JWT, refreshing before expiry with jitter."""
+        with self._lock:
+            now = self._clock()
+            if self._token and now < (
+                self._expires_at - self.refresh_margin - self._refresh_jitter
+            ):
+                return self._token
+            google_token = self._google_identity_token()
+            request = urllib.request.Request(
+                self.loom_url + "/api/auth/federate",
+                data=json.dumps({"token": google_token}).encode(),
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    exchanged = json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                # Deliberately exclude the response body: an upstream must not
+                # trick a service into reflecting either credential into logs.
+                raise WeaverError(
+                    f"POST /auth/federate: HTTP {error.code}"
+                ) from None
+            except urllib.error.URLError as error:
+                raise WeaverError(f"POST /auth/federate: {error.reason}") from None
+            token = exchanged.get("token")
+            expires_at = exchanged.get("expires_at")
+            if not token or not isinstance(expires_at, int):
+                raise WeaverError("POST /auth/federate: invalid credential response")
+            self._token = token
+            self._expires_at = expires_at
+            self._refresh_jitter = random.uniform(0, 30)
+            return token
+
+    def _google_identity_token(self):
+        query = urllib.parse.urlencode(
+            {"audience": self.audience, "format": "full"}
+        )
+        request = urllib.request.Request(
+            self._metadata_url + "?" + query,
+            headers={"Metadata-Flavor": "Google"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                token = response.read().decode().strip()
+        except urllib.error.HTTPError as error:
+            raise WeaverError(f"Google identity token: HTTP {error.code}") from None
+        except urllib.error.URLError as error:
+            raise WeaverError(f"Google identity token: {error.reason}") from None
+        if token.count(".") != 2:
+            raise WeaverError("Google identity token: invalid response")
+        return token
+
+
 def gh_json(args, cwd=None, timeout=30):
     """Run ``gh <args>`` and parse its stdout as JSON.
 
@@ -215,9 +310,10 @@ class Client:
     construction. Sessions and branches cross as plain dicts.
     """
 
-    def __init__(self, base=None, capabilities=None):
+    def __init__(self, base=None, capabilities=None, credentials=None):
         self.base = _base_url(base)
         self.capabilities = list(capabilities or [])
+        self.credentials = credentials
 
     def can(self, cap):
         """Whether this client holds ``cap`` (``observe`` is always held)."""
@@ -235,18 +331,28 @@ class Client:
         headers = {"Content-Type": "application/json"} if data else {}
         # The engine injects $LOOM_TOKEN (the machine-local token); present it so
         # the round authenticates even when loopback trust is off.
-        token = (os.environ.get("LOOM_TOKEN") or "").strip()
+        token = (
+            self.credentials.token()
+            if self.credentials is not None
+            else (os.environ.get("LOOM_TOKEN") or "").strip()
+        )
         if token:
             headers["Authorization"] = "Bearer " + token
-        req = urllib.request.Request(url, data=data, method=method, headers=headers)
-        try:
-            with urllib.request.urlopen(req) as resp:
-                raw = resp.read()
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace").strip()
-            raise WeaverError(f"{method} {path}: HTTP {e.code}: {detail}") from None
-        except urllib.error.URLError as e:
-            raise WeaverError(f"{method} {path}: {e.reason}") from None
+        for attempt in range(2):
+            req = urllib.request.Request(url, data=data, method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    raw = resp.read()
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and self.credentials is not None and attempt == 0:
+                    self.credentials.invalidate()
+                    headers["Authorization"] = "Bearer " + self.credentials.token()
+                    continue
+                detail = e.read().decode("utf-8", errors="replace").strip()
+                raise WeaverError(f"{method} {path}: HTTP {e.code}: {detail}") from None
+            except urllib.error.URLError as e:
+                raise WeaverError(f"{method} {path}: {e.reason}") from None
         return json.loads(raw) if raw else None
 
     # -- Reads (observe) ----------------------------------------------------
@@ -283,6 +389,20 @@ class Client:
             {"prompt": prompt, "model": model or "", "effort": effort or ""},
         )
         return (reply or {}).get("output")
+
+    def run(self, profile, idempotency_key, session, source="ops"):
+        """Create an idempotent profile-scoped automation run; needs ``launch``."""
+        self._gate("launch")
+        return self._request(
+            "POST",
+            "/runs",
+            {
+                "profile": profile,
+                "idempotency_key": idempotency_key,
+                "source": source,
+                "session": session,
+            },
+        )
 
     # -- Writes (capability-gated) --------------------------------------------
 

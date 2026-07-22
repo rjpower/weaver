@@ -7,9 +7,12 @@ the stack entry point.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pulumi
 import pulumi_gcp as gcp
@@ -24,6 +27,137 @@ def _positive_config_int(value: int | None, default: int, name: str) -> int:
     if resolved <= 0:
         raise ValueError(f"{name} must be positive")
     return resolved
+
+
+SECRET_REF = re.compile(
+    r"^projects/(?P<project>[a-z0-9-]+)/secrets/(?P<secret>[A-Za-z0-9_-]+)/versions/(?:latest|[0-9]+)$"
+)
+
+
+@dataclass(frozen=True)
+class WorkloadIdentityConfig:
+    name: str
+    profile: str
+    service_tag: str
+    service_account_id: str
+
+    @classmethod
+    def parse(cls, value: dict[str, Any]) -> "WorkloadIdentityConfig":
+        name = str(value.get("name", "")).strip()
+        profile = str(value.get("profile", "")).strip()
+        service_tag = str(value.get("serviceTag", name)).strip()
+        account_id = str(value.get("serviceAccountId", f"loom-{name}")).strip()
+        if not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", account_id):
+            raise ValueError(f"invalid serviceAccountId for workload {name!r}")
+        if not name or not profile or not service_tag:
+            raise ValueError("workloads require name, profile, and serviceTag")
+        if not re.fullmatch(r"[a-z](?:[a-z0-9-]{0,62}[a-z0-9])?", name):
+            raise ValueError(f"invalid workload name {name!r}")
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", service_tag):
+            raise ValueError(f"invalid serviceTag for workload {name!r}")
+        return cls(name, profile, service_tag, account_id)
+
+
+def _profile_manifest(
+    profiles: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    """Translate stack-friendly camelCase profiles into Loom's REST contract."""
+    result: list[dict[str, Any]] = []
+    secret_refs: list[tuple[str, str]] = []
+    for name, raw in sorted(profiles.items()):
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name):
+            raise ValueError(f"invalid profile name {name!r}")
+        agent = str(raw.get("agent", "")).strip()
+        if not agent:
+            raise ValueError(f"profile {name!r} requires agent")
+        profile = {
+            "name": name,
+            "description": str(raw.get("description", "")),
+            "agent_kind": agent,
+            "model": str(raw.get("model", "")),
+            "effort": str(raw.get("effort", "")),
+            "protocol": str(raw.get("protocol", "")),
+            "mode": str(raw.get("mode", "auto")),
+            "class": str(raw.get("class", "interactive")),
+            "strict": bool(raw.get("strict", False)),
+            "env_clear": bool(raw.get("envClear", False)),
+            "ambient_allowlist": list(raw.get("ambientAllowlist", [])),
+            "idle_archive_secs": raw.get("idleArchiveSeconds"),
+            "max_concurrent": int(raw.get("maxConcurrent", 0)),
+            "turn_budget": raw.get("turnBudget"),
+        }
+        env = []
+        for env_name, env_value in sorted(dict(raw.get("env", {})).items()):
+            if (
+                not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name)
+                or env_name.startswith(("LOOM_", "WEAVER_"))
+            ):
+                raise ValueError(
+                    f"profile {name!r} has invalid environment name {env_name!r}"
+                )
+            if not isinstance(env_value, dict):
+                raise ValueError(
+                    f"profile {name!r} env {env_name!r} must use a full secretRef"
+                )
+            secret_ref = str(env_value.get("secretRef", "")).strip()
+            match = SECRET_REF.fullmatch(secret_ref)
+            if not match:
+                raise ValueError(
+                    f"profile {name!r} env {env_name!r} must use a full secretRef"
+                )
+            env.append({"name": env_name, "secret_ref": secret_ref})
+            secret_refs.append((match.group("project"), match.group("secret")))
+        result.append({"profile": profile, "env": env})
+    return result, secret_refs
+
+
+def _github_federation_manifest(
+    mappings: list[dict[str, Any]], audience: str
+) -> list[dict[str, Any]]:
+    result = []
+    for raw in mappings:
+        name = str(raw.get("name", "")).strip()
+        repository_id = str(raw.get("repositoryId", "")).strip()
+        workflow_ref = str(raw.get("workflowRef", "")).strip()
+        profile = str(raw.get("profile", "")).strip()
+        if not all((name, repository_id, workflow_ref, profile)):
+            raise ValueError(
+                "githubFederations require name, repositoryId, workflowRef, and profile"
+            )
+        result.append(
+            {
+                "name": name,
+                "provider": "github",
+                "issuer": "https://token.actions.githubusercontent.com",
+                "audience": audience,
+                "service_tag": str(raw.get("serviceTag", "github-actions")),
+                "repository_id": repository_id,
+                "workflow_ref": workflow_ref,
+                "event_name": raw.get("event"),
+                "ref_pattern": raw.get("ref"),
+                "profiles": [profile],
+            }
+        )
+    return result
+
+
+def _google_federation_mapping(
+    workload: WorkloadIdentityConfig,
+    audience: str,
+    email: str,
+    subject: str,
+) -> dict[str, Any]:
+    """Render the exact two-claim Google identity binding Loom verifies."""
+    return {
+        "name": workload.name,
+        "provider": "google",
+        "issuer": "https://accounts.google.com",
+        "audience": audience,
+        "subject": str(subject),
+        "service_account": email,
+        "service_tag": workload.service_tag,
+        "profiles": [workload.profile],
+    }
 
 
 @dataclass(frozen=True)
@@ -47,6 +181,10 @@ class DeploymentConfig:
     image_tag: str = "latest"
     github_repository: str = "rjpower/weaver"
     github_ref: str = "refs/heads/main"
+    profiles: dict[str, dict[str, Any]] | None = None
+    workloads: tuple[WorkloadIdentityConfig, ...] = ()
+    github_federations: tuple[dict[str, Any], ...] = ()
+    alert_emails: tuple[str, ...] = ()
     snapshot_retention_days: int = 14
     backup_retention_days: int = 30
 
@@ -64,6 +202,16 @@ class DeploymentConfig:
             ("backupRetentionDays", self.backup_retention_days),
         ):
             _positive_config_int(value, value, name)
+        profile_names = set((self.profiles or {}).keys())
+        workload_names: set[str] = set()
+        for workload in self.workloads:
+            if workload.name in workload_names:
+                raise ValueError(f"duplicate workload name {workload.name!r}")
+            if workload.profile not in profile_names:
+                raise ValueError(
+                    f"workload {workload.name!r} references unknown profile {workload.profile!r}"
+                )
+            workload_names.add(workload.name)
 
     @classmethod
     def from_pulumi(cls) -> "DeploymentConfig":
@@ -98,6 +246,16 @@ class DeploymentConfig:
             image_tag=config.get("imageTag") or "latest",
             github_repository=config.get("githubRepository") or "rjpower/weaver",
             github_ref=config.get("githubRef") or "refs/heads/main",
+            profiles=dict(config.get_object("profiles") or {}),
+            workloads=tuple(
+                WorkloadIdentityConfig.parse(value)
+                for value in list(config.get_object("workloads") or [])
+            ),
+            github_federations=tuple(
+                dict(value)
+                for value in list(config.get_object("githubFederations") or [])
+            ),
+            alert_emails=tuple(config.get_object("alertEmails") or []),
             snapshot_retention_days=_positive_config_int(
                 config.get_int("snapshotRetentionDays"), 14, "snapshotRetentionDays"
             ),
@@ -114,6 +272,9 @@ class Infrastructure:
     artifact_repository: gcp.artifactregistry.Repository
     backup_bucket: gcp.storage.Bucket
     workload_identity_provider: gcp.iam.WorkloadIdentityPoolProvider
+    workload_accounts: tuple[gcp.serviceaccount.Account, ...]
+    uptime_check: gcp.monitoring.UptimeCheckConfig
+    dashboard: gcp.monitoring.Dashboard
 
 
 def _enable_apis(project: str) -> list[gcp.projects.Service]:
@@ -123,6 +284,8 @@ def _enable_apis(project: str) -> list[gcp.projects.Service]:
         "dns.googleapis.com",
         "iam.googleapis.com",
         "iamcredentials.googleapis.com",
+        "logging.googleapis.com",
+        "monitoring.googleapis.com",
         "secretmanager.googleapis.com",
         "sts.googleapis.com",
         "storage.googleapis.com",
@@ -157,6 +320,77 @@ def create_infrastructure(config: DeploymentConfig) -> Infrastructure:
         display_name="GitHub Actions loom image publisher",
         opts=api_options,
     )
+
+    profile_manifest, profile_secret_refs = _profile_manifest(config.profiles or {})
+    audience = f"https://{config.domain.rstrip('/')}"
+    workload_accounts: list[gcp.serviceaccount.Account] = []
+    workload_mapping_outputs: list[pulumi.Output[dict[str, Any]]] = []
+    workload_client_outputs: list[pulumi.Output[dict[str, str]]] = []
+    for workload in config.workloads:
+        resource_name = re.sub(r"[^a-z0-9-]", "-", workload.name.lower())
+        account = gcp.serviceaccount.Account(
+            f"loom-workload-{resource_name}",
+            project=config.project,
+            account_id=workload.service_account_id,
+            display_name=f"Loom workload: {workload.name}",
+            opts=api_options,
+        )
+        workload_accounts.append(account)
+        workload_mapping_outputs.append(
+            pulumi.Output.all(account.email, account.unique_id).apply(
+                lambda values, workload=workload: _google_federation_mapping(
+                    workload, audience, values[0], values[1]
+                )
+            )
+        )
+        workload_client_outputs.append(
+            account.email.apply(
+                lambda email, workload=workload: {
+                    "name": workload.name,
+                    "serviceAccount": email,
+                    "loomUrl": audience,
+                    "tokenAudience": audience,
+                    "profile": workload.profile,
+                    "serviceTag": workload.service_tag,
+                }
+            )
+        )
+    github_mappings = _github_federation_manifest(
+        list(config.github_federations), audience
+    )
+    def render_deployment_manifest(workload_mappings: list[dict[str, Any]]) -> str:
+        return json.dumps(
+            {
+                "profiles": profile_manifest,
+                "federations": github_mappings + workload_mappings,
+                "prune": True,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    deployment_manifest: pulumi.Input[str]
+    if workload_mapping_outputs:
+        deployment_manifest = pulumi.Output.all(*workload_mapping_outputs).apply(
+            lambda workload_mappings: render_deployment_manifest(
+                list(workload_mappings)
+            )
+        )
+    else:
+        deployment_manifest = render_deployment_manifest([])
+    vm_observability_grants = [
+        gcp.projects.IAMMember(
+            f"loom-vm-{suffix}",
+            project=config.project,
+            role=role,
+            member=vm_account.email.apply(lambda email: f"serviceAccount:{email}"),
+            opts=api_options,
+        )
+        for suffix, role in (
+            ("metric-writer", "roles/monitoring.metricWriter"),
+            ("log-writer", "roles/logging.logWriter"),
+        )
+    ]
 
     artifact_repository = gcp.artifactregistry.Repository(
         "loom-images",
@@ -287,6 +521,23 @@ def create_infrastructure(config: DeploymentConfig) -> Infrastructure:
         role="roles/secretmanager.secretAccessor",
         member=vm_account.email.apply(lambda email: f"serviceAccount:{email}"),
     )
+    profile_secret_readers = []
+    for secret_project, secret_name in sorted(set(profile_secret_refs)):
+        suffix = hashlib.sha256(
+            f"{secret_project}/{secret_name}".encode()
+        ).hexdigest()[:10]
+        profile_secret_readers.append(
+            gcp.secretmanager.SecretIamMember(
+                f"loom-profile-secret-{suffix}",
+                project=secret_project,
+                secret_id=secret_name,
+                role="roles/secretmanager.secretAccessor",
+                member=vm_account.email.apply(
+                    lambda email: f"serviceAccount:{email}"
+                ),
+                opts=api_options,
+            )
+        )
 
     backup_bucket = gcp.storage.Bucket(
         "loom-backups",
@@ -362,6 +613,22 @@ def create_infrastructure(config: DeploymentConfig) -> Infrastructure:
         "image-mode": config.image_mode,
         "ar-image": image,
         "backup-bucket": backup_bucket.name,
+        "loom-deployment": deployment_manifest,
+        "loom-ops-agent-config": """metrics:
+  receivers:
+    loom:
+      type: prometheus
+      config:
+        scrape_configs:
+          - job_name: loom
+            scrape_interval: 30s
+            static_configs:
+              - targets: [\"127.0.0.1:7878\"]
+  service:
+    pipelines:
+      loom:
+        receivers: [loom]
+""",
     }
     dependencies: list[pulumi.Resource] = [
         web_firewall,
@@ -374,6 +641,8 @@ def create_infrastructure(config: DeploymentConfig) -> Infrastructure:
         backup_bucket,
         vm_backup_writer,
         snapshot_attachment,
+        *profile_secret_readers,
+        *vm_observability_grants,
     ]
     if dns_record:
         dependencies.append(dns_record)
@@ -417,6 +686,142 @@ def create_infrastructure(config: DeploymentConfig) -> Infrastructure:
         opts=pulumi.ResourceOptions(depends_on=dependencies),
     )
 
+    uptime_check = gcp.monitoring.UptimeCheckConfig(
+        "loom-readiness",
+        project=config.project,
+        display_name="Loom readiness",
+        period="60s",
+        timeout="10s",
+        log_check_failures=True,
+        http_check={
+            "path": "/api/ready",
+            "port": 443,
+            "request_method": "GET",
+            "use_ssl": True,
+            "validate_ssl": True,
+        },
+        monitored_resource={
+            "type": "uptime_url",
+            "labels": {"project_id": config.project, "host": config.domain},
+        },
+        opts=pulumi.ResourceOptions(depends_on=[instance]),
+    )
+    notification_channels = [
+        gcp.monitoring.NotificationChannel(
+            f"loom-alert-email-{index}",
+            project=config.project,
+            display_name=f"Loom operator {email}",
+            type="email",
+            labels={"email_address": email},
+            opts=api_options,
+        )
+        for index, email in enumerate(config.alert_emails)
+    ]
+    gcp.monitoring.AlertPolicy(
+        "loom-readiness-failed",
+        project=config.project,
+        display_name="Loom is not ready",
+        combiner="OR",
+        notification_channels=[channel.name for channel in notification_channels],
+        conditions=[
+            {
+                "display_name": "Public readiness probes are failing",
+                "condition_threshold": {
+                    "filter": (
+                        'metric.type="monitoring.googleapis.com/uptime_check/check_passed" '
+                        'AND resource.type="uptime_url" '
+                        f'AND resource.label.host="{config.domain}"'
+                    ),
+                    "duration": "120s",
+                    "comparison": "COMPARISON_LT",
+                    "threshold_value": 1,
+                    "aggregations": [
+                        {
+                            "alignment_period": "120s",
+                            "per_series_aligner": "ALIGN_NEXT_OLDER",
+                            "cross_series_reducer": "REDUCE_COUNT_TRUE",
+                            "group_by_fields": ["resource.label.host"],
+                        }
+                    ],
+                    "evaluation_missing_data": "EVALUATION_MISSING_DATA_ACTIVE",
+                },
+            }
+        ],
+        alert_strategy={"auto_close": "1800s"},
+        documentation={
+            "content": (
+                f"Loom readiness at {audience}/api/ready has failed for two minutes. "
+                "Inspect /api/diagnostics and the loom startup journal."
+            ),
+            "mime_type": "text/markdown",
+        },
+        opts=pulumi.ResourceOptions(depends_on=[uptime_check]),
+    )
+    dashboard = gcp.monitoring.Dashboard(
+        "loom-operations",
+        project=config.project,
+        dashboard_json=json.dumps(
+            {
+                "displayName": "Loom operations",
+                "mosaicLayout": {
+                    "columns": 12,
+                    "tiles": [
+                        {
+                            "xPos": 0,
+                            "yPos": 0,
+                            "width": 6,
+                            "height": 4,
+                            "widget": {
+                                "title": "Current sessions by state",
+                                "xyChart": {
+                                    "dataSets": [
+                                        {
+                                            "plotType": "LINE",
+                                            "targetAxis": "Y1",
+                                            "timeSeriesQuery": {
+                                                "prometheusQuery": (
+                                                    "sum by (status, profile) "
+                                                    "(loom_sessions_current)"
+                                                )
+                                            },
+                                        }
+                                    ],
+                                    "yAxis": {"label": "sessions", "scale": "LINEAR"},
+                                },
+                            },
+                        },
+                        {
+                            "xPos": 6,
+                            "yPos": 0,
+                            "width": 6,
+                            "height": 4,
+                            "widget": {
+                                "title": "Automation runs by state",
+                                "xyChart": {
+                                    "dataSets": [
+                                        {
+                                            "plotType": "STACKED_BAR",
+                                            "targetAxis": "Y1",
+                                            "timeSeriesQuery": {
+                                                "prometheusQuery": (
+                                                    "sum by (status, source, service, profile) "
+                                                    "(loom_automation_runs_current)"
+                                                )
+                                            },
+                                        }
+                                    ],
+                                    "yAxis": {"label": "runs", "scale": "LINEAR"},
+                                },
+                            },
+                        },
+                    ],
+                },
+            },
+            sort_keys=True,
+        ),
+        opts=api_options,
+    )
+
     pulumi.export("address", address.address)
     pulumi.export("url", f"https://{config.domain}/")
     pulumi.export("instanceName", instance.name)
@@ -425,6 +830,15 @@ def create_infrastructure(config: DeploymentConfig) -> Infrastructure:
     pulumi.export("backupBucket", backup_bucket.url)
     pulumi.export("githubWorkloadIdentityProvider", workload_provider.name)
     pulumi.export("githubServiceAccount", ci_account.email)
+    pulumi.export("tokenAudience", audience)
+    pulumi.export("profileNames", sorted((config.profiles or {}).keys()))
+    pulumi.export(
+        "workloadClients",
+        pulumi.Output.all(*workload_client_outputs)
+        if workload_client_outputs
+        else [],
+    )
+    pulumi.export("monitoringDashboard", dashboard.id)
     if not config.dns_managed_zone:
         pulumi.log.warn(
             "dnsManagedZone is unset: create the exported address's A record "
@@ -437,4 +851,7 @@ def create_infrastructure(config: DeploymentConfig) -> Infrastructure:
         artifact_repository=artifact_repository,
         backup_bucket=backup_bucket,
         workload_identity_provider=workload_provider,
+        workload_accounts=tuple(workload_accounts),
+        uptime_check=uptime_check,
+        dashboard=dashboard,
     )

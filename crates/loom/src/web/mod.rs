@@ -15,8 +15,10 @@
 //!   session). `/api/branches/{id}` — GET / PATCH (goal / title / description).
 //! * `/api/branches/{id}/issues` — list / POST issues for a branch.
 //! * `/api/issues/{id}` — GET / PATCH / DELETE an issue by id.
-//! * `/api/repos/recent`, `/api/repos/branches`, `/api/health`, `/api/settings`
-//!   — unchanged.
+//! * `/api/health` + `/api/health/live` are process-level liveness;
+//!   `/api/ready` checks the database and migration streams; `/metrics` exposes
+//!   bounded-label OpenMetrics; `/api/diagnostics` is the admin inventory.
+//! * `/api/repos/recent`, `/api/repos/branches`, `/api/settings` — unchanged.
 //!
 //! The `/api/hook` endpoint that used to exist is gone — agent hooks now go
 //! through `weaver hook --event …` which writes an `events` row consumed by
@@ -67,6 +69,8 @@ mod artifacts;
 mod auth;
 mod automation;
 mod branches;
+mod deployment;
+mod diagnostics;
 mod discussion;
 mod env;
 mod issues;
@@ -84,6 +88,8 @@ use artifacts::*;
 use auth::*;
 use automation::*;
 use branches::*;
+use deployment::*;
+use diagnostics::*;
 use discussion::*;
 use env::*;
 use issues::*;
@@ -539,7 +545,12 @@ pub fn router(state: AppState) -> Router {
     // middleware — these must work for an unauthenticated caller, since they are
     // how one *becomes* authenticated.
     let public = Router::new()
-        .route("/health", get(|| async { "ok" }))
+        // `/health` remains the compatibility liveness probe. `/health/live`
+        // names it explicitly; readiness checks DB + migration state.
+        .route("/health", get(liveness))
+        .route("/health/live", get(liveness))
+        .route("/ready", get(readiness))
+        .route("/health/ready", get(readiness))
         .route("/auth/me", get(auth_me))
         .route("/auth/login", post(auth_login))
         .route("/auth/logout", post(auth_logout))
@@ -731,6 +742,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::put(put_repo_env).delete(delete_repo_env),
         )
         .route("/settings", get(get_settings).patch(patch_settings))
+        .route("/deployment/reconcile", post(reconcile_deployment))
         .route("/profiles", get(list_profiles).post(create_profile))
         .route(
             "/profiles/{name}",
@@ -758,6 +770,7 @@ pub fn router(state: AppState) -> Router {
         .route("/logs/stream", get(logs_stream))
         .route("/status", get(server_status))
         .route("/tasks", get(tasks_snapshot))
+        .route("/diagnostics", get(diagnostics))
         // Watches — periodic / triggered watch programs over the fleet.
         .route("/watches", get(list_watches).post(create_watch))
         // The static segment wins over the `{id}` capture below, so a program
@@ -811,10 +824,13 @@ pub fn router(state: AppState) -> Router {
         // ETag/304 short-circuit for cacheable GETs — applied across the whole
         // API surface (public + protected) before the state is sealed in.
         .layer(axum::middleware::from_fn(api_etag_middleware))
-        .with_state(state);
+        .with_state(state.clone());
 
     let index = static_dir().join("index.html");
     Router::new()
+        // Conventional root scrape endpoint. The public edge may block it
+        // while a same-host metrics agent scrapes the loopback listener.
+        .route("/metrics", get(metrics))
         .nest("/api", api)
         .fallback_service(ServeDir::new(static_dir()).fallback(ServeFile::new(index)))
         .layer(axum::middleware::from_fn(static_cache_middleware))
@@ -823,6 +839,7 @@ pub fn router(state: AppState) -> Router {
         // Outermost, so it wraps auth and every other layer: tag each request's log
         // lines with its method + path (see `request_context_span`).
         .layer(axum::middleware::from_fn(request_context_span))
+        .with_state(state)
 }
 
 #[cfg(test)]

@@ -100,6 +100,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: FederationCmd,
     },
+    /// Apply a declarative deployment manifest through Loom's REST API.
+    Deployment {
+        #[command(subcommand)]
+        cmd: DeploymentCmd,
+    },
     /// Show the repo's issue board (every issue across branches + backlog).
     Issue {
         #[command(subcommand)]
@@ -568,27 +573,48 @@ enum TokenCmd {
     },
 }
 
+#[derive(Args)]
+struct FederationAddArgs {
+    /// Stable mapping name. Omitted legacy calls derive one from identity fields.
+    name: Option<String>,
+    #[arg(long, default_value = "github")]
+    provider: String,
+    #[arg(long, default_value = "https://token.actions.githubusercontent.com")]
+    issuer: String,
+    #[arg(long)]
+    audience: String,
+    #[arg(long)]
+    subject: Option<String>,
+    #[arg(long)]
+    service_account: Option<String>,
+    #[arg(long, default_value = "github-actions")]
+    service_tag: String,
+    #[arg(long)]
+    repository_id: Option<String>,
+    #[arg(long)]
+    workflow_ref: Option<String>,
+    #[arg(long)]
+    event: Option<String>,
+    #[arg(long = "ref")]
+    git_ref: Option<String>,
+    #[arg(long = "profile", required = true)]
+    profiles: Vec<String>,
+}
+
 #[derive(Subcommand)]
 enum FederationCmd {
-    Add {
-        #[arg(long, default_value = "https://token.actions.githubusercontent.com")]
-        issuer: String,
-        #[arg(long)]
-        audience: String,
-        #[arg(long)]
-        repository_id: String,
-        #[arg(long)]
-        workflow_ref: String,
-        #[arg(long)]
-        event: Option<String>,
-        #[arg(long = "ref")]
-        git_ref: Option<String>,
-        #[arg(long)]
-        profile: String,
-    },
+    Add(Box<FederationAddArgs>),
     Ls,
-    Rm {
-        id: String,
+    Rm { id: String },
+}
+
+#[derive(Subcommand)]
+enum DeploymentCmd {
+    /// Reconcile profiles, secret references, and workload federation mappings.
+    Apply {
+        /// JSON manifest path, or `-` for stdin.
+        #[arg(long, default_value = "-")]
+        file: String,
     },
 }
 
@@ -647,6 +673,12 @@ enum ProfileEnvCmd {
         profile: String,
         name: String,
         value: String,
+    },
+    /// Set a write-only GCP Secret Manager version reference.
+    Secret {
+        profile: String,
+        name: String,
+        secret_ref: String,
     },
     /// Remove an environment value.
     Rm { profile: String, name: String },
@@ -784,6 +816,7 @@ async fn run() -> Result<()> {
         Cmd::Token { cmd } => run_token(cmd).await,
         Cmd::Profile { cmd } => run_profile(cmd).await,
         Cmd::Federation { cmd } => run_federation(cmd).await,
+        Cmd::Deployment { cmd } => run_deployment(cmd).await,
         Cmd::Setup { cmd } => run_setup(cmd).await,
         Cmd::Config { cmd } => run_config(cmd).await,
         Cmd::Launch(opts) => cmd_launch(opts.into()).await,
@@ -916,24 +949,47 @@ fn parse_ttl(value: &str) -> Result<i64> {
 async fn run_federation(cmd: FederationCmd) -> Result<()> {
     let client = client::default();
     match cmd {
-        FederationCmd::Add {
-            issuer,
-            audience,
-            repository_id,
-            workflow_ref,
-            event,
-            git_ref,
-            profile,
-        } => {
+        FederationCmd::Add(args) => {
+            let FederationAddArgs {
+                name,
+                provider,
+                issuer,
+                audience,
+                subject,
+                service_account,
+                service_tag,
+                repository_id,
+                workflow_ref,
+                event,
+                git_ref,
+                profiles,
+            } = *args;
+            let name = name.unwrap_or_else(|| {
+                use sha2::Digest as _;
+                let identity = format!(
+                    "{provider}:{}:{}:{}:{}",
+                    subject.as_deref().unwrap_or_default(),
+                    service_account.as_deref().unwrap_or_default(),
+                    repository_id.as_deref().unwrap_or_default(),
+                    workflow_ref.as_deref().unwrap_or_default(),
+                );
+                let digest = sha2::Sha256::digest(identity.as_bytes());
+                format!("federation-{}", hex::encode(&digest[..8]))
+            });
             let mapping = client
                 .add_federation(&weaver_api::FederationReq {
+                    name,
+                    provider,
                     issuer,
                     audience,
+                    subject,
+                    service_account,
+                    service_tag,
                     repository_id,
                     workflow_ref,
                     event_name: event,
                     ref_pattern: git_ref,
-                    profile,
+                    profiles,
                 })
                 .await?;
             println!("added federation mapping {}", mapping.id);
@@ -941,14 +997,44 @@ async fn run_federation(cmd: FederationCmd) -> Result<()> {
         FederationCmd::Ls => {
             for mapping in client.list_federations().await? {
                 println!(
-                    "{}  repo={}  workflow={}  profile={}",
-                    mapping.id, mapping.repository_id, mapping.workflow_ref, mapping.profile
+                    "{}  provider={}  service={}  profiles={}",
+                    mapping.name,
+                    mapping.provider,
+                    mapping.service_tag,
+                    mapping.profiles.join(",")
                 );
             }
         }
         FederationCmd::Rm { id } => {
             client.remove_federation(&id).await?;
             println!("removed federation mapping {id}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_deployment(cmd: DeploymentCmd) -> Result<()> {
+    match cmd {
+        DeploymentCmd::Apply { file } => {
+            let contents = if file == "-" {
+                use std::io::Read as _;
+                let mut contents = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut contents)
+                    .context("reading deployment manifest from stdin")?;
+                contents
+            } else {
+                std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading deployment manifest {file}"))?
+            };
+            let request: weaver_api::DeploymentReq =
+                serde_json::from_str(&contents).context("decoding deployment manifest")?;
+            let result = client::default().reconcile_deployment(&request).await?;
+            println!(
+                "reconciled {} profiles and {} federation mappings",
+                result.profiles.len(),
+                result.federations.len()
+            );
         }
     }
     Ok(())
@@ -1011,6 +1097,16 @@ async fn run_profile(cmd: ProfileCmd) -> Result<()> {
             } => {
                 client.set_profile_env(&profile, &name, &value).await?;
                 println!("set {name} on profile {profile}");
+            }
+            ProfileEnvCmd::Secret {
+                profile,
+                name,
+                secret_ref,
+            } => {
+                client
+                    .set_profile_env_secret(&profile, &name, &secret_ref)
+                    .await?;
+                println!("set Secret Manager reference for {name} on profile {profile}");
             }
             ProfileEnvCmd::Rm { profile, name } => {
                 client.remove_profile_env(&profile, &name).await?;

@@ -90,6 +90,14 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
     ),
 ];
 
+/// Latest core schema version compiled into this binary.
+///
+/// Health and diagnostics callers use this to distinguish "the database
+/// answers" from "the database has every migration this process expects".
+pub fn latest_version() -> i64 {
+    MIGRATIONS.last().map_or(0, |(version, _, _)| *version)
+}
+
 /// weaver-core's own stream. Kept private: the tables it manages are this
 /// crate's to migrate, and callers only ever need [`run`].
 const STREAM: Stream = Stream::new("schema_migrations", MIGRATIONS);

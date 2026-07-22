@@ -20,6 +20,7 @@ enum ActorKind {
         subject: String,
     },
     Automation {
+        origin: String,
         subject: String,
         profiles: Vec<String>,
         run_id: Option<String>,
@@ -43,6 +44,7 @@ impl Actor {
                 delegated,
             }),
             Grant::Automation { subject, profiles } => Self(ActorKind::Automation {
+                origin: "automation".to_string(),
                 subject: subject.clone(),
                 profiles: profiles.clone(),
                 run_id: None,
@@ -71,12 +73,14 @@ impl Actor {
     }
 
     pub(crate) fn automation(
+        origin: impl Into<String>,
         subject: impl Into<String>,
         profiles: Vec<String>,
         run_id: impl Into<String>,
         session_id: impl Into<String>,
     ) -> Self {
         Self(ActorKind::Automation {
+            origin: origin.into(),
             subject: subject.into(),
             profiles,
             run_id: Some(run_id.into()),
@@ -92,7 +96,7 @@ impl Actor {
             | ActorKind::Session { .. } => "agent",
             ActorKind::Admin { .. } => "user",
             ActorKind::Producer { origin, .. } => origin,
-            ActorKind::Automation { .. } => "actions",
+            ActorKind::Automation { origin, .. } => origin,
         }
     }
 

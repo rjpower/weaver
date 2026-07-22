@@ -96,16 +96,22 @@ pub(super) async fn create_run(
 ) -> ApiResult<Json<RunView>> {
     let profile = req.profile.trim().to_string();
     let (subject, profiles) = run_identity(&principal, &profile)?;
-    if req.source != "actions" {
+    if !matches!(req.source.as_str(), "actions" | "ops" | "grafana") {
         return Err(AppError::bad_request(
-            "only the 'actions' run source is supported",
+            "run source must be 'actions', 'ops', or 'grafana'",
         ));
     }
     req.session.profile = Some(profile.clone());
     req.session.class = None;
 
     let idempotency_key = match &principal.automation_context {
-        Some(context) => {
+        Some(context) if context.provider == "github" => {
+            let context = context.github.as_ref().ok_or_else(|| {
+                AppError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "GitHub automation credential is missing workflow context",
+                )
+            })?;
             if let Some(repo) = req
                 .session
                 .repo
@@ -125,7 +131,7 @@ pub(super) async fn create_run(
                 context.repository_id, context.run_id, context.run_attempt
             )
         }
-        None => {
+        _ => {
             let key = req.idempotency_key.trim();
             if key.is_empty() {
                 return Err(AppError::bad_request("idempotency_key is required"));
@@ -134,10 +140,16 @@ pub(super) async fn create_run(
         }
     };
     let request_json = serde_json::to_string(&req)?;
+    let service_tag = principal
+        .automation_context
+        .as_ref()
+        .map(|context| context.service_tag.as_str())
+        .unwrap_or(req.source.as_str());
     let reservation = crate::runs::reserve(
         &st.db,
         &subject,
         &req.source,
+        service_tag,
         &profile,
         &idempotency_key,
         &request_json,
@@ -165,6 +177,7 @@ pub(super) async fn create_run(
         crate::runs::Reservation::Created(run) => run,
     };
     let actor = crate::runtime::Actor::automation(
+        req.source.clone(),
         subject,
         profiles,
         run.id.clone(),

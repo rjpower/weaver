@@ -25,9 +25,19 @@ const LOOM_MIGRATIONS: &[(i64, &str, &str)] = &[
         "grants-runs",
         include_str!("../migrations/0003_grants_runs.sql"),
     ),
+    (
+        4,
+        "workload-federation",
+        include_str!("../migrations/0004_workload_federation.sql"),
+    ),
 ];
 
 const LOOM_STREAM: Stream = Stream::new("loom_schema_migrations", LOOM_MIGRATIONS);
+
+/// Latest loom-owned schema version compiled into this binary.
+pub fn latest_migration_version() -> i64 {
+    LOOM_MIGRATIONS.last().map_or(0, |(version, _, _)| *version)
+}
 
 /// Open the shared database and apply loom's schema after the core schema.
 pub async fn connect(path: &Path) -> Result<Db> {
@@ -247,7 +257,7 @@ mod tests {
                 .fetch_all(&db)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(versions, vec![1, 2, 3, 4]);
 
         let columns = table_columns(&db, "sessions").await.unwrap();
         for expected in [
@@ -331,7 +341,7 @@ mod tests {
                 .fetch_all(&db)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1]);
+        assert_eq!(versions, vec![1, 2, 3, 4]);
         let index_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master
              WHERE type = 'index' AND name = 'idx_sessions_active_branch'",
@@ -405,7 +415,7 @@ mod tests {
             .fetch_one(&db)
             .await
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
 
         // Adoption replaced the historical index predicate: archived history
         // no longer prevents a new active session from claiming the branch.
