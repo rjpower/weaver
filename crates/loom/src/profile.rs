@@ -13,6 +13,11 @@ use crate::db::{now_iso, Db};
 
 pub const DEFAULT_PROFILE: &str = "default";
 
+const STOCK_PROFILES: &[(&str, &str)] = &[(
+    "github_comment.json",
+    include_str!("../profiles/github_comment.json"),
+)];
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Profile {
     pub name: String,
@@ -30,6 +35,10 @@ pub struct Profile {
     pub idle_archive_secs: Option<i64>,
     pub max_concurrent: i64,
     pub turn_budget: Option<i64>,
+    pub prelude: String,
+    pub restricted: bool,
+    /// JSON array in storage; parsed through [`allowed_tool_rules`].
+    pub allowed_tools: String,
     pub revision: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -42,6 +51,16 @@ impl Profile {
 
     pub fn is_automation_safe(&self) -> bool {
         self.strict && self.env_clear && self.class == "automation"
+    }
+
+    pub fn allowed_tool_rules(&self) -> Result<Vec<String>> {
+        serde_json::from_str(&self.allowed_tools).context("invalid profile allowed tools")
+    }
+
+    /// Exact rules to stamp onto a session. Profiles retain concise built-in
+    /// MCP set names, but launched sessions are immutable and auditable.
+    pub fn effective_allowed_tool_rules(&self) -> Result<Vec<String>> {
+        crate::mcp::expand_tool_sets(&self.allowed_tool_rules()?)
     }
 
     pub fn as_input(&self) -> Result<ProfileInput> {
@@ -60,6 +79,9 @@ impl Profile {
             idle_archive_secs: self.idle_archive_secs,
             max_concurrent: self.max_concurrent,
             turn_budget: self.turn_budget,
+            prelude: self.prelude.clone(),
+            restricted: self.restricted,
+            allowed_tools: self.allowed_tool_rules()?,
         })
     }
 }
@@ -92,10 +114,63 @@ pub struct ProfileInput {
     pub max_concurrent: i64,
     #[serde(default)]
     pub turn_budget: Option<i64>,
+    #[serde(default = "default_prelude")]
+    pub prelude: String,
+    #[serde(default)]
+    pub restricted: bool,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
 }
 
 fn default_class() -> String {
     "interactive".to_string()
+}
+
+fn default_prelude() -> String {
+    "weaver".to_string()
+}
+
+/// Extract the Claude SDK tool name from either `Read` or a scoped rule such
+/// as `Bash(gh issue view:*)`. Reject malformed rules here so launch code never
+/// has to guess how to build the adapter's visible-tools list.
+pub(crate) fn allowed_tool_name(rule: &str) -> Option<&str> {
+    if rule.is_empty() || rule != rule.trim() || rule.contains(['\n', '\r', '\0']) {
+        return None;
+    }
+    if !rule.contains('(') {
+        return Some(rule);
+    }
+    let body = rule.strip_suffix(')')?;
+    let (name, pattern) = body.split_once('(')?;
+    if name.is_empty() || pattern.is_empty() || pattern.contains(['(', ')']) {
+        return None;
+    }
+    Some(name)
+}
+
+fn is_restricted_mcp_tool_set(rule: &str) -> bool {
+    crate::mcp::is_tool_set(rule)
+}
+
+/// Restricted filesystem rules must stay below the session worktree. Claude's
+/// permission syntax is glob-like, so require an explicit `./` anchor and reject
+/// parent/root components before the rule ever reaches the adapter.
+fn is_restricted_read_rule(rule: &str) -> bool {
+    let Some(body) = rule.strip_suffix(')') else {
+        return false;
+    };
+    let Some((name, pattern)) = body.split_once('(') else {
+        return false;
+    };
+    matches!(name, "Read" | "Glob" | "Grep")
+        && pattern.starts_with("./")
+        && !pattern.contains('\\')
+        && std::path::Path::new(pattern).components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::Normal(_)
+            )
+        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -148,6 +223,20 @@ async fn validate_input(db: &Db, input: &ProfileInput) -> Result<(String, String
     {
         bail!("profile limits must be zero or positive");
     }
+    if !matches!(input.prelude.trim(), "weaver" | "none") {
+        bail!("profile prelude must be 'weaver' or 'none'");
+    }
+    if input.allowed_tools.len() > 64
+        || input.allowed_tools.iter().any(|rule| {
+            rule.len() > 256
+                || !(matches!(
+                    allowed_tool_name(rule),
+                    Some("Read" | "Glob" | "Grep" | "Bash" | "WebFetch" | "WebSearch")
+                ) || is_restricted_mcp_tool_set(rule))
+        })
+    {
+        bail!("invalid profile allowed tool rule");
+    }
     let agent_kind = input.agent_kind.trim();
     let meta = crate::agent::metadata_for(db, agent_kind)
         .await?
@@ -169,6 +258,23 @@ async fn validate_input(db: &Db, input: &ProfileInput) -> Result<(String, String
         "auto" | "default" | "acceptEdits" | "plan" | "bypassPermissions"
     ) {
         bail!("invalid profile mode '{mode}'");
+    }
+    if input.restricted
+        && (input.class.trim() != "automation"
+            || !input.strict
+            || !input.env_clear
+            || agent_kind != "claude"
+            || protocol != "acp"
+            || mode != "default"
+            || input.prelude.trim() != "none"
+            || input.allowed_tools.is_empty()
+            || input
+                .allowed_tools
+                .iter()
+                .any(|rule| !is_restricted_mcp_tool_set(rule) && !is_restricted_read_rule(rule))
+            || !input.ambient_allowlist.is_empty())
+    {
+        bail!("restricted profiles must be strict env-cleared Claude ACP automation profiles with prelude 'none', mode 'default', no ambient allowlist, repository-scoped read rules, and/or reviewed built-in MCP tool sets");
     }
     Ok((protocol, mode))
 }
@@ -218,17 +324,28 @@ pub async fn upsert(db: &Db, input: &ProfileInput) -> Result<Profile> {
         idle_archive_secs: input.idle_archive_secs,
         max_concurrent: input.max_concurrent,
         turn_budget: input.turn_budget,
+        prelude: input.prelude.trim().to_string(),
+        restricted: input.restricted,
+        allowed_tools: input.allowed_tools.clone(),
     };
     let ambient = serde_json::to_string(&normalized.ambient_allowlist)?;
+    let allowed_tools = serde_json::to_string(&normalized.allowed_tools)?;
     if let Some(existing) = get(db, name).await? {
         if existing.as_input()? == normalized {
             return Ok(existing);
         }
+        let widens_restricted_tools = existing.restricted
+            && widens_allowlist(
+                &existing.effective_allowed_tool_rules()?,
+                &crate::mcp::expand_tool_sets(&normalized.allowed_tools)?,
+            );
         if existing.is_automation_safe()
             && has_automation_sessions(db, name).await?
             && (!normalized.strict
                 || !normalized.env_clear
                 || normalized.class != "automation"
+                || (existing.restricted && !normalized.restricted)
+                || widens_restricted_tools
                 || widens_allowlist(&existing.ambient_names()?, &normalized.ambient_allowlist))
         {
             bail!("cannot weaken a profile referenced by automation sessions");
@@ -239,8 +356,9 @@ pub async fn upsert(db: &Db, input: &ProfileInput) -> Result<Profile> {
         "INSERT INTO profiles
          (name, description, agent_kind, model, effort, protocol, mode, class,
           strict, env_clear, ambient_allowlist, idle_archive_secs, max_concurrent,
-          turn_budget, revision, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+          turn_budget, revision, created_at, updated_at, prelude, restricted,
+          allowed_tools)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
          ON CONFLICT(name) DO UPDATE SET
           description=excluded.description, agent_kind=excluded.agent_kind,
           model=excluded.model, effort=excluded.effort, protocol=excluded.protocol,
@@ -248,6 +366,8 @@ pub async fn upsert(db: &Db, input: &ProfileInput) -> Result<Profile> {
           env_clear=excluded.env_clear, ambient_allowlist=excluded.ambient_allowlist,
           idle_archive_secs=excluded.idle_archive_secs,
           max_concurrent=excluded.max_concurrent, turn_budget=excluded.turn_budget,
+          prelude=excluded.prelude, restricted=excluded.restricted,
+          allowed_tools=excluded.allowed_tools,
           revision=profiles.revision + 1, updated_at=excluded.updated_at",
     )
     .bind(name)
@@ -266,6 +386,9 @@ pub async fn upsert(db: &Db, input: &ProfileInput) -> Result<Profile> {
     .bind(normalized.turn_budget)
     .bind(&now)
     .bind(&now)
+    .bind(&normalized.prelude)
+    .bind(normalized.restricted)
+    .bind(allowed_tools)
     .execute(db)
     .await?;
     get(db, name)
@@ -493,6 +616,22 @@ pub async fn deployment_managed_names(db: &Db) -> Result<Vec<String>> {
     .await?)
 }
 
+/// Seed reviewed stock profile manifests when they are absent. Existing rows
+/// remain operator-editable: startup never overwrites a profile after its first
+/// seed, and deployment reconciliation can still take explicit ownership.
+pub async fn seed_stock_profiles(db: &Db) -> Result<()> {
+    for (source, contents) in STOCK_PROFILES {
+        let input: ProfileInput = serde_json::from_str(contents)
+            .with_context(|| format!("parsing stock profile {source}"))?;
+        if get(db, &input.name).await?.is_none() {
+            upsert(db, &input)
+                .await
+                .with_context(|| format!("seeding stock profile {source}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Repair the one-time legacy seed through the same runtime metadata validators
 /// new profile writes use. Valid profiles are left untouched; a stale removed
 /// custom agent or selector falls back to the builtin default instead of making
@@ -516,6 +655,9 @@ pub async fn normalize_default(db: &Db) -> Result<()> {
         idle_archive_secs: current.idle_archive_secs,
         max_concurrent: current.max_concurrent,
         turn_budget: current.turn_budget,
+        prelude: current.prelude.clone(),
+        restricted: current.restricted,
+        allowed_tools: current.allowed_tool_rules().unwrap_or_default(),
     };
     if validate_input(db, &input).await.is_ok() {
         return Ok(());
@@ -544,6 +686,58 @@ mod tests {
         assert!(validate_name("").is_err());
         assert!(validate_name("2bad").is_err());
         assert!(validate_name("bad name").is_err());
+    }
+
+    #[test]
+    fn claude_tool_rules_must_be_well_formed() {
+        assert_eq!(allowed_tool_name("Read(./**)"), Some("Read"));
+        assert_eq!(allowed_tool_name("Bash(gh issue view:*)"), Some("Bash"));
+        assert_eq!(allowed_tool_name("Bash"), Some("Bash"));
+        assert_eq!(allowed_tool_name("Bash(gh issue view:*"), None);
+        assert_eq!(allowed_tool_name(" Bash(gh issue view:*)"), None);
+        assert!(is_restricted_mcp_tool_set("mcp/github/comment"));
+        assert!(!is_restricted_mcp_tool_set("mcp/github/admin"));
+    }
+
+    #[tokio::test]
+    async fn restricted_profiles_require_scoped_tool_rules() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let stock = get(&db, "github_comment").await.unwrap().unwrap();
+        let mut input = stock.as_input().unwrap();
+        input.allowed_tools = vec!["Read".to_string()];
+        assert!(upsert(&db, &input).await.is_err());
+
+        input.allowed_tools = vec!["Read(./**)".to_string()];
+        assert!(upsert(&db, &input).await.is_ok());
+
+        input.allowed_tools = vec!["mcp/github/comment".to_string()];
+        assert!(upsert(&db, &input).await.is_ok());
+
+        input.allowed_tools = vec!["Read(../**)".to_string()];
+        assert!(upsert(&db, &input).await.is_err());
+        input.allowed_tools = vec!["Glob(/etc/**)".to_string()];
+        assert!(upsert(&db, &input).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stock_profiles_seed_from_manifests_without_overwriting_edits() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let stock = get(&db, "github_comment").await.unwrap().unwrap();
+        assert!(stock.restricted);
+
+        let mut edited = stock.as_input().unwrap();
+        edited.description = "operator-edited description".to_string();
+        upsert(&db, &edited).await.unwrap();
+        seed_stock_profiles(&db).await.unwrap();
+
+        assert_eq!(
+            get(&db, "github_comment")
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            "operator-edited description"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,7 @@
+ALTER TABLE profiles ADD COLUMN prelude TEXT NOT NULL DEFAULT 'weaver';
+ALTER TABLE profiles ADD COLUMN restricted INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE profiles ADD COLUMN allowed_tools TEXT NOT NULL DEFAULT '[]';
+
+ALTER TABLE sessions ADD COLUMN policy_prelude TEXT NOT NULL DEFAULT 'weaver';
+ALTER TABLE sessions ADD COLUMN policy_restricted INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN policy_allowed_tools TEXT NOT NULL DEFAULT '[]';
