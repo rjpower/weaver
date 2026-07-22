@@ -417,7 +417,7 @@ async fn start_inner(
     // From this point onward the detached relay exists. Any failure must tear it
     // down and clear partially-persisted provider state before returning, or the
     // caller gets a stuck row plus a relay name handoff cannot safely reuse.
-    let prepared: Result<Task> = async {
+    let prepared: Result<(Task, mpsc::Receiver<Command>)> = async {
         let stream = crate::backend::subscribe_relay(&relay_name, 0).await?;
         let mut task = Task::fresh(
             state,
@@ -427,14 +427,29 @@ async fn start_inner(
             events_tx.clone(),
         )
         .await?;
-        task.handshake(&launch, handoff).await?;
-        Ok(task)
+        // `session/load` may replay an unanswered permission request and wait
+        // for the client response before returning. Register the task before
+        // setup so the REST permission route can drive that request instead of
+        // deadlocking against a handshake that has not published its handle.
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(64);
+        task.generation = state.acp.register(
+            session_id,
+            AcpHandle {
+                cmd_tx,
+                events_tx: events_tx.clone(),
+                metadata: task.metadata.clone(),
+            },
+        );
+        if let Err(error) = task.handshake(&launch, handoff, &mut cmd_rx).await {
+            task.registry.remove_own(&task.session_id, task.generation);
+            return Err(error);
+        }
+        Ok((task, cmd_rx))
     }
     .await;
-    let mut task = match prepared {
-        Ok(task) => task,
+    let (task, cmd_rx) = match prepared {
+        Ok(prepared) => prepared,
         Err(error) => {
-            state.acp.stop(session_id);
             let latest = session::get(&state.db, session_id).await.ok().flatten();
             if let Some(turn) = latest.as_ref().and_then(session::acp_inflight_turn) {
                 let _ = chat::close_abandoned_turn(&state.db, session_id, turn).await;
@@ -449,15 +464,6 @@ async fn start_inner(
         }
     };
 
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    task.generation = state.acp.register(
-        session_id,
-        AcpHandle {
-            cmd_tx,
-            events_tx,
-            metadata: task.metadata.clone(),
-        },
-    );
     tokio::spawn(async move { task.run(cmd_rx).await });
     Ok(())
 }
@@ -948,7 +954,12 @@ impl Task {
 
     // -- handshake ----------------------------------------------------------
 
-    async fn handshake(&mut self, launch: &AcpLaunch, handoff: Option<Value>) -> Result<()> {
+    async fn handshake(
+        &mut self,
+        launch: &AcpLaunch,
+        handoff: Option<Value>,
+        cmd_rx: &mut mpsc::Receiver<Command>,
+    ) -> Result<()> {
         let id = self.next_id();
         self.stream
             .write(&wire::request_line(
@@ -958,7 +969,7 @@ impl Task {
             ))
             .await?;
         let (res, err) = self
-            .recv_until_response(id, method::INITIALIZE, launch.setup_timeout)
+            .recv_until_response(id, method::INITIALIZE, launch.setup_timeout, cmd_rx)
             .await?;
         let res = res.ok_or_else(|| anyhow!("initialize failed: {err:?}"))?;
         if let Ok(init) = serde_json::from_value::<wire::InitializeResult>(res) {
@@ -975,7 +986,7 @@ impl Task {
                     .write(&wire::request_line(id, method::SESSION_NEW, params))
                     .await?;
                 let (res, err) = self
-                    .recv_until_response(id, method::SESSION_NEW, launch.setup_timeout)
+                    .recv_until_response(id, method::SESSION_NEW, launch.setup_timeout, cmd_rx)
                     .await?;
                 let res = res.ok_or_else(|| anyhow!("session/new failed: {err:?}"))?;
                 let ns: wire::NewSessionResult = serde_json::from_value(res)?;
@@ -1012,7 +1023,7 @@ impl Task {
                 // History replays as `session/update` notifications during the call.
                 let load_timeout = launch.setup_timeout.saturating_mul(4);
                 let (res, err) = self
-                    .recv_until_response(id, method::SESSION_LOAD, load_timeout)
+                    .recv_until_response(id, method::SESSION_LOAD, load_timeout, cmd_rx)
                     .await?;
                 self.suppress_journal = false;
                 // Drop any consolidation the suppressed replay left half-open so it
@@ -1046,7 +1057,7 @@ impl Task {
                 ))
                 .await?;
             let (result, error) = self
-                .recv_until_response(id, method::SESSION_SET_MODE, launch.setup_timeout)
+                .recv_until_response(id, method::SESSION_SET_MODE, launch.setup_timeout, cmd_rx)
                 .await?;
             if result.is_none() {
                 bail!("session/set_mode failed: {error:?}");
@@ -1073,6 +1084,7 @@ impl Task {
         want: u64,
         method_name: &str,
         timeout: Duration,
+        cmd_rx: &mut mpsc::Receiver<Command>,
     ) -> Result<(Option<Value>, Option<Value>)> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -1080,34 +1092,73 @@ impl Task {
             if remaining.is_zero() {
                 bail!("timed out waiting for ACP {method_name} response after {timeout:?}");
             }
-            let event = tokio::time::timeout(remaining, self.stream.recv())
-                .await
-                .map_err(|_| {
-                    anyhow!("timed out waiting for ACP {method_name} response after {timeout:?}")
-                })?;
-            match event {
-                Some(RelayEvent::Frame { seq, payload }) => {
-                    self.highest_seq = seq;
-                    let inc: Incoming = match serde_json::from_slice(&payload) {
-                        Ok(i) => i,
-                        Err(_) => {
+            tokio::select! {
+                event = self.stream.recv() => match event {
+                    Some(RelayEvent::Frame { seq, payload }) => {
+                        self.highest_seq = seq;
+                        let inc: Incoming = match serde_json::from_slice(&payload) {
+                            Ok(i) => i,
+                            Err(_) => {
+                                self.maybe_ack().await?;
+                                continue;
+                            }
+                        };
+                        if inc.kind() == IncomingKind::Response
+                            && inc.id.as_ref().and_then(Value::as_u64) == Some(want)
+                        {
                             self.maybe_ack().await?;
-                            continue;
+                            return Ok((inc.result, inc.error));
                         }
-                    };
-                    if inc.kind() == IncomingKind::Response
-                        && inc.id.as_ref().and_then(Value::as_u64) == Some(want)
-                    {
+                        self.dispatch_frame(seq, inc).await;
                         self.maybe_ack().await?;
-                        return Ok((inc.result, inc.error));
                     }
-                    self.dispatch_frame(seq, inc).await;
-                    self.maybe_ack().await?;
+                    Some(RelayEvent::Exit { status }) => {
+                        bail!("agent exited during handshake (status {status:?})")
+                    }
+                    None => bail!("relay closed during handshake"),
+                },
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(cmd) => self.on_setup_command(cmd).await,
+                    None => bail!("ACP session setup was stopped"),
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    bail!("timed out waiting for ACP {method_name} response after {timeout:?}")
                 }
-                Some(RelayEvent::Exit { status }) => {
-                    bail!("agent exited during handshake (status {status:?})")
-                }
-                None => bail!("relay closed during handshake"),
+            }
+        }
+    }
+
+    /// During initialize/new/load only permission answers are safe to drive.
+    /// In particular, a replayed open permission can be a prerequisite for the
+    /// `session/load` response itself. Reject other controls promptly rather
+    /// than queueing an HTTP request behind setup or sending it with an empty
+    /// provider session id.
+    async fn on_setup_command(&mut self, cmd: Command) {
+        let setup_error = || anyhow!("ACP session setup is still in progress");
+        match cmd {
+            Command::AnswerPermission {
+                request_id,
+                option_id,
+                by,
+                reply,
+            } => {
+                let answer = self.answer_permission(&request_id, &option_id, &by).await;
+                let _ = reply.send(answer);
+            }
+            Command::Prompt { reply, .. } | Command::ForcePending { reply, .. } => {
+                let _ = reply.send(Err(setup_error()));
+            }
+            Command::RetractPending { reply } => {
+                let _ = reply.send(Err(setup_error()));
+            }
+            Command::Cancel { reply } | Command::SetMode { reply, .. } => {
+                let _ = reply.send(Err(setup_error()));
+            }
+            Command::SetConfigOption { reply, .. } => {
+                let _ = reply.send(Err(setup_error()));
+            }
+            Command::PrepareHandoff { reply } => {
+                let _ = reply.send(Err(setup_error()));
             }
         }
     }

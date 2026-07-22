@@ -1994,9 +1994,105 @@ async fn handoff_failure_cleans_up_the_replacement() {
     );
 }
 
-/// B. Adopt after a full crash (task + relay gone): the monitor orphans the row,
-///    `/adopt` respawns the relay and reopens via `session/load`, and the journal
-///    continues without duplicating the replayed history.
+/// A permission replayed during `session/load` is drivable before adoption
+/// completes, breaking the load → permission → load dependency cycle.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopt_can_answer_a_permission_replayed_during_load() {
+    let _permission_id = EnvVarSet::set("FAKE_ACP_PERMISSION_ID", "4242");
+    let _load_permission = EnvVarSet::set("FAKE_ACP_LOAD_PERMISSION", "resume-edit");
+    let ts = TestServer::start().await;
+    seed_acp_agent(&ts, "fakeacp-permission").await;
+
+    // Leave a durable open permission in the original conversation. A fresh
+    // adapter process will replay the same request while loading this session.
+    let created = rest_create(
+        &ts,
+        "fakeacp-permission",
+        "permission:resume-edit|say:after-permission",
+    )
+    .await;
+    let id = created["id"].as_str().unwrap().to_string();
+    let relay = created["term_session"].as_str().unwrap().to_string();
+    let chat = poll_chat(&ts, &id, Duration::from_secs(10), |blocks| {
+        blocks.iter().any(|block| {
+            block["kind"] == "permission_request"
+                && block["payload"]["request_id"] == "4242"
+                && block["payload"]["outcome"].is_null()
+        })
+    })
+    .await;
+    assert_eq!(chat["live_turn"], 0);
+
+    assert!(ts.state.acp.stop(&id), "the original task was live");
+    backend::kill_session_and_wait(&relay).await.unwrap();
+    poll_view(&ts, &id, Duration::from_secs(15), |view| {
+        view["status"] == "orphaned"
+    })
+    .await;
+
+    // Adoption remains in `session/load` until this response arrives. Drive it
+    // through the public route concurrently, exactly as the dashboard does.
+    let adopt_client = weaver_api::Client::new(ts.client.base());
+    let adopt_id = id.clone();
+    let adopt = tokio::spawn(async move {
+        adopt_client
+            .post(&format!("/api/sessions/{adopt_id}/adopt"), json!({}))
+            .await
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !ts.state.acp.is_live(&id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "adopting task was not registered during session/load"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    loop {
+        match ts
+            .client
+            .post(
+                &format!("/api/sessions/{id}/permissions/4242"),
+                json!({ "option_id": "allow-once" }),
+            )
+            .await
+        {
+            Ok(answer) => {
+                assert_eq!(answer["resolved"], true);
+                break;
+            }
+            Err(error)
+                if error.to_string().contains("404") && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => panic!("setup-time permission was not drivable: {error}"),
+        }
+    }
+
+    adopt
+        .await
+        .expect("adopt task joins")
+        .expect("adopt completes after the permission answer");
+    assert!(ts.state.acp.is_live(&id));
+    let chat = ts
+        .client
+        .get(&format!("/api/sessions/{id}/chat"))
+        .await
+        .unwrap();
+    let permission = chat["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["kind"] == "permission_request")
+        .unwrap();
+    assert_eq!(permission["payload"]["outcome"]["option_id"], "allow-once");
+    assert_eq!(permission["payload"]["outcome"]["by"], "manual");
+}
+
+/// B. Adopt after a full crash without an open permission: the ordinary load
+///    replay remains deduplicated and the journal continues on the next turn.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn adopt_reopens_via_load_without_duplicates() {
