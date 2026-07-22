@@ -6,7 +6,7 @@
 > the slug rules, and the reconcile engine built around it do not.
 
 Status: **implemented** (issue
-[#14](https://github.com/rjpower/weaver/issues/14)). This doc surveys how the
+[#14](https://github.com/marin-community/loom/issues/14)). This doc surveys how the
 field handles spec-driven, multi-step agent work, then argues for a weaver-shaped
 answer; the design it argues for now ships. What landed:
 

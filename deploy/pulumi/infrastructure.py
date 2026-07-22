@@ -178,11 +178,11 @@ class DeploymentConfig:
     machine_type: str = "e2-highmem-4"
     boot_disk_gb: int = 100
     data_disk_gb: int = 500
-    repo_url: str = "https://github.com/rjpower/weaver.git"
+    repo_url: str = "https://github.com/marin-community/loom.git"
     git_ref: str = "main"
     image_mode: str = "build"
     image_tag: str = "latest"
-    github_repository: str = "rjpower/weaver"
+    github_repository: str = "marin-community/loom"
     github_ref: str = "refs/heads/main"
     profiles: dict[str, dict[str, Any]] | None = None
     workloads: tuple[WorkloadIdentityConfig, ...] = ()
@@ -243,11 +243,11 @@ class DeploymentConfig:
                 config.get_int("dataDiskGb"), 500, "dataDiskGb"
             ),
             repo_url=config.get("repoUrl")
-            or "https://github.com/rjpower/weaver.git",
+            or "https://github.com/marin-community/loom.git",
             git_ref=config.get("gitRef") or "main",
             image_mode=config.get("imageMode") or "build",
             image_tag=config.get("imageTag") or "latest",
-            github_repository=config.get("githubRepository") or "rjpower/weaver",
+            github_repository=config.get("githubRepository") or "marin-community/loom",
             github_ref=config.get("githubRef") or "refs/heads/main",
             profiles=dict(config.get_object("profiles") or {}),
             workloads=tuple(

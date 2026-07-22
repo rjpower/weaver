@@ -615,7 +615,7 @@ def wait_for_https(domain: str, timeout: int = 300) -> bool:
 @click.option(
     "--repo-url",
     envvar="REPO_URL",
-    default="https://github.com/rjpower/weaver.git",
+    default="https://github.com/marin-community/loom.git",
     show_default=True,
     help="Git URL the VM clones to get deploy/standalone.",
 )
