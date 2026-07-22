@@ -9,7 +9,7 @@ use crate::profile::{self, Profile, ProfileInput};
 
 use super::{ApiResult, AppError, AppState};
 
-fn input(req: ProfileReq, name: String) -> ProfileInput {
+pub(super) fn input(req: ProfileReq, name: String) -> ProfileInput {
     ProfileInput {
         name,
         description: req.description,
@@ -28,7 +28,7 @@ fn input(req: ProfileReq, name: String) -> ProfileInput {
     }
 }
 
-async fn view(st: &AppState, profile: Profile) -> ApiResult<ProfileView> {
+pub(super) async fn view(st: &AppState, profile: Profile) -> ApiResult<ProfileView> {
     let ambient_allowlist = profile
         .ambient_names()
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -37,6 +37,8 @@ async fn view(st: &AppState, profile: Profile) -> ApiResult<ProfileView> {
         .into_iter()
         .map(|entry| ProfileEnvView {
             name: entry.name,
+            source: entry.source,
+            secret_ref: entry.secret_ref,
             updated_at: entry.updated_at,
         })
         .collect();
@@ -124,9 +126,16 @@ pub(super) async fn put_profile_env(
     Path((profile_name, name)): Path<(String, String)>,
     Json(req): Json<PutProfileEnvReq>,
 ) -> ApiResult<Json<ProfileView>> {
-    profile::env_set(&st.db, &profile_name, &name, &req.value)
-        .await
-        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    match (req.value.as_deref(), req.secret_ref.as_deref()) {
+        (Some(value), None) => profile::env_set(&st.db, &profile_name, &name, value).await,
+        (None, Some(secret_ref)) => {
+            profile::env_set_secret(&st.db, &profile_name, &name, secret_ref).await
+        }
+        _ => Err(anyhow::anyhow!(
+            "exactly one of value and secret_ref is required"
+        )),
+    }
+    .map_err(|e| AppError::bad_request(e.to_string()))?;
     let item = profile::get(&st.db, &profile_name)
         .await?
         .ok_or_else(|| AppError::not_found("profile"))?;

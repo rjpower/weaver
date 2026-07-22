@@ -26,8 +26,11 @@ use super::{ApiResult, AppError, AppState};
 // Three credentials resolve to one `auth::Principal`: an `Authorization: Bearer`
 // API token, a login session cookie, or a trusted-loopback request. The
 // `require_auth` middleware enforces this on every route except the public login
-// surface (`/auth/me`, `/auth/login`, `/auth/logout`, `/auth/github/*`) and
-// `/health`. The crypto and storage live in `crate::auth`; this is the HTTP glue.
+// surface (`/auth/me`, `/auth/login`, `/auth/logout`, `/auth/github/*`), the
+// cryptographically authenticated federation/webhook routes, and
+// health/readiness probes. The root `/metrics` route is outside this nested API
+// middleware entirely. The crypto and storage live in `crate::auth`; this is
+// the HTTP glue.
 // ===========================================================================
 
 /// The login cookie's `Max-Age` in seconds, derived from the stored-session TTL

@@ -6,6 +6,7 @@
 //! rotatable and are loaded again on a real respawn.
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::db::{now_iso, Db};
@@ -63,7 +64,7 @@ impl Profile {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileInput {
     pub name: String,
     #[serde(default)]
@@ -100,7 +101,17 @@ fn default_class() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ProfileEnvMeta {
     pub name: String,
+    pub source: String,
+    pub secret_ref: Option<String>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ProfileEnvRow {
+    name: String,
+    value: String,
+    source: String,
+    secret_ref: Option<String>,
 }
 
 pub fn validate_name(name: &str) -> std::result::Result<(), String> {
@@ -192,14 +203,33 @@ pub async fn get(db: &Db, name: &str) -> Result<Option<Profile>> {
 pub async fn upsert(db: &Db, input: &ProfileInput) -> Result<Profile> {
     let name = input.name.trim();
     let (protocol, mode) = validate_input(db, input).await?;
-    let ambient = serde_json::to_string(&input.ambient_allowlist)?;
+    let normalized = ProfileInput {
+        name: name.to_string(),
+        description: input.description.trim().to_string(),
+        agent_kind: input.agent_kind.trim().to_string(),
+        model: input.model.trim().to_string(),
+        effort: input.effort.trim().to_string(),
+        protocol,
+        mode,
+        class: input.class.trim().to_string(),
+        strict: input.strict,
+        env_clear: input.env_clear,
+        ambient_allowlist: input.ambient_allowlist.clone(),
+        idle_archive_secs: input.idle_archive_secs,
+        max_concurrent: input.max_concurrent,
+        turn_budget: input.turn_budget,
+    };
+    let ambient = serde_json::to_string(&normalized.ambient_allowlist)?;
     if let Some(existing) = get(db, name).await? {
+        if existing.as_input()? == normalized {
+            return Ok(existing);
+        }
         if existing.is_automation_safe()
             && has_automation_sessions(db, name).await?
-            && (!input.strict
-                || !input.env_clear
-                || input.class != "automation"
-                || widens_allowlist(&existing.ambient_names()?, &input.ambient_allowlist))
+            && (!normalized.strict
+                || !normalized.env_clear
+                || normalized.class != "automation"
+                || widens_allowlist(&existing.ambient_names()?, &normalized.ambient_allowlist))
         {
             bail!("cannot weaken a profile referenced by automation sessions");
         }
@@ -221,19 +251,19 @@ pub async fn upsert(db: &Db, input: &ProfileInput) -> Result<Profile> {
           revision=profiles.revision + 1, updated_at=excluded.updated_at",
     )
     .bind(name)
-    .bind(input.description.trim())
-    .bind(input.agent_kind.trim())
-    .bind(input.model.trim())
-    .bind(input.effort.trim())
-    .bind(protocol)
-    .bind(mode)
-    .bind(input.class.trim())
-    .bind(input.strict)
-    .bind(input.env_clear)
+    .bind(&normalized.description)
+    .bind(&normalized.agent_kind)
+    .bind(&normalized.model)
+    .bind(&normalized.effort)
+    .bind(&normalized.protocol)
+    .bind(&normalized.mode)
+    .bind(&normalized.class)
+    .bind(normalized.strict)
+    .bind(normalized.env_clear)
     .bind(ambient)
-    .bind(input.idle_archive_secs)
-    .bind(input.max_concurrent)
-    .bind(input.turn_budget)
+    .bind(normalized.idle_archive_secs)
+    .bind(normalized.max_concurrent)
+    .bind(normalized.turn_budget)
     .bind(&now)
     .bind(&now)
     .execute(db)
@@ -278,7 +308,8 @@ pub async fn remove(db: &Db, name: &str) -> Result<bool> {
 
 pub async fn env_meta(db: &Db, profile: &str) -> Result<Vec<ProfileEnvMeta>> {
     Ok(sqlx::query_as::<_, ProfileEnvMeta>(
-        "SELECT name, updated_at FROM profile_env WHERE profile_name = ? ORDER BY name",
+        "SELECT name, source, secret_ref, updated_at
+         FROM profile_env WHERE profile_name = ? ORDER BY name",
     )
     .bind(profile)
     .fetch_all(db)
@@ -286,12 +317,31 @@ pub async fn env_meta(db: &Db, profile: &str) -> Result<Vec<ProfileEnvMeta>> {
 }
 
 pub async fn env_pairs(db: &Db, profile: &str) -> Result<Vec<(String, String)>> {
-    Ok(sqlx::query_as::<_, (String, String)>(
-        "SELECT name, value FROM profile_env WHERE profile_name = ? ORDER BY name",
+    let rows = sqlx::query_as::<_, ProfileEnvRow>(
+        "SELECT name, value, source, secret_ref
+         FROM profile_env WHERE profile_name = ? ORDER BY name",
     )
     .bind(profile)
     .fetch_all(db)
-    .await?)
+    .await?;
+    let mut values = Vec::with_capacity(rows.len());
+    for row in rows {
+        let value = match row.source.as_str() {
+            "literal" => row.value,
+            "gcp_secret" => {
+                let secret_ref = row
+                    .secret_ref
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("profile environment secret reference is missing"))?;
+                resolve_gcp_secret(secret_ref).await.with_context(|| {
+                    format!("resolving profile environment variable {}", row.name)
+                })?
+            }
+            source => bail!("unsupported profile environment source '{source}'"),
+        };
+        values.push((row.name, value));
+    }
+    Ok(values)
 }
 
 pub async fn env_get(db: &Db, profile: &str, name: &str) -> Result<Option<String>> {
@@ -310,9 +360,12 @@ pub async fn env_set(db: &Db, profile: &str, name: &str, value: &str) -> Result<
         bail!("unknown profile '{profile}'");
     }
     sqlx::query(
-        "INSERT INTO profile_env (profile_name, name, value, updated_at) VALUES (?, ?, ?, ?)
+        "INSERT INTO profile_env
+         (profile_name, name, value, source, secret_ref, updated_at)
+         VALUES (?, ?, ?, 'literal', NULL, ?)
          ON CONFLICT(profile_name, name) DO UPDATE SET
-          value=excluded.value, updated_at=excluded.updated_at",
+          value=excluded.value, source='literal', secret_ref=NULL,
+          updated_at=excluded.updated_at",
     )
     .bind(profile)
     .bind(name)
@@ -321,6 +374,95 @@ pub async fn env_set(db: &Db, profile: &str, name: &str, value: &str) -> Result<
     .execute(db)
     .await?;
     Ok(())
+}
+
+pub async fn env_set_secret(db: &Db, profile: &str, name: &str, secret_ref: &str) -> Result<()> {
+    crate::agent_env::validate_name(name).map_err(|e| anyhow!(e))?;
+    if get(db, profile).await?.is_none() {
+        bail!("unknown profile '{profile}'");
+    }
+    validate_gcp_secret_ref(secret_ref)?;
+    sqlx::query(
+        "INSERT INTO profile_env
+         (profile_name, name, value, source, secret_ref, updated_at)
+         VALUES (?, ?, '', 'gcp_secret', ?, ?)
+         ON CONFLICT(profile_name, name) DO UPDATE SET
+          value='', source='gcp_secret', secret_ref=excluded.secret_ref,
+          updated_at=excluded.updated_at",
+    )
+    .bind(profile)
+    .bind(name)
+    .bind(secret_ref)
+    .bind(now_iso())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+fn validate_gcp_secret_ref(secret_ref: &str) -> Result<()> {
+    let parts: Vec<&str> = secret_ref.split('/').collect();
+    if parts.len() != 6
+        || parts[0] != "projects"
+        || parts[2] != "secrets"
+        || parts[4] != "versions"
+        || parts[1].is_empty()
+        || parts[3].is_empty()
+        || parts[5].is_empty()
+        || !parts.iter().all(|part| {
+            part.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+        || (parts[5] != "latest" && !parts[5].bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        bail!("secret_ref must be projects/PROJECT/secrets/SECRET/versions/VERSION");
+    }
+    Ok(())
+}
+
+async fn resolve_gcp_secret(secret_ref: &str) -> Result<String> {
+    validate_gcp_secret_ref(secret_ref)?;
+    #[derive(Deserialize)]
+    struct MetadataToken {
+        access_token: String,
+    }
+    #[derive(Deserialize)]
+    struct SecretPayload {
+        data: String,
+    }
+    #[derive(Deserialize)]
+    struct SecretAccess {
+        payload: SecretPayload,
+    }
+
+    let http = reqwest::Client::new();
+    let token = http
+        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+        .header("Metadata-Flavor", "Google")
+        .send()
+        .await
+        .context("requesting the VM workload access token")?
+        .error_for_status()
+        .context("the VM workload access token request was rejected")?
+        .json::<MetadataToken>()
+        .await
+        .context("decoding the VM workload access token")?;
+    let access = http
+        .get(format!(
+            "https://secretmanager.googleapis.com/v1/{secret_ref}:access"
+        ))
+        .bearer_auth(token.access_token)
+        .send()
+        .await
+        .context("requesting the Secret Manager value")?
+        .error_for_status()
+        .context("the Secret Manager value request was rejected")?
+        .json::<SecretAccess>()
+        .await
+        .context("decoding the Secret Manager response")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(access.payload.data)
+        .context("decoding the Secret Manager payload")?;
+    String::from_utf8(bytes).context("Secret Manager value is not UTF-8")
 }
 
 pub async fn env_remove(db: &Db, profile: &str, name: &str) -> Result<bool> {
@@ -333,6 +475,22 @@ pub async fn env_remove(db: &Db, profile: &str, name: &str) -> Result<bool> {
             .rows_affected()
             > 0,
     )
+}
+
+pub async fn mark_deployment_managed(db: &Db, name: &str) -> Result<()> {
+    sqlx::query("UPDATE profiles SET managed_by_deployment = 1 WHERE name = ?")
+        .bind(name)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+pub async fn deployment_managed_names(db: &Db) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT name FROM profiles WHERE managed_by_deployment = 1 ORDER BY name",
+    )
+    .fetch_all(db)
+    .await?)
 }
 
 /// Repair the one-time legacy seed through the same runtime metadata validators
@@ -405,5 +563,47 @@ mod tests {
                 .as_deref(),
             Some("secret")
         );
+    }
+
+    #[tokio::test]
+    async fn unchanged_profiles_do_not_advance_the_revision() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let existing = get(&db, DEFAULT_PROFILE).await.unwrap().unwrap();
+        let input = existing.as_input().unwrap();
+
+        let unchanged = upsert(&db, &input).await.unwrap();
+
+        assert_eq!(unchanged.revision, existing.revision);
+        assert_eq!(unchanged.updated_at, existing.updated_at);
+    }
+
+    #[tokio::test]
+    async fn secret_references_are_validated_and_values_stay_out_of_the_database() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let secret_ref = "projects/acme-prod/secrets/ops_token/versions/latest";
+
+        env_set_secret(&db, DEFAULT_PROFILE, "OPS_TOKEN", secret_ref)
+            .await
+            .unwrap();
+        let metadata = env_meta(&db, DEFAULT_PROFILE).await.unwrap();
+        assert_eq!(metadata[0].name, "OPS_TOKEN");
+        assert_eq!(metadata[0].source, "gcp_secret");
+        assert_eq!(metadata[0].secret_ref.as_deref(), Some(secret_ref));
+        assert_eq!(
+            env_get(&db, DEFAULT_PROFILE, "OPS_TOKEN")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
+
+        assert!(env_set_secret(
+            &db,
+            DEFAULT_PROFILE,
+            "OPS_TOKEN",
+            "projects/acme-prod/secrets/ops_token/versions/not-a-version"
+        )
+        .await
+        .is_err());
     }
 }

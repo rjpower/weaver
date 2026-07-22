@@ -567,7 +567,7 @@ pub async fn lookup_token(db: &Db, token: &str) -> Result<Option<Principal>> {
                     subject: claims.sub.clone(),
                     profiles: claims.profiles.clone(),
                 },
-                automation_context: claims.github,
+                automation_context: claims.federation,
             }));
     }
     let hash = sha256_hex(token);

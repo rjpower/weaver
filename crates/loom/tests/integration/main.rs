@@ -15,6 +15,7 @@ mod auth;
 mod branches;
 mod conversation;
 mod custom_agents;
+mod diagnostics;
 mod env;
 mod ide;
 mod logs;

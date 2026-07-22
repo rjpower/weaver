@@ -1,4 +1,4 @@
-//! Short-lived automation credentials and GitHub Actions OIDC federation.
+//! Short-lived automation credentials and provider-backed OIDC federation.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -24,7 +24,7 @@ const DEFAULT_AUDIENCE: &str = "loom";
 const MAX_TTL_SECS: i64 = 3600;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct FederationContext {
+pub struct GithubContext {
     pub repository_id: String,
     pub repository: String,
     pub workflow_ref: String,
@@ -33,6 +33,18 @@ pub struct FederationContext {
     pub git_ref: String,
     pub run_id: String,
     pub run_attempt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FederationContext {
+    pub provider: String,
+    pub issuer: String,
+    pub subject: String,
+    pub service_tag: String,
+    #[serde(default)]
+    pub service_account: Option<String>,
+    #[serde(default)]
+    pub github: Option<GithubContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +59,11 @@ pub struct LoomClaims {
     pub exp: i64,
     pub jti: String,
     #[serde(default)]
-    pub github: Option<FederationContext>,
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub service_tag: Option<String>,
+    #[serde(default)]
+    pub federation: Option<FederationContext>,
 }
 
 fn key_path() -> PathBuf {
@@ -97,7 +113,7 @@ pub async fn mint(
     subject: &str,
     profiles: Vec<String>,
     ttl_secs: i64,
-    github: Option<FederationContext>,
+    federation: Option<FederationContext>,
 ) -> Result<AutomationTokenView> {
     let subject = subject.trim();
     if subject.is_empty() || profiles.is_empty() {
@@ -128,7 +144,11 @@ pub async fn mint(
         nbf: now - 5,
         exp: expires_at,
         jti: hex::encode(nonce),
-        github,
+        provider: federation.as_ref().map(|context| context.provider.clone()),
+        service_tag: federation
+            .as_ref()
+            .map(|context| context.service_tag.clone()),
+        federation,
     };
     let (encoding_key, _) = signing_keys()?;
     let token = encode(&Header::new(Algorithm::EdDSA), &claims, &encoding_key)?;
@@ -160,101 +180,234 @@ pub async fn verify(db: &Db, token: &str) -> Result<Option<LoomClaims>> {
 #[derive(Debug, Clone, FromRow)]
 struct FederationRow {
     id: String,
+    name: String,
+    provider: String,
     issuer: String,
     audience: String,
-    repository_id: String,
-    workflow_ref: String,
+    subject: Option<String>,
+    service_account: Option<String>,
+    service_tag: String,
+    repository_id: Option<String>,
+    workflow_ref: Option<String>,
     event_name: Option<String>,
     ref_pattern: Option<String>,
-    profile: String,
+    profiles_json: String,
     created_at: String,
+    updated_at: String,
 }
 
-impl From<FederationRow> for FederationView {
-    fn from(row: FederationRow) -> Self {
-        Self {
-            id: row.id,
-            issuer: row.issuer,
-            audience: row.audience,
-            repository_id: row.repository_id,
-            workflow_ref: row.workflow_ref,
-            event_name: row.event_name,
-            ref_pattern: row.ref_pattern,
-            profile: row.profile,
-            created_at: row.created_at,
-        }
+impl FederationRow {
+    fn profiles(&self) -> Result<Vec<String>> {
+        serde_json::from_str(&self.profiles_json).context("invalid federation profiles")
+    }
+
+    fn view(&self) -> Result<FederationView> {
+        Ok(FederationView {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            provider: self.provider.clone(),
+            issuer: self.issuer.clone(),
+            audience: self.audience.clone(),
+            subject: self.subject.clone(),
+            service_account: self.service_account.clone(),
+            service_tag: self.service_tag.clone(),
+            repository_id: self.repository_id.clone(),
+            workflow_ref: self.workflow_ref.clone(),
+            event_name: self.event_name.clone(),
+            ref_pattern: self.ref_pattern.clone(),
+            profiles: self.profiles()?,
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
+        })
     }
 }
 
 pub async fn federation_add(db: &Db, req: &FederationReq) -> Result<FederationView> {
-    let issuer = req.issuer.trim().trim_end_matches('/');
+    let name = req.name.trim();
+    crate::profile::validate_name(name).map_err(|error| anyhow!(error))?;
+    let provider = req.provider.trim().to_ascii_lowercase();
+    if !matches!(provider.as_str(), "github" | "google") {
+        bail!("federation provider must be 'github' or 'google'");
+    }
+    let issuer = req.issuer.trim();
     let audience = req.audience.trim();
-    if issuer.is_empty()
-        || audience.is_empty()
-        || req.repository_id.trim().is_empty()
-        || req.workflow_ref.trim().is_empty()
+    if issuer.is_empty() || audience.is_empty() {
+        bail!("issuer and audience are required");
+    }
+    if issuer.ends_with('/') || audience.ends_with('/') {
+        bail!("federation issuer and audience must not have a trailing slash");
+    }
+    let service_tag = req.service_tag.trim();
+    if service_tag.is_empty()
+        || service_tag.len() > 64
+        || !service_tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
     {
-        bail!("issuer, audience, repository_id, and workflow_ref are required");
+        bail!("service_tag must be 1-64 portable label characters");
     }
-    if audience.ends_with('/') {
-        bail!("federation audience must not have a trailing slash");
+    let mut profiles: Vec<String> = req
+        .profiles
+        .iter()
+        .map(|profile| profile.trim().to_string())
+        .collect();
+    profiles.sort();
+    profiles.dedup();
+    if profiles.is_empty() || profiles.iter().any(String::is_empty) {
+        bail!("at least one federation profile is required");
     }
-    let profile = crate::profile::get(db, req.profile.trim())
-        .await?
-        .ok_or_else(|| anyhow!("unknown profile '{}'", req.profile))?;
-    if !profile.is_automation_safe() {
-        bail!("federation profile must be automation-class, strict, and env-cleared");
+    for profile_name in &profiles {
+        let profile = crate::profile::get(db, profile_name)
+            .await?
+            .ok_or_else(|| anyhow!("unknown profile '{profile_name}'"))?;
+        if !profile.is_automation_safe() {
+            bail!("federation profiles must be automation-class, strict, and env-cleared");
+        }
+    }
+    let optional = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let subject = optional(req.subject.as_deref());
+    let service_account = optional(req.service_account.as_deref());
+    let repository_id = optional(req.repository_id.as_deref());
+    let workflow_ref = optional(req.workflow_ref.as_deref());
+    match provider.as_str() {
+        "github" => {
+            if repository_id.is_none() || workflow_ref.is_none() {
+                bail!("GitHub federation requires repository_id and workflow_ref");
+            }
+            if subject.is_some() || service_account.is_some() {
+                bail!("GitHub federation does not accept Google identity fields");
+            }
+        }
+        "google" => {
+            if issuer != "https://accounts.google.com" {
+                bail!("Google federation issuer must be https://accounts.google.com");
+            }
+            if !subject
+                .as_deref()
+                .is_some_and(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+                || !service_account
+                    .as_deref()
+                    .is_some_and(|value| value.ends_with(".iam.gserviceaccount.com"))
+            {
+                bail!("Google federation requires a numeric subject and service-account email");
+            }
+            if repository_id.is_some() || workflow_ref.is_some() {
+                bail!("Google federation does not accept GitHub identity fields");
+            }
+        }
+        _ => unreachable!(),
     }
     let id = hex::encode(rand::random::<[u8; 8]>());
+    let now = now_iso();
+    let profiles_json = serde_json::to_string(&profiles)?;
     sqlx::query(
         "INSERT INTO federation_mappings
-         (id, issuer, audience, repository_id, workflow_ref, event_name, ref_pattern, profile, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, name, provider, issuer, audience, subject, service_account,
+          service_tag, repository_id, workflow_ref, event_name, ref_pattern,
+          profiles_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(name) DO UPDATE SET
+          provider=excluded.provider, issuer=excluded.issuer,
+          audience=excluded.audience, subject=excluded.subject,
+          service_account=excluded.service_account,
+          service_tag=excluded.service_tag,
+          repository_id=excluded.repository_id,
+          workflow_ref=excluded.workflow_ref, event_name=excluded.event_name,
+          ref_pattern=excluded.ref_pattern, profiles_json=excluded.profiles_json,
+          updated_at=excluded.updated_at
+         WHERE provider IS NOT excluded.provider OR issuer IS NOT excluded.issuer
+            OR audience IS NOT excluded.audience OR subject IS NOT excluded.subject
+            OR service_account IS NOT excluded.service_account
+            OR service_tag IS NOT excluded.service_tag
+            OR repository_id IS NOT excluded.repository_id
+            OR workflow_ref IS NOT excluded.workflow_ref
+            OR event_name IS NOT excluded.event_name
+            OR ref_pattern IS NOT excluded.ref_pattern
+            OR profiles_json IS NOT excluded.profiles_json",
     )
     .bind(&id)
+    .bind(name)
+    .bind(&provider)
     .bind(issuer)
     .bind(audience)
-    .bind(req.repository_id.trim())
-    .bind(req.workflow_ref.trim())
-    .bind(req.event_name.as_deref().map(str::trim).filter(|v| !v.is_empty()))
-    .bind(req.ref_pattern.as_deref().map(str::trim).filter(|v| !v.is_empty()))
-    .bind(&profile.name)
-    .bind(now_iso())
+    .bind(subject)
+    .bind(service_account)
+    .bind(service_tag)
+    .bind(repository_id)
+    .bind(workflow_ref)
+    .bind(
+        req.event_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .bind(
+        req.ref_pattern
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty()),
+    )
+    .bind(profiles_json)
+    .bind(&now)
+    .bind(&now)
     .execute(db)
     .await?;
-    federation_get(db, &id)
+    federation_get(db, name)
         .await?
         .ok_or_else(|| anyhow!("mapping vanished"))
 }
 
 pub async fn federation_list(db: &Db) -> Result<Vec<FederationView>> {
-    Ok(sqlx::query_as::<_, FederationRow>(
-        "SELECT * FROM federation_mappings ORDER BY created_at DESC",
+    sqlx::query_as::<_, FederationRow>("SELECT * FROM federation_mappings ORDER BY created_at DESC")
+        .fetch_all(db)
+        .await?
+        .into_iter()
+        .map(|row| row.view())
+        .collect()
+}
+
+pub async fn federation_get(db: &Db, key: &str) -> Result<Option<FederationView>> {
+    sqlx::query_as::<_, FederationRow>("SELECT * FROM federation_mappings WHERE id = ? OR name = ?")
+        .bind(key)
+        .bind(key)
+        .fetch_optional(db)
+        .await?
+        .map(|row| row.view())
+        .transpose()
+}
+
+pub async fn federation_remove(db: &Db, key: &str) -> Result<bool> {
+    Ok(
+        sqlx::query("DELETE FROM federation_mappings WHERE id = ? OR name = ?")
+            .bind(key)
+            .bind(key)
+            .execute(db)
+            .await?
+            .rows_affected()
+            > 0,
+    )
+}
+
+pub async fn federation_mark_deployment_managed(db: &Db, name: &str) -> Result<()> {
+    sqlx::query("UPDATE federation_mappings SET managed_by_deployment = 1 WHERE name = ?")
+        .bind(name)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+pub async fn deployment_managed_federation_names(db: &Db) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT name FROM federation_mappings
+         WHERE managed_by_deployment = 1 ORDER BY name",
     )
     .fetch_all(db)
-    .await?
-    .into_iter()
-    .map(Into::into)
-    .collect())
-}
-
-async fn federation_get(db: &Db, id: &str) -> Result<Option<FederationView>> {
-    Ok(
-        sqlx::query_as::<_, FederationRow>("SELECT * FROM federation_mappings WHERE id = ?")
-            .bind(id)
-            .fetch_optional(db)
-            .await?
-            .map(Into::into),
-    )
-}
-
-pub async fn federation_remove(db: &Db, id: &str) -> Result<bool> {
-    Ok(sqlx::query("DELETE FROM federation_mappings WHERE id = ?")
-        .bind(id)
-        .execute(db)
-        .await?
-        .rows_affected()
-        > 0)
+    .await?)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,12 +445,40 @@ struct GithubClaims {
     _exp: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoogleClaims {
+    iss: String,
+    aud: Audience,
+    sub: String,
+    email: String,
+    email_verified: bool,
+    #[serde(rename = "exp")]
+    _exp: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OidcHint {
+    iss: String,
+    aud: Audience,
+    sub: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    repository_id: Option<String>,
+    #[serde(default)]
+    workflow_ref: Option<String>,
+    #[serde(default)]
+    event_name: Option<String>,
+    #[serde(default, rename = "ref")]
+    git_ref: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct Discovery {
     jwks_uri: String,
 }
 
-fn unverified_claims(token: &str) -> Result<GithubClaims> {
+fn unverified_claims(token: &str) -> Result<OidcHint> {
     let payload = token
         .split('.')
         .nth(1)
@@ -318,31 +499,45 @@ fn ref_matches(pattern: Option<&str>, value: &str) -> bool {
 
 pub async fn federate(db: &Db, token: &str) -> Result<AutomationTokenView> {
     let hint = unverified_claims(token)?;
-    let rows = sqlx::query_as::<_, FederationRow>(
-        "SELECT * FROM federation_mappings
-         WHERE issuer = ? AND repository_id = ? AND workflow_ref = ?",
-    )
-    .bind(hint.iss.trim_end_matches('/'))
-    .bind(&hint.repository_id)
-    .bind(&hint.workflow_ref)
-    .fetch_all(db)
-    .await?;
-    let mapping = rows
+    let rows =
+        sqlx::query_as::<_, FederationRow>("SELECT * FROM federation_mappings WHERE issuer = ?")
+            .bind(&hint.iss)
+            .fetch_all(db)
+            .await?;
+    let mut matches = rows
         .into_iter()
-        .find(|mapping| {
-            hint.aud.contains(&mapping.audience)
-                && mapping
-                    .event_name
-                    .as_deref()
-                    .is_none_or(|event| event == hint.event_name)
-                && ref_matches(mapping.ref_pattern.as_deref(), &hint.git_ref)
+        .filter(|mapping| {
+            if !hint.aud.contains(&mapping.audience) {
+                return false;
+            }
+            match mapping.provider.as_str() {
+                "github" => {
+                    mapping.repository_id.as_deref() == hint.repository_id.as_deref()
+                        && mapping.workflow_ref.as_deref() == hint.workflow_ref.as_deref()
+                        && mapping
+                            .event_name
+                            .as_deref()
+                            .is_none_or(|event| Some(event) == hint.event_name.as_deref())
+                        && hint.git_ref.as_deref().is_some_and(|git_ref| {
+                            ref_matches(mapping.ref_pattern.as_deref(), git_ref)
+                        })
+                }
+                "google" => {
+                    mapping.subject.as_deref() == Some(hint.sub.as_str())
+                        && mapping.service_account.as_deref() == hint.email.as_deref()
+                }
+                _ => false,
+            }
         })
-        .ok_or_else(|| anyhow!("no federation mapping matches this workflow identity"))?;
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        bail!("multiple federation mappings match this workload identity");
+    }
+    let mapping = matches
+        .pop()
+        .ok_or_else(|| anyhow!("no federation mapping matches this workload identity"))?;
 
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        mapping.issuer.trim_end_matches('/')
-    );
+    let discovery_url = format!("{}/.well-known/openid-configuration", mapping.issuer);
     let http = reqwest::Client::new();
     let discovery = http
         .get(discovery_url)
@@ -359,6 +554,13 @@ pub async fn federate(db: &Db, token: &str) -> Result<AutomationTokenView> {
         .json::<jsonwebtoken::jwk::JwkSet>()
         .await?;
     let header = decode_header(token)?;
+    if !matches!(header.alg, Algorithm::RS256 | Algorithm::EdDSA)
+        || ((mapping.provider == "google"
+            || mapping.issuer == "https://token.actions.githubusercontent.com")
+            && header.alg != Algorithm::RS256)
+    {
+        bail!("OIDC signing algorithm is not allowed for this provider");
+    }
     let kid = header
         .kid
         .as_deref()
@@ -370,35 +572,66 @@ pub async fn federate(db: &Db, token: &str) -> Result<AutomationTokenView> {
     let mut validation = Validation::new(header.alg);
     validation.set_issuer(&[mapping.issuer.as_str()]);
     validation.set_audience(&[mapping.audience.as_str()]);
-    let verified = decode::<GithubClaims>(token, &key, &validation)?.claims;
-    if verified.repository_id != mapping.repository_id
-        || verified.workflow_ref != mapping.workflow_ref
-        || mapping
-            .event_name
-            .as_deref()
-            .is_some_and(|event| event != verified.event_name)
-        || !ref_matches(mapping.ref_pattern.as_deref(), &verified.git_ref)
-    {
-        bail!("verified OIDC claims do not match the federation mapping");
-    }
-    let context = FederationContext {
-        repository_id: verified.repository_id,
-        repository: verified.repository,
-        workflow_ref: verified.workflow_ref,
-        workflow_sha: verified.workflow_sha,
-        event_name: verified.event_name,
-        git_ref: verified.git_ref,
-        run_id: verified.run_id,
-        run_attempt: verified.run_attempt,
+    let profiles = mapping.profiles()?;
+    let (subject, context) = match mapping.provider.as_str() {
+        "github" => {
+            let verified = decode::<GithubClaims>(token, &key, &validation)?.claims;
+            if mapping.repository_id.as_deref() != Some(verified.repository_id.as_str())
+                || mapping.workflow_ref.as_deref() != Some(verified.workflow_ref.as_str())
+                || mapping
+                    .event_name
+                    .as_deref()
+                    .is_some_and(|event| event != verified.event_name)
+                || !ref_matches(mapping.ref_pattern.as_deref(), &verified.git_ref)
+            {
+                bail!("verified OIDC claims do not match the federation mapping");
+            }
+            let subject = format!(
+                "github:{}:{}:{}",
+                verified.repository_id, verified.workflow_ref, verified.sub
+            );
+            let github = GithubContext {
+                repository_id: verified.repository_id,
+                repository: verified.repository,
+                workflow_ref: verified.workflow_ref,
+                workflow_sha: verified.workflow_sha,
+                event_name: verified.event_name,
+                git_ref: verified.git_ref,
+                run_id: verified.run_id,
+                run_attempt: verified.run_attempt,
+            };
+            let context = FederationContext {
+                provider: mapping.provider.clone(),
+                issuer: mapping.issuer.clone(),
+                subject: subject.clone(),
+                service_tag: mapping.service_tag.clone(),
+                service_account: None,
+                github: Some(github),
+            };
+            (subject, context)
+        }
+        "google" => {
+            let verified = decode::<GoogleClaims>(token, &key, &validation)?.claims;
+            if !verified.email_verified
+                || mapping.subject.as_deref() != Some(verified.sub.as_str())
+                || mapping.service_account.as_deref() != Some(verified.email.as_str())
+            {
+                bail!("verified Google identity does not match the federation mapping");
+            }
+            let subject = format!("google:{}:{}", verified.sub, verified.email);
+            let context = FederationContext {
+                provider: mapping.provider.clone(),
+                issuer: verified.iss,
+                subject: subject.clone(),
+                service_tag: mapping.service_tag.clone(),
+                service_account: Some(verified.email),
+                github: None,
+            };
+            (subject, context)
+        }
+        _ => bail!("unsupported federation provider"),
     };
-    // The exact verified workflow identity is the automation subject. Keep the
-    // GitHub `sub` in it for audit while authorization remains keyed on stable
-    // repository_id + workflow_ref.
-    let subject = format!(
-        "github:{}:{}:{}",
-        mapping.repository_id, mapping.workflow_ref, verified.sub
-    );
-    mint(db, &subject, vec![mapping.profile], 600, Some(context)).await
+    mint(db, &subject, profiles, 600, Some(context)).await
 }
 
 #[cfg(test)]
@@ -463,6 +696,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn google_workload_mappings_are_exact_and_idempotent() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        automation_profile(&db).await;
+        let req = FederationReq {
+            name: "marin-ops".to_string(),
+            provider: "google".to_string(),
+            issuer: "https://accounts.google.com".to_string(),
+            audience: "https://loom.example.com".to_string(),
+            subject: Some("11223344556677889900".to_string()),
+            service_account: Some("loom-marin-ops@acme.iam.gserviceaccount.com".to_string()),
+            service_tag: "marin-ops".to_string(),
+            repository_id: None,
+            workflow_ref: None,
+            event_name: None,
+            ref_pattern: None,
+            profiles: vec!["actions".to_string()],
+        };
+
+        let created = federation_add(&db, &req).await.unwrap();
+        let unchanged = federation_add(&db, &req).await.unwrap();
+        assert_eq!(unchanged.id, created.id);
+        assert_eq!(unchanged.updated_at, created.updated_at);
+        assert_eq!(unchanged.subject.as_deref(), Some("11223344556677889900"));
+        assert_eq!(unchanged.profiles, vec!["actions"]);
+
+        let mut invalid = req;
+        invalid.name = "invalid-google".to_string();
+        invalid.subject = Some("service-account-name".to_string());
+        assert!(federation_add(&db, &invalid).await.is_err());
+    }
+
+    #[tokio::test]
     #[serial_test::serial]
     async fn github_oidc_signature_and_mapping_are_verified_before_context_is_copied() {
         let home = tempfile::tempdir().unwrap();
@@ -504,13 +769,20 @@ mod tests {
         federation_add(
             &db,
             &FederationReq {
+                name: "actions-main".to_string(),
+                provider: "github".to_string(),
                 issuer: issuer.clone(),
                 audience: "loom-test".to_string(),
-                repository_id: "123".to_string(),
-                workflow_ref: "acme/repo/.github/workflows/loom.yml@refs/heads/main".to_string(),
+                subject: None,
+                service_account: None,
+                service_tag: "github-actions".to_string(),
+                repository_id: Some("123".to_string()),
+                workflow_ref: Some(
+                    "acme/repo/.github/workflows/loom.yml@refs/heads/main".to_string(),
+                ),
                 event_name: Some("issues".to_string()),
                 ref_pattern: Some("refs/heads/main".to_string()),
-                profile: "actions".to_string(),
+                profiles: vec!["actions".to_string()],
             },
         )
         .await
@@ -540,7 +812,9 @@ mod tests {
         .unwrap();
         let exchanged = federate(&db, &oidc).await.unwrap();
         let loom = verify(&db, &exchanged.token).await.unwrap().unwrap();
-        let context = loom.github.unwrap();
+        let federation = loom.federation.unwrap();
+        assert_eq!(federation.service_tag, "github-actions");
+        let context = federation.github.unwrap();
         assert_eq!(context.repository, "acme/repo");
         assert_eq!(context.workflow_sha, "abc123");
         assert_eq!(context.run_attempt, "2");

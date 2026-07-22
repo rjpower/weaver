@@ -20,3 +20,45 @@ config:
   # Build locally on the VM for the first deployment. After the image workflow
   # has published an image, change to pull and add imageTag with its commit SHA.
   loom-gcp:imageMode: build
+  # Runtime policy is reconciled through Loom's REST API on every startup
+  # generation. Environment values are Secret Manager references, never raw
+  # values in Pulumi state or VM metadata.
+  loom-gcp:profiles:
+    ops:
+      description: Marin operations automation
+      class: automation
+      agent: codex
+      protocol: acp
+      mode: plan
+      strict: true
+      envClear: true
+      ambientAllowlist: []
+      maxConcurrent: 1
+      turnBudget: 20
+      idleArchiveSeconds: 1800
+      env:
+        KUBECONFIG:
+          secretRef: projects/my-project/secrets/ops-kubeconfig/versions/latest
+  # Pulumi creates these service accounts and exports the non-secret client
+  # configuration a Cloud Run service or Grafana gateway consumes. Import an
+  # existing account at the generated resource URN before the first update.
+  loom-gcp:workloads:
+    - name: marin-ops
+      serviceAccountId: loom-marin-ops
+      serviceTag: marin-ops
+      profile: ops
+    - name: grafana
+      serviceAccountId: loom-grafana
+      serviceTag: grafana
+      profile: ops
+  loom-gcp:githubFederations:
+    - name: weaver-issues
+      repositoryId: "123456789"
+      workflowRef: rjpower/weaver/.github/workflows/loom-issue.yml@refs/heads/main
+      event: issues
+      ref: refs/heads/main
+      serviceTag: weaver-actions
+      profile: ops
+  # Optional Cloud Monitoring email channels for the managed readiness alert.
+  loom-gcp:alertEmails:
+    - operator@example.com

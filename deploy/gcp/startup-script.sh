@@ -89,6 +89,16 @@ if ! command -v gcloud >/dev/null 2>&1; then
   apt-get install -y --no-install-recommends google-cloud-cli
 fi
 
+# ---- Google Cloud Ops Agent (Prometheus receiver) --------------------------
+if ! dpkg-query -W -f='${Status}' google-cloud-ops-agent 2>/dev/null | grep -q 'ok installed'; then
+  echo "== installing Google Cloud Ops Agent =="
+  OPS_AGENT_INSTALLER=/tmp/add-google-cloud-ops-agent-repo.sh
+  curl -fsSLo "$OPS_AGENT_INSTALLER" \
+    https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+  bash "$OPS_AGENT_INSTALLER" --also-install
+  rm -f "$OPS_AGENT_INSTALLER"
+fi
+
 # ---- git (to clone the repo) ----------------------------------------------
 # Installed in its own command-guarded block, NOT bundled into the gcloud
 # install above: on a reboot where gcloud is already present that block is
@@ -198,6 +208,40 @@ if [ "$IMAGE_MODE" = "pull" ] && [ -n "$AR_IMAGE" ]; then
 else
   echo "== building and starting the stack =="
   docker compose up -d --build
+fi
+
+# ---- reconcile Pulumi-owned runtime policy ---------------------------------
+# The manifest contains profile policy, Secret Manager references, and exact
+# workload identities — never secret values. Apply it through Loom's REST API
+# from inside the container, where the machine-local credential already exists.
+DEPLOYMENT_FILE=/run/loom-deployment.json
+if meta instance/attributes/loom-deployment >"$DEPLOYMENT_FILE" 2>/dev/null && [ -s "$DEPLOYMENT_FILE" ]; then
+  echo "== waiting for loom before deployment reconciliation =="
+  for _ in $(seq 1 60); do
+    if curl -fsS http://127.0.0.1:7878/api/health >/dev/null; then
+      break
+    fi
+    sleep 2
+  done
+  if ! curl -fsS http://127.0.0.1:7878/api/health >/dev/null; then
+    echo "loom startup-script: loom did not become healthy for reconciliation" >&2
+    exit 1
+  fi
+  docker compose exec -T loom loom deployment apply --file - <"$DEPLOYMENT_FILE"
+  rm -f "$DEPLOYMENT_FILE"
+fi
+
+# Pulumi renders the Ops Agent receiver as instance metadata. The receiver
+# scrapes Loom's loopback-only `/metrics`; its service account can only write
+# telemetry and read explicitly referenced profile secrets.
+OPS_AGENT_CONFIG=/etc/google-cloud-ops-agent/config.yaml
+OPS_AGENT_PENDING=/run/loom-ops-agent.yaml
+if meta instance/attributes/loom-ops-agent-config >"$OPS_AGENT_PENDING" 2>/dev/null && [ -s "$OPS_AGENT_PENDING" ]; then
+  install -o root -g root -m 0644 "$OPS_AGENT_PENDING" "$OPS_AGENT_CONFIG"
+  rm -f "$OPS_AGENT_PENDING"
+  systemctl restart google-cloud-ops-agent
+else
+  rm -f "$OPS_AGENT_PENDING"
 fi
 
 echo "== loom startup-script done =="

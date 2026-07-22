@@ -76,39 +76,105 @@ The protected address, data disk, secret, and backup bucket make an accidental
 during an explicitly planned teardown. The boot disk is disposable; the
 separately attached data disk is retained when the VM is replaced.
 
-## Actions automation bring-up
+## Runtime profiles and workload identities
 
 Use one canonical public URL with no trailing slash. It is both the API base
-and the exact OIDC audience, so `https://loom.example.com` and
-`https://loom.example.com/` are intentionally different and the latter is
-rejected by the workflow.
+and exact OIDC audience. Declare profiles, their Secret Manager references,
+and workload bindings in `Pulumi.<stack>.yaml`; see
+[`Pulumi.example.yaml`](Pulumi.example.yaml) for a complete `ops` profile with
+Marin, Grafana, and GitHub Actions callers. Raw profile secret values are not
+accepted by the stack. Pulumi grants the Loom VM access only to the named
+secrets and places a non-secret reconciliation manifest in VM metadata.
 
-Create a strict, environment-cleared profile and then bind the exact workflow
-identity to it:
-
-```sh
-export LOOM_URL=https://loom.example.com
-loom profile add github-actions \
-  --agent codex --class automation --strict --env-clear \
-  --mode auto --max-concurrent 2 --turn-budget 100 --idle-archive-secs 28800
-loom profile env set github-actions GH_TOKEN '<fine-grained token>'
-
-repo=rjpower/weaver
-repo_id=$(gh api "repos/$repo" --jq .id)
-loom federation add \
-  --audience "$LOOM_URL" \
-  --repository-id "$repo_id" \
-  --workflow-ref "$repo/.github/workflows/loom-issue.yml@refs/heads/main" \
-  --event issues --ref refs/heads/main --profile github-actions
+```mermaid
+flowchart LR
+    P[Pulumi stack] -->|profile policy + secret refs| M[VM metadata manifest]
+    P -->|secret-level accessor| SM[Secret Manager]
+    P -->|service account| W[Cloud Run / GCE workload]
+    M -->|local admin API on startup| L[Loom]
+    L -->|resolve at session launch| SM
+    W -->|Google audience-bound ID token| F[POST /api/auth/federate]
+    F -->|10 minute Loom JWT| W
+    W -->|profile-scoped run| L
 ```
 
-Set repository variable `LOOM_URL` to that same value and, if the profile is
-not named `github-actions`, set `LOOM_PROFILE`. The opt-in
+On every startup generation, the VM waits for Loom readiness and runs `loom
+deployment apply` against the local REST API. Reconciliation is idempotent and
+prunes only profiles and identity mappings previously managed by the deployment
+manifest; operator-created resources are left alone. A referenced secret is
+resolved when a session launches or respawns, so rotating its Secret Manager
+version does not require storing a value in SQLite or Pulumi state.
+
+Each `workloads` entry creates a Google service account. Its immutable numeric
+subject and exact email address are bound to one declared profile. Grant that
+service account to the Cloud Run service (or other GCP workload), then consume
+the non-secret `workloadClients` stack output. The stdlib-only Python helper
+renews both sides of the exchange:
+
+```python
+from weaver_loom import Client, WorkloadCredentials
+
+credentials = WorkloadCredentials("https://loom.example.com")
+loom = Client(
+    base="https://loom.example.com",
+    credentials=credentials,
+    capabilities=["launch"],
+)
+run = loom.run(
+    "ops",
+    idempotency_key="incident-2026-07-22",
+    session={
+        "repo": "marin-community/marin",
+        "goal": "Investigate the production alert and report findings",
+    },
+    source="ops",
+)
+```
+
+No long-lived Loom token is stored in the caller. The helper gets an
+audience-bound Google identity token from the metadata server, exchanges it for
+a ten-minute profile-scoped Loom JWT, refreshes before expiry with jitter, and
+retries once after a 401. Revocation is immediate at the next exchange: remove
+the workload mapping with `pulumi up`, or detach/disable its service account.
+
+GitHub mappings are declared in `githubFederations`; use the repository's
+numeric `repositoryId`, exact workflow ref, event, and branch ref. Set repository
+variable `LOOM_URL` to the canonical stack URL and, if needed, set
+`LOOM_PROFILE`. The opt-in
 [`loom-issue.yml`](../../.github/workflows/loom-issue.yml) workflow then starts
 one retry-safe run when the `loom` label is added to an issue. It requests only
 `contents: read` and `id-token: write`; no long-lived Loom credential is stored
-in GitHub. Run `loom federation ls` to audit mappings and `loom profile show
-github-actions` to verify that secret values remain withheld.
+in GitHub. Run `loom federation ls`, `loom profile show ops`, and `pulumi stack
+output workloadClients` to audit the effective non-secret configuration.
+
+## Operations and debugging
+
+The VM runs the Google Cloud Ops Agent and scrapes Loom's loopback-only
+OpenMetrics endpoint every 30 seconds. Caddy deliberately returns 404 for the
+public `/metrics` path. Pulumi also creates:
+
+- a public HTTPS readiness uptime check at `/api/ready`;
+- a two-minute readiness alert, with optional email channels from
+  `alertEmails`; and
+- a Cloud Monitoring dashboard for current sessions and automation runs,
+  partitioned only by bounded status, profile, source, and mapped service labels.
+
+Use `/api/health` for liveness and `/api/ready` for dependency readiness. An
+authenticated administrator can open Settings → Diagnostics or request
+`/api/diagnostics` for current session/run counts, database migration state,
+task health, and process/runtime details. Diagnostics and metrics never include
+branch names, paths, user IDs, workload subjects, tokens, or raw error text.
+
+Useful first checks after a bring-up are:
+
+```sh
+curl -fsS https://loom.example.com/api/health
+curl -fsS https://loom.example.com/api/ready
+gcloud compute ssh loom --zone=us-central1-a \
+  --command='sudo systemctl status google-cloud-ops-agent; journalctl -u google-cloud-ops-agent -n 100'
+gcloud compute ssh loom --zone=us-central1-a \
+  --command='curl -fsS http://127.0.0.1:7878/metrics | head'
+```
 
 ## Backups
 

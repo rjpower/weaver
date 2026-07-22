@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import re
 
 import pulumi
@@ -20,6 +21,8 @@ class RecordingMocks(Mocks):
             outputs["address"] = "203.0.113.10"
         if args.typ == "gcp:serviceaccount/account:Account":
             outputs["email"] = f"{args.name}@example.iam.gserviceaccount.com"
+            outputs["uniqueId"] = "11223344556677889900"
+            outputs["unique_id"] = "11223344556677889900"
         if args.typ == "gcp:storage/bucket:Bucket":
             outputs["url"] = f"gs://{args.name}"
         return f"{args.name}_id", outputs
@@ -33,7 +36,10 @@ pulumi.runtime.set_mocks(mocks, project="loom-gcp", stack="test", preview=False)
 
 from infrastructure import (  # noqa: E402
     DeploymentConfig,
+    WorkloadIdentityConfig,
+    _google_federation_mapping,
     _positive_config_int,
+    _profile_manifest,
     create_infrastructure,
 )
 
@@ -51,6 +57,32 @@ def make_infrastructure():
             dns_managed_zone="example-zone",
             image_mode="pull",
             image_tag="0123456789abcdef0123456789abcdef01234567",
+            profiles={
+                "ops": {
+                    "agent": "codex",
+                    "protocol": "acp",
+                    "mode": "plan",
+                    "class": "automation",
+                    "strict": True,
+                    "envClear": True,
+                    "maxConcurrent": 1,
+                    "env": {
+                        "KUBECONFIG": {
+                            "secretRef": "projects/example/secrets/ops-kubeconfig/versions/latest"
+                        }
+                    },
+                }
+            },
+            workloads=(
+                WorkloadIdentityConfig.parse(
+                    {
+                        "name": "marin-ops",
+                        "profile": "ops",
+                        "serviceTag": "marin-ops",
+                        "serviceAccountId": "loom-marin-ops",
+                    }
+                ),
+            ),
         )
     )
 
@@ -74,6 +106,66 @@ def test_pull_mode_requires_a_commit_sha() -> None:
             loom_dotenv="LOOM_DOMAIN=loom.example.com\n",
             image_mode="pull",
             image_tag="latest",
+        )
+
+
+def test_profile_manifest_accepts_references_but_not_secret_values() -> None:
+    profiles, references = _profile_manifest(
+        {
+            "ops": {
+                "agent": "codex",
+                "strict": True,
+                "envClear": True,
+                "env": {
+                    "OPS_TOKEN": {
+                        "secretRef": "projects/example/secrets/ops-token/versions/7"
+                    }
+                },
+            }
+        }
+    )
+    assert profiles[0]["env"] == [
+        {
+            "name": "OPS_TOKEN",
+            "secret_ref": "projects/example/secrets/ops-token/versions/7",
+        }
+    ]
+    assert references == [("example", "ops-token")]
+    with pytest.raises(ValueError, match="full secretRef"):
+        _profile_manifest(
+            {"ops": {"agent": "codex", "env": {"OPS_TOKEN": "plaintext"}}}
+        )
+
+
+def test_google_mapping_binds_numeric_subject_email_and_profile() -> None:
+    workload = WorkloadIdentityConfig.parse(
+        {
+            "name": "marin-ops",
+            "profile": "ops",
+            "serviceTag": "marin-ops",
+            "serviceAccountId": "loom-marin-ops",
+        }
+    )
+    mapping = _google_federation_mapping(
+        workload,
+        "https://loom.example.com",
+        "loom-marin-ops@example.iam.gserviceaccount.com",
+        "11223344556677889900",
+    )
+    assert mapping["subject"] == "11223344556677889900"
+    assert mapping["service_account"].endswith(".iam.gserviceaccount.com")
+    assert mapping["profiles"] == ["ops"]
+
+
+@pytest.mark.parametrize("account_id", ["short", "a" * 31, "Upper-case"])
+def test_workload_service_account_ids_follow_gcp_limits(account_id: str) -> None:
+    with pytest.raises(ValueError, match="serviceAccountId"):
+        WorkloadIdentityConfig.parse(
+            {
+                "name": "marin-ops",
+                "profile": "ops",
+                "serviceAccountId": account_id,
+            }
         )
 
 
@@ -136,12 +228,14 @@ def test_wif_is_repository_and_main_bound_with_least_privilege_iam():
 
 def test_iam_roles_are_narrow() -> None:
     source = inspect.getsource(create_infrastructure)
-    assert set(re.findall(r'role="([^"]+)"', source)) == {
+    assert set(re.findall(r'"(roles/[^"]+)"', source)) == {
         "roles/iam.workloadIdentityUser",
         "roles/artifactregistry.writer",
         "roles/artifactregistry.reader",
         "roles/secretmanager.secretAccessor",
         "roles/storage.objectCreator",
+        "roles/monitoring.metricWriter",
+        "roles/logging.logWriter",
     }
 
 
@@ -157,6 +251,36 @@ def test_backup_bucket_enforces_public_access_prevention():
         assert prevention == "enforced"
 
     return infrastructure.instance.id.apply(check)
+
+
+@pulumi.runtime.test
+def test_profiles_workload_identity_and_monitoring_are_declarative():
+    infrastructure = make_infrastructure()
+
+    def check(_: object) -> None:
+        names = [resource.name for resource in mocks.resources]
+        assert "loom-workload-marin-ops" in names
+        assert "loom-profile-secret-" in " ".join(names)
+        assert "loom-readiness" in names
+        assert "loom-operations" in names
+        assert "loom-readiness-failed" in names
+
+        vm = by_name("loom")
+        manifest = json.loads(vm.inputs["metadata"]["loom-deployment"])
+        assert manifest["prune"] is True
+        assert manifest["profiles"][0]["profile"]["name"] == "ops"
+        env = manifest["profiles"][0]["env"][0]
+        assert env == {
+            "name": "KUBECONFIG",
+            "secret_ref": "projects/example/secrets/ops-kubeconfig/versions/latest",
+        }
+        mapping = manifest["federations"][0]
+        assert mapping["provider"] == "google"
+        assert mapping["subject"] == "11223344556677889900"
+        assert mapping["service_account"].endswith(".iam.gserviceaccount.com")
+        assert mapping["profiles"] == ["ops"]
+
+    return infrastructure.dashboard.id.apply(check)
 
 
 @pulumi.runtime.test

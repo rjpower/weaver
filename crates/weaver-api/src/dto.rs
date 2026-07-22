@@ -262,6 +262,10 @@ pub struct ProfileView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileEnvView {
     pub name: String,
+    /// `literal` or `gcp_secret`. The value itself is never returned.
+    pub source: String,
+    #[serde(default)]
+    pub secret_ref: Option<String>,
     pub updated_at: String,
 }
 
@@ -298,7 +302,12 @@ pub struct ProfileReq {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PutProfileEnvReq {
-    pub value: String,
+    /// A write-only literal. Exactly one of `value` and `secret_ref` is required.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// A GCP Secret Manager version resource, resolved only at launch/respawn.
+    #[serde(default)]
+    pub secret_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,16 +330,34 @@ pub struct FederateReq {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederationReq {
+    /// Stable operator-owned identity used for idempotent reconciliation.
+    pub name: String,
+    #[serde(default = "github_provider")]
+    pub provider: String,
     #[serde(default = "github_oidc_issuer")]
     pub issuer: String,
     pub audience: String,
-    pub repository_id: String,
-    pub workflow_ref: String,
+    /// Exact numeric OIDC subject for Google workload identities.
+    #[serde(default)]
+    pub subject: Option<String>,
+    /// Exact verified Google service-account email.
+    #[serde(default)]
+    pub service_account: Option<String>,
+    /// Stable, bounded audit label copied into Loom automation credentials.
+    pub service_tag: String,
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    #[serde(default)]
+    pub workflow_ref: Option<String>,
     #[serde(default)]
     pub event_name: Option<String>,
     #[serde(default)]
     pub ref_pattern: Option<String>,
-    pub profile: String,
+    pub profiles: Vec<String>,
+}
+
+fn github_provider() -> String {
+    "github".to_string()
 }
 
 fn github_oidc_issuer() -> String {
@@ -340,14 +367,56 @@ fn github_oidc_issuer() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederationView {
     pub id: String,
+    pub name: String,
+    pub provider: String,
     pub issuer: String,
     pub audience: String,
-    pub repository_id: String,
-    pub workflow_ref: String,
+    pub subject: Option<String>,
+    pub service_account: Option<String>,
+    pub service_tag: String,
+    pub repository_id: Option<String>,
+    pub workflow_ref: Option<String>,
     pub event_name: Option<String>,
     pub ref_pattern: Option<String>,
-    pub profile: String,
+    pub profiles: Vec<String>,
     pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One named profile and its authoritative write-only environment declaration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentProfileReq {
+    pub profile: ProfileReq,
+    #[serde(default)]
+    pub env: Vec<DeploymentProfileEnvReq>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentProfileEnvReq {
+    pub name: String,
+    /// Omit both fields to preserve an existing write-only value by name.
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub secret_ref: Option<String>,
+}
+
+/// Declarative runtime resources rendered by Pulumi and reconciled by name.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeploymentReq {
+    #[serde(default)]
+    pub profiles: Vec<DeploymentProfileReq>,
+    #[serde(default)]
+    pub federations: Vec<FederationReq>,
+    /// Remove previously deployment-managed resources omitted from this request.
+    #[serde(default)]
+    pub prune: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentView {
+    pub profiles: Vec<ProfileView>,
+    pub federations: Vec<FederationView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,6 +437,7 @@ pub struct RunView {
     pub id: String,
     pub actor_subject: String,
     pub source: String,
+    pub service_tag: String,
     pub profile: String,
     pub idempotency_key: String,
     pub session_id: String,
@@ -376,6 +446,113 @@ pub struct RunView {
     pub summary: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// One migration stream's observed and expected state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationStreamView {
+    pub stream: String,
+    pub current: i64,
+    pub expected: i64,
+    pub applied: i64,
+    pub ready: bool,
+}
+
+/// Public readiness response. Liveness remains the process-only `/api/health`;
+/// this shape proves that the database and both migration streams are usable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadinessView {
+    pub status: String,
+    pub database: bool,
+    pub migrations: Vec<MigrationStreamView>,
+    /// Optional facilities may report degraded here without taking the API out
+    /// of service. Empty until remote runner pools exist.
+    pub degraded: Vec<String>,
+}
+
+/// A session count across every bounded control-plane dimension available in
+/// the current schema. `runner_pool` is `local` until runner pools land.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticSessionCount {
+    pub status: String,
+    pub class: String,
+    pub profile: String,
+    pub protocol: String,
+    pub runner_pool: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticProfileCapacity {
+    pub profile: String,
+    pub revision: i64,
+    pub active: i64,
+    /// `None` means unlimited (`max_concurrent = 0`).
+    pub maximum: Option<i64>,
+    pub available: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticRunCount {
+    pub status: String,
+    pub source: String,
+    pub service_tag: String,
+    pub profile: String,
+    pub count: i64,
+}
+
+/// A redacted recent failed run. Deliberately excludes actor, idempotency key,
+/// session id, request body, and raw failure summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticRunFailure {
+    pub source: String,
+    pub profile: String,
+    pub outcome: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticRunSummary {
+    pub counts: Vec<DiagnosticRunCount>,
+    pub stale_creating: i64,
+    pub recent_failures: Vec<DiagnosticRunFailure>,
+}
+
+/// Aggregated orphan/error inventory. No session, branch, path, principal, or
+/// error text crosses this diagnostics boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticProblemSummary {
+    pub status: String,
+    pub class: String,
+    pub profile: String,
+    pub protocol: String,
+    pub runner_pool: String,
+    pub count: i64,
+    pub latest_activity_at: Option<String>,
+}
+
+/// Non-secret federation mapping metadata useful for verifying deployment
+/// reconciliation. This never includes a bearer/OIDC token or signing key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticFederation {
+    pub name: String,
+    pub provider: String,
+    pub audience: String,
+    pub service_tag: String,
+    pub profiles: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Admin-only operational snapshot returned by `/api/diagnostics`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticsView {
+    pub sessions: Vec<DiagnosticSessionCount>,
+    pub profiles: Vec<DiagnosticProfileCapacity>,
+    pub automation_runs: DiagnosticRunSummary,
+    pub problems: Vec<DiagnosticProblemSummary>,
+    pub migrations: Vec<MigrationStreamView>,
+    pub federations: Vec<DiagnosticFederation>,
 }
 
 fn default_class() -> String {

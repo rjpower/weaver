@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue';
 import * as api from '../api';
-import type { LogLine, ServerStatus, TaskRecord } from '../types';
+import type { Diagnostics, LogLine, ServerStatus, TaskRecord } from '../types';
 
 // Live server logs, straight from the process's tracing output — the same lines
 // that go to stdout / `docker compose logs`, but readable from the browser so an
@@ -14,6 +14,7 @@ import type { LogLine, ServerStatus, TaskRecord } from '../types';
 const MAX_LINES = 5000;
 const lines = ref<LogLine[]>([]);
 const status = ref<ServerStatus | null>(null);
+const diagnostics = ref<Diagnostics | null>(null);
 const error = ref('');
 
 // Filters. `minLevel` is a severity floor (show this and louder).
@@ -94,9 +95,16 @@ function closeStream() {
 
 async function loadSnapshot() {
   try {
-    const [snap, st] = await Promise.all([api.getLogs(2000), api.getServerStatus()]);
+    const [snap, st, diag] = await Promise.all([
+      api.getLogs(2000),
+      api.getServerStatus(),
+      // Diagnostics require the admin grant. Keep the operator-visible log and
+      // status snapshot useful when that optional request is forbidden or down.
+      api.getDiagnostics().catch(() => null),
+    ]);
     lines.value = snap;
     status.value = st;
+    diagnostics.value = diag;
     error.value = '';
     await nextTick();
     scrollToBottom(true);
@@ -185,6 +193,13 @@ const uptime = computed(() => {
   return h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`;
 });
 
+const currentSessionCount = computed(
+  () =>
+    diagnostics.value?.sessions
+      .filter((row) => row.status !== 'archived')
+      .reduce((total, row) => total + row.count, 0) ?? 0,
+);
+
 // --- Background tasks ------------------------------------------------------
 // The detached `@loom` webhook launches (clone → create → reply) that run off the
 // webhook request. Polled — low-frequency, so a few-second refresh is plenty; no
@@ -240,6 +255,180 @@ onUnmounted(() => {
       >
       <span :title="status.started_at">started {{ shortTime(status.started_at) }}</span>
     </div>
+
+    <!-- Durable operational state. The backend returns aggregates and mapping
+         metadata only: no session ids, paths, users, tokens, or raw failures. -->
+    <section v-if="diagnostics" class="mb-5 space-y-3" data-testid="diagnostics-overview">
+      <div class="flex flex-wrap items-center gap-2">
+        <h2 class="mr-1 text-2xs font-semibold uppercase tracking-wider text-muted">
+          Control plane
+        </h2>
+        <span class="rounded bg-input px-2 py-1 font-mono text-2xs text-fg">
+          {{ currentSessionCount }} non-archived sessions
+        </span>
+        <span
+          v-for="migration in diagnostics.migrations"
+          :key="migration.stream"
+          class="rounded px-2 py-1 font-mono text-2xs"
+          :class="migration.ready ? 'bg-ok/10 text-ok' : 'bg-block/10 text-block'"
+        >
+          {{ migration.stream }} schema {{ migration.current }}/{{ migration.expected }}
+        </span>
+      </div>
+
+      <div class="grid gap-3 xl:grid-cols-2">
+        <div class="overflow-x-auto rounded-md border border-line">
+          <table class="w-full border-collapse font-mono text-2xs">
+            <thead>
+              <tr class="bg-surface text-left text-faint">
+                <th class="px-2 py-1 font-medium">Profile</th>
+                <th class="px-2 py-1 font-medium">Revision</th>
+                <th class="px-2 py-1 font-medium">Used</th>
+                <th class="px-2 py-1 font-medium">Available</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="profile in diagnostics.profiles"
+                :key="profile.profile"
+                class="border-t border-line/40"
+              >
+                <td class="px-2 py-1 text-fg">{{ profile.profile }}</td>
+                <td class="px-2 py-1 text-muted">{{ profile.revision }}</td>
+                <td class="px-2 py-1 text-muted">
+                  {{ profile.active }} / {{ profile.maximum ?? '∞' }}
+                </td>
+                <td class="px-2 py-1" :class="profile.available === 0 ? 'text-block' : 'text-ok'">
+                  {{ profile.available ?? 'unlimited' }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="overflow-x-auto rounded-md border border-line">
+          <table class="w-full border-collapse font-mono text-2xs">
+            <thead>
+              <tr class="bg-surface text-left text-faint">
+                <th class="px-2 py-1 font-medium">Status</th>
+                <th class="px-2 py-1 font-medium">Profile</th>
+                <th class="px-2 py-1 font-medium">Class</th>
+                <th class="px-2 py-1 font-medium">Protocol</th>
+                <th class="px-2 py-1 text-right font-medium">Count</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="!diagnostics.sessions.length">
+                <td colspan="5" class="px-2 py-2 text-muted">No sessions.</td>
+              </tr>
+              <tr
+                v-for="row in diagnostics.sessions"
+                :key="`${row.status}:${row.profile}:${row.class}:${row.protocol}:${row.runner_pool}`"
+                class="border-t border-line/40"
+              >
+                <td
+                  class="px-2 py-1"
+                  :class="
+                    row.status === 'error'
+                      ? 'text-block'
+                      : row.status === 'orphaned'
+                        ? 'text-attn'
+                        : 'text-fg'
+                  "
+                >
+                  {{ row.status }}
+                </td>
+                <td class="px-2 py-1 text-muted">{{ row.profile }}</td>
+                <td class="px-2 py-1 text-muted">{{ row.class }}</td>
+                <td class="px-2 py-1 text-muted">{{ row.protocol }}</td>
+                <td class="px-2 py-1 text-right text-fg">{{ row.count }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="grid gap-3 xl:grid-cols-2">
+        <div class="rounded-md border border-line bg-surface px-3 py-2 text-xs">
+          <h3 class="mb-1 text-2xs font-semibold uppercase tracking-wider text-muted">
+            Automation runs
+          </h3>
+          <p v-if="!diagnostics.automation_runs.counts.length" class="text-faint">No runs yet.</p>
+          <div v-else class="flex flex-wrap gap-1.5 font-mono text-2xs">
+            <span
+              v-for="run in diagnostics.automation_runs.counts"
+              :key="`${run.status}:${run.source}:${run.service_tag}:${run.profile}`"
+              class="rounded bg-input px-2 py-1"
+              :class="run.status === 'failed' ? 'text-block' : 'text-muted'"
+            >
+              {{ run.service_tag }}/{{ run.profile }} · {{ run.status }} {{ run.count }}
+            </span>
+          </div>
+          <p v-if="diagnostics.automation_runs.stale_creating" class="mt-2 text-2xs text-block">
+            {{ diagnostics.automation_runs.stale_creating }} creating for more than five minutes
+          </p>
+        </div>
+
+        <div class="rounded-md border border-line bg-surface px-3 py-2 text-xs">
+          <h3 class="mb-1 text-2xs font-semibold uppercase tracking-wider text-muted">
+            Orphan / error inventory
+          </h3>
+          <p v-if="!diagnostics.problems.length" class="text-ok">No orphaned or error sessions.</p>
+          <div v-else class="space-y-1 font-mono text-2xs">
+            <p
+              v-for="problem in diagnostics.problems"
+              :key="`${problem.status}:${problem.profile}:${problem.protocol}`"
+            >
+              <span :class="problem.status === 'error' ? 'text-block' : 'text-attn'">
+                {{ problem.count }} {{ problem.status }}
+              </span>
+              <span class="text-muted">
+                · {{ problem.profile }} / {{ problem.class }} / {{ problem.protocol }} /
+                {{ problem.runner_pool }}
+              </span>
+              <span v-if="problem.latest_activity_at" class="text-faint">
+                · latest {{ shortTime(problem.latest_activity_at) }}
+              </span>
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <details
+        v-if="diagnostics.federations.length"
+        class="rounded-md border border-line bg-surface px-3 py-2"
+      >
+        <summary class="cursor-pointer text-2xs font-semibold uppercase tracking-wider text-muted">
+          Federation mappings ({{ diagnostics.federations.length }})
+        </summary>
+        <div class="mt-2 overflow-x-auto">
+          <table class="w-full border-collapse font-mono text-2xs">
+            <thead>
+              <tr class="text-left text-faint">
+                <th class="px-2 py-1 font-medium">Name</th>
+                <th class="px-2 py-1 font-medium">Provider / service</th>
+                <th class="px-2 py-1 font-medium">Audience</th>
+                <th class="px-2 py-1 font-medium">Profiles</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="mapping in diagnostics.federations"
+                :key="mapping.name"
+                class="border-t border-line/40"
+              >
+                <td class="px-2 py-1 text-fg">{{ mapping.name }}</td>
+                <td class="px-2 py-1 text-muted">
+                  {{ mapping.provider }} · {{ mapping.service_tag }}
+                </td>
+                <td class="px-2 py-1 break-all text-muted">{{ mapping.audience }}</td>
+                <td class="px-2 py-1 text-muted">{{ mapping.profiles.join(', ') }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </section>
 
     <!-- Background tasks: the detached @loom webhook launches. -->
     <section class="mb-5">

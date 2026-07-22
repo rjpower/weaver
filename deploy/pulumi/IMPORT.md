@@ -56,7 +56,26 @@ only then attach it under Pulumi. Otherwise the new empty Docker data root makes
 the old boot-disk volumes appear to vanish. Do not import old secret versions:
 setting `loomDotenv` creates a fresh version while preserving history.
 The snapshot policy, backup bucket/timer, WIF provider, and CI service account
-are new and need no import.
+are new and need no import. The readiness uptime check, alert policy, dashboard,
+Ops Agent configuration, and metric/log writer bindings are also new.
+
+If a service account named in `loom-gcp:workloads` already exists, import it
+before the first preview. The Pulumi logical name is `loom-workload-<name>` and
+the provider ID uses the configured `serviceAccountId`:
+
+```sh
+export WORKLOAD_NAME=marin-ops WORKLOAD_SERVICE_ACCOUNT=loom-marin-ops
+pulumi import gcp:serviceaccount/account:Account \
+  "loom-workload-${WORKLOAD_NAME}" \
+  "projects/${PROJECT}/serviceAccounts/${WORKLOAD_SERVICE_ACCOUNT}@${PROJECT}.iam.gserviceaccount.com"
+```
+
+Do not substitute an email address or display name into Loom's federation
+manifest. After import, Pulumi reads the account's immutable numeric `uniqueId`
+and exact email and renders both into the mapping. A preview that replaces an
+existing workload account means its configured `serviceAccountId` or import ID
+does not match; fix that before updating or every token minted for the former
+numeric subject will stop matching.
 
 Before accepting the update:
 
@@ -74,6 +93,10 @@ Before accepting the update:
 5. The legacy script granted Secret Manager access at project scope. Once the
    new secret-level binding is verified, remove that old project-level binding
    so the VM retains access only to `LOOM_DOTENV`.
+6. Confirm every secret reference declared under `profiles.*.env` exists and
+   that preview adds a secret-level accessor binding for the Loom VM. A missing
+   secret version fails closed when a session launches; it does not fall back to
+   an ambient or stale value.
 
 Pulumi may propose IAM-member additions and metadata changes on the first
 managed update; those are expected. A persistent-disk, address, secret, or VM

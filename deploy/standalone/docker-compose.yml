@@ -59,6 +59,10 @@ services:
         condition: service_completed_successfully
     expose:
       - "7878" # internal to the compose network only — never published
+    ports:
+      # Loopback-only scrape/debug path for the host's Ops Agent. Caddy remains
+      # the sole public listener and explicitly blocks `/metrics`.
+      - "127.0.0.1:7878:7878"
     # Docker-out-of-Docker: a session's `docker build`/`docker compose` talks to
     # the HOST's Docker daemon over its bind-mounted socket (volumes, below), so
     # builds run on the host — reusing its layer cache and writing images/layers

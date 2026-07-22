@@ -34,6 +34,9 @@ class InfrastructureSourceContract(unittest.TestCase):
                 "gcp.artifactregistry.Repository",
                 "gcp.iam.WorkloadIdentityPool",
                 "gcp.iam.WorkloadIdentityPoolProvider",
+                "gcp.monitoring.UptimeCheckConfig",
+                "gcp.monitoring.AlertPolicy",
+                "gcp.monitoring.Dashboard",
             }.issubset(calls)
         )
 

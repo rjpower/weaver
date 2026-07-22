@@ -13,10 +13,11 @@ use serde_json::Value;
 use crate::dto::{
     AnchorDto, ArtifactMeta, ArtifactUpsertReq, ArtifactView, AutomationTokenReq,
     AutomationTokenView, BranchStatusReq, BranchView, CommentDto, CreateEventReq, CreateIssueReq,
-    CreateRepoIssueReq, CreateReq, CreateTokenReq, CreateWatchReq, CreatedTokenView, FederationReq,
-    FederationView, HandoffReq, IssueView, NewCommentBody, NewThreadBody, PatchIssueReq,
-    PatchSessionReq, PatchWatchReq, ProfileReq, ProfileView, PutProfileEnvReq, RunReq, RunView,
-    RunWatchReq, SendReq, SessionView, SettingsEnvelope, TagReq, ThreadDto, TokenView, WatchView,
+    CreateRepoIssueReq, CreateReq, CreateTokenReq, CreateWatchReq, CreatedTokenView, DeploymentReq,
+    DeploymentView, DiagnosticsView, FederationReq, FederationView, HandoffReq, IssueView,
+    NewCommentBody, NewThreadBody, PatchIssueReq, PatchSessionReq, PatchWatchReq, ProfileReq,
+    ProfileView, PutProfileEnvReq, ReadinessView, RunReq, RunView, RunWatchReq, SendReq,
+    SessionView, SettingsEnvelope, TagReq, ThreadDto, TokenView, WatchView,
 };
 
 /// A client for one loom server, identified by its base URL.
@@ -664,6 +665,16 @@ impl Client {
 
     // -- Settings -------------------------------------------------------------
 
+    /// Public database and migration readiness (`GET /api/ready`).
+    pub async fn readiness(&self) -> Result<ReadinessView> {
+        self.get_typed("/api/ready").await
+    }
+
+    /// Admin-only redacted operational inventory (`GET /api/diagnostics`).
+    pub async fn diagnostics(&self) -> Result<DiagnosticsView> {
+        self.get_typed("/api/diagnostics").await
+    }
+
     /// List named launch profiles. Secret environment values are withheld.
     pub async fn list_profiles(&self) -> Result<Vec<ProfileView>> {
         self.get_typed("/api/profiles").await
@@ -700,7 +711,30 @@ impl Client {
         value: &str,
     ) -> Result<ProfileView> {
         let req = PutProfileEnvReq {
-            value: value.to_string(),
+            value: Some(value.to_string()),
+            secret_ref: None,
+        };
+        self.send_typed(
+            Method::PUT,
+            &format!(
+                "/api/profiles/{}/env/{}",
+                Self::seg(profile),
+                Self::seg(name)
+            ),
+            Some(&req),
+        )
+        .await
+    }
+
+    pub async fn set_profile_env_secret(
+        &self,
+        profile: &str,
+        name: &str,
+        secret_ref: &str,
+    ) -> Result<ProfileView> {
+        let req = PutProfileEnvReq {
+            value: None,
+            secret_ref: Some(secret_ref.to_string()),
         };
         self.send_typed(
             Method::PUT,
@@ -800,6 +834,11 @@ impl Client {
 
     pub async fn remove_federation(&self, id: &str) -> Result<Value> {
         self.delete(&format!("/api/auth/federations/{}", Self::seg(id)))
+            .await
+    }
+
+    pub async fn reconcile_deployment(&self, req: &DeploymentReq) -> Result<DeploymentView> {
+        self.send_typed(Method::POST, "/api/deployment/reconcile", Some(req))
             .await
     }
 

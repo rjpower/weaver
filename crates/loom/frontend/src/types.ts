@@ -836,6 +836,8 @@ export interface Profile {
 
 export interface ProfileEnv {
   name: string;
+  source: 'literal' | 'gcp_secret';
+  secret_ref: string | null;
   updated_at: string;
 }
 
@@ -914,6 +916,80 @@ export interface ServerStatus {
   version: string;
   pid: number;
   started_at: string;
+}
+
+export interface MigrationStream {
+  stream: string;
+  current: number;
+  expected: number;
+  applied: number;
+  ready: boolean;
+}
+
+export interface DiagnosticSessionCount {
+  status: string;
+  class: string;
+  profile: string;
+  protocol: string;
+  runner_pool: string;
+  count: number;
+}
+
+export interface DiagnosticProfileCapacity {
+  profile: string;
+  revision: number;
+  active: number;
+  maximum: number | null;
+  available: number | null;
+}
+
+export interface DiagnosticRunCount {
+  status: string;
+  source: string;
+  service_tag: string;
+  profile: string;
+  count: number;
+}
+
+export interface DiagnosticRunFailure {
+  source: string;
+  profile: string;
+  outcome: string | null;
+  updated_at: string;
+}
+
+export interface DiagnosticProblemSummary {
+  status: string;
+  class: string;
+  profile: string;
+  protocol: string;
+  runner_pool: string;
+  count: number;
+  latest_activity_at: string | null;
+}
+
+export interface DiagnosticFederation {
+  name: string;
+  provider: string;
+  audience: string;
+  service_tag: string;
+  profiles: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+/** Redacted admin operational snapshot from `GET /api/diagnostics`. */
+export interface Diagnostics {
+  sessions: DiagnosticSessionCount[];
+  profiles: DiagnosticProfileCapacity[];
+  automation_runs: {
+    counts: DiagnosticRunCount[];
+    stale_creating: number;
+    recent_failures: DiagnosticRunFailure[];
+  };
+  problems: DiagnosticProblemSummary[];
+  migrations: MigrationStream[];
+  federations: DiagnosticFederation[];
 }
 
 /** One detached background task (a `@loom` webhook launch). Mirrors
