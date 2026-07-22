@@ -2186,12 +2186,7 @@ async fn adopt_terminal_into_acp(
     let mut extra_env = resume_environment(&st.db, session, &repo_root, &repo_cfg).await;
     rotate_session_token(&st.db, session, &mut extra_env).await?;
     let run_dir = db::run_dir(&session.id);
-    let primer_file = (session.policy_prelude == "weaver")
-        .then(|| {
-            let f = run_dir.join("primer.txt");
-            f.exists().then_some(f)
-        })
-        .flatten();
+    let primer_file = stamped_primer_file(&run_dir, &session.policy_prelude);
     let goal_file = {
         let f = run_dir.join("goal.txt");
         f.exists().then_some(f)
@@ -2360,6 +2355,14 @@ async fn adopt_acp(
     Ok(())
 }
 
+fn stamped_primer_file(run_dir: &std::path::Path, prelude: &str) -> Option<PathBuf> {
+    if prelude != "weaver" {
+        return None;
+    }
+    let file = run_dir.join("primer.txt");
+    file.exists().then_some(file)
+}
+
 /// Resolve the persisted primer/goal files used to resume either backend. Refresh
 /// the positional goal from the authoritative branch artifact first: an ACP
 /// adapter that cannot load its old provider session falls back to this prompt in
@@ -2370,12 +2373,7 @@ async fn resume_prompt_files(
     branch: &Branch,
 ) -> (Option<PathBuf>, Option<PathBuf>) {
     let run_dir = db::run_dir(&session.id);
-    let primer_file = (session.policy_prelude == "weaver")
-        .then(|| {
-            let f = run_dir.join("primer.txt");
-            f.exists().then_some(f)
-        })
-        .flatten();
+    let primer_file = stamped_primer_file(&run_dir, &session.policy_prelude);
     let goal_file = {
         let f = run_dir.join("goal.txt");
         if f.exists() {
