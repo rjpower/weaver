@@ -717,7 +717,8 @@ never enters the agent environment. Allowed rules execute directly; any remainin
 request is answered with the adapter's one-shot rejection (or a cancelled
 outcome), including after `session/load`. Runtime handoff and permission-mode
 changes are forbidden. The stock `github_comment` profile contains the policy
-only; deployment must provide its write-only `GH_TOKEN`.
+only; its reviewed JSON manifest is seeded when absent and then remains
+operator-editable. Deployment must provide its write-only `GH_TOKEN`.
 
 **Cookies** are `HttpOnly; SameSite=Lax; Path=/`; the `Secure` attribute is
 added when `auth.cookie_secure` is on (set it when loom is reached over HTTPS).

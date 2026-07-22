@@ -387,8 +387,10 @@ Notable settings:
   Claude setting sources, expose repository-scoped read tools plus fixed
   server-side GitHub tools, and have Loom reject every unmatched permission
   request. The GitHub credential never enters the agent process. The stock
-  `github_comment` profile is ready for GitHub-originated editorial/comment
-  tasks after an operator adds its write-only `GH_TOKEN` environment value. See
+  `github_comment` profile is seeded from its reviewed declarative manifest and
+  remains operator-editable after the first seed. It is ready for
+  GitHub-originated editorial/comment tasks after an operator adds its
+  write-only `GH_TOKEN` environment value. See
   [Restricted GitHub sessions](docs/restricted-sessions.md).
 - Profile environment values are write-only: API, CLI, and Settings responses
   expose names and update times, never secret values.

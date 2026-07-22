@@ -13,6 +13,11 @@ use crate::db::{now_iso, Db};
 
 pub const DEFAULT_PROFILE: &str = "default";
 
+const STOCK_PROFILES: &[(&str, &str)] = &[(
+    "github_comment.json",
+    include_str!("../profiles/github_comment.json"),
+)];
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Profile {
     pub name: String,
@@ -604,6 +609,22 @@ pub async fn deployment_managed_names(db: &Db) -> Result<Vec<String>> {
     .await?)
 }
 
+/// Seed reviewed stock profile manifests when they are absent. Existing rows
+/// remain operator-editable: startup never overwrites a profile after its first
+/// seed, and deployment reconciliation can still take explicit ownership.
+pub async fn seed_stock_profiles(db: &Db) -> Result<()> {
+    for (source, contents) in STOCK_PROFILES {
+        let input: ProfileInput = serde_json::from_str(contents)
+            .with_context(|| format!("parsing stock profile {source}"))?;
+        if get(db, &input.name).await?.is_none() {
+            upsert(db, &input)
+                .await
+                .with_context(|| format!("seeding stock profile {source}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Repair the one-time legacy seed through the same runtime metadata validators
 /// new profile writes use. Valid profiles are left untouched; a stale removed
 /// custom agent or selector falls back to the builtin default instead of making
@@ -686,6 +707,27 @@ mod tests {
         assert!(upsert(&db, &input).await.is_err());
         input.allowed_tools = vec!["Glob(/etc/**)".to_string()];
         assert!(upsert(&db, &input).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stock_profiles_seed_from_manifests_without_overwriting_edits() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let stock = get(&db, "github_comment").await.unwrap().unwrap();
+        assert!(stock.restricted);
+
+        let mut edited = stock.as_input().unwrap();
+        edited.description = "operator-edited description".to_string();
+        upsert(&db, &edited).await.unwrap();
+        seed_stock_profiles(&db).await.unwrap();
+
+        assert_eq!(
+            get(&db, "github_comment")
+                .await
+                .unwrap()
+                .unwrap()
+                .description,
+            "operator-edited description"
+        );
     }
 
     #[tokio::test]

@@ -14,6 +14,12 @@ general shell nor the GitHub token enters the agent process. Anything outside
 the configured Claude permission rules is rejected by Loom.
 The profile intentionally has no token in its seed. Configure a least-privilege
 CI identity as its write-only `GH_TOKEN` before enabling a federation mapping.
+Its stock policy lives in `crates/loom/profiles/github_comment.json`, not in a
+schema migration. Loom seeds a missing stock profile through normal validation
+and does not overwrite later operator edits. Custom profiles use the same
+REST/CLI/UI or deployment-reconciliation contract; loading policy implicitly
+from a managed checkout would let repository content choose its own launch
+boundary and is deliberately unsupported.
 
 ## GitHub Actions request
 

@@ -85,6 +85,7 @@ async fn migrate_loom(pool: &Db) -> Result<()> {
     LOOM_STREAM.ensure_indicator(pool).await?;
     LOOM_STREAM.apply_pending(pool).await?;
     crate::profile::normalize_default(pool).await?;
+    crate::profile::seed_stock_profiles(pool).await?;
 
     // Configuration-dependent seeding is intentionally not a migration. If the
     // first start has no owner configured, a later restart must retry it.

@@ -1,0 +1,27 @@
+{
+  "name": "github_comment",
+  "description": "Restricted GitHub comment automation with a caller-supplied task prompt",
+  "agent_kind": "claude",
+  "model": "",
+  "effort": "",
+  "protocol": "acp",
+  "mode": "default",
+  "class": "automation",
+  "strict": true,
+  "env_clear": true,
+  "ambient_allowlist": [],
+  "idle_archive_secs": 900,
+  "max_concurrent": 4,
+  "turn_budget": 4,
+  "prelude": "none",
+  "restricted": true,
+  "allowed_tools": [
+    "Read(./**)",
+    "mcp__loom_github__issue_view",
+    "mcp__loom_github__issue_comment",
+    "mcp__loom_github__issue_edit",
+    "mcp__loom_github__pr_view",
+    "mcp__loom_github__pr_comment",
+    "mcp__loom_github__pr_edit"
+  ]
+}
