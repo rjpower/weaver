@@ -138,15 +138,7 @@ pub(crate) fn allowed_tool_name(rule: &str) -> Option<&str> {
 }
 
 fn is_restricted_mcp_tool(rule: &str) -> bool {
-    matches!(
-        rule,
-        "mcp__loom_github__issue_view"
-            | "mcp__loom_github__issue_comment"
-            | "mcp__loom_github__issue_edit"
-            | "mcp__loom_github__pr_view"
-            | "mcp__loom_github__pr_comment"
-            | "mcp__loom_github__pr_edit"
-    )
+    crate::restricted_mcp::is_permission_rule(rule)
 }
 
 /// Restricted filesystem rules must stay below the session worktree. Claude's

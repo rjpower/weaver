@@ -10,6 +10,25 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const SERVER_NAME: &str = "loom_github";
+pub(crate) const GITHUB_TOOL_NAMES: [&str; 6] = [
+    "issue_view",
+    "issue_comment",
+    "issue_edit",
+    "pr_view",
+    "pr_comment",
+    "pr_edit",
+];
+
+pub(crate) fn permission_rule(tool: &str) -> Option<String> {
+    GITHUB_TOOL_NAMES
+        .contains(&tool)
+        .then(|| format!("mcp__loom_github__{tool}"))
+}
+
+pub(crate) fn is_permission_rule(rule: &str) -> bool {
+    rule.strip_prefix("mcp__loom_github__")
+        .is_some_and(|tool| GITHUB_TOOL_NAMES.contains(&tool))
+}
 
 fn tools() -> Value {
     let number = json!({ "type": "integer", "minimum": 1 });
@@ -17,7 +36,7 @@ fn tools() -> Value {
     let title = json!({ "type": "string", "minLength": 1, "maxLength": 256 });
     json!([
         {
-            "name": "issue_view",
+            "name": GITHUB_TOOL_NAMES[0],
             "description": "Read one issue in the GitHub repository fixed to this session.",
             "inputSchema": {
                 "type": "object", "additionalProperties": false,
@@ -25,7 +44,7 @@ fn tools() -> Value {
             }
         },
         {
-            "name": "issue_comment",
+            "name": GITHUB_TOOL_NAMES[1],
             "description": "Post a comment on one issue in the GitHub repository fixed to this session.",
             "inputSchema": {
                 "type": "object", "additionalProperties": false,
@@ -34,7 +53,7 @@ fn tools() -> Value {
             }
         },
         {
-            "name": "issue_edit",
+            "name": GITHUB_TOOL_NAMES[2],
             "description": "Replace an issue body and optionally its title in the GitHub repository fixed to this session.",
             "inputSchema": {
                 "type": "object", "additionalProperties": false,
@@ -43,7 +62,7 @@ fn tools() -> Value {
             }
         },
         {
-            "name": "pr_view",
+            "name": GITHUB_TOOL_NAMES[3],
             "description": "Read one pull request in the GitHub repository fixed to this session.",
             "inputSchema": {
                 "type": "object", "additionalProperties": false,
@@ -51,7 +70,7 @@ fn tools() -> Value {
             }
         },
         {
-            "name": "pr_comment",
+            "name": GITHUB_TOOL_NAMES[4],
             "description": "Post a comment on one pull request in the GitHub repository fixed to this session.",
             "inputSchema": {
                 "type": "object", "additionalProperties": false,
@@ -60,7 +79,7 @@ fn tools() -> Value {
             }
         },
         {
-            "name": "pr_edit",
+            "name": GITHUB_TOOL_NAMES[5],
             "description": "Replace a pull-request body and optionally its title in the GitHub repository fixed to this session.",
             "inputSchema": {
                 "type": "object", "additionalProperties": false,
@@ -175,7 +194,7 @@ pub async fn serve_github() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::tools;
+    use super::{tools, GITHUB_TOOL_NAMES};
 
     #[test]
     fn surface_contains_only_fixed_github_operations() {
@@ -186,16 +205,6 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            names,
-            [
-                "issue_view",
-                "issue_comment",
-                "issue_edit",
-                "pr_view",
-                "pr_comment",
-                "pr_edit"
-            ]
-        );
+        assert_eq!(names, GITHUB_TOOL_NAMES);
     }
 }

@@ -28,14 +28,6 @@ struct ToolArguments {
     title: Option<String>,
 }
 
-fn permission_rule(tool: &str) -> Option<String> {
-    matches!(
-        tool,
-        "issue_view" | "issue_comment" | "issue_edit" | "pr_view" | "pr_comment" | "pr_edit"
-    )
-    .then(|| format!("mcp__loom_github__{tool}"))
-}
-
 async fn github_token(st: &AppState, session: &crate::session::Session) -> ApiResult<String> {
     if let Some(username) = session.created_by.as_deref() {
         if let Some(token) = crate::user_token::get(&st.db, username).await? {
@@ -180,8 +172,8 @@ pub(super) async fn restricted_github_tool(
             "session is not restricted",
         ));
     }
-    let rule =
-        permission_rule(&tool).ok_or_else(|| AppError::not_found("restricted GitHub tool"))?;
+    let rule = crate::restricted_mcp::permission_rule(&tool)
+        .ok_or_else(|| AppError::not_found("restricted GitHub tool"))?;
     let allowed: Vec<String> = serde_json::from_str(&session.policy_allowed_tools)
         .map_err(|error| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     if !allowed.iter().any(|candidate| candidate == &rule) {
@@ -227,16 +219,16 @@ pub(super) async fn restricted_github_tool(
 
 #[cfg(test)]
 mod tests {
-    use super::{permission_rule, validate_arguments};
+    use super::validate_arguments;
     use serde_json::json;
 
     #[test]
     fn only_the_fixed_mcp_tools_map_to_permissions() {
         assert_eq!(
-            permission_rule("issue_edit").as_deref(),
+            crate::restricted_mcp::permission_rule("issue_edit").as_deref(),
             Some("mcp__loom_github__issue_edit")
         );
-        assert!(permission_rule("repository_delete").is_none());
+        assert!(crate::restricted_mcp::permission_rule("repository_delete").is_none());
     }
 
     #[test]
