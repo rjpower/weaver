@@ -717,7 +717,7 @@ def create_infrastructure(config: DeploymentConfig) -> Infrastructure:
         )
         for index, email in enumerate(config.alert_emails)
     ]
-    gcp.monitoring.AlertPolicy(
+    readiness_alert = gcp.monitoring.AlertPolicy(
         "loom-readiness-failed",
         project=config.project,
         display_name="Loom is not ready",
@@ -819,7 +819,7 @@ def create_infrastructure(config: DeploymentConfig) -> Infrastructure:
             },
             sort_keys=True,
         ),
-        opts=pulumi.ResourceOptions(depends_on=[instance]),
+        opts=pulumi.ResourceOptions(depends_on=[instance, readiness_alert]),
     )
 
     pulumi.export("address", address.address)
