@@ -248,7 +248,7 @@ pub fn resolve(explicit: Option<&str>) -> Result<Option<ResolvedContext>> {
     resolve_from(&paths, explicit, environment.as_deref(), &cwd)
 }
 
-/// Resolve a named context from explicit inputs, used by the CLI and tests.
+/// Resolve a named context from supplied paths, selectors, and working directory.
 pub fn resolve_from(
     paths: &ClientPaths,
     explicit: Option<&str>,
