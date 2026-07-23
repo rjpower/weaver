@@ -1131,6 +1131,12 @@ function toggleFold(key: string, dflt = false) {
   m.set(key, !foldOpen(key, dflt));
   folds.value = m;
 }
+function activityItemOpen(item: ActivityItem): boolean {
+  return foldOpen(`tool-${item.tool.tool_call_id}`, item.failed);
+}
+function toggleActivityItem(item: ActivityItem) {
+  toggleFold(`tool-${item.tool.tool_call_id}`, item.failed);
+}
 
 // ── Working timer (elapsed + time since observable progress) ─────────────────
 const clock = ref(Date.now());
@@ -1328,21 +1334,16 @@ function goTo(anchor: string) {
                       class="acp-activity-line"
                       :disabled="!canExpandTool(entry.item.tool)"
                       :aria-expanded="
-                        canExpandTool(entry.item.tool)
-                          ? foldOpen(`tool-${entry.item.tool.tool_call_id}`, entry.item.failed)
-                          : undefined
+                        canExpandTool(entry.item.tool) ? activityItemOpen(entry.item) : undefined
                       "
-                      @click="toggleFold(`tool-${entry.item.tool.tool_call_id}`, entry.item.failed)"
+                      @click="toggleActivityItem(entry.item)"
                     >
                       <span class="acp-tool-glyph">{{ toolGlyph(entry.item.tool.tool_kind) }}</span>
                       <span
                         class="acp-activity-title"
                         :class="{
-                          truncate: !foldOpen(
-                            `tool-${entry.item.tool.tool_call_id}`,
-                            entry.item.failed,
-                          ),
-                          open: foldOpen(`tool-${entry.item.tool.tool_call_id}`, entry.item.failed),
+                          truncate: !activityItemOpen(entry.item),
+                          open: activityItemOpen(entry.item),
                         }"
                         data-testid="acp-activity-title"
                         >{{ entry.item.tool.title || entry.item.tool.tool_kind }}</span
@@ -1354,16 +1355,13 @@ function goTo(anchor: string) {
                         v-else-if="canExpandTool(entry.item.tool)"
                         class="chev sm"
                         :class="{
-                          open: foldOpen(`tool-${entry.item.tool.tool_call_id}`, entry.item.failed),
+                          open: activityItemOpen(entry.item),
                         }"
                         >▸</span
                       >
                     </button>
                     <div
-                      v-if="
-                        hasDetail(entry.item.tool) &&
-                        foldOpen(`tool-${entry.item.tool.tool_call_id}`, entry.item.failed)
-                      "
+                      v-if="hasDetail(entry.item.tool) && activityItemOpen(entry.item)"
                       class="acp-detail"
                       data-testid="acp-detail"
                     >
