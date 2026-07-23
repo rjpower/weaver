@@ -2682,12 +2682,16 @@ pub(super) async fn log_session(
 pub(super) async fn conversation_session(
     State(st): State<AppState>,
     Path(key): Path<String>,
-) -> ApiResult<Json<weaver_core::transcript::Log>> {
+) -> ApiResult<Response> {
     let (session, branch) = require_session(&st.db, &key).await?;
-    match crate::chatlog::conversation(&st.db, &session, &branch).await {
-        Some(log) => Ok(Json(log)),
-        None => Err(AppError::not_found("conversation")),
-    }
+    let log = crate::chatlog::conversation(&st.db, &session, &branch)
+        .await
+        .ok_or_else(|| AppError::not_found("conversation"))?;
+    // A terminal transcript can be many megabytes. JSON serialization is CPU
+    // work too, so keep it beside discovery/parsing on the blocking pool rather
+    // than letting a large response stall unrelated async routes.
+    let body = tokio::task::spawn_blocking(move || serde_json::to_vec(&log)).await??;
+    Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
 }
 
 pub(super) async fn events_sse(
@@ -3057,16 +3061,42 @@ fn effective_turn_mode(session: &Session) -> Option<String> {
         .and_then(|v| v.get("mode").and_then(Value::as_str).map(str::to_string))
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct ChatPageQuery {
+    before_turn: Option<i64>,
+    before_seq: Option<i64>,
+}
+
+const CHAT_PAGE_SIZE: usize = 200;
+
 /// The journaled conversation plus the agent-owned composer metadata. The
 /// journal works without a live task; metadata is empty until an adapter is
 /// attached and advertises its commands/configuration controls.
 pub(super) async fn get_session_chat(
     State(st): State<AppState>,
     Path(key): Path<String>,
+    Query(query): Query<ChatPageQuery>,
 ) -> ApiResult<Json<Value>> {
     let (session, _) = require_session(&st.db, &key).await?;
     require_acp(&session)?;
-    let blocks = crate::chat::list(&st.db, &session.id).await?;
+    let before = match (query.before_turn, query.before_seq) {
+        (Some(turn), Some(seq)) => Some((turn, seq)),
+        (None, None) => None,
+        _ => {
+            return Err(AppError::bad_request(
+                "before_turn and before_seq must be supplied together",
+            ))
+        }
+    };
+    let (blocks, has_more) =
+        crate::chat::list_page(&st.db, &session.id, before, CHAT_PAGE_SIZE).await?;
+    let older_cursor = if has_more {
+        blocks
+            .first()
+            .map(|block| json!({ "turn": block.turn, "seq": block.seq }))
+    } else {
+        None
+    };
     let metadata = st
         .acp
         .get(&session.id)
@@ -3080,6 +3110,7 @@ pub(super) async fn get_session_chat(
         .filter(|pending| !pending.trim().is_empty());
     Ok(Json(json!({
         "blocks": blocks,
+        "older_cursor": older_cursor,
         "live_turn": session_mod::acp_inflight_turn(&session),
         "effective_mode": effective_turn_mode(&session),
         "pending_prompt": pending_prompt,

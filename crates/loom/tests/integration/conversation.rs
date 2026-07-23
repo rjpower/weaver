@@ -52,3 +52,60 @@ async fn conversation_endpoint_returns_the_iris_log() {
     assert_eq!(messages[1]["role"], "assistant");
     assert_eq!(messages[1]["blocks"][0]["text"], "Working on it.");
 }
+
+/// The ACP endpoint opens at a bounded tail and pages backward with an exclusive
+/// cursor. A long DB journal must not become one unbounded response.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_endpoint_pages_long_journals_from_the_tail() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    let sess = client
+        .post(
+            "/api/sessions",
+            json!({ "goal": "long chat", "cwd": ts.cwd(), "agent": "shell" }),
+        )
+        .await
+        .unwrap();
+    let id = sess["id"].as_str().unwrap().to_string();
+    sqlx::query("UPDATE sessions SET protocol = 'acp' WHERE id = ?")
+        .bind(&id)
+        .execute(&ts.state.db)
+        .await
+        .unwrap();
+    for seq in 0..205 {
+        loom::chat::insert(
+            &ts.state.db,
+            &id,
+            0,
+            seq,
+            loom::chat::kind::AGENT_MESSAGE,
+            &json!({ "text": seq.to_string() }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let latest = client
+        .get(&format!("/api/sessions/{id}/chat"))
+        .await
+        .unwrap();
+    let blocks = latest["blocks"].as_array().unwrap();
+    assert_eq!(blocks.len(), 200);
+    assert_eq!(blocks.first().unwrap()["seq"], 5);
+    assert_eq!(blocks.last().unwrap()["seq"], 204);
+    assert_eq!(latest["older_cursor"], json!({ "turn": 0, "seq": 5 }));
+
+    let older = client
+        .get(&format!(
+            "/api/sessions/{id}/chat?before_turn=0&before_seq=5"
+        ))
+        .await
+        .unwrap();
+    let blocks = older["blocks"].as_array().unwrap();
+    assert_eq!(blocks.len(), 5);
+    assert_eq!(blocks.first().unwrap()["seq"], 0);
+    assert_eq!(blocks.last().unwrap()["seq"], 4);
+    assert!(older["older_cursor"].is_null());
+}

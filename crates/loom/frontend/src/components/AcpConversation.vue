@@ -164,6 +164,9 @@ function restoreLiveTiming(turn: number | null, preserveObserved = false) {
 type LoadState = 'loading' | 'ready' | 'error';
 const state = ref<LoadState>('loading');
 const errorMsg = ref('');
+const olderCursor = ref<{ turn: number; seq: number } | null>(null);
+const loadingOlder = ref(false);
+const olderError = ref('');
 
 let loadSeq = 0;
 async function load({ preserve = false }: { preserve?: boolean } = {}) {
@@ -173,15 +176,18 @@ async function load({ preserve = false }: { preserve?: boolean } = {}) {
   if (!preserve) {
     state.value = 'loading';
     pinned.value = true;
+    blocks.clear();
+    shadows.clear();
+    liveTools.clear();
+    olderCursor.value = null;
+    olderError.value = '';
   }
   try {
     const snap = await getSessionChat(id.value);
     if (seq !== loadSeq) return;
     const preserveObservedTiming = preserve && liveTurnNo.value === snap.live_turn;
-    blocks.clear();
     for (const b of snap.blocks) blocks.set(blockKey(b.turn, b.seq), b);
-    shadows.clear();
-    liveTools.clear();
+    if (!preserve) olderCursor.value = snap.older_cursor;
     liveTurnNo.value = snap.live_turn;
     turnLive.value = snap.live_turn != null;
     restoreLiveTiming(snap.live_turn, preserveObservedTiming);
@@ -201,6 +207,32 @@ async function load({ preserve = false }: { preserve?: boolean } = {}) {
   if (seq !== loadSeq) return;
   if (pinned.value) scrollToBottom();
   updateActive();
+}
+
+/** Prepend one older DB page while keeping the same prose under the reader's
+ * eyes. The live stream continues applying tail blocks during this request. */
+async function loadOlder() {
+  const cursor = olderCursor.value;
+  if (!cursor || loadingOlder.value) return;
+  const requestId = id.value;
+  loadingOlder.value = true;
+  olderError.value = '';
+  const root = convScroll.value;
+  const oldHeight = root?.scrollHeight ?? 0;
+  const oldTop = root?.scrollTop ?? 0;
+  try {
+    const snap = await getSessionChat(requestId, cursor);
+    if (requestId !== id.value) return;
+    for (const b of snap.blocks) blocks.set(blockKey(b.turn, b.seq), b);
+    olderCursor.value = snap.older_cursor;
+    await nextTick();
+    if (root) root.scrollTop = oldTop + (root.scrollHeight - oldHeight);
+    updateActive();
+  } catch (e) {
+    olderError.value = (e as Error).message ?? 'Failed to load earlier conversation';
+  } finally {
+    loadingOlder.value = false;
+  }
 }
 
 // ── Stream application ───────────────────────────────────────────────────────
@@ -267,10 +299,10 @@ function onQueue(ev: SseQueue) {
 // ── SSE lifecycle (kept-alive discipline) ────────────────────────────────────
 let source: EventSource | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let snapshotFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 function rebindStream() {
   closeStream();
   openStream();
-  load({ preserve: true });
 }
 function rebindAfterHandoff(event: Event) {
   const handedOffId = (event as CustomEvent<{ id?: string }>).detail?.id;
@@ -280,6 +312,16 @@ function rebindAfterHandoff(event: Event) {
 function openStream() {
   const stream = new EventSource(`/api/sessions/${id.value}/chat/stream`);
   source = stream;
+  // The stream normally opens immediately and then owns the first snapshot,
+  // closing the snapshot→SSE gap. If a proxy/browser delays EventSource setup,
+  // do not leave the conversation on "Loading…" forever: fetch after a short
+  // grace period, then reconcile once the stream eventually connects.
+  if (state.value === 'loading' && !snapshotFallbackTimer) {
+    snapshotFallbackTimer = setTimeout(() => {
+      snapshotFallbackTimer = null;
+      if (state.value === 'loading') load();
+    }, 1500);
+  }
   stream.addEventListener('block', (e) =>
     onBlock(JSON.parse((e as MessageEvent).data) as ChatBlock),
   );
@@ -294,9 +336,15 @@ function openStream() {
   stream.addEventListener('metadata', (e) => {
     applyMetadata(JSON.parse((e as MessageEvent).data) as AcpMetadata);
   });
-  // Once the server has installed the subscription, reconcile from the durable
-  // journal. Subscribing first avoids a snapshot-to-stream gap during handoff.
-  stream.addEventListener('open', () => load({ preserve: true }));
+  // Fetch only after the server installed the subscription, closing the
+  // snapshot-to-stream gap without the former duplicate journal request. A
+  // reconnect reconciles the newest page while retaining explicitly loaded
+  // older pages.
+  stream.addEventListener('open', () => {
+    if (snapshotFallbackTimer) clearTimeout(snapshotFallbackTimer);
+    snapshotFallbackTimer = null;
+    load({ preserve: state.value === 'ready' });
+  });
   // A provider handoff cleanly closes the old task's broadcast. Browsers do not
   // consistently reconnect an EventSource after a clean EOF, so explicitly
   // replace it and refetch the durable snapshot before tailing the new task.
@@ -314,6 +362,8 @@ function openStream() {
 function closeStream() {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   reconnectTimer = null;
+  if (snapshotFallbackTimer) clearTimeout(snapshotFallbackTimer);
+  snapshotFallbackTimer = null;
   source?.close();
   source = null;
 }
@@ -321,12 +371,10 @@ function closeStream() {
 onMounted(() => {
   window.addEventListener('loom:acp-handoff', rebindAfterHandoff);
   openStream();
-  load();
 });
 onActivated(() => {
   if (source) return;
   openStream();
-  load({ preserve: true });
 });
 onDeactivated(closeStream);
 onUnmounted(() => {
@@ -335,8 +383,8 @@ onUnmounted(() => {
 });
 watch(id, () => {
   closeStream();
+  state.value = 'loading';
   openStream();
-  load();
 });
 watch(
   () => props.session.agent_kind,
@@ -851,8 +899,12 @@ function usageFromPayload(payload: UsagePayload): AcpUsage | null {
 // The latest plan block feeds the right rail, not the transcript flow.
 const latestPlan = computed<PlanEntry[]>(() => {
   let entries: PlanEntry[] = [];
+  let latest: [number, number] = [-1, -1];
   for (const b of blocks.values()) {
-    if (b.kind === 'plan') entries = (b.payload as unknown as PlanPayload).entries ?? entries;
+    if (b.kind === 'plan' && (b.turn > latest[0] || (b.turn === latest[0] && b.seq > latest[1]))) {
+      entries = (b.payload as unknown as PlanPayload).entries ?? entries;
+      latest = [b.turn, b.seq];
+    }
   }
   return entries;
 });
@@ -860,7 +912,6 @@ const latestPlan = computed<PlanEntry[]>(() => {
 const model = computed<{ rows: Row[]; toc: TocItem[]; usage: AcpUsage | null }>(() => {
   const rows: Row[] = [];
   const toc: TocItem[] = [];
-  let n = 0;
 
   const sorted = [...blocks.values()].sort((a, b) => a.turn - b.turn || a.seq - b.seq);
 
@@ -888,7 +939,7 @@ const model = computed<{ rows: Row[]; toc: TocItem[]; usage: AcpUsage | null }>(
         flushActivity();
         const user = b.payload as unknown as UserMessagePayload;
         const steered = user.steered === true;
-        if (!steered) n += 1;
+        const n = b.turn + 1;
         const anchor = steered ? `acp-steer-${b.turn}-${b.seq}` : `acp-turn-${b.turn}`;
         const text = user.text ?? '';
         rows.push({
@@ -1233,6 +1284,21 @@ function goTo(anchor: string) {
                   : 'The transcript appears when the agent takes its first turn.'
               }}
             </p>
+          </div>
+
+          <div v-if="olderCursor" class="mb-4 flex justify-center">
+            <div class="text-center">
+              <button
+                type="button"
+                class="btn-secondary px-3 py-1 text-xs"
+                :disabled="loadingOlder"
+                data-testid="acp-load-older"
+                @click="loadOlder"
+              >
+                {{ loadingOlder ? 'Loading earlier conversation…' : 'Load earlier conversation' }}
+              </button>
+              <p v-if="olderError" class="mt-2 text-xs text-block">{{ olderError }}</p>
+            </div>
           </div>
 
           <template v-for="row in model.rows" :key="row.key">

@@ -184,6 +184,9 @@ export interface ChatBlock {
  *  turn number of a `session/prompt` still running, else null). */
 export interface ChatSnapshot {
   blocks: ChatBlock[];
+  /** Oldest loaded block, used as an exclusive cursor for an older history
+   * page. Null means this snapshot reached the start of the journal. */
+  older_cursor: { turn: number; seq: number } | null;
   live_turn: number | null;
   /** Permission posture captured when the live turn started. A different selected
    *  mode is queued for the next turn. */

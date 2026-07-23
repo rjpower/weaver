@@ -18,7 +18,10 @@
 //! `~/.iris/logs/sessions`. Capture is best-effort: a failure returns a warning
 //! and never blocks the archive.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 use weaver_core::branch::Branch;
@@ -94,6 +97,91 @@ fn locate(session: &Session) -> Vec<PathBuf> {
     transcript::codex_transcripts_for(&work_dir)
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone)]
+struct CachedTranscript {
+    checked_at: Instant,
+    last_used_at: Instant,
+    files: Vec<FileStamp>,
+    log: Option<transcript::Log>,
+}
+
+static TRANSCRIPT_CACHE: OnceLock<Mutex<HashMap<String, CachedTranscript>>> = OnceLock::new();
+const TRANSCRIPT_CACHE_TTL: Duration = Duration::from_secs(2);
+const TRANSCRIPT_CACHE_CAPACITY: usize = 8;
+
+fn file_stamps(files: &[PathBuf]) -> Vec<FileStamp> {
+    let mut stamps = files
+        .iter()
+        .map(|path| {
+            let metadata = path.metadata().ok();
+            FileStamp {
+                path: path.clone(),
+                len: metadata.as_ref().map_or(0, std::fs::Metadata::len),
+                modified: metadata.and_then(|m| m.modified().ok()),
+            }
+        })
+        .collect::<Vec<_>>();
+    stamps.sort_by(|a, b| a.path.cmp(&b.path));
+    stamps
+}
+
+/// Locate and parse a terminal transcript on the blocking pool, memoizing both
+/// positive and negative results briefly. Session/status SSE bursts used to
+/// launch several identical full `~/.codex` walks and parses at once; holding
+/// the small process-local cache lock makes that work single-flight.
+fn cached_terminal_conversation(session: &Session) -> Option<transcript::Log> {
+    let cache = TRANSCRIPT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(hit) = cache.get_mut(&session.id) {
+        // Do not memoize "no transcript" for the full TTL: a newly launched
+        // agent creates its first file immediately after an empty probe.
+        if hit.log.is_some() && hit.checked_at.elapsed() < TRANSCRIPT_CACHE_TTL {
+            hit.last_used_at = Instant::now();
+            return hit.log.clone();
+        }
+    }
+
+    let files = locate(session);
+    let stamps = file_stamps(&files);
+    if let Some(hit) = cache.get_mut(&session.id) {
+        if hit.files == stamps {
+            hit.checked_at = Instant::now();
+            hit.last_used_at = Instant::now();
+            return hit.log.clone();
+        }
+    }
+
+    let log = transcript::parse_files(&files);
+    if !cache.contains_key(&session.id) && cache.len() >= TRANSCRIPT_CACHE_CAPACITY {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used_at)
+            .map(|(id, _)| id.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        session.id.clone(),
+        CachedTranscript {
+            checked_at: Instant::now(),
+            last_used_at: Instant::now(),
+            files: stamps,
+            log: log.clone(),
+        },
+    );
+    log
+}
+
 /// The captured iris-JSON path for a session's branch (`<log_dir>/<branch>/
 /// chat.json`), whether or not it exists yet. `None` only when the log dir can't
 /// be resolved.
@@ -124,9 +212,20 @@ pub async fn conversation(db: &Db, session: &Session, branch: &Branch) -> Option
         let raw = tokio::fs::read_to_string(&path).await.ok()?;
         return serde_json::from_str(&raw).ok();
     }
-    let files = locate(session);
-    if let Some(log) = transcript::parse_files(&files) {
-        return Some(log);
+    // Codex discovery walks its rollout tree and conversion parses potentially
+    // large JSONL files. Never run that synchronous filesystem/CPU work on an
+    // async request worker: one long chat must not stall artifacts or health.
+    let terminal = session.clone();
+    match tokio::task::spawn_blocking(move || cached_terminal_conversation(&terminal)).await {
+        Ok(Some(log)) => return Some(log),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session.id,
+                %error,
+                "terminal conversation loader failed"
+            );
+        }
     }
     let path = captured_json_path(db, branch).await?;
     let raw = tokio::fs::read_to_string(&path).await.ok()?;
@@ -306,7 +405,20 @@ pub async fn capture(
         return capture_acp(db, session, branch).await;
     }
     let mut warnings = Vec::new();
-    let files = locate(session);
+    let terminal = session.clone();
+    let (files, log) = match tokio::task::spawn_blocking(move || {
+        let files = locate(&terminal);
+        let log = transcript::parse_files(&files);
+        (files, log)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            warnings.push(format!("conversation parser task failed: {error}"));
+            return (None, warnings);
+        }
+    };
     if files.is_empty() {
         // Missing transcript for an agent that produces one is worth a warning;
         // for a custom agent or bare shell it's expected, so stay quiet.
@@ -318,7 +430,7 @@ pub async fn capture(
         }
         return (None, warnings);
     }
-    let Some(log) = transcript::parse_files(&files) else {
+    let Some(log) = log else {
         warnings.push(format!(
             "found {} transcript file(s) but none parsed",
             files.len()

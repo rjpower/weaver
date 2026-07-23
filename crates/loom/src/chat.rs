@@ -124,8 +124,7 @@ pub async fn insert(
     Ok(res.rows_affected() > 0)
 }
 
-/// Every block for a session, in `(turn, seq)` order — the transcript snapshot
-/// the client fetches before tailing the SSE stream.
+/// Every block for a session, in `(turn, seq)` order.
 pub async fn list(db: &Db, session_id: &str) -> Result<Vec<ChatBlockView>> {
     let rows = sqlx::query_as::<_, ChatBlockRow>(
         "SELECT turn, seq, kind, payload, created_at FROM chat_blocks
@@ -135,6 +134,56 @@ pub async fn list(db: &Db, session_id: &str) -> Result<Vec<ChatBlockView>> {
     .fetch_all(db)
     .await?;
     Ok(rows.into_iter().map(ChatBlockView::from).collect())
+}
+
+/// One newest-first page of a session journal, returned in display order.
+///
+/// `before` is the oldest `(turn, seq)` already held by the client. Fetching
+/// strictly before it makes pages stable while the live SSE tail appends newer
+/// blocks. One extra row determines `has_more` without a separate count query.
+pub async fn list_page(
+    db: &Db,
+    session_id: &str,
+    before: Option<(i64, i64)>,
+    limit: usize,
+) -> Result<(Vec<ChatBlockView>, bool)> {
+    let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+    let rows = match before {
+        Some((turn, seq)) => {
+            sqlx::query_as::<_, ChatBlockRow>(
+                "SELECT turn, seq, kind, payload, created_at FROM chat_blocks
+                 WHERE session_id = ?
+                   AND (turn < ? OR (turn = ? AND seq < ?))
+                 ORDER BY turn DESC, seq DESC LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(turn)
+            .bind(turn)
+            .bind(seq)
+            .bind(fetch_limit)
+            .fetch_all(db)
+            .await?
+        }
+        None => {
+            sqlx::query_as::<_, ChatBlockRow>(
+                "SELECT turn, seq, kind, payload, created_at FROM chat_blocks
+                 WHERE session_id = ?
+                 ORDER BY turn DESC, seq DESC LIMIT ?",
+            )
+            .bind(session_id)
+            .bind(fetch_limit)
+            .fetch_all(db)
+            .await?
+        }
+    };
+    let has_more = rows.len() > limit;
+    let mut blocks: Vec<_> = rows
+        .into_iter()
+        .take(limit)
+        .map(ChatBlockView::from)
+        .collect();
+    blocks.reverse();
+    Ok((blocks, has_more))
 }
 
 #[derive(sqlx::FromRow)]
@@ -574,6 +623,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(max_turn_seq(&db, &s).await.unwrap(), Some((1, 2)));
+    }
+
+    #[tokio::test]
+    async fn list_page_starts_at_the_tail_and_pages_back_without_overlap() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let s = seed_session(&db).await;
+        for seq in 0..7 {
+            insert(
+                &db,
+                &s,
+                seq / 3,
+                seq % 3,
+                kind::AGENT_MESSAGE,
+                &json!({ "text": seq.to_string() }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let (latest, has_more) = list_page(&db, &s, None, 3).await.unwrap();
+        assert!(has_more);
+        assert_eq!(
+            latest.iter().map(|b| (b.turn, b.seq)).collect::<Vec<_>>(),
+            vec![(1, 1), (1, 2), (2, 0)]
+        );
+
+        let first = &latest[0];
+        let (older, has_more) = list_page(&db, &s, Some((first.turn, first.seq)), 3)
+            .await
+            .unwrap();
+        assert!(has_more);
+        assert_eq!(
+            older.iter().map(|b| (b.turn, b.seq)).collect::<Vec<_>>(),
+            vec![(0, 1), (0, 2), (1, 0)]
+        );
+
+        let first = &older[0];
+        let (oldest, has_more) = list_page(&db, &s, Some((first.turn, first.seq)), 3)
+            .await
+            .unwrap();
+        assert!(!has_more);
+        assert_eq!(
+            oldest.iter().map(|b| (b.turn, b.seq)).collect::<Vec<_>>(),
+            vec![(0, 0)]
+        );
     }
 
     #[tokio::test]
