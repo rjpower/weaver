@@ -1023,8 +1023,10 @@ async fn cmd_login(name: String, url: Option<String>, token_stdin: bool) -> Resu
 
     let remote = Client::new(url.clone()).with_token(Some(token.to_string()));
     let me = remote.get("/api/auth/me").await?;
-    if me.get("authenticated").and_then(Value::as_bool) != Some(true) {
-        bail!("Loom rejected the API token");
+    if me.get("authenticated").and_then(Value::as_bool) != Some(true)
+        || me.get("via").and_then(Value::as_str) != Some("token")
+    {
+        bail!("Loom rejected the personal API token");
     }
     remote
         .list_tokens()
