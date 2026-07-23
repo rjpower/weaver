@@ -745,6 +745,13 @@ pub(crate) async fn provision_session(
     };
     tracing::debug!(repo_root = %repo_root.display(), "loaded repo config");
 
+    // A GitHub App token is repository-scoped. A managed slug gives both the
+    // preflight and issue seeding an exact installation target; a local path
+    // must keep using an explicitly supplied session credential.
+    let managed_slug = req
+        .repo
+        .as_deref()
+        .and_then(|repo| crate::repo::parse_slug(repo).ok());
     let agent_overridden = req
         .agent
         .as_deref()
@@ -824,7 +831,7 @@ pub(crate) async fn provision_session(
         .unwrap_or(&launch_profile.mode)
         .to_string();
     tracing::debug!(model = %model, effort = %effort, protocol = %protocol, "resolved and validated model/effort/protocol");
-    let restricted_github_app = if launch_profile.restricted {
+    let restricted_github_app = if launch_profile.restricted && managed_slug.is_some() {
         st.trigger.app()
     } else {
         None
@@ -848,10 +855,6 @@ pub(crate) async fn provision_session(
     let mut description = String::new();
     let mut github_repo = None;
     let mut github_issue: Option<i64> = None;
-    let managed_slug = req
-        .repo
-        .as_deref()
-        .and_then(|repo| crate::repo::parse_slug(repo).ok());
     if let Some(number) = req.issue {
         tracing::info!(issue = number, repo = %repo_root.display(), "fetching github issue to seed session");
         let issue = fetch_launch_issue(&st, &repo_root, managed_slug.as_ref(), number)

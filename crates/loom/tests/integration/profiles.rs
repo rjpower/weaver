@@ -18,6 +18,12 @@ impl EnvVarSet {
         std::env::set_var(name, value);
         Self { name, previous }
     }
+
+    fn unset(name: &'static str) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::remove_var(name);
+        Self { name, previous }
+    }
 }
 
 impl Drop for EnvVarSet {
@@ -121,6 +127,45 @@ async fn restricted_profile_sends_the_caller_goal_as_the_first_prompt() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+}
+
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_restricted_launch_does_not_treat_the_app_as_an_unscoped_credential() {
+    let _token = EnvVarSet::unset("GH_TOKEN");
+    let ts = TestServer::start().await;
+    weaver_core::config::apply(
+        &ts.state.db,
+        &[
+            (
+                loom::github_app::APP_ID_KEY.to_string(),
+                Some("123456".to_string()),
+            ),
+            (
+                loom::github_app::APP_PRIVATE_KEY_KEY.to_string(),
+                Some("configured-for-preflight".to_string()),
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let error = ts
+        .client
+        .post(
+            "/api/sessions",
+            json!({
+                "cwd": ts.cwd(),
+                "profile": "github_comment",
+                "goal": "no repository installation target"
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("server returned 428"), "{error}");
+    assert!(error.contains("No GitHub token configured"), "{error}");
 }
 
 #[serial]
