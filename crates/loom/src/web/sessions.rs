@@ -2981,6 +2981,8 @@ pub(super) async fn handoff_session(
     let mut extra_env = resume_environment(&st.db, &session, &repo_root, &repo_cfg).await;
     rotate_session_token(&st.db, &session, &mut extra_env).await?;
     apply_user_github_token(&st.db, &mut extra_env, session.created_by.as_deref()).await;
+    // Restricted sessions return before this handoff path, so an App credential
+    // cannot be relevant here.
     ensure_github_token_available(
         &st.db,
         &extra_env,

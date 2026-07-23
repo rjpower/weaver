@@ -223,7 +223,7 @@ async fn restricted_github_tool_uses_the_server_side_token_and_fixed_repo() {
         & 0o777;
     assert_eq!(config_mode, 0o700);
 
-    let fallback = ts
+    let second_response = ts
         .client
         .post(
             &format!("/api/sessions/{id}/restricted-github/issue_view"),
@@ -231,7 +231,7 @@ async fn restricted_github_tool_uses_the_server_side_token_and_fixed_repo() {
         )
         .await
         .unwrap();
-    assert!(fallback["text"]
+    assert!(second_response["text"]
         .as_str()
         .unwrap()
         .contains("profile:issue view 7 --repo octo/fixed"));
