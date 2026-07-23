@@ -34,11 +34,6 @@ function normalizeAgentChoices(metadata = selectedAgent.value) {
   }
 }
 
-function changeAgent(event: Event) {
-  if (!draft.value) return;
-  draft.value.agent_kind = (event.target as HTMLSelectElement).value;
-}
-
 watch(selectedAgent, normalizeAgentChoices);
 
 function editable(profile: Profile): ProfileInput {
@@ -202,9 +197,8 @@ onMounted(load);
             >Agent
             <select
               data-testid="profile-agent"
-              :value="draft.agent_kind"
+              v-model="draft.agent_kind"
               class="mt-1 w-full rounded bg-input px-2 py-1.5"
-              @change="changeAgent"
             >
               <option v-for="agent in agents" :key="agent.kind" :value="agent.kind">
                 {{ agent.label }}
