@@ -212,7 +212,24 @@ onMounted(load);
           </label>
           <label class="text-xs"
             >Model
+            <input
+              v-if="selectedAgent?.accepts_raw_model"
+              data-testid="profile-model"
+              v-model="draft.model"
+              list="profile-model-options"
+              placeholder="Agent default"
+              class="mt-1 w-full rounded bg-input px-2 py-1.5"
+            />
+            <datalist v-if="selectedAgent?.accepts_raw_model" id="profile-model-options">
+              <option
+                v-for="model in selectedAgent.models"
+                :key="model.id"
+                :value="model.id"
+                :label="model.label"
+              />
+            </datalist>
             <select
+              v-else
               data-testid="profile-model"
               v-model="draft.model"
               class="mt-1 w-full rounded bg-input px-2 py-1.5"
