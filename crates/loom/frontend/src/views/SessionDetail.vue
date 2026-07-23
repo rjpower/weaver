@@ -86,8 +86,9 @@ const workTab = computed<WorkTab>(() =>
 
 // Lazy-mount panes on first visit, then keep them (v-show) so re-selecting is
 // instant. The terminal is always mounted; the rest start cold so a session-open
-// stays cheap. A watch mounts whichever pane becomes the effective tab — so an
-// ACP session, whose default *is* Conversation, mounts it without a click.
+// stays cheap. Watch the pane actually on screen, not the backend's default:
+// an ACP artifact deep-link is docked over its default Conversation tab and must
+// not fetch/render a potentially huge chat behind the requested document.
 const mounted = reactive({
   overview: false,
   conversation: false,
@@ -95,7 +96,7 @@ const mounted = reactive({
   artifacts: artifactsActive.value,
 });
 watch(
-  effectiveLocalTab,
+  workTab,
   (t) => {
     if (t === 'overview' || t === 'conversation' || t === 'shells') mounted[t] = true;
   },

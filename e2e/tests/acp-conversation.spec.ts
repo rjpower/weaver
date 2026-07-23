@@ -311,6 +311,73 @@ test.describe('acp conversation', () => {
     await page.screenshot({ path: test.info().outputPath('acp-empty-state.png') });
   });
 
+  test('loads the journal tail once and pages older history on demand', async ({ page, weaver }) => {
+    const s = await launchAcpSession(weaver, { goal: 'say:ready', name: 'acp-paged' });
+    test.skip(s === null, SKIP_MSG);
+    let snapshots = 0;
+    await page.route(`**/api/sessions/${s!.id}/chat*`, (route) => {
+      if (new URL(route.request().url()).pathname.endsWith('/chat/stream')) {
+        return route.continue();
+      }
+      snapshots += 1;
+      const older = new URL(route.request().url()).searchParams.has('before_turn');
+      return route.fulfill({
+        json: {
+          blocks: [
+            {
+              turn: older ? 0 : 8,
+              seq: 0,
+              kind: older ? 'user_message' : 'agent_message',
+              payload: { text: older ? 'oldest retained prompt' : 'newest retained answer' },
+              created_at: '2026-07-23T00:00:00Z',
+            },
+          ],
+          older_cursor: older ? null : { turn: 8, seq: 0 },
+          live_turn: null,
+          effective_mode: null,
+          pending_prompt: null,
+          metadata: { commands: [], config_options: [], modes: [], steering_supported: false },
+        },
+      });
+    });
+
+    await page.goto(`${weaver.baseUrl}/s/${s!.id}`);
+    const conversation = page.getByTestId('acp-conversation');
+    await expect(conversation.getByText('newest retained answer', { exact: true })).toBeVisible();
+    await expect(conversation.getByText('oldest retained prompt', { exact: true })).toHaveCount(0);
+    expect(snapshots).toBe(1);
+
+    await page.getByTestId('acp-load-older').click();
+    await expect(conversation.getByText('oldest retained prompt', { exact: true })).toBeVisible();
+    await expect(page.getByTestId('acp-load-older')).toHaveCount(0);
+    expect(snapshots).toBe(2);
+  });
+
+  test('an artifact hard refresh does not load the hidden default conversation', async ({
+    page,
+    weaver,
+  }) => {
+    const s = await launchAcpSession(weaver, { goal: 'say:ready', name: 'acp-artifact' });
+    test.skip(s === null, SKIP_MSG);
+    await weaver.writeArtifact(s!, 'proxy-results', '# Proxy results\n\nReady.\n', {
+      title: 'Proxy results',
+    });
+    let chatRequests = 0;
+    page.on('request', (request) => {
+      if (new URL(request.url()).pathname.includes(`/api/sessions/${s!.id}/chat`)) {
+        chatRequests += 1;
+      }
+    });
+
+    await page.goto(`${weaver.baseUrl}/s/${s!.id}/artifacts/proxy-results`);
+    await expect(page.locator('.markdown-body h1')).toContainText('Proxy results');
+    await page.reload();
+    await expect(page.locator('.markdown-body h1')).toContainText('Proxy results');
+    // Let any mistakenly mounted conversation component issue its initial request.
+    await page.waitForTimeout(500);
+    expect(chatRequests).toBe(0);
+  });
+
   test('a live turn shows a status line naming the activity', async ({ page, weaver }) => {
     await page.clock.install();
     await openAcp(page, weaver, { goal: 'say:ready' });

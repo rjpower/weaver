@@ -322,10 +322,14 @@ export const handoffSession = (
 
 import type { AcpMetadata, ChatSnapshot, PromptAck } from './types';
 
-/** The journaled conversation snapshot for an ACP session — the transcript a
- *  client paints before tailing `/chat/stream` (`GET /sessions/{id}/chat`). A
- *  terminal session 409s (it has no chat journal). */
-export const getSessionChat = (id: string) => get(`/sessions/${id}/chat`) as Promise<ChatSnapshot>;
+/** A newest-first page of the journaled ACP conversation. The response is in
+ * display order and carries an exclusive cursor for the next older page. */
+export const getSessionChat = (id: string, before?: { turn: number; seq: number } | null) => {
+  const query = before
+    ? `?before_turn=${encodeURIComponent(before.turn)}&before_seq=${encodeURIComponent(before.seq)}`
+    : '';
+  return get(`/sessions/${id}/chat${query}`) as Promise<ChatSnapshot>;
+};
 
 /** Send a user message to an ACP session. Returns 202 with
  *  `{ queued, steered, turn }`: a live turn is steered when the adapter supports
