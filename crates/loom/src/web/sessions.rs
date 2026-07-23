@@ -34,7 +34,7 @@ use super::scratch::{scratch_note, write_initial_scratch};
 use super::{author_or_manual, require_branch, require_session, session_view};
 use super::{ApiResult, AppError, AppState};
 
-const MISSING_GITHUB_TOKEN_MESSAGE: &str = "No GitHub token configured. Add your personal GitHub token in Settings > Account, or configure GH_TOKEN in Settings > Environment.";
+const MISSING_GITHUB_TOKEN_MESSAGE: &str = "No GitHub token configured. Add your personal GitHub token in Settings > Account, or configure a write-only GH_TOKEN on the selected profile.";
 const HANDOFF_HISTORY_CHARS: usize = 64 * 1024;
 
 /// Resolve an optional per-request ACP permission posture over the workspace
@@ -258,13 +258,13 @@ fn repo_cfg_or_default(repo_root: &std::path::Path) -> weaver_core::repo_config:
     })
 }
 
-/// Build the environment exported into a session's agent terminal, layered in
-/// priority order: the profile environment, then the per-repo [`repo_env`], then
-/// the repo's committed `.weaver/config.toml` `[env]` — each layer overriding the
-/// previous for a shared name. Loom fills in its repo-local defaults last only
-/// when no layer supplied the name. Best-effort: a database error in a layer
-/// degrades to the layers that did resolve. `cfg` is the already-loaded repo
-/// config (the caller reads it once for env, setup, and defaults).
+/// Build the environment exported into a session's agent terminal, starting
+/// with the selected profile and then layering the per-repo [`repo_env`] and
+/// committed `.weaver/config.toml` `[env]`. A strict profile keeps ownership of
+/// its declared names; a restricted profile receives only its own environment.
+/// Loom fills in its repo-local defaults last only when no layer supplied the
+/// name. Best-effort: a database error in a layer degrades to the layers that
+/// did resolve. `cfg` is the already-loaded repo config.
 async fn launch_env_for_profile(
     db: &Db,
     repo_root: &std::path::Path,
@@ -381,11 +381,10 @@ async fn resume_environment(
 /// Overlay the launching user's personal GitHub token onto `env` as `GH_TOKEN`,
 /// so the session's `git push` / `gh` act as that user (their pushes and PRs are
 /// attributed to them, matching the per-user commit identity loom already sets).
-/// The user's registered token takes precedence over any ambient `GH_TOKEN`; when
-/// they have none, whatever a lower env layer set (the ambient Settings →
-/// Environment value, `repo_env`, or the repo file) stands as the fallback. Only
-/// for a launch that carries a `created_by` username. Best-effort: a lookup
-/// failure is logged, never fatal, so a token-store hiccup can't block a launch.
+/// The user's registered token takes precedence over any `GH_TOKEN` from the
+/// selected profile, repository environment, or committed repo config. Only for
+/// a launch that carries a `created_by` username. Best-effort: a lookup failure
+/// is logged, never fatal, so a token-store hiccup can't block a launch.
 async fn apply_user_github_token(
     db: &Db,
     env: &mut Vec<(String, String)>,
@@ -398,14 +397,14 @@ async fn apply_user_github_token(
             tracing::info!(%username, "applied user github token as GH_TOKEN");
         }
         Ok(_) => {
-            tracing::debug!(%username, "no personal github token on file, leaving ambient GH_TOKEN")
+            tracing::debug!(%username, "no personal github token on file, retaining session GH_TOKEN")
         }
         Err(e) => tracing::warn!(%username, "failed to load user github token: {e}"),
     }
 }
 
 /// Set `name` in `env`, replacing an existing entry in place (so a user token
-/// overrides an ambient value) or appending it when absent.
+/// overrides a lower-precedence value) or appending it when absent.
 fn set_env(env: &mut Vec<(String, String)>, name: &str, value: String) {
     if let Some(slot) = env.iter_mut().find(|(k, _)| k == name) {
         slot.1 = value;
@@ -756,9 +755,10 @@ pub(crate) async fn provision_session(
     };
     let runtime = agent.clone();
     tracing::debug!(agent = %agent, runtime = %runtime, "resolved agent runtime");
-    // The resolved launch environment: global agent_env < per-repo repo_env < the
-    // repo file's [env]. It is needed before provisioning so a real agent launch
-    // can stop cleanly when neither the user nor the deployment provides GH_TOKEN.
+    // The resolved launch environment: selected profile < per-repo repo_env <
+    // the repo file's [env]. It is needed before provisioning so a real agent
+    // launch can stop cleanly when neither the user nor an environment layer
+    // provides GH_TOKEN.
     let mut extra_env = launch_env_for_profile(
         &st.db,
         &repo_root,
@@ -778,7 +778,8 @@ pub(crate) async fn provision_session(
     // GH_TOKEN (design §6.3, "Level B"). See `apply_user_github_token` for the
     // precedence rules. This happens before preflight. Ordinary sessions export
     // it; a restricted ACP launch removes it from the adapter environment and
-    // the server-side GitHub tool resolves the same user's token on demand.
+    // its server-side GitHub tool independently resolves an App or profile
+    // credential.
     apply_user_github_token(&st.db, &mut extra_env, created_by.as_deref()).await;
 
     // Normalize and validate the model / effort selections through the resolved
@@ -3726,8 +3727,10 @@ mod tests {
             .unwrap();
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn restricted_builtin_accepts_configured_github_app() {
+        let _env = EnvVarGuard::unset("GH_TOKEN");
         let db = crate::db::connect_in_memory().await.unwrap();
         seed_user(&db, "alice").await;
         weaver_core::config::apply(

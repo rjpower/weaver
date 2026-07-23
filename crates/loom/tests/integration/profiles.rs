@@ -132,7 +132,6 @@ async fn restricted_github_tool_uses_the_server_side_token_and_fixed_repo() {
         &gh,
         "#!/bin/sh\n\
          case \"$GH_TOKEN\" in\n\
-           requester-token) printf 'requester:' ;;\n\
            server-only-token) printf 'profile:' ;;\n\
            *) exit 17 ;;\n\
          esac\n\
@@ -214,7 +213,7 @@ async fn restricted_github_tool_uses_the_server_side_token_and_fixed_repo() {
         .await
         .unwrap();
     let text = response["text"].as_str().unwrap();
-    assert!(text.contains("requester:issue edit 7 --repo octo/fixed --body clean body"));
+    assert!(text.contains("profile:issue edit 7 --repo octo/fixed --body clean body"));
     assert!(!text.contains("server-only-token"));
     assert!(!text.contains("requester-token"));
     let config_mode = std::fs::metadata(loom::db::run_dir(id).join("restricted-gh-config"))
@@ -224,9 +223,6 @@ async fn restricted_github_tool_uses_the_server_side_token_and_fixed_repo() {
         & 0o777;
     assert_eq!(config_mode, 0o700);
 
-    loom::user_token::remove(&ts.state.db, "rjpower")
-        .await
-        .unwrap();
     let fallback = ts
         .client
         .post(

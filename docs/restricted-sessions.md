@@ -17,11 +17,13 @@ The MCP bridge calls a session-scoped Loom endpoint; Loom runs `gh` server-side
 against the session's fixed repository and linked issue/PR number, so neither a
 general shell nor the GitHub token enters the agent process. Anything outside
 the configured Claude permission rules is rejected by Loom.
-The profile intentionally has no token in its seed. Loom resolves the
-requester's stored token first, a profile `GH_TOKEN` second, and the configured
-GitHub App's short-lived installation token for the fixed repository otherwise.
-An App-less deployment can configure a least-privilege CI identity as the
-profile's write-only `GH_TOKEN`. Its stock policy lives in
+The profile intentionally has no token in its seed. Loom uses the configured
+GitHub App's short-lived installation token for the fixed repository. If an App
+is configured but is not installed on that repository, the operation fails
+rather than falling back to a broader credential. An App-less deployment can
+configure a least-privilege CI identity as the profile's write-only `GH_TOKEN`.
+Personal user tokens remain exclusive to ordinary interactive sessions. The
+stock policy lives in
 `crates/loom/profiles/github_comment.json`, not in a schema migration. Loom
 seeds a missing stock profile through normal validation and does not overwrite
 later operator edits. Custom profiles use the same REST/CLI/UI or
@@ -30,6 +32,20 @@ checkout would let repository content choose its own launch boundary and is
 deliberately unsupported. Custom profiles may compose the built-in capability
 sets Loom recognizes, but cannot define executable MCP adapters from repository
 content.
+
+## GitHub credential policy
+
+| Use case | Primary credential | Fallback |
+| --- | --- | --- |
+| Ordinary interactive session | Launching user's personal token from **Settings → Account** | Selected profile's `GH_TOKEN`, then lower session environment layers |
+| Restricted GitHub tool | Short-lived GitHub App installation token for the session's fixed repository | Profile `GH_TOKEN` only when no App is configured |
+| GitHub Actions calling Loom | GitHub OIDC exchanged for a ten-minute Loom automation token | None |
+
+The same environment variable name appears inside an ordinary session because
+`git` and `gh` expect it, but the stores and trust boundaries are separate.
+When a GitHub App is configured, a mint or installation failure is an error:
+Loom does not silently widen authority by falling back to a personal or shared
+PAT.
 
 ## GitHub Actions request
 
@@ -87,8 +103,8 @@ fixed GitHub tool. Prefer the configured GitHub App, whose installation token is
 short-lived and scoped to the session's fixed repository. App-less deployments
 can put a least-privilege token in the profile's write-only environment,
 preferably as a deployment-managed Secret Manager reference. The existing
-human/comment launch path uses the approved requester's stored GitHub token by
-default, also server-side for a restricted session.
+ordinary interactive launch path uses the approved requester's stored GitHub
+token by default; restricted sessions do not.
 
 ## Production rollout
 
@@ -109,5 +125,6 @@ default, also server-side for a restricted session.
    exchange above, keeping its current body-hash/stale-write prompt. Roll the
    action revision through `marin-community/*` consumers in batches.
 
-Disable the federation mapping or remove the profile token to stop new runs.
-That rollback does not affect interactive Loom sessions.
+Disable the federation mapping to stop new runs. On an App-less deployment,
+removing the profile token also disables the fixed GitHub operations. Neither
+rollback affects interactive Loom sessions.

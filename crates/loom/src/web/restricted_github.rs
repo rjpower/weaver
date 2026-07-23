@@ -28,28 +28,11 @@ struct ToolArguments {
     title: Option<String>,
 }
 
-async fn github_token(
+async fn restricted_github_token(
     st: &AppState,
-    created_by: Option<&str>,
     profile: &str,
     repo: &crate::repo::RepoSlug,
 ) -> ApiResult<String> {
-    if let Some(username) = created_by {
-        if let Some(token) = crate::user_token::get(&st.db, username).await? {
-            if !token.trim().is_empty() {
-                return Ok(token);
-            }
-        }
-    }
-    if let Some(token) = crate::profile::env_pairs(&st.db, profile)
-        .await
-        .map_err(|error| AppError::new(StatusCode::BAD_GATEWAY, error.to_string()))?
-        .into_iter()
-        .find_map(|(name, value)| (name == "GH_TOKEN").then_some(value))
-        .filter(|value| !value.trim().is_empty())
-    {
-        return Ok(token);
-    }
     if let Some(app) = st.trigger.app() {
         if app.is_configured().await {
             return app
@@ -65,6 +48,15 @@ async fn github_token(
                     )
                 });
         }
+    }
+    if let Some(token) = crate::profile::env_pairs(&st.db, profile)
+        .await
+        .map_err(|error| AppError::new(StatusCode::BAD_GATEWAY, error.to_string()))?
+        .into_iter()
+        .find_map(|(name, value)| (name == "GH_TOKEN").then_some(value))
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(token);
     }
     Err(AppError::new(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -224,7 +216,7 @@ pub(super) async fn restricted_github_tool(
             "GitHub tool target does not match the session's linked thread",
         ));
     }
-    let token = github_token(&st, session.created_by.as_deref(), &session.profile, &repo).await?;
+    let token = restricted_github_token(&st, &session.profile, &repo).await?;
     let config_dir = crate::db::run_dir(&session.id).join("restricted-gh-config");
     tokio::fs::create_dir_all(&config_dir)
         .await
@@ -254,9 +246,10 @@ pub(super) async fn restricted_github_tool(
 mod tests {
     use std::sync::Arc;
 
+    use axum::http::StatusCode;
     use serde_json::json;
 
-    use super::{github_token, validate_arguments};
+    use super::{restricted_github_token, validate_arguments};
 
     #[test]
     fn only_the_fixed_mcp_tools_map_to_permissions() {
@@ -278,8 +271,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn github_app_is_the_restricted_tool_credential_fallback() {
+    async fn github_app_precedes_the_restricted_profile_credential() {
         let db = crate::db::connect_in_memory().await.unwrap();
+        crate::profile::env_set(&db, "github_comment", "GH_TOKEN", "profile-token")
+            .await
+            .unwrap();
         let app = Arc::new(crate::github_app::tests::configured_test_app(db.clone()).await);
         let state = super::AppState {
             db,
@@ -291,10 +287,16 @@ mod tests {
         };
         let repo = crate::repo::parse_slug("marin-community/loom").unwrap();
 
-        let resolved = github_token(&state, None, "github_comment", &repo)
+        let resolved = restricted_github_token(&state, "github_comment", &repo)
             .await
             .unwrap();
 
         assert_eq!(resolved, "ghs_installation_token");
+
+        let uninstalled = crate::repo::parse_slug("uninstalled/loom").unwrap();
+        let error = restricted_github_token(&state, "github_comment", &uninstalled)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
     }
 }
