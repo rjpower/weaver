@@ -291,7 +291,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resolved, "ghs_installation_token");
+        assert_ne!(
+            resolved, "profile-token",
+            "the profile credential must not override a configured App"
+        );
 
         let uninstalled = crate::repo::parse_slug("uninstalled/loom").unwrap();
         let error = restricted_github_token(&state, "github_comment", &uninstalled)

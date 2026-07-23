@@ -150,22 +150,26 @@ async fn local_restricted_launch_does_not_treat_the_app_as_an_unscoped_credentia
     .await
     .unwrap();
 
-    let error = ts
-        .client
-        .post(
-            "/api/sessions",
-            json!({
-                "cwd": ts.cwd(),
-                "profile": "github_comment",
-                "goal": "no repository installation target"
-            }),
-        )
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/api/sessions", ts.addr))
+        .json(&json!({
+            "cwd": ts.cwd(),
+            "profile": "github_comment",
+            "goal": "no repository installation target"
+        }))
+        .send()
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap();
 
-    assert!(error.contains("server returned 428"), "{error}");
-    assert!(error.contains("No GitHub token configured"), "{error}");
+    assert_eq!(response.status(), StatusCode::PRECONDITION_REQUIRED);
+    assert!(ts
+        .client
+        .get("/api/sessions")
+        .await
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[serial]
