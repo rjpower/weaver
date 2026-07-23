@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import * as api from '../api';
 import type { AgentMetadata, Profile, ProfileInput } from '../types';
 
@@ -19,12 +19,9 @@ const selectedAgent = computed(() =>
   agents.value.find((agent) => agent.kind === draft.value?.agent_kind),
 );
 
-function changeAgent(event: Event) {
+function normalizeAgentChoices(metadata = selectedAgent.value) {
   const profile = draft.value;
-  if (!profile) return;
-  profile.agent_kind = (event.target as HTMLSelectElement).value;
-  const metadata = selectedAgent.value;
-  if (!metadata) return;
+  if (!profile || !metadata) return;
   if (
     profile.model &&
     !metadata.accepts_raw_model &&
@@ -36,6 +33,13 @@ function changeAgent(event: Event) {
     profile.effort = '';
   }
 }
+
+function changeAgent(event: Event) {
+  if (!draft.value) return;
+  draft.value.agent_kind = (event.target as HTMLSelectElement).value;
+}
+
+watch(selectedAgent, normalizeAgentChoices);
 
 function editable(profile: Profile): ProfileInput {
   const {
@@ -59,6 +63,7 @@ function choose(name: string) {
   selected.value = name;
   const profile = profiles.value.find((item) => item.name === name);
   draft.value = profile ? editable(profile) : null;
+  normalizeAgentChoices();
   creating.value = false;
   error.value = '';
   notice.value = '';

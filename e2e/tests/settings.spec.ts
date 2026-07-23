@@ -14,19 +14,23 @@ test.describe("settings · profiles", () => {
         efforts: { id: string; label: string }[];
       }[];
     };
+    const claude = registry.agents.find((agent) => agent.kind === "claude")!;
     const codex = registry.agents.find((agent) => agent.kind === "codex")!;
     await page.goto(`${weaver.baseUrl}/settings`);
 
     const agent = page.getByTestId("profile-agent");
+    const model = page.getByTestId("profile-model");
+    const effort = page.getByTestId("profile-effort");
     await expect(agent.locator("option")).toContainText([
       "Claude",
       "Codex",
       "Shell",
     ]);
 
+    await agent.selectOption("claude");
+    await model.selectOption(claude.models[0].id);
     await agent.selectOption("codex");
-    const model = page.getByTestId("profile-model");
-    const effort = page.getByTestId("profile-effort");
+    await expect(model).toHaveValue("");
     await expect(model.locator("option")).toContainText([
       "Agent default",
       ...codex.models.map((choice) => choice.label),
