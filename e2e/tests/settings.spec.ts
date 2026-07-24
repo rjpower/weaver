@@ -82,6 +82,91 @@ test.describe("settings · profiles", () => {
     await expect(mode).toHaveValue("bypassPermissions");
   });
 
+  test("custom MCP source validates and becomes a selectable profile group", async ({
+    page,
+    weaver,
+  }) => {
+    const source = `# /// script
+# requires-python = ">=3.11"
+# ///
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        result = {
+            "protocolVersion": request["params"]["protocolVersion"],
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "docs-search", "version": "1"},
+        }
+        response = {"jsonrpc": "2.0", "id": request["id"], "result": result}
+    elif method == "tools/list":
+        tool = {
+            "name": "lookup",
+            "description": "Search the docs",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {"tools": [tool]},
+        }
+    else:
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "error": {"code": -32601, "message": "not found"},
+        }
+    print(json.dumps(response), flush=True)
+`;
+
+    await page.goto(`${weaver.baseUrl}/settings`);
+    const panel = page.getByTestId("mcp-panel");
+    await panel.getByRole("button", { name: "Add custom MCP" }).click();
+    await panel.getByLabel("Identity").fill("/docs/search");
+    await panel.getByLabel("Label").fill("Docs search");
+    await panel.getByLabel("Python MCP source (PEP 723)").fill(source);
+    await panel.getByRole("button", { name: "Save and validate" }).click();
+    await expect(panel.getByText("ready · r1")).toBeVisible({
+      timeout: 30_000,
+    });
+
+    const custom = (await (
+      await fetch(`${weaver.baseUrl}/api/mcps/custom/docs/search`)
+    ).json()) as {
+      identity: string;
+      group: string;
+      tools: string[];
+      validation_state: string;
+    };
+    expect(custom).toMatchObject({
+      identity: "/docs/search",
+      group: "docs",
+      tools: ["lookup"],
+      validation_state: "ready",
+    });
+
+    await page.reload();
+    await page.getByTestId("profile-agent").selectOption("codex");
+    await page.getByLabel("Protocol").selectOption("acp");
+    const access = page.getByRole("group", { name: "MCP access" });
+    await access.getByRole("button", { name: "groups" }).click();
+    await access.getByLabel("docs").check();
+    await page.getByTestId("profile-save").click();
+    await expect(page.getByText("Saved default.")).toBeVisible();
+
+    const profile = (await (
+      await fetch(`${weaver.baseUrl}/api/profiles/default`)
+    ).json()) as {
+      mcp_access: { mode: string; groups: string[] };
+    };
+    expect(profile.mcp_access).toEqual({ mode: "groups", groups: ["docs"] });
+  });
+
   test("overlapping settings are consolidated into workspace and access", async ({
     page,
     weaver,

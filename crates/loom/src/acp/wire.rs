@@ -430,8 +430,8 @@ pub fn initialize_params() -> Value {
 
 /// `session/new` params. `meta` is the optional `_meta` object (adapter options
 /// such as `{"claudeCode":{"options":{...}}}`).
-pub fn new_session_params(cwd: &str, meta: Option<&Value>) -> Value {
-    let mut v = serde_json::json!({ "cwd": cwd, "mcpServers": [] });
+pub fn new_session_params(cwd: &str, mcp_servers: &[Value], meta: Option<&Value>) -> Value {
+    let mut v = serde_json::json!({ "cwd": cwd, "mcpServers": mcp_servers });
     if let Some(meta) = meta {
         v["_meta"] = meta.clone();
     }
@@ -439,8 +439,14 @@ pub fn new_session_params(cwd: &str, meta: Option<&Value>) -> Value {
 }
 
 /// `session/load` params.
-pub fn load_session_params(session_id: &str, cwd: &str, meta: Option<&Value>) -> Value {
-    let mut value = serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] });
+pub fn load_session_params(
+    session_id: &str,
+    cwd: &str,
+    mcp_servers: &[Value],
+    meta: Option<&Value>,
+) -> Value {
+    let mut value =
+        serde_json::json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers });
     if let Some(meta) = meta {
         value["_meta"] = meta.clone();
     }
@@ -521,9 +527,20 @@ mod tests {
         let meta = serde_json::json!({
             "claudeCode": { "options": { "settingSources": [], "tools": ["Read"] } }
         });
-        let params = load_session_params("session-1", "/worktree", Some(&meta));
+        let servers = vec![json!({
+            "name": "loom_github",
+            "command": "/usr/bin/loom",
+            "args": ["mcp", "serve", "github"],
+            "env": [],
+        })];
+        let params = load_session_params("session-1", "/worktree", &servers, Some(&meta));
         assert_eq!(params["sessionId"], "session-1");
         assert_eq!(params["_meta"], meta);
+        assert_eq!(params["mcpServers"], json!(servers));
+
+        let fresh = new_session_params("/worktree", &servers, None);
+        assert_eq!(fresh["mcpServers"], json!(servers));
+        assert!(fresh.get("_meta").is_none());
     }
 
     #[test]

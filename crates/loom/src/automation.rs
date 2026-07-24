@@ -659,6 +659,7 @@ mod tests {
                 prelude: "weaver".to_string(),
                 restricted: false,
                 allowed_tools: vec![],
+                mcp_access: weaver_api::McpAccess::default(),
             },
         )
         .await

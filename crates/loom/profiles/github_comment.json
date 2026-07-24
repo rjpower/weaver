@@ -15,8 +15,11 @@
   "turn_budget": 4,
   "prelude": "none",
   "restricted": true,
-  "allowed_tools": [
-    "Read(./**)",
-    "mcp/github/comment@v1"
-  ]
+  "runtime_permissions": [
+    "Read(./**)"
+  ],
+  "mcp_access": {
+    "mode": "groups",
+    "groups": ["github"]
+  }
 }

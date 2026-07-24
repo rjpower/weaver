@@ -10,6 +10,7 @@ import SlackPanel from '../components/SlackPanel.vue';
 import EnvPanel from '../components/EnvPanel.vue';
 import LogsPanel from '../components/LogsPanel.vue';
 import ProfilesPanel from '../components/ProfilesPanel.vue';
+import McpPanel from '../components/McpPanel.vue';
 import CustomAgentsPanel from '../components/CustomAgentsPanel.vue';
 import AppearancePanel from '../components/AppearancePanel.vue';
 import SettingFieldRow from '../components/SettingFieldRow.vue';
@@ -44,7 +45,7 @@ const categories: CategoryItem[] = [
     id: 'agents',
     label: 'Agents',
     groups: ['Agents'],
-    summary: 'Default runtime profiles and custom agents for new work sessions.',
+    summary: 'Runtime profiles, MCP capabilities, and custom agents for new work sessions.',
   },
   {
     id: 'sessions',
@@ -310,6 +311,7 @@ onMounted(load);
 
         <div v-else-if="category === 'agents'" class="space-y-4">
           <ProfilesPanel :key="profilesKey" />
+          <McpPanel />
           <CustomAgentsPanel :agents="customAgents" @reload="reloadAgents" />
         </div>
 

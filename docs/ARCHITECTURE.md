@@ -54,6 +54,9 @@ other `weaver` subcommand.
 | `crates/loom/src/builtins.rs` | the builtin watch program registry; the script programs are real Python files in `crates/loom/watches/`, embedded into the binary |
 | `python/weaver-loom/` | the pure-Python layer over the loom REST API (`weaver_loom`: client + watch round context); stdlib-only, uv-buildable, vendored onto every script's `PYTHONPATH` by the engine; server-free contract tests in `tests/` (`uv run pytest`, CI's `python-binding` job) |
 | `crates/loom/src/agent.rs` | launching agents: resolving the execution `protocol`, launching a `terminal` agent into a per-session PTY (installing its `.claude/settings.local.json` hooks) or building an `acp` launch (`build_acp_launch` — the adapter command, `_meta` options, and goal), plus the one-shot headless agent behind `POST /api/agent/oneshot` |
+| `crates/loom/src/mcp/` | trusted builtin MCP registry and stdio adapters: provider-neutral versioned capability sets, exact permission translation, and the fixed GitHub/messaging bridges |
+| `crates/loom/src/custom_mcp.rs` | operator-authored MCP definitions: grouped path identities, immutable sqlite revisions, bounded `uv` validation, and exact session-snapshot execution |
+| `crates/loom/src/profile.rs` | named launch policy, including provider-neutral `mcp_access` resolution and the restricted-profile trust boundary |
 | `crates/loom/src/session.rs` | `Session` row + sqlx queries |
 | `crates/loom/src/chatlog.rs` | conversation log: capture at archive (write the iris `chat.json` + rendered `chat.md` under `session.log_dir`) and serve it for the Conversation tab (`conversation()` — a terminal session's live transcript, an acp session's chat journal mapped to iris (`journal_to_log`), else the capture) |
 | `crates/loom/src/backend.rs` | the terminal-management seam: every programmatic terminal op (create/has/capture/send/kill/list) drives the session's `tapestry` supervisor. Also the ACP transport seam — `new_relay_session`/`subscribe_relay`/`relay_write`/`relay_ack` drive a session's tapestry **relay** supervisor (a durable JSON-RPC frame spool) |
@@ -250,8 +253,11 @@ All routes live under `/api`. The Vue SPA is the primary consumer.
 | `GET /api/ready` | public structured readiness: database access plus core and loom migration versions; optional future remote runner degradation will be reported without failing the whole API |
 | `GET /metrics` | public OpenMetrics scrape derived from durable session/profile/run/migration state; labels are bounded operational dimensions and never contain session/branch/path/user/token/error values (deployments normally restrict this at the public edge) |
 | `GET /api/diagnostics` | admin-only redacted counts, profile capacity, automation failures/staleness, orphan/error inventory, migration state, and non-secret federation metadata; backs Settings → Diagnostics |
-| `GET /api/sessions` / `POST /api/sessions` | list / create sessions (list takes `archived` — default `false` — and `automation` — default `false`; create resolves `profile` or `default`, permits launch selectors only when the profile is non-strict, stamps the resolved profile revision/policy, opens a tracking issue, and returns its id as `tracking_issue`) |
-| `GET POST /api/profiles`; `GET PUT DELETE /api/profiles/{name}` | named launch-policy CRUD, including prelude and restricted Claude tool policy; profile secret values are never returned |
+| `GET /api/sessions` / `POST /api/sessions` | list / create sessions (list takes `archived` — default `false` — and `automation` — default `false`; create resolves `profile` or `default`, permits launch selectors only when the profile is non-strict, stamps the resolved profile revision/policy, opens a tracking issue, and returns its id as `tracking_issue`; views include the exact source-redacted MCP audit snapshot) |
+| `GET POST /api/profiles`; `GET PUT DELETE /api/profiles/{name}` | named launch-policy CRUD, including provider-neutral `mcp_access`, prelude, and the runtime-permission compatibility escape hatch; profile secret values are never returned |
+| `GET /api/profiles/{name}/effective`; `POST /api/profiles/{name}/probe` | inspect the exact profile-revision capability sets, custom revisions, runtime permission translation, and MCP processes without launching; probe also reports retired builtins and removed/disabled pinned custom definitions |
+| `GET /api/mcps` | merged trusted-builtin and operator-authored MCP registry |
+| `GET POST /api/mcps/custom`; `GET PUT DELETE /api/mcps/custom/{path}` | admin-only custom MCP CRUD; every write creates an immutable revision and validates real MCP discovery plus optional tests through `uv` |
 | `PUT DELETE /api/profiles/{profile}/env/{name}` | write-only profile environment management; a write supplies exactly one literal `value` or a full GCP Secret Manager `secret_ref`, and reads expose only source/reference metadata |
 | `POST /api/deployment/reconcile` | admin-only idempotent reconciliation of deployment-managed profiles, environment references, and federation mappings; pruning never touches operator-managed rows |
 | `POST /api/auth/federate` | exchange an exact mapped, signature-verified GitHub or Google OIDC identity for a ten-minute Ed25519-signed, profile-scoped Loom automation token |
@@ -740,6 +746,26 @@ handoff and permission-mode changes are forbidden. The stock `github_comment`
 profile contains the policy only; its reviewed JSON manifest is seeded when
 absent and then remains operator-editable. App-less deployments must provide
 its write-only `GH_TOKEN`.
+
+**MCP/profile control plane.** A profile stores `mcp_access` as `none`, `all`,
+or an explicit group list. Saving resolves the trusted builtin registry and
+enabled, validated custom definitions and pins the exact result to that profile
+revision. Launch validates availability, copies the capability
+identities/digests and custom source revisions into
+`sessions.policy_mcp_access`, and gives every ACP runtime native `mcpServers`
+descriptors whose subprocess tool surfaces are filtered to the stamped rules.
+Neither an unchanged profile nor recovery re-resolves the current registry.
+Custom definitions live under
+absolute identities such as `/engineering/search/docs`; their first segment is
+the selectable group. A save runs `initialize` and `tools/list`, then optional
+tests, through `uv run --script`. Runtime children start from a cleared
+environment with only `PATH`, Loom-controlled uv cache/interpreter paths, and
+session-scoped Loom API context. Custom code is
+admin-authored and dependency-contained, not sandboxed; it cannot use
+builtin-reserved group names or enter restricted sessions. Loom also refuses to
+remove a server pinned by a profile, or the last server in a group while an
+explicit profile selection still references it. The detailed rationale and diagrams are in
+[plans/mcp-profiles.md](plans/mcp-profiles.md).
 
 **Cookies** are `HttpOnly; SameSite=Lax; Path=/`; the `Secure` attribute is
 added when `auth.cookie_secure` is on (set it when loom is reached over HTTPS).

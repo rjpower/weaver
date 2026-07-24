@@ -431,10 +431,16 @@ export const deleteEnv = (name: string) =>
 
 // --- Launch profiles -------------------------------------------------------
 
-import type { Profile, ProfileInput } from './types';
+import type { CustomMcp, CustomMcpInput, Profile, ProfileInput } from './types';
 
 export const listProfiles = () => get('/profiles') as Promise<Profile[]>;
 export const getMcpRegistry = () => get('/mcps') as Promise<import('./types').McpRegistry>;
+export const createCustomMcp = (input: CustomMcpInput) =>
+  post('/mcps/custom', input) as Promise<CustomMcp>;
+export const updateCustomMcp = (identity: string, input: CustomMcpInput) =>
+  put(`/mcps/custom/${identity.replace(/^\/+/, '')}`, input) as Promise<CustomMcp>;
+export const deleteCustomMcp = (identity: string) =>
+  del(`/mcps/custom/${identity.replace(/^\/+/, '')}`);
 export const createProfile = (profile: ProfileInput) =>
   post('/profiles', profile) as Promise<Profile>;
 export const updateProfile = (name: string, profile: ProfileInput) =>

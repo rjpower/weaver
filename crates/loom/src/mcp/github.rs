@@ -33,11 +33,13 @@ pub(super) const ADAPTER: Adapter = Adapter {
     expand_tool_set,
     is_permission_rule,
     server_config,
+    tools,
     serve: serve_boxed,
 };
 
 const CAPABILITY_SETS: &[CapabilitySet] = &[CapabilitySet {
     name: COMMENT_TOOL_SET_V1,
+    group: "github",
     version: "v1",
     description: "Read, comment on, and edit the issue or pull request bound to the session.",
     tools: &GITHUB_TOOL_NAMES,
@@ -152,6 +154,12 @@ fn error(id: &Value, code: i64, message: impl Into<String>) -> Value {
 }
 
 async fn call_tool(name: &str, arguments: Value) -> Result<Value> {
+    if !GITHUB_TOOL_NAMES.contains(&name) {
+        anyhow::bail!("unknown GitHub tool '{name}'");
+    }
+    if !super::runtime_tool_allowed(name) {
+        anyhow::bail!("GitHub tool '{name}' is not allowed by this session");
+    }
     let session_id =
         std::env::var("LOOM_SESSION_ID").context("restricted MCP is missing LOOM_SESSION_ID")?;
     let path = format!(
@@ -195,7 +203,7 @@ async fn dispatch(request: Value) -> Option<Value> {
             )
         }
         "ping" => result(&id, json!({})),
-        "tools/list" => result(&id, json!({ "tools": tools() })),
+        "tools/list" => result(&id, json!({ "tools": super::runtime_tools(tools()) })),
         "tools/call" => {
             let name = request.pointer("/params/name").and_then(Value::as_str);
             let arguments = request
@@ -208,7 +216,7 @@ async fn dispatch(request: Value) -> Option<Value> {
                     Err(err) => result(
                         &id,
                         json!({
-                            "content": [{ "type": "text", "text": err.to_string() }],
+                            "content": [{ "type": "text", "text": format!("{err:#}") }],
                             "isError": true
                         }),
                     ),

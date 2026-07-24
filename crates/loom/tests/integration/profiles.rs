@@ -46,11 +46,13 @@ async fn stock_github_comment_profile_round_trips_restricted_policy() {
     assert_eq!(profile["mode"], "default");
     assert_eq!(profile["prelude"], "none");
     assert_eq!(profile["restricted"], true);
-    assert!(profile["allowed_tools"]
+    assert!(profile["runtime_permissions"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|rule| rule == "mcp/github/comment@v1"));
+        .any(|rule| rule == "Read(./**)"));
+    assert_eq!(profile["mcp_access"]["mode"], "groups");
+    assert_eq!(profile["mcp_access"]["groups"], json!(["github"]));
     assert!(profile["env"].as_array().unwrap().is_empty());
 }
 
@@ -69,6 +71,204 @@ async fn mcp_registry_is_inspectable_without_source_access() {
     assert!(set["digest"].as_str().unwrap().starts_with("sha256:"));
     assert_eq!(set["adapter"], "github");
     assert_eq!(set["tools"].as_array().unwrap().len(), 6);
+}
+
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_mcp_crud_validates_source_and_profiles_select_its_group() {
+    let ts = TestServer::start().await;
+    let source = r#"
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    if request["method"] == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "test-custom", "version": "1"},
+        }
+    elif request["method"] == "tools/list":
+        result = {
+            "tools": [{
+                "name": "ping",
+                "description": "Return a value.",
+                "inputSchema": {"type": "object"},
+            }]
+        }
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"#;
+    let test_source = r#"
+import os
+from pathlib import Path
+
+assert "tools/list" in Path(os.environ["LOOM_MCP_SOURCE"]).read_text()
+print("custom tests passed")
+"#;
+    let custom = ts
+        .client
+        .post(
+            "/api/mcps/custom",
+            json!({
+                "identity": "/ops/status",
+                "label": "Status helper",
+                "description": "Test custom MCP",
+                "source": source,
+                "test_source": test_source,
+                "enabled": true
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(custom["group"], "ops");
+    assert_eq!(custom["revision"], 1);
+    assert_eq!(custom["validation_state"], "ready");
+    assert_eq!(custom["tools"], json!(["ping"]));
+    assert!(custom["validation_message"]
+        .as_str()
+        .unwrap()
+        .contains("custom tests passed"));
+
+    let registry = ts.client.get("/api/mcps").await.unwrap();
+    assert!(registry["custom_servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|server| server["identity"] == "/ops/status"));
+
+    let profile_req = json!({
+        "name": "custom-tools",
+        "description": "ordinary ACP profile with custom tools",
+        "agent_kind": "claude",
+        "protocol": "acp",
+        "mode": "default",
+        "mcp_access": {"mode": "groups", "groups": ["ops"]}
+    });
+    let created_profile = ts
+        .client
+        .post("/api/profiles", profile_req.clone())
+        .await
+        .unwrap();
+    assert_eq!(created_profile["revision"], 1);
+    let effective = ts
+        .client
+        .get("/api/profiles/custom-tools/effective")
+        .await
+        .unwrap();
+    assert_eq!(
+        effective["mcp_policy"]["custom_servers"][0]["identity"],
+        "/ops/status"
+    );
+    assert_eq!(effective["mcp_policy"]["custom_servers"][0]["revision"], 1);
+    assert!(effective["runtime_permissions"][0]
+        .as_str()
+        .unwrap()
+        .starts_with("mcp__loom_custom_"));
+    assert!(
+        std::path::Path::new(effective["mcp_servers"][0]["command"].as_str().unwrap())
+            .is_absolute()
+    );
+    assert_eq!(
+        effective["mcp_servers"][0]["args"],
+        json!(["mcp", "serve-custom", "/ops/status"])
+    );
+    let probe = ts
+        .client
+        .post("/api/profiles/custom-tools/probe", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(probe["ok"], true);
+
+    let source_v2 = source.replace("Return a value.", "Return a pinned value.");
+    let edited = ts
+        .client
+        .put(
+            "/api/mcps/custom/ops/status",
+            json!({
+                "identity": "/ignored/by/put/path",
+                "label": "Status helper",
+                "description": "Test custom MCP",
+                "source": source_v2.clone(),
+                "test_source": test_source,
+                "enabled": true
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(edited["revision"], 2);
+    let still_pinned = ts
+        .client
+        .get("/api/profiles/custom-tools/effective")
+        .await
+        .unwrap();
+    assert_eq!(
+        still_pinned["mcp_policy"]["custom_servers"][0]["revision"],
+        1
+    );
+
+    let reconciled = ts
+        .client
+        .put("/api/profiles/custom-tools", profile_req)
+        .await
+        .unwrap();
+    assert_eq!(reconciled["revision"], 2);
+    let effective = ts
+        .client
+        .get("/api/profiles/custom-tools/effective")
+        .await
+        .unwrap();
+    assert_eq!(effective["mcp_policy"]["custom_servers"][0]["revision"], 2);
+
+    let disabled = ts
+        .client
+        .put(
+            "/api/mcps/custom/ops/status",
+            json!({
+                "identity": "/ignored/by/put/path",
+                "label": "Status helper",
+                "description": "Test custom MCP",
+                "source": source_v2,
+                "test_source": test_source,
+                "enabled": false
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disabled["identity"], "/ops/status");
+    assert_eq!(disabled["revision"], 3);
+    let probe = ts
+        .client
+        .post("/api/profiles/custom-tools/probe", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(probe["ok"], false);
+    assert!(probe["errors"][0].as_str().unwrap().contains("is disabled"));
+
+    let response = reqwest::Client::new()
+        .delete(format!("http://{}/api/mcps/custom/ops/status", ts.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(response.text().await.unwrap().contains("pinned by profile"));
+
+    let response = reqwest::Client::new()
+        .delete(format!("http://{}/api/profiles/custom-tools", ts.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = reqwest::Client::new()
+        .delete(format!("http://{}/api/mcps/custom/ops/status", ts.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
 #[serial]
@@ -101,6 +301,14 @@ async fn restricted_profile_sends_the_caller_goal_as_the_first_prompt() {
         )
         .await
         .unwrap();
+    assert_eq!(
+        session["mcp_policy"]["capability_sets"][0]["name"],
+        "mcp/github/comment@v1"
+    );
+    assert!(session["mcp_policy"]["capability_sets"][0]["digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
     let id = session["id"].as_str().unwrap();
     assert!(ts
         .client
@@ -249,6 +457,14 @@ async fn restricted_github_tool_uses_the_server_side_token_and_fixed_repo() {
     let stamped: Vec<String> = serde_json::from_str(&stamped).unwrap();
     assert!(stamped.contains(&"mcp__loom_github__issue_edit".to_string()));
     assert!(!stamped.contains(&"mcp/github/comment".to_string()));
+    let mcp_policy: String =
+        sqlx::query_scalar("SELECT policy_mcp_access FROM sessions WHERE id = ?")
+            .bind(id)
+            .fetch_one(&ts.state.db)
+            .await
+            .unwrap();
+    assert!(mcp_policy.contains("mcp/github/comment@v1"));
+    assert!(mcp_policy.contains("sha256:"));
     let tracking = weaver_core::issue::add(
         &ts.state.db,
         &weaver_core::issue::NewIssue {
@@ -411,14 +627,15 @@ async fn deployment_manifest_reconciles_profiles_secret_refs_and_workload_identi
             "profile": {
                 "name": "ops",
                 "description": "operations automation",
-                "agent_kind": "shell",
-                "protocol": "terminal",
+                "agent_kind": "claude",
+                "protocol": "acp",
                 "mode": "plan",
                 "class": "automation",
                 "strict": true,
                 "env_clear": true,
                 "max_concurrent": 1,
-                "turn_budget": 20
+                "turn_budget": 20,
+                "mcp_access": {"mode": "groups", "groups": ["messaging"]}
             },
             "env": [{
                 "name": "KUBECONFIG",
@@ -444,6 +661,10 @@ async fn deployment_manifest_reconciles_profiles_secret_refs_and_workload_identi
         .await
         .unwrap();
     assert_eq!(first["profiles"][0]["revision"], 1);
+    assert_eq!(
+        first["profiles"][0]["mcp_access"],
+        json!({"mode": "groups", "groups": ["messaging"]})
+    );
     assert_eq!(first["profiles"][0]["env"][0]["source"], "gcp_secret");
     assert_eq!(
         first["profiles"][0]["env"][0]["secret_ref"],

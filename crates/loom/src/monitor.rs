@@ -649,6 +649,8 @@ mod tests {
             policy_prelude: "weaver".to_string(),
             policy_restricted: false,
             policy_allowed_tools: "[]".to_string(),
+            policy_mcp_access: r#"{"selection":{"mode":"none","groups":[]},"capability_sets":[]}"#
+                .to_string(),
             creator_kind: "user".to_string(),
             creator_subject: "owner".to_string(),
             parent_session_id: None,

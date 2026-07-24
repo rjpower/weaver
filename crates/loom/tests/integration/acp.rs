@@ -96,6 +96,7 @@ async fn start_new_with_env(
         cwd: cwd.clone(),
         env,
         env_clear: false,
+        mcp_servers: vec![],
         new_or_load: NewOrLoad::New { cwd, meta: None },
         mode: mode.map(str::to_string),
         initial_model: None,
@@ -124,6 +125,7 @@ async fn silent_setup_stage_times_out_and_cleans_provider_state() {
             "session/new".to_string(),
         )],
         env_clear: false,
+        mcp_servers: vec![],
         new_or_load: NewOrLoad::New { cwd, meta: None },
         mode: None,
         initial_model: None,
@@ -360,6 +362,7 @@ async fn launch_model_and_effort_replace_adapter_config_defaults() {
         cwd: cwd.clone(),
         env: vec![],
         env_clear: false,
+        mcp_servers: vec![],
         new_or_load: NewOrLoad::New { cwd, meta: None },
         mode: None,
         initial_model: Some("fake-deep".to_string()),
@@ -394,6 +397,7 @@ async fn load_preserves_adapter_restored_model_and_effort() {
         cwd: cwd.clone(),
         env: vec![],
         env_clear: false,
+        mcp_servers: vec![],
         new_or_load: NewOrLoad::Load {
             acp_session_id: "fake-loaded".to_string(),
             meta: None,
@@ -2568,6 +2572,7 @@ async fn codex_acp_launch_maps_the_adapter_contract() {
         prelude: "weaver",
         restricted: false,
         allowed_tools: "[]",
+        mcp_access: r#"{"selection":{"mode":"none","groups":[]},"capability_sets":[],"custom_servers":[]}"#,
         custom: None,
     };
 

@@ -31,7 +31,10 @@ deployment-reconciliation contract; loading policy implicitly from a managed
 checkout would let repository content choose its own launch boundary and is
 deliberately unsupported. Custom profiles may compose the built-in capability
 sets Loom recognizes, but cannot define executable MCP adapters from repository
-content.
+content. Operator-authored custom MCPs are available to ordinary profiles only;
+their groups cannot shadow trusted builtin groups, and restricted profiles
+require explicit builtin groups rather than future-widening `all`, even though
+both use the same provider-neutral `mcp_access` contract.
 
 ## GitHub credential policy
 

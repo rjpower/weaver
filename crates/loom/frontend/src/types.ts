@@ -134,6 +134,8 @@ export interface Session {
   profile: string;
   profile_revision: number;
   launch_mode: string;
+  /** Exact capability snapshot stamped at launch. Custom source is redacted. */
+  mcp_policy: SessionMcpPolicy;
   /** The ACP modes the adapter offers, when the server exposes them. Absent today
    *  (SessionView carries only `current_mode`), so the mode chip falls back to the
    *  well-known claude/codex mode set — see `AcpConversation`. */
@@ -853,7 +855,8 @@ export interface Profile {
   turn_budget: number | null;
   prelude: 'weaver' | 'none';
   restricted: boolean;
-  allowed_tools: string[];
+  runtime_permissions: string[];
+  mcp_access: McpAccess;
   revision: number;
   created_at: string;
   updated_at: string;
@@ -872,6 +875,7 @@ export interface ProfileEnv {
 export interface McpRegistry {
   adapters: McpAdapter[];
   capability_sets: McpCapabilitySet[];
+  custom_servers: CustomMcp[];
 }
 
 export interface McpAdapter {
@@ -882,12 +886,55 @@ export interface McpAdapter {
 
 export interface McpCapabilitySet {
   name: string;
+  group: string;
   version: string;
   digest: string;
   description: string;
   adapter: string;
   tools: string[];
 }
+
+export interface McpAccess {
+  mode: 'none' | 'all' | 'groups';
+  groups: string[];
+}
+
+export interface SessionMcpPolicy {
+  selection: McpAccess;
+  capability_sets: McpCapabilitySet[];
+  custom_servers: SessionCustomMcp[];
+}
+
+export interface SessionCustomMcp {
+  identity: string;
+  group: string;
+  revision: number;
+  digest: string;
+  server_name: string;
+  tools: string[];
+}
+
+export interface CustomMcp {
+  identity: string;
+  group: string;
+  label: string;
+  description: string;
+  enabled: boolean;
+  revision: number;
+  digest: string;
+  source: string;
+  test_source: string;
+  tools: string[];
+  validation_state: 'ready' | 'failed';
+  validation_message: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export type CustomMcpInput = Pick<
+  CustomMcp,
+  'identity' | 'label' | 'description' | 'enabled' | 'source' | 'test_source'
+>;
 
 export type ProfileInput = Omit<Profile, 'revision' | 'created_at' | 'updated_at' | 'env'>;
 

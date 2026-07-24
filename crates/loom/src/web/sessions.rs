@@ -1064,12 +1064,24 @@ pub(crate) async fn provision_session(
     } else {
         (0, 0)
     };
+    let mcp_policy = launch_profile
+        .mcp_policy_snapshot()
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let mcp_errors = crate::mcp::snapshot_errors(&st.db, &mcp_policy).await?;
+    if !mcp_errors.is_empty() {
+        return Err(AppError::bad_request(format!(
+            "profile MCP policy is unavailable: {}",
+            mcp_errors.join("; ")
+        )));
+    }
     let stamped_allowed_tools = serde_json::to_string(
         &launch_profile
-            .effective_allowed_tool_rules()
+            .effective_allowed_tool_rules_for(&mcp_policy)
             .map_err(|error| AppError::bad_request(error.to_string()))?,
     )
     .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let stamped_mcp_access = serde_json::to_string(&mcp_policy)
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
     let (creator_kind, creator_subject) = actor.creator_identity();
     let launch_policy = session_mod::SessionLaunchPolicy {
         profile: profile_name.clone(),
@@ -1082,6 +1094,7 @@ pub(crate) async fn provision_session(
         prelude: launch_profile.prelude.clone(),
         restricted: launch_profile.restricted,
         allowed_tools: stamped_allowed_tools.clone(),
+        mcp_access: stamped_mcp_access,
         creator_kind: creator_kind.to_string(),
         creator_subject,
         parent_session_id,
@@ -1333,6 +1346,7 @@ pub(crate) async fn provision_session(
                 prelude: &launch_profile.prelude,
                 restricted: launch_profile.restricted,
                 allowed_tools: &stamped_allowed_tools,
+                mcp_access: &launch_policy.mcp_access,
                 custom: custom.as_ref(),
             },
             agent::AcpOpen::Fresh,
@@ -2071,12 +2085,24 @@ pub(crate) async fn create_warm_session(
     // a transient authentication failure during startup.
     let status = agent::initial_status(&st.db, &agent).await;
     let (inherited_idle, inherited_turn_budget) = automation_policy_defaults(&st.db).await;
+    let mcp_policy = launch_profile
+        .mcp_policy_snapshot()
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let mcp_errors = crate::mcp::snapshot_errors(&st.db, &mcp_policy).await?;
+    if !mcp_errors.is_empty() {
+        return Err(AppError::bad_request(format!(
+            "profile MCP policy is unavailable: {}",
+            mcp_errors.join("; ")
+        )));
+    }
     let stamped_allowed_tools = serde_json::to_string(
         &launch_profile
-            .effective_allowed_tool_rules()
+            .effective_allowed_tool_rules_for(&mcp_policy)
             .map_err(|error| AppError::bad_request(error.to_string()))?,
     )
     .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let stamped_mcp_access = serde_json::to_string(&mcp_policy)
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
     let session = session_mod::insert_with_policy(
         &st.db,
         &NewSession {
@@ -2108,6 +2134,7 @@ pub(crate) async fn create_warm_session(
             prelude: launch_profile.prelude.clone(),
             restricted: launch_profile.restricted,
             allowed_tools: stamped_allowed_tools,
+            mcp_access: stamped_mcp_access,
             creator_kind: "system".to_string(),
             creator_subject: format!("watch:{}", watch.id),
             parent_session_id: None,
@@ -2288,6 +2315,7 @@ async fn adopt_terminal_into_acp(
             prelude: &session.policy_prelude,
             restricted: session.policy_restricted,
             allowed_tools: &session.policy_allowed_tools,
+            mcp_access: &session.policy_mcp_access,
             custom: None,
         },
         open,
@@ -2387,6 +2415,7 @@ async fn adopt_acp(
                 prelude: &session.policy_prelude,
                 restricted: session.policy_restricted,
                 allowed_tools: &session.policy_allowed_tools,
+                mcp_access: &session.policy_mcp_access,
                 custom: custom.as_ref(),
             },
             open,
@@ -3008,6 +3037,7 @@ pub(super) async fn handoff_session(
             prelude: &session.policy_prelude,
             restricted: session.policy_restricted,
             allowed_tools: &session.policy_allowed_tools,
+            mcp_access: &session.policy_mcp_access,
             custom: custom.as_ref(),
         },
         agent::AcpOpen::Fresh,

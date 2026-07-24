@@ -673,9 +673,34 @@ enum McpCmd {
     Ls,
     /// Show one versioned capability set by name.
     Show { name: String },
+    /// Add or replace an operator-authored uv MCP script.
+    Add(Box<McpAddOpts>),
+    /// Remove an operator-authored MCP definition.
+    Rm { identity: String },
     /// Run one trusted stdio adapter (used only by Loom's agent runtime).
     #[command(hide = true)]
     Serve { adapter: String },
+    /// Run an exact custom source snapshot (used only by the agent runtime).
+    #[command(hide = true)]
+    ServeCustom { identity: String },
+}
+
+#[derive(Args)]
+struct McpAddOpts {
+    /// Absolute identity, for example /engineering/search/docs.
+    identity: String,
+    #[arg(long)]
+    label: String,
+    #[arg(long, default_value = "")]
+    description: String,
+    /// Python script containing PEP 723 inline dependencies.
+    #[arg(long)]
+    file: String,
+    /// Optional uv Python test script.
+    #[arg(long)]
+    tests: Option<String>,
+    #[arg(long)]
+    disabled: bool,
 }
 
 #[derive(Subcommand)]
@@ -685,7 +710,14 @@ enum ProfileCmd {
     /// List profiles (secret values are never returned).
     Ls,
     /// Show one profile.
-    Show { name: String },
+    Show {
+        name: String,
+        /// Resolve the exact runtime permissions and MCP processes.
+        #[arg(long)]
+        effective: bool,
+    },
+    /// Validate and resolve a profile without launching a session.
+    Probe { name: String },
     /// Remove an unused profile (`default` is protected).
     Rm { name: String },
     /// Manage a profile's write-only environment.
@@ -730,9 +762,16 @@ struct ProfileAddOpts {
     /// Apply Loom's restricted automation security posture.
     #[arg(long)]
     restricted: bool,
-    /// Claude SDK tool rules allowed without an interactive approval.
-    #[arg(long, value_delimiter = ',')]
-    allowed_tool: Vec<String>,
+    /// Provider runtime permission rules (legacy; prefer --mcp).
+    #[arg(
+        long = "runtime-permission",
+        visible_alias = "allowed-tool",
+        value_delimiter = ','
+    )]
+    runtime_permission: Vec<String>,
+    /// MCP access mode: none, all, or a comma-separated group list.
+    #[arg(long, default_value = "none")]
+    mcp: String,
 }
 
 #[derive(Subcommand)]
@@ -974,24 +1013,84 @@ async fn run_session(cmd: SessionCmd) -> Result<()> {
 async fn run_mcp(cmd: McpCmd) -> Result<()> {
     match cmd {
         McpCmd::Serve { adapter } => loom::mcp::serve(&adapter).await,
+        McpCmd::ServeCustom { identity } => loom::custom_mcp::serve_from_env(&identity).await,
         McpCmd::Ls => {
             let registry = client::default()?.mcp_registry().await?;
-            for set in registry.capability_sets {
+            for set in &registry.capability_sets {
                 println!(
                     "{:<30} {:<4} {:<12} {}",
                     set.name, set.version, set.adapter, set.description
+                );
+            }
+            for server in &registry.custom_servers {
+                println!(
+                    "{:<30} r{:<3} {:<12} {}",
+                    server.identity, server.revision, server.validation_state, server.description
                 );
             }
             Ok(())
         }
         McpCmd::Show { name } => {
             let registry = client::default()?.mcp_registry().await?;
+            if let Some(server) = registry
+                .custom_servers
+                .iter()
+                .find(|server| server.identity == name)
+            {
+                println!("{}", serde_json::to_string_pretty(server)?);
+                return Ok(());
+            }
             let set = registry
                 .capability_sets
                 .into_iter()
                 .find(|set| set.name == name)
                 .ok_or_else(|| anyhow!("unknown MCP capability set '{name}'"))?;
             println!("{}", serde_json::to_string_pretty(&set)?);
+            Ok(())
+        }
+        McpCmd::Add(opts) => {
+            let source = std::fs::read_to_string(&opts.file)
+                .with_context(|| format!("reading custom MCP source {}", opts.file))?;
+            let test_source = match &opts.tests {
+                Some(path) => std::fs::read_to_string(path)
+                    .with_context(|| format!("reading custom MCP tests {path}"))?,
+                None => String::new(),
+            };
+            let req = weaver_api::CustomMcpReq {
+                identity: opts.identity.clone(),
+                label: opts.label.clone(),
+                description: opts.description.clone(),
+                source,
+                test_source,
+                enabled: !opts.disabled,
+            };
+            let registry = client::default()?.mcp_registry().await?;
+            let value = if registry
+                .custom_servers
+                .iter()
+                .any(|server| server.identity == opts.identity)
+            {
+                client::default()?
+                    .put_custom_mcp(&opts.identity, &req)
+                    .await?
+            } else {
+                client::default()?.create_custom_mcp(&req).await?
+            };
+            println!(
+                "{} revision {} ({})",
+                value.identity, value.revision, value.validation_state
+            );
+            if !value.validation_message.is_empty() {
+                println!("{}", value.validation_message);
+            }
+            if value.validation_state != "ready" {
+                bail!("custom MCP validation failed");
+            }
+            Ok(())
+        }
+        McpCmd::Rm { identity } => {
+            client::default()?.delete_custom_mcp(&identity).await?;
+            println!("removed {identity}");
             Ok(())
         }
     }
@@ -1289,7 +1388,8 @@ async fn run_profile(cmd: ProfileCmd) -> Result<()> {
                     turn_budget: opts.turn_budget,
                     prelude: opts.prelude,
                     restricted: opts.restricted,
-                    allowed_tools: opts.allowed_tool,
+                    runtime_permissions: opts.runtime_permission,
+                    mcp_access: parse_mcp_access(&opts.mcp)?,
                 })
                 .await?;
             println!(
@@ -1309,11 +1409,22 @@ async fn run_profile(cmd: ProfileCmd) -> Result<()> {
                 );
             }
         }
-        ProfileCmd::Show { name } => {
+        ProfileCmd::Show { name, effective } => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&client.get_profile(&name).await?)?
+                if effective {
+                    serde_json::to_string_pretty(&client.effective_profile(&name).await?)?
+                } else {
+                    serde_json::to_string_pretty(&client.get_profile(&name).await?)?
+                }
             );
+        }
+        ProfileCmd::Probe { name } => {
+            let probe = client.probe_profile(&name).await?;
+            println!("{}", serde_json::to_string_pretty(&probe)?);
+            if !probe.ok {
+                bail!("profile probe failed");
+            }
         }
         ProfileCmd::Rm { name } => {
             client.delete_profile(&name).await?;
@@ -1345,6 +1456,29 @@ async fn run_profile(cmd: ProfileCmd) -> Result<()> {
         },
     }
     Ok(())
+}
+
+fn parse_mcp_access(value: &str) -> Result<weaver_api::McpAccess> {
+    let value = value.trim();
+    if matches!(value, "none" | "all") {
+        return Ok(weaver_api::McpAccess {
+            mode: value.to_string(),
+            groups: Vec::new(),
+        });
+    }
+    let groups = value
+        .split(',')
+        .map(str::trim)
+        .filter(|group| !group.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if groups.is_empty() {
+        bail!("--mcp must be 'none', 'all', or a comma-separated group list");
+    }
+    Ok(weaver_api::McpAccess {
+        mode: "groups".to_string(),
+        groups,
+    })
 }
 
 async fn cmd_token_create(name: String, expires_days: Option<i64>) -> Result<()> {
@@ -3708,6 +3842,58 @@ mod tests {
                     ..
                 }
             } if name == "production"
+        ));
+    }
+
+    #[test]
+    fn profile_mcp_cli_parses_modes_and_groups() {
+        assert_eq!(
+            parse_mcp_access("none").unwrap(),
+            weaver_api::McpAccess::default()
+        );
+        assert_eq!(
+            parse_mcp_access("all").unwrap(),
+            weaver_api::McpAccess {
+                mode: "all".to_string(),
+                groups: vec![],
+            }
+        );
+        assert_eq!(
+            parse_mcp_access("github, messaging").unwrap(),
+            weaver_api::McpAccess {
+                mode: "groups".to_string(),
+                groups: vec!["github".to_string(), "messaging".to_string()],
+            }
+        );
+        assert!(parse_mcp_access("").is_err());
+
+        let Cli { cmd, .. } =
+            Cli::try_parse_from(["loom", "mcp", "show", "mcp/github/comment@v1"]).unwrap();
+        assert!(matches!(
+            cmd,
+            Cmd::Mcp {
+                cmd: McpCmd::Show { name }
+            } if name == "mcp/github/comment@v1"
+        ));
+
+        let Cli { cmd, .. } = Cli::try_parse_from([
+            "loom",
+            "profile",
+            "add",
+            "ops",
+            "--agent",
+            "claude",
+            "--protocol",
+            "acp",
+            "--mcp",
+            "github,messaging",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cmd,
+            Cmd::Profile {
+                cmd: ProfileCmd::Add(options)
+            } if options.mcp == "github,messaging"
         ));
     }
 

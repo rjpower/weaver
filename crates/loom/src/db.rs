@@ -35,6 +35,11 @@ const LOOM_MIGRATIONS: &[(i64, &str, &str)] = &[
         "restricted-profiles",
         include_str!("../migrations/0005_restricted_profiles.sql"),
     ),
+    (
+        6,
+        "mcp-access",
+        include_str!("../migrations/0006_mcp_access.sql"),
+    ),
 ];
 
 const LOOM_STREAM: Stream = Stream::new("loom_schema_migrations", LOOM_MIGRATIONS);
@@ -84,6 +89,7 @@ async fn migrate_loom(pool: &Db) -> Result<()> {
 
     LOOM_STREAM.ensure_indicator(pool).await?;
     LOOM_STREAM.apply_pending(pool).await?;
+    crate::profile::backfill_mcp_policies(pool).await?;
     crate::profile::normalize_default(pool).await?;
     crate::profile::seed_stock_profiles(pool).await?;
 
@@ -263,7 +269,7 @@ mod tests {
                 .fetch_all(&db)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
 
         let columns = table_columns(&db, "sessions").await.unwrap();
         for expected in [
@@ -281,6 +287,7 @@ mod tests {
             "policy_prelude",
             "policy_restricted",
             "policy_allowed_tools",
+            "policy_mcp_access",
         ] {
             assert!(
                 columns.iter().any(|column| column == expected),
@@ -296,10 +303,7 @@ mod tests {
         assert_eq!(stock.prelude, "none");
         assert_eq!(stock.agent_kind, "claude");
         assert_eq!(stock.mode, "default");
-        assert!(stock
-            .allowed_tool_rules()
-            .unwrap()
-            .contains(&"mcp/github/comment@v1".to_string()));
+        assert_eq!(stock.mcp_access().unwrap().groups, vec!["github"]);
 
         insert_branch(&db, "t1").await;
         sqlx::query(
@@ -310,6 +314,39 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcp_migration_preserves_legacy_profile_intent() {
+        let db = core_connect_in_memory().await.unwrap();
+        for (_, _, migration) in LOOM_MIGRATIONS.iter().take(5) {
+            for statement in split_statements(migration) {
+                sqlx::query(&statement).execute(&db).await.unwrap();
+            }
+        }
+        sqlx::query(
+            "UPDATE profiles
+             SET allowed_tools = '[\"Read(./**)\",\"mcp/github/comment@v1\"]'
+             WHERE name = 'default'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        for statement in split_statements(LOOM_MIGRATIONS[5].2) {
+            sqlx::query(&statement).execute(&db).await.unwrap();
+        }
+
+        let row =
+            sqlx::query("SELECT allowed_tools, mcp_access FROM profiles WHERE name = 'default'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(row.get::<String, _>("allowed_tools"), r#"["Read(./**)"]"#);
+        assert_eq!(
+            row.get::<String, _>("mcp_access"),
+            r#"{"mode":"groups","groups":["github"]}"#
+        );
     }
 
     /// Regression for the on-disk upgrade path: loom once opened the shared
@@ -363,7 +400,7 @@ mod tests {
                 .fetch_all(&db)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
         let index_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master
              WHERE type = 'index' AND name = 'idx_sessions_active_branch'",
@@ -437,7 +474,7 @@ mod tests {
             .fetch_one(&db)
             .await
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 6);
 
         // Adoption replaced the historical index predicate: archived history
         // no longer prevents a new active session from claiming the branch.
