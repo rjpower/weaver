@@ -3,7 +3,10 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use weaver_api::{ProfileEnvView, ProfileReq, ProfileView, PutProfileEnvReq};
+use weaver_api::{
+    EffectiveProfileView, McpServerProcessView, ProfileEnvView, ProfileProbeView, ProfileReq,
+    ProfileView, PutProfileEnvReq,
+};
 
 use crate::profile::{self, Profile, ProfileInput};
 
@@ -27,7 +30,8 @@ pub(super) fn input(req: ProfileReq, name: String) -> ProfileInput {
         turn_budget: req.turn_budget,
         prelude: req.prelude,
         restricted: req.restricted,
-        allowed_tools: req.allowed_tools,
+        allowed_tools: req.runtime_permissions,
+        mcp_access: req.mcp_access,
     }
 }
 
@@ -45,8 +49,11 @@ pub(super) async fn view(st: &AppState, profile: Profile) -> ApiResult<ProfileVi
             updated_at: entry.updated_at,
         })
         .collect();
-    let allowed_tools = profile
+    let runtime_permissions = profile
         .allowed_tool_rules()
+        .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mcp_access = profile
+        .mcp_access()
         .map_err(|e| AppError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(ProfileView {
         name: profile.name,
@@ -65,7 +72,8 @@ pub(super) async fn view(st: &AppState, profile: Profile) -> ApiResult<ProfileVi
         turn_budget: profile.turn_budget,
         prelude: profile.prelude,
         restricted: profile.restricted,
-        allowed_tools,
+        runtime_permissions,
+        mcp_access,
         revision: profile.revision,
         created_at: profile.created_at,
         updated_at: profile.updated_at,
@@ -89,6 +97,62 @@ pub(super) async fn get_profile(
         .await?
         .ok_or_else(|| AppError::not_found("profile"))?;
     Ok(Json(view(&st, item).await?))
+}
+
+async fn effective(st: &AppState, item: Profile) -> ApiResult<EffectiveProfileView> {
+    let mcp_policy = item
+        .mcp_policy_snapshot()
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let runtime_permissions = item
+        .effective_allowed_tool_rules_for(&mcp_policy)
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let mcp_servers = crate::mcp::acp_server_configs(&runtime_permissions, Some(&mcp_policy))
+        .into_iter()
+        .map(|config| McpServerProcessView {
+            name: config["name"].as_str().unwrap_or_default().to_string(),
+            command: config["command"].as_str().unwrap_or_default().to_string(),
+            args: config["args"]
+                .as_array()
+                .map(|args| {
+                    args.iter()
+                        .filter_map(|arg| arg.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+        .collect();
+    Ok(EffectiveProfileView {
+        profile: view(st, item).await?,
+        mcp_policy,
+        runtime_permissions,
+        mcp_servers,
+    })
+}
+
+pub(super) async fn effective_profile(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<EffectiveProfileView>> {
+    let item = profile::get(&st.db, &name)
+        .await?
+        .ok_or_else(|| AppError::not_found("profile"))?;
+    Ok(Json(effective(&st, item).await?))
+}
+
+pub(super) async fn probe_profile(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<ProfileProbeView>> {
+    let item = profile::get(&st.db, &name)
+        .await?
+        .ok_or_else(|| AppError::not_found("profile"))?;
+    let effective = effective(&st, item).await?;
+    let errors = crate::mcp::snapshot_errors(&st.db, &effective.mcp_policy).await?;
+    Ok(Json(ProfileProbeView {
+        ok: errors.is_empty(),
+        effective,
+        errors,
+    }))
 }
 
 pub(super) async fn create_profile(

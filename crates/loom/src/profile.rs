@@ -39,6 +39,10 @@ pub struct Profile {
     pub restricted: bool,
     /// JSON array in storage; parsed through [`allowed_tool_rules`].
     pub allowed_tools: String,
+    /// Provider-neutral MCP selection JSON.
+    pub mcp_access: String,
+    /// Exact resolved registry snapshot pinned to this profile revision.
+    pub mcp_policy: String,
     pub revision: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -57,10 +61,32 @@ impl Profile {
         serde_json::from_str(&self.allowed_tools).context("invalid profile allowed tools")
     }
 
+    pub fn mcp_access(&self) -> Result<weaver_api::McpAccess> {
+        serde_json::from_str(&self.mcp_access).context("invalid profile MCP access")
+    }
+
+    pub fn mcp_policy_snapshot(&self) -> Result<weaver_api::McpPolicySnapshot> {
+        serde_json::from_str(&self.mcp_policy).context("invalid profile MCP policy snapshot")
+    }
+
     /// Exact rules to stamp onto a session. Profiles retain concise built-in
     /// MCP set names, but launched sessions are immutable and auditable.
     pub fn effective_allowed_tool_rules(&self) -> Result<Vec<String>> {
-        crate::mcp::expand_tool_sets(&self.allowed_tool_rules()?)
+        let snapshot = self.mcp_policy_snapshot()?;
+        self.effective_allowed_tool_rules_for(&snapshot)
+    }
+
+    pub fn effective_allowed_tool_rules_for(
+        &self,
+        snapshot: &weaver_api::McpPolicySnapshot,
+    ) -> Result<Vec<String>> {
+        let mut rules = crate::mcp::expand_tool_sets(&self.allowed_tool_rules()?)?;
+        for rule in crate::mcp::rules_for_snapshot(snapshot)? {
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        }
+        Ok(rules)
     }
 
     pub fn as_input(&self) -> Result<ProfileInput> {
@@ -82,6 +108,7 @@ impl Profile {
             prelude: self.prelude.clone(),
             restricted: self.restricted,
             allowed_tools: self.allowed_tool_rules()?,
+            mcp_access: self.mcp_access()?,
         })
     }
 }
@@ -118,8 +145,10 @@ pub struct ProfileInput {
     pub prelude: String,
     #[serde(default)]
     pub restricted: bool,
-    #[serde(default)]
+    #[serde(default, alias = "runtime_permissions")]
     pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub mcp_access: weaver_api::McpAccess,
 }
 
 fn default_class() -> String {
@@ -206,7 +235,10 @@ pub fn validate_name(name: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-async fn validate_input(db: &Db, input: &ProfileInput) -> Result<(String, String)> {
+async fn validate_input(
+    db: &Db,
+    input: &ProfileInput,
+) -> Result<(String, String, weaver_api::McpPolicySnapshot)> {
     validate_name(input.name.trim()).map_err(|e| anyhow!(e))?;
     if !matches!(input.class.trim(), "interactive" | "automation") {
         bail!("profile class must be 'interactive' or 'automation'");
@@ -237,6 +269,30 @@ async fn validate_input(db: &Db, input: &ProfileInput) -> Result<(String, String
     {
         bail!("invalid profile allowed tool rule");
     }
+    let mcp_snapshot = crate::mcp::resolve_access(db, &input.mcp_access).await?;
+    let custom_selected = crate::custom_mcp::list(db).await?.iter().any(|server| {
+        input.mcp_access.mode == "all"
+            || (input.mcp_access.mode == "groups"
+                && input.mcp_access.groups.contains(&server.group))
+    });
+    if input.mcp_access.mode != "groups" && !input.mcp_access.groups.is_empty() {
+        bail!("MCP groups may only be set when MCP access mode is 'groups'");
+    }
+    if input.mcp_access.mode == "groups" && input.mcp_access.groups.is_empty() {
+        bail!("MCP access mode 'groups' requires at least one group");
+    }
+    if input.mcp_access.groups.len() > 64 {
+        bail!("an MCP profile may select at most 64 groups");
+    }
+    let mut unique_groups = std::collections::HashSet::new();
+    if input
+        .mcp_access
+        .groups
+        .iter()
+        .any(|group| group.len() > 64 || !unique_groups.insert(group))
+    {
+        bail!("MCP groups must be unique and at most 64 bytes");
+    }
     let agent_kind = input.agent_kind.trim();
     let meta = crate::agent::metadata_for(db, agent_kind)
         .await?
@@ -259,6 +315,15 @@ async fn validate_input(db: &Db, input: &ProfileInput) -> Result<(String, String
     ) {
         bail!("invalid profile mode '{mode}'");
     }
+    if protocol != "acp"
+        && (input.mcp_access.mode != "none"
+            || input
+                .allowed_tools
+                .iter()
+                .any(|rule| is_restricted_mcp_tool_set(rule)))
+    {
+        bail!("MCP access requires the ACP protocol");
+    }
     if input.restricted
         && (input.class.trim() != "automation"
             || !input.strict
@@ -267,7 +332,9 @@ async fn validate_input(db: &Db, input: &ProfileInput) -> Result<(String, String
             || protocol != "acp"
             || mode != "default"
             || input.prelude.trim() != "none"
-            || input.allowed_tools.is_empty()
+            || input.mcp_access.mode == "all"
+            || (input.allowed_tools.is_empty() && mcp_snapshot.capability_sets.is_empty())
+            || custom_selected
             || input
                 .allowed_tools
                 .iter()
@@ -276,7 +343,7 @@ async fn validate_input(db: &Db, input: &ProfileInput) -> Result<(String, String
     {
         bail!("restricted profiles must be strict env-cleared Claude ACP automation profiles with prelude 'none', mode 'default', no ambient allowlist, repository-scoped read rules, and/or reviewed built-in MCP tool sets");
     }
-    Ok((protocol, mode))
+    Ok((protocol, mode, mcp_snapshot))
 }
 
 pub async fn active_count(db: &Db, name: &str) -> Result<i64> {
@@ -308,7 +375,7 @@ pub async fn get(db: &Db, name: &str) -> Result<Option<Profile>> {
 
 pub async fn upsert(db: &Db, input: &ProfileInput) -> Result<Profile> {
     let name = input.name.trim();
-    let (protocol, mode) = validate_input(db, input).await?;
+    let (protocol, mode, mcp_policy) = validate_input(db, input).await?;
     let normalized = ProfileInput {
         name: name.to_string(),
         description: input.description.trim().to_string(),
@@ -327,17 +394,24 @@ pub async fn upsert(db: &Db, input: &ProfileInput) -> Result<Profile> {
         prelude: input.prelude.trim().to_string(),
         restricted: input.restricted,
         allowed_tools: input.allowed_tools.clone(),
+        mcp_access: input.mcp_access.clone(),
     };
     let ambient = serde_json::to_string(&normalized.ambient_allowlist)?;
     let allowed_tools = serde_json::to_string(&normalized.allowed_tools)?;
+    let mcp_access = serde_json::to_string(&normalized.mcp_access)?;
+    let mcp_policy_json = serde_json::to_string(&mcp_policy)?;
     if let Some(existing) = get(db, name).await? {
-        if existing.as_input()? == normalized {
+        if existing.as_input()? == normalized && existing.mcp_policy_snapshot()? == mcp_policy {
             return Ok(existing);
         }
         let widens_restricted_tools = existing.restricted
             && widens_allowlist(
-                &existing.effective_allowed_tool_rules()?,
-                &crate::mcp::expand_tool_sets(&normalized.allowed_tools)?,
+                &existing.effective_allowed_tool_rules_for(&existing.mcp_policy_snapshot()?)?,
+                &{
+                    let mut rules = crate::mcp::expand_tool_sets(&normalized.allowed_tools)?;
+                    rules.extend(crate::mcp::rules_for_snapshot(&mcp_policy)?);
+                    rules
+                },
             );
         if existing.is_automation_safe()
             && has_automation_sessions(db, name).await?
@@ -357,8 +431,8 @@ pub async fn upsert(db: &Db, input: &ProfileInput) -> Result<Profile> {
          (name, description, agent_kind, model, effort, protocol, mode, class,
           strict, env_clear, ambient_allowlist, idle_archive_secs, max_concurrent,
           turn_budget, revision, created_at, updated_at, prelude, restricted,
-          allowed_tools)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+          allowed_tools, mcp_access, mcp_policy)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(name) DO UPDATE SET
           description=excluded.description, agent_kind=excluded.agent_kind,
           model=excluded.model, effort=excluded.effort, protocol=excluded.protocol,
@@ -367,7 +441,8 @@ pub async fn upsert(db: &Db, input: &ProfileInput) -> Result<Profile> {
           idle_archive_secs=excluded.idle_archive_secs,
           max_concurrent=excluded.max_concurrent, turn_budget=excluded.turn_budget,
           prelude=excluded.prelude, restricted=excluded.restricted,
-          allowed_tools=excluded.allowed_tools,
+          allowed_tools=excluded.allowed_tools, mcp_access=excluded.mcp_access,
+          mcp_policy=excluded.mcp_policy,
           revision=profiles.revision + 1, updated_at=excluded.updated_at",
     )
     .bind(name)
@@ -389,6 +464,8 @@ pub async fn upsert(db: &Db, input: &ProfileInput) -> Result<Profile> {
     .bind(&normalized.prelude)
     .bind(normalized.restricted)
     .bind(allowed_tools)
+    .bind(mcp_access)
+    .bind(mcp_policy_json)
     .execute(db)
     .await?;
     get(db, name)
@@ -632,6 +709,23 @@ pub async fn seed_stock_profiles(db: &Db) -> Result<()> {
     Ok(())
 }
 
+/// Populate the exact MCP snapshot for profiles created before migration 6.
+/// This is a compatibility backfill, so it does not advance their revision.
+pub async fn backfill_mcp_policies(db: &Db) -> Result<()> {
+    for profile in list(db).await? {
+        if !profile.mcp_policy.is_empty() {
+            continue;
+        }
+        let snapshot = crate::mcp::resolve_access(db, &profile.mcp_access()?).await?;
+        sqlx::query("UPDATE profiles SET mcp_policy = ? WHERE name = ? AND mcp_policy = ''")
+            .bind(serde_json::to_string(&snapshot)?)
+            .bind(&profile.name)
+            .execute(db)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Repair the one-time legacy seed through the same runtime metadata validators
 /// new profile writes use. Valid profiles are left untouched; a stale removed
 /// custom agent or selector falls back to the builtin default instead of making
@@ -658,6 +752,7 @@ pub async fn normalize_default(db: &Db) -> Result<()> {
         prelude: current.prelude.clone(),
         restricted: current.restricted,
         allowed_tools: current.allowed_tool_rules().unwrap_or_default(),
+        mcp_access: current.mcp_access().unwrap_or_default(),
     };
     if validate_input(db, &input).await.is_ok() {
         return Ok(());
@@ -695,7 +790,7 @@ mod tests {
         assert_eq!(allowed_tool_name("Bash"), Some("Bash"));
         assert_eq!(allowed_tool_name("Bash(gh issue view:*"), None);
         assert_eq!(allowed_tool_name(" Bash(gh issue view:*)"), None);
-        assert!(is_restricted_mcp_tool_set("mcp/github/comment"));
+        assert!(is_restricted_mcp_tool_set("mcp/github/comment@v1"));
         assert!(!is_restricted_mcp_tool_set("mcp/github/admin"));
     }
 
@@ -710,12 +805,39 @@ mod tests {
         input.allowed_tools = vec!["Read(./**)".to_string()];
         assert!(upsert(&db, &input).await.is_ok());
 
-        input.allowed_tools = vec!["mcp/github/comment".to_string()];
+        input.allowed_tools = vec!["mcp/github/comment@v1".to_string()];
         assert!(upsert(&db, &input).await.is_ok());
 
         input.allowed_tools = vec!["Read(../**)".to_string()];
         assert!(upsert(&db, &input).await.is_err());
         input.allowed_tools = vec!["Glob(/etc/**)".to_string()];
+        assert!(upsert(&db, &input).await.is_err());
+
+        input.allowed_tools = vec!["Read(./**)".to_string()];
+        input.mcp_access = weaver_api::McpAccess {
+            mode: "all".to_string(),
+            groups: Vec::new(),
+        };
+        assert!(upsert(&db, &input).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mcp_selection_requires_groups_and_acp() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let mut input = get(&db, DEFAULT_PROFILE)
+            .await
+            .unwrap()
+            .unwrap()
+            .as_input()
+            .unwrap();
+        input.mcp_access = weaver_api::McpAccess {
+            mode: "groups".to_string(),
+            groups: Vec::new(),
+        };
+        assert!(upsert(&db, &input).await.is_err());
+
+        input.mcp_access.groups = vec!["github".to_string()];
+        input.protocol = "terminal".to_string();
         assert!(upsert(&db, &input).await.is_err());
     }
 

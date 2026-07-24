@@ -894,6 +894,8 @@ pub struct AcpLaunchSpec<'a> {
     pub restricted: bool,
     /// JSON array stamped on the session/profile.
     pub allowed_tools: &'a str,
+    /// Provider-neutral MCP policy snapshot stamped onto the session.
+    pub mcp_access: &'a str,
     /// The resolved custom agent when `runtime` names one (its `launch` command is
     /// the ACP adapter); `None` for the builtin claude.
     pub custom: Option<&'a CustomAgent>,
@@ -938,6 +940,11 @@ pub async fn build_acp_launch(
 
     let primer_text = read_opt(spec.primer_file).await;
     let mut goal_text = read_opt(spec.goal_file).await;
+    let allowed_tools: Vec<String> = serde_json::from_str(spec.allowed_tools)
+        .context("invalid session runtime-permission snapshot")?;
+    let mcp_snapshot: weaver_api::McpPolicySnapshot =
+        serde_json::from_str(spec.mcp_access).context("invalid session MCP policy snapshot")?;
+    let mcp_servers = crate::mcp::acp_server_configs(&allowed_tools, Some(&mcp_snapshot));
     if is_codex && goal_text.is_none() {
         // No appendSystemPrompt analogue: a primer-only launch seeds the primer
         // positionally, mirroring the terminal path's
@@ -1005,6 +1012,7 @@ pub async fn build_acp_launch(
         cwd: spec.work_dir.to_path_buf(),
         env,
         env_clear: spec.env_clear,
+        mcp_servers,
         new_or_load,
         // Codex boots directly in its mapped mode via `INITIAL_AGENT_MODE`; a
         // post-setup `session/set_mode` would re-send a claude-flavored id it
@@ -1179,9 +1187,8 @@ fn claude_acp_meta(
     if !mode.is_empty() {
         options.insert("permissionMode".to_string(), json!(mode));
     }
+    let allowed_tools: Vec<String> = serde_json::from_str(allowed_tools_json).unwrap_or_default();
     if restricted {
-        let allowed_tools: Vec<String> =
-            serde_json::from_str(allowed_tools_json).unwrap_or_default();
         let mut tools = Vec::<String>::new();
         for rule in &allowed_tools {
             let Some(name) = crate::profile::allowed_tool_name(rule) else {
@@ -1210,10 +1217,6 @@ fn claude_acp_meta(
         options.insert("tools".to_string(), json!(tools));
         options.insert("settingSources".to_string(), json!([]));
         options.insert("strictMcpConfig".to_string(), json!(true));
-        let mcp_servers = crate::mcp::server_configs(&allowed_tools);
-        if !mcp_servers.is_empty() {
-            options.insert("mcpServers".to_string(), Value::Object(mcp_servers));
-        }
     }
     if options.is_empty() {
         return None;
@@ -2125,11 +2128,7 @@ mod tests {
                 "mcp__loom_github__issue_comment"
             ])
         );
-        assert_eq!(restricted["mcpServers"]["loom_github"]["command"], "loom");
-        assert_eq!(
-            restricted["mcpServers"]["loom_github"]["args"],
-            json!(["mcp", "github"])
-        );
+        assert!(restricted.get("mcpServers").is_none());
         assert_eq!(opts2["permissionMode"], "plan");
     }
 
@@ -2159,6 +2158,8 @@ mod tests {
                 prelude: "none",
                 restricted: true,
                 allowed_tools: r#"["Read(./**)","mcp__loom_github__issue_edit"]"#,
+                mcp_access:
+                    r#"{"selection":{"mode":"none","groups":[]},"capability_sets":[],"custom_servers":[]}"#,
                 custom: None,
             },
             AcpOpen::Fresh,
@@ -2182,5 +2183,21 @@ mod tests {
             .env
             .iter()
             .any(|(name, value)| { name == "CLAUDE_CODE_DISABLE_AUTO_MEMORY" && value == "1" }));
+        assert_eq!(launch.mcp_servers.len(), 1);
+        assert_eq!(launch.mcp_servers[0]["name"], "loom_github");
+        assert!(launch.mcp_servers[0]["command"]
+            .as_str()
+            .is_some_and(|command| std::path::Path::new(command).is_absolute()));
+        assert_eq!(
+            launch.mcp_servers[0]["args"],
+            json!(["mcp", "serve", "github"])
+        );
+        assert_eq!(
+            launch.mcp_servers[0]["env"],
+            json!([{
+                "name": "LOOM_MCP_ALLOWED_TOOLS",
+                "value": "[\"issue_edit\"]"
+            }])
+        );
     }
 }

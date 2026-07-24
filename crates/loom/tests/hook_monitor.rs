@@ -271,6 +271,8 @@ async fn seed_classed_session(
             prelude: "weaver".to_string(),
             restricted: false,
             allowed_tools: "[]".to_string(),
+            mcp_access: r#"{"selection":{"mode":"none","groups":[]},"capability_sets":[]}"#
+                .to_string(),
             creator_kind: "system".to_string(),
             creator_subject: "test".to_string(),
             parent_session_id: None,

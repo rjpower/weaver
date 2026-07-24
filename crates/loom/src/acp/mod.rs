@@ -99,6 +99,8 @@ pub struct AcpLaunch {
     /// supervisor, never on argv).
     pub env: Vec<(String, String)>,
     pub env_clear: bool,
+    /// Provider-neutral ACP v1 stdio MCP server descriptors.
+    pub mcp_servers: Vec<Value>,
     /// Open a fresh session or reload an existing one.
     pub new_or_load: NewOrLoad,
     /// The initial permission posture (`bypassPermissions`, `acceptEdits`,
@@ -1089,7 +1091,11 @@ impl Task {
         match &launch.new_or_load {
             NewOrLoad::New { cwd, meta } => {
                 let id = self.next_id();
-                let params = wire::new_session_params(&cwd.to_string_lossy(), meta.as_ref());
+                let params = wire::new_session_params(
+                    &cwd.to_string_lossy(),
+                    &launch.mcp_servers,
+                    meta.as_ref(),
+                );
                 self.stream
                     .write(&wire::request_line(id, method::SESSION_NEW, params))
                     .await?;
@@ -1129,6 +1135,7 @@ impl Task {
                 let params = wire::load_session_params(
                     acp_session_id,
                     &launch.cwd.to_string_lossy(),
+                    &launch.mcp_servers,
                     meta.as_ref(),
                 );
                 self.stream

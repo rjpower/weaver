@@ -287,6 +287,12 @@ Loom serves a JSON API under `/api`; the Vue SPA is the primary consumer.
   `POST /api/sessions/{id}/{note,archive,adopt,github}`,
   `GET /api/sessions/{id}/{diff,log,events}`,
   `GET /api/sessions/{id}/terminal` (WebSocket: xterm.js ⇄ the tapestry PTY)
+- `GET /api/mcps`, `GET POST /api/mcps/custom`, and
+  `GET PUT DELETE /api/mcps/custom/{path}` (builtin discovery and validated,
+  revisioned custom MCP administration)
+- `GET POST /api/profiles`, `GET PUT DELETE /api/profiles/{name}`,
+  `GET /api/profiles/{name}/effective`, and
+  `POST /api/profiles/{name}/probe`
 - `GET /api/branches`, `GET PATCH /api/branches/{id}`,
   `GET POST /api/branches/{id}/issues` (issues claimed by the branch),
   `GET PATCH DELETE /api/issues/{id}`
@@ -409,6 +415,14 @@ weaver config ls
 loom profile ls
 loom profile show default
 loom profile show github_comment
+loom mcp ls
+loom mcp show mcp/github/comment@v1
+loom profile add ops --agent codex --mcp github,messaging
+loom profile show ops --effective
+loom profile probe ops
+# Add or update a dependency-self-contained custom MCP (save validates it):
+loom mcp add /engineering/search/docs --label "Docs search" \
+  --file server.py --tests test_mcp.py
 # App-less deployments can give restricted GitHub tools a shared identity:
 loom profile env secret github_comment GH_TOKEN \
   projects/my-project/secrets/loom-github-ci-token/versions/latest
@@ -424,7 +438,7 @@ Notable settings:
 - Restricted profiles are Claude ACP automation envelopes for caller-supplied
   prompts. They suppress the Weaver prelude and repository setup/config, clear
   Claude setting sources, expose repository-scoped read tools plus fixed
-  server-side GitHub tools selected by the built-in `mcp/github/comment`
+  server-side GitHub tools selected by the built-in `mcp/github/comment@v1`
   capability set, and have Loom reject every unmatched permission request.
   Loom expands profile capability sets into exact permissions when it stamps a
   session and derives adapter processes from its trusted MCP registry; profiles
@@ -436,6 +450,25 @@ Notable settings:
   from its reviewed declarative manifest and remains operator-editable after the
   first seed. See
   [Restricted GitHub sessions](docs/restricted-sessions.md).
+- MCP capability sets are stable, provider-neutral profile policy. Inspect
+  their adapter, exact tool surface, version, and content digest with `loom mcp
+  ls` / `loom mcp show`; the Settings profile editor exposes the same registry.
+  Profiles choose `none`, `all`, or an explicit comma-separated group list with
+  `--mcp`. Saving pins the exact capabilities to that profile revision; editing
+  the registry cannot silently widen it, and saving the profile again is the
+  explicit reconciliation point. The builtins cover fixed-repository GitHub
+  work, durable status updates, and fixed-thread Slack replies; all reuse Loom's existing
+  session-scoped routes, so provider credentials remain server-side.
+  Provider-specific runtime permission rules remain an implementation detail of
+  the selected agent, rather than the vocabulary used to name MCP access.
+- Administrators can add Python MCP servers under identities such as
+  `/engineering/search/docs`. Loom stores immutable source revisions in sqlite,
+  runs real MCP discovery plus optional tests through `uv`, and excludes failed
+  or disabled definitions from newly saved profile revisions. Custom scripts run with a
+  cleared environment, Loom-controlled uv dependency paths, and session-scoped
+  Loom API context, are never admitted to restricted profiles, and are operator
+  code rather than an OS sandbox. See the
+  [MCP/profile design](docs/plans/mcp-profiles.md).
 - Profile environment values are write-only: API, CLI, and Settings responses
   expose names and update times, never secret values.
 - Ordinary sessions default `CARGO_TARGET_DIR` to the primary repository's

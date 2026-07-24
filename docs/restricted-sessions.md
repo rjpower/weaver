@@ -8,7 +8,7 @@ the workflow owns task semantics, stale-write checks, and prose policy.
 The stock `github_comment` profile uses Claude over ACP with no Weaver prelude,
 no repository environment or setup script, no Claude user/project/local
 settings, repository-scoped read tools, and a fixed GitHub issue/PR MCP surface.
-The profile selects that reviewed surface as `mcp/github/comment`; Loom expands
+The profile selects that reviewed surface as `mcp/github/comment@v1`; Loom expands
 the set into exact tool permissions when it stamps the session and launches the
 corresponding built-in adapter from its registry. Profile data cannot provide an
 adapter command. New adapter families belong in `crates/loom/src/mcp/` and must
@@ -31,7 +31,10 @@ deployment-reconciliation contract; loading policy implicitly from a managed
 checkout would let repository content choose its own launch boundary and is
 deliberately unsupported. Custom profiles may compose the built-in capability
 sets Loom recognizes, but cannot define executable MCP adapters from repository
-content.
+content. Operator-authored custom MCPs are available to ordinary profiles only;
+their groups cannot shadow trusted builtin groups, and restricted profiles
+require explicit builtin groups rather than future-widening `all`, even though
+both use the same provider-neutral `mcp_access` contract.
 
 ## GitHub credential policy
 

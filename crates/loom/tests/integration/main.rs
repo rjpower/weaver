@@ -19,6 +19,7 @@ mod diagnostics;
 mod env;
 mod ide;
 mod logs;
+mod mcp_conformance;
 mod pane;
 mod profiles;
 mod recover;

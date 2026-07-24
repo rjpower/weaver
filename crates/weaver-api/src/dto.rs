@@ -195,6 +195,9 @@ pub struct SessionView {
     /// Resolved launch permission posture, immutable for this session.
     #[serde(default)]
     pub launch_mode: String,
+    /// Exact, source-redacted MCP capability snapshot stamped at launch.
+    #[serde(default)]
+    pub mcp_policy: SessionMcpPolicyView,
     pub branch: BranchView,
 }
 
@@ -261,7 +264,9 @@ pub struct ProfileView {
     #[serde(default)]
     pub restricted: bool,
     #[serde(default)]
-    pub allowed_tools: Vec<String>,
+    pub runtime_permissions: Vec<String>,
+    #[serde(default)]
+    pub mcp_access: McpAccess,
     pub revision: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -277,6 +282,180 @@ pub struct ProfileEnvView {
     #[serde(default)]
     pub secret_ref: Option<String>,
     pub updated_at: String,
+}
+
+/// One trusted MCP adapter Loom can launch.  This is deliberately provider
+/// neutral: clients select a capability set, while an agent runtime translates
+/// its tools into that provider's permission vocabulary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpAdapterView {
+    pub name: String,
+    pub description: String,
+    pub server_name: String,
+}
+
+/// An inspectable, content-addressed collection of MCP tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpCapabilitySetView {
+    pub name: String,
+    pub group: String,
+    pub version: String,
+    pub digest: String,
+    pub description: String,
+    pub adapter: String,
+    pub tools: Vec<String>,
+}
+
+/// The trusted MCP registry exposed to operators and the settings UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpRegistryView {
+    pub adapters: Vec<McpAdapterView>,
+    pub capability_sets: Vec<McpCapabilitySetView>,
+    #[serde(default)]
+    pub custom_servers: Vec<CustomMcpView>,
+}
+
+/// Provider-neutral MCP selection carried by a profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpAccess {
+    /// `none`, `all`, or `groups`.
+    pub mode: String,
+    #[serde(default)]
+    pub groups: Vec<String>,
+}
+
+impl Default for McpAccess {
+    fn default() -> Self {
+        Self {
+            mode: "none".to_string(),
+            groups: Vec::new(),
+        }
+    }
+}
+
+/// Exact MCP registry content stamped onto a launched session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpPolicySnapshot {
+    pub selection: McpAccess,
+    #[serde(default)]
+    pub capability_sets: Vec<McpCapabilitySetView>,
+    #[serde(default)]
+    pub custom_servers: Vec<CustomMcpSnapshot>,
+}
+
+/// Source-redacted MCP audit policy returned on ordinary session views.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionMcpPolicyView {
+    pub selection: McpAccess,
+    #[serde(default)]
+    pub capability_sets: Vec<McpCapabilitySetView>,
+    #[serde(default)]
+    pub custom_servers: Vec<SessionCustomMcpView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCustomMcpView {
+    pub identity: String,
+    pub group: String,
+    pub revision: i64,
+    pub digest: String,
+    pub server_name: String,
+    pub tools: Vec<String>,
+}
+
+impl From<&McpPolicySnapshot> for SessionMcpPolicyView {
+    fn from(snapshot: &McpPolicySnapshot) -> Self {
+        Self {
+            selection: snapshot.selection.clone(),
+            capability_sets: snapshot.capability_sets.clone(),
+            custom_servers: snapshot
+                .custom_servers
+                .iter()
+                .map(|server| SessionCustomMcpView {
+                    identity: server.identity.clone(),
+                    group: server.group.clone(),
+                    revision: server.revision,
+                    digest: server.digest.clone(),
+                    server_name: server.server_name.clone(),
+                    tools: server.tools.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Exact executable custom MCP revision stamped onto a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomMcpSnapshot {
+    pub identity: String,
+    pub group: String,
+    pub revision: i64,
+    pub digest: String,
+    pub server_name: String,
+    pub tools: Vec<String>,
+    /// Source is part of the immutable recovery snapshot. It is operator-authored
+    /// code, never a credential, and is not exposed in ordinary session views.
+    pub source: String,
+}
+
+/// Body for creating or updating an operator-authored MCP server.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CustomMcpReq {
+    pub identity: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    pub source: String,
+    #[serde(default)]
+    pub test_source: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Latest custom MCP definition and validation result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomMcpView {
+    pub identity: String,
+    pub group: String,
+    pub label: String,
+    pub description: String,
+    pub enabled: bool,
+    pub revision: i64,
+    pub digest: String,
+    pub source: String,
+    pub test_source: String,
+    pub tools: Vec<String>,
+    pub validation_state: String,
+    pub validation_message: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerProcessView {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+/// Fully resolved non-secret profile policy without launching a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EffectiveProfileView {
+    pub profile: ProfileView,
+    pub mcp_policy: McpPolicySnapshot,
+    pub runtime_permissions: Vec<String>,
+    pub mcp_servers: Vec<McpServerProcessView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileProbeView {
+    pub ok: bool,
+    pub effective: EffectiveProfileView,
+    pub errors: Vec<String>,
 }
 
 /// Body for creating or replacing a profile.
@@ -312,8 +491,12 @@ pub struct ProfileReq {
     pub prelude: String,
     #[serde(default)]
     pub restricted: bool,
+    /// Provider-specific fallback permissions. New integrations should use
+    /// `mcp_access`; `allowed_tools` remains a read-compatible input alias.
+    #[serde(default, alias = "allowed_tools")]
+    pub runtime_permissions: Vec<String>,
     #[serde(default)]
-    pub allowed_tools: Vec<String>,
+    pub mcp_access: McpAccess,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1458,4 +1641,30 @@ pub struct SetGithubConfigReq {
     pub client_id: String,
     #[serde(default)]
     pub client_secret: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_mcp_policy_redacts_custom_source_but_keeps_audit_identity() {
+        let snapshot = McpPolicySnapshot {
+            custom_servers: vec![CustomMcpSnapshot {
+                identity: "/ops/status".to_string(),
+                group: "ops".to_string(),
+                revision: 3,
+                digest: "sha256:abc".to_string(),
+                server_name: "loom_custom_abc".to_string(),
+                tools: vec!["status".to_string()],
+                source: "operator-only source".to_string(),
+            }],
+            ..Default::default()
+        };
+        let audit = SessionMcpPolicyView::from(&snapshot);
+        let encoded = serde_json::to_string(&audit).unwrap();
+        assert!(!encoded.contains("operator-only source"));
+        assert!(encoded.contains("/ops/status"));
+        assert!(encoded.contains("sha256:abc"));
+    }
 }

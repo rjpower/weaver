@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue';
 import * as api from '../api';
-import type { AgentMetadata, Profile, ProfileInput } from '../types';
+import type { AgentMetadata, McpRegistry, Profile, ProfileInput } from '../types';
 
 const profiles = ref<Profile[]>([]);
 const agents = ref<AgentMetadata[]>([]);
+const mcpRegistry = ref<McpRegistry | null>(null);
 const selected = ref('default');
 const draft = ref<ProfileInput | null>(null);
 const creating = ref(false);
@@ -18,6 +19,15 @@ const current = computed(() => profiles.value.find((profile) => profile.name ===
 const selectedAgent = computed(() =>
   agents.value.find((agent) => agent.kind === draft.value?.agent_kind),
 );
+const mcpGroups = computed(() => {
+  const groups = new Map<string, boolean>();
+  for (const set of mcpRegistry.value?.capability_sets ?? []) groups.set(set.group, true);
+  for (const server of mcpRegistry.value?.custom_servers ?? [])
+    if (!groups.has(server.group)) groups.set(server.group, false);
+  return [...groups]
+    .map(([name, builtin]) => ({ name, builtin }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+});
 
 function normalizeAgentChoices(metadata = selectedAgent.value) {
   const profile = draft.value;
@@ -35,6 +45,22 @@ function normalizeAgentChoices(metadata = selectedAgent.value) {
 }
 
 watch(selectedAgent, normalizeAgentChoices);
+watch(
+  () => draft.value?.restricted,
+  (restricted) => {
+    if (!restricted || !draft.value) return;
+    if (draft.value.mcp_access.mode === 'all') {
+      draft.value.mcp_access = { mode: 'none', groups: [] };
+    } else if (draft.value.mcp_access.mode === 'groups') {
+      const builtins = new Set(
+        mcpGroups.value.filter((group) => group.builtin).map((group) => group.name),
+      );
+      draft.value.mcp_access.groups = draft.value.mcp_access.groups.filter((group) =>
+        builtins.has(group),
+      );
+    }
+  },
+);
 
 function editable(profile: Profile): ProfileInput {
   const {
@@ -50,7 +76,8 @@ function editable(profile: Profile): ProfileInput {
   return {
     ...input,
     ambient_allowlist: [...input.ambient_allowlist],
-    allowed_tools: [...input.allowed_tools],
+    runtime_permissions: [...input.runtime_permissions],
+    mcp_access: { ...input.mcp_access, groups: [...input.mcp_access.groups] },
   };
 }
 
@@ -66,9 +93,14 @@ function choose(name: string) {
 
 async function load() {
   try {
-    const [items, metadata] = await Promise.all([api.listProfiles(), api.listAgents()]);
+    const [items, metadata, registry] = await Promise.all([
+      api.listProfiles(),
+      api.listAgents(),
+      api.getMcpRegistry(),
+    ]);
     profiles.value = items;
     agents.value = metadata.agents;
+    mcpRegistry.value = registry;
     choose(
       items.some((item) => item.name === selected.value)
         ? selected.value
@@ -100,7 +132,8 @@ function add() {
     turn_budget: null,
     prelude: 'weaver',
     restricted: false,
-    allowed_tools: [],
+    runtime_permissions: [],
+    mcp_access: { mode: 'none', groups: [] },
   };
 }
 
@@ -347,20 +380,81 @@ onMounted(load);
               "
             />
           </label>
+          <fieldset class="space-y-2 rounded border border-line p-2 sm:col-span-2">
+            <legend class="px-1 text-xs font-medium">MCP access</legend>
+            <div class="flex flex-wrap gap-1.5">
+              <button
+                v-for="mode in ['none', 'all', 'groups'] as const"
+                :key="mode"
+                type="button"
+                class="rounded border px-2.5 py-1 text-xs capitalize"
+                :disabled="draft.restricted && mode === 'all'"
+                :class="
+                  draft.mcp_access.mode === mode
+                    ? 'border-accent bg-accent text-accent-fg'
+                    : 'border-line bg-input text-muted'
+                "
+                @click="
+                  draft!.mcp_access = {
+                    mode,
+                    groups: mode === 'groups' ? draft!.mcp_access.groups : [],
+                  }
+                "
+              >
+                {{ mode }}
+              </button>
+            </div>
+            <div v-if="draft.mcp_access.mode === 'groups'" class="flex flex-wrap gap-2">
+              <label
+                v-for="group in mcpGroups"
+                :key="group.name"
+                class="flex items-center gap-1 text-xs"
+                :class="{ 'opacity-50': draft.restricted && !group.builtin }"
+              >
+                <input
+                  type="checkbox"
+                  :checked="draft.mcp_access.groups.includes(group.name)"
+                  :disabled="draft.restricted && !group.builtin"
+                  @change="
+                    draft!.mcp_access.groups = ($event.target as HTMLInputElement).checked
+                      ? [...draft!.mcp_access.groups, group.name]
+                      : draft!.mcp_access.groups.filter((value) => value !== group.name)
+                  "
+                />
+                <code>{{ group.name }}</code>
+              </label>
+            </div>
+            <p class="text-xs text-muted">
+              None starts no MCP processes. All includes every enabled builtin and custom MCP.
+              Restricted profiles may select trusted builtins only.
+            </p>
+          </fieldset>
           <label class="text-xs sm:col-span-2"
-            >Allowed Claude tools (one permission rule per line)
+            >Runtime permissions (one provider-specific rule per line)
             <textarea
-              :value="draft.allowed_tools.join('\n')"
-              rows="6"
+              :value="draft.runtime_permissions.join('\n')"
+              rows="3"
               class="mt-1 w-full rounded bg-input px-2 py-1.5 font-mono"
               @input="
-                draft!.allowed_tools = ($event.target as HTMLTextAreaElement).value
+                draft!.runtime_permissions = ($event.target as HTMLTextAreaElement).value
                   .split('\n')
                   .map((v) => v.trim())
                   .filter(Boolean)
               "
             />
+            <span class="mt-1 block text-muted">
+              Legacy escape hatch for restricted filesystem rules such as <code>Read(./**)</code>.
+              Integrations belong in MCP access above.
+            </span>
           </label>
+          <div v-if="mcpRegistry?.capability_sets.length" class="text-xs sm:col-span-2">
+            <div class="mb-1 font-medium">Available trusted MCP capability sets</div>
+            <ul class="space-y-1 text-muted">
+              <li v-for="set in mcpRegistry.capability_sets" :key="set.name">
+                <code>{{ set.name }}</code> — {{ set.description }}
+              </li>
+            </ul>
+          </div>
           <div class="flex gap-2 sm:col-span-2">
             <button
               data-testid="profile-save"

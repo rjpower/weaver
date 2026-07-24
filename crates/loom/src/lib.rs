@@ -17,6 +17,7 @@ pub mod chatlog;
 pub mod client;
 pub mod client_context;
 pub mod custom_agents;
+pub mod custom_mcp;
 pub mod db;
 pub mod endpoint;
 pub mod envfile;

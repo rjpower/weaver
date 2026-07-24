@@ -13,9 +13,10 @@ use serde_json::Value;
 use crate::dto::{
     AnchorDto, ArtifactMeta, ArtifactUpsertReq, ArtifactView, AutomationTokenReq,
     AutomationTokenView, BranchStatusReq, BranchView, CommentDto, CreateEventReq, CreateIssueReq,
-    CreateRepoIssueReq, CreateReq, CreateTokenReq, CreateWatchReq, CreatedTokenView, DeploymentReq,
-    DeploymentView, DiagnosticsView, FederationReq, FederationView, HandoffReq, IssueView,
-    NewCommentBody, NewThreadBody, PatchIssueReq, PatchSessionReq, PatchWatchReq, ProfileReq,
+    CreateRepoIssueReq, CreateReq, CreateTokenReq, CreateWatchReq, CreatedTokenView, CustomMcpReq,
+    CustomMcpView, DeploymentReq, DeploymentView, DiagnosticsView, EffectiveProfileView,
+    FederationReq, FederationView, HandoffReq, IssueView, McpRegistryView, NewCommentBody,
+    NewThreadBody, PatchIssueReq, PatchSessionReq, PatchWatchReq, ProfileProbeView, ProfileReq,
     ProfileView, PutProfileEnvReq, ReadinessView, RunReq, RunView, RunWatchReq, SendReq,
     SessionView, SettingsEnvelope, TagReq, ThreadDto, TokenView, WatchView,
 };
@@ -675,6 +676,37 @@ impl Client {
         self.get_typed("/api/diagnostics").await
     }
 
+    /// Trusted MCP adapters and their provider-neutral capability sets.
+    pub async fn mcp_registry(&self) -> Result<McpRegistryView> {
+        self.get_typed("/api/mcps").await
+    }
+
+    pub async fn create_custom_mcp(&self, req: &CustomMcpReq) -> Result<CustomMcpView> {
+        self.send_typed(Method::POST, "/api/mcps/custom", Some(req))
+            .await
+    }
+
+    pub async fn put_custom_mcp(
+        &self,
+        identity: &str,
+        req: &CustomMcpReq,
+    ) -> Result<CustomMcpView> {
+        self.send_typed(
+            Method::PUT,
+            &format!("/api/mcps/custom/{}", identity.trim_start_matches('/')),
+            Some(req),
+        )
+        .await
+    }
+
+    pub async fn delete_custom_mcp(&self, identity: &str) -> Result<Value> {
+        self.delete(&format!(
+            "/api/mcps/custom/{}",
+            identity.trim_start_matches('/')
+        ))
+        .await
+    }
+
     /// List named launch profiles. Secret environment values are withheld.
     pub async fn list_profiles(&self) -> Result<Vec<ProfileView>> {
         self.get_typed("/api/profiles").await
@@ -683,6 +715,20 @@ impl Client {
     pub async fn get_profile(&self, name: &str) -> Result<ProfileView> {
         self.get_typed(&format!("/api/profiles/{}", Self::seg(name)))
             .await
+    }
+
+    pub async fn effective_profile(&self, name: &str) -> Result<EffectiveProfileView> {
+        self.get_typed(&format!("/api/profiles/{}/effective", Self::seg(name)))
+            .await
+    }
+
+    pub async fn probe_profile(&self, name: &str) -> Result<ProfileProbeView> {
+        self.send_typed::<(), _>(
+            Method::POST,
+            &format!("/api/profiles/{}/probe", Self::seg(name)),
+            None,
+        )
+        .await
     }
 
     pub async fn create_profile(&self, req: &ProfileReq) -> Result<ProfileView> {

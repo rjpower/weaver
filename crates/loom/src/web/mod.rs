@@ -75,6 +75,7 @@ mod discussion;
 mod env;
 mod issues;
 mod logview;
+mod mcps;
 mod profiles;
 mod repo_env;
 mod repos;
@@ -95,6 +96,7 @@ use discussion::*;
 use env::*;
 use issues::*;
 use logview::*;
+use mcps::*;
 use profiles::*;
 use repo_env::*;
 use repos::*;
@@ -132,7 +134,7 @@ use crate::db::Db;
 use crate::events::EventBus;
 use crate::github;
 use crate::session::{self as session_mod, Session};
-use weaver_api::{BranchView, SessionView};
+use weaver_api::{BranchView, McpPolicySnapshot, SessionMcpPolicyView, SessionView};
 use weaver_core::branch as branch_mod;
 use weaver_core::branch::Branch;
 use weaver_core::tags;
@@ -311,6 +313,14 @@ pub(crate) async fn session_view(
     } else {
         None
     };
+    let mcp_policy = serde_json::from_str::<McpPolicySnapshot>(&session.policy_mcp_access)
+        .map(|snapshot| SessionMcpPolicyView::from(&snapshot))
+        .map_err(|error| {
+            AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid session MCP policy snapshot: {error}"),
+            )
+        })?;
     Ok(SessionView {
         id: session.id.clone(),
         status: session.status.clone(),
@@ -342,6 +352,7 @@ pub(crate) async fn session_view(
         profile: session.profile.clone(),
         profile_revision: session.profile_revision,
         launch_mode: session.launch_mode.clone(),
+        mcp_policy,
         branch: bv,
     })
 }
@@ -749,7 +760,20 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/settings", get(get_settings).patch(patch_settings))
         .route("/deployment/reconcile", post(reconcile_deployment))
+        .route("/mcps", get(list_mcps))
+        .route(
+            "/mcps/custom",
+            get(list_custom_mcps).post(create_custom_mcp),
+        )
+        .route(
+            "/mcps/custom/{*identity}",
+            get(get_custom_mcp)
+                .put(put_custom_mcp)
+                .delete(delete_custom_mcp),
+        )
         .route("/profiles", get(list_profiles).post(create_profile))
+        .route("/profiles/{name}/effective", get(effective_profile))
+        .route("/profiles/{name}/probe", post(probe_profile))
         .route(
             "/profiles/{name}",
             get(get_profile).put(put_profile).delete(delete_profile),
