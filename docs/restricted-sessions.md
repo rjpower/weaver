@@ -100,6 +100,13 @@ GitHub caller keys accept up to 128 ASCII letters, digits, `.`, `_`, `:`, and
 the compatibility behavior of deduplicating one workflow run attempt; a body
 hash key converges retries and reruns for the same source description.
 
+Automation callers may also set `channel` to route distinct idempotency keys
+through one live ACP session. The channel is scoped to the verified subject,
+service tag, profile, and source. A busy session queues the update through its
+durable ACP prompt path; a provisioning or orphaned channel returns a retryable
+error instead of acknowledging an undelivered update. Channel names accept up
+to 64 ASCII letters, digits, `.`, `_`, `:`, and `-`.
+
 Do not put `GH_TOKEN` in the request or prompt. Automation requests are stored
 for audit and idempotency. Loom resolves a credential only while executing a
 fixed GitHub tool. Prefer the configured GitHub App, whose installation token is

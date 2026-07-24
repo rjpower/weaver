@@ -629,6 +629,11 @@ pub struct RunReq {
     pub idempotency_key: String,
     #[serde(default = "actions_source")]
     pub source: String,
+    /// Stable conversation route for related automation deliveries. Each
+    /// idempotency key remains a distinct run; channel deliveries reuse one
+    /// live ACP session.
+    #[serde(default)]
+    pub channel: Option<String>,
     pub session: CreateReq,
 }
 
@@ -658,6 +663,7 @@ pub struct RunView {
     pub service_tag: String,
     pub profile: String,
     pub idempotency_key: String,
+    pub channel: Option<String>,
     pub session_id: String,
     pub status: String,
     pub outcome: Option<String>,

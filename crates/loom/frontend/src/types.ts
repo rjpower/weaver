@@ -153,6 +153,7 @@ export interface AutomationRun {
   service_tag: string;
   profile: string;
   idempotency_key: string;
+  channel: string | null;
   session_id: string;
   status: string;
   outcome: string | null;

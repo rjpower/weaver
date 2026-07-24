@@ -40,6 +40,11 @@ const LOOM_MIGRATIONS: &[(i64, &str, &str)] = &[
         "mcp-access",
         include_str!("../migrations/0006_mcp_access.sql"),
     ),
+    (
+        7,
+        "automation-channels",
+        include_str!("../migrations/0007_automation_channels.sql"),
+    ),
 ];
 
 const LOOM_STREAM: Stream = Stream::new("loom_schema_migrations", LOOM_MIGRATIONS);
@@ -269,7 +274,7 @@ mod tests {
                 .fetch_all(&db)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
 
         let columns = table_columns(&db, "sessions").await.unwrap();
         for expected in [
@@ -400,7 +405,7 @@ mod tests {
                 .fetch_all(&db)
                 .await
                 .unwrap();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
         let index_sql: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master
              WHERE type = 'index' AND name = 'idx_sessions_active_branch'",
@@ -474,7 +479,7 @@ mod tests {
             .fetch_one(&db)
             .await
             .unwrap();
-        assert_eq!(count, 6);
+        assert_eq!(count, 7);
 
         // Adoption replaced the historical index predicate: archived history
         // no longer prevents a new active session from claiming the branch.

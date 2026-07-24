@@ -620,6 +620,95 @@ async fn strict_profile_crud_withholds_secrets_and_stamps_sessions() {
 
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automation_channel_reuses_one_acp_session_without_replaying_deliveries() {
+    let _adapter = EnvVarGuard::set(
+        "WEAVER_CLAUDE_ACP_CMD",
+        &crate::fixtures::fake_acp_agent_cmd(),
+    );
+    let ts = TestServer::start().await;
+    ts.client
+        .post(
+            "/api/profiles",
+            json!({
+                "name": "ops",
+                "description": "operations intake",
+                "agent_kind": "claude",
+                "protocol": "acp",
+                "mode": "default",
+                "class": "automation",
+                "strict": true,
+                "env_clear": true,
+                "max_concurrent": 1,
+                "turn_budget": 20,
+                "prelude": "none"
+            }),
+        )
+        .await
+        .unwrap();
+
+    let first_request = json!({
+        "profile": "ops",
+        "source": "grafana",
+        "channel": "operator",
+        "idempotency_key": "alert:first",
+        "session": {
+            "cwd": ts.cwd(),
+            "title": "Grafana operator",
+            "goal": "first alert"
+        }
+    });
+    let first = ts.client.post("/api/runs", first_request).await.unwrap();
+    let second_request = json!({
+        "profile": "ops",
+        "source": "grafana",
+        "channel": "operator",
+        "idempotency_key": "alert:second",
+        "session": {
+            "cwd": ts.cwd(),
+            "title": "Grafana operator",
+            "goal": "second alert"
+        }
+    });
+    let second = ts
+        .client
+        .post("/api/runs", second_request.clone())
+        .await
+        .unwrap();
+    let duplicate = ts.client.post("/api/runs", second_request).await.unwrap();
+
+    assert_ne!(first["id"], second["id"]);
+    assert_eq!(first["session_id"], second["session_id"]);
+    assert_eq!(second["id"], duplicate["id"]);
+    assert_eq!(second["channel"], "operator");
+
+    let sessions = ts
+        .client
+        .get("/api/sessions?automation=true")
+        .await
+        .unwrap();
+    assert_eq!(sessions.as_array().unwrap().len(), 1);
+
+    let chat = ts
+        .client
+        .get(&format!(
+            "/api/sessions/{}/chat",
+            first["session_id"].as_str().unwrap()
+        ))
+        .await
+        .unwrap();
+    let second_deliveries = chat["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|block| {
+            block["kind"] == "user_message" && block["payload"]["text"] == "second alert"
+        })
+        .count();
+    assert_eq!(second_deliveries, 1);
+}
+
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deployment_manifest_reconciles_profiles_secret_refs_and_workload_identity() {
     let ts = TestServer::start().await;
     let manifest = json!({

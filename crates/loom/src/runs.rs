@@ -14,6 +14,7 @@ pub struct Run {
     pub service_tag: String,
     pub profile: String,
     pub idempotency_key: String,
+    pub channel: Option<String>,
     pub request_json: String,
     pub session_id: String,
     pub status: String,
@@ -32,6 +33,7 @@ impl From<Run> for RunView {
             service_tag: run.service_tag,
             profile: run.profile,
             idempotency_key: run.idempotency_key,
+            channel: run.channel,
             session_id: run.session_id,
             status: run.status,
             outcome: run.outcome,
@@ -47,38 +49,70 @@ pub enum Reservation {
     Existing(Run),
 }
 
-pub async fn reserve(
-    db: &Db,
-    subject: &str,
-    source: &str,
-    service_tag: &str,
-    profile: &str,
-    idempotency_key: &str,
-    request_json: &str,
-) -> Result<Reservation> {
+pub struct NewRun<'a> {
+    pub subject: &'a str,
+    pub source: &'a str,
+    pub service_tag: &'a str,
+    pub profile: &'a str,
+    pub idempotency_key: &'a str,
+    pub channel: Option<&'a str>,
+    pub request_json: &'a str,
+}
+
+pub enum ChannelAction {
+    Launch(Run),
+    Prompt(Run),
+    Ready(Run),
+    Busy(Run),
+}
+
+#[derive(FromRow)]
+struct ChannelOwner {
+    owner_run_id: String,
+    session_id: String,
+    run_status: String,
+    run_updated_at: String,
+    session_status: Option<String>,
+    session_protocol: Option<String>,
+}
+
+pub fn validate_channel(channel: &str) -> Result<()> {
+    if channel.is_empty()
+        || channel.len() > 64
+        || !channel
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        anyhow::bail!("channel must be 1-64 ASCII letters, digits, '.', '_', ':', or '-'");
+    }
+    Ok(())
+}
+
+pub async fn reserve(db: &Db, request: NewRun<'_>) -> Result<Reservation> {
     let id = weaver_core::branch::new_id();
     let session_id = weaver_core::branch::new_id();
     let now = now_iso();
     let result = sqlx::query(
         "INSERT INTO automation_runs
-         (id, actor_subject, source, service_tag, profile, idempotency_key, request_json,
-          session_id, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'creating', ?, ?)
+         (id, actor_subject, source, service_tag, profile, idempotency_key, channel,
+          request_json, session_id, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'creating', ?, ?)
          ON CONFLICT(actor_subject, idempotency_key) DO NOTHING",
     )
     .bind(&id)
-    .bind(subject)
-    .bind(source)
-    .bind(service_tag)
-    .bind(profile)
-    .bind(idempotency_key)
-    .bind(request_json)
+    .bind(request.subject)
+    .bind(request.source)
+    .bind(request.service_tag)
+    .bind(request.profile)
+    .bind(request.idempotency_key)
+    .bind(request.channel)
+    .bind(request.request_json)
     .bind(&session_id)
     .bind(&now)
     .bind(&now)
     .execute(db)
     .await?;
-    let run = get_by_key(db, subject, idempotency_key)
+    let run = get_by_key(db, request.subject, request.idempotency_key)
         .await?
         .expect("inserted or conflicting automation run exists");
     Ok(if result.rows_affected() == 1 {
@@ -86,6 +120,152 @@ pub async fn reserve(
     } else {
         Reservation::Existing(run)
     })
+}
+
+pub async fn route_channel(db: &Db, run_id: &str) -> Result<ChannelAction> {
+    let mut tx = weaver_core::db::begin_immediate(db).await?;
+    let mut run = sqlx::query_as::<_, Run>("SELECT * FROM automation_runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let channel = run
+        .channel
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("automation run has no channel"))?;
+    validate_channel(&channel)?;
+
+    let owner = sqlx::query_as::<_, ChannelOwner>(
+        "SELECT c.owner_run_id, c.session_id, r.status AS run_status,
+                r.updated_at AS run_updated_at, s.status AS session_status,
+                s.protocol AS session_protocol
+         FROM automation_channels c
+         JOIN automation_runs r ON r.id = c.owner_run_id
+         LEFT JOIN sessions s ON s.id = c.session_id
+         WHERE c.actor_subject = ? AND c.source = ? AND c.service_tag = ?
+           AND c.profile = ? AND c.channel = ?",
+    )
+    .bind(&run.actor_subject)
+    .bind(&run.source)
+    .bind(&run.service_tag)
+    .bind(&run.profile)
+    .bind(&channel)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let action = match owner {
+        None => {
+            sqlx::query(
+                "INSERT INTO automation_channels
+                 (actor_subject, source, service_tag, profile, channel, owner_run_id,
+                  session_id, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&run.actor_subject)
+            .bind(&run.source)
+            .bind(&run.service_tag)
+            .bind(&run.profile)
+            .bind(&channel)
+            .bind(&run.id)
+            .bind(&run.session_id)
+            .bind(now_iso())
+            .execute(&mut *tx)
+            .await?;
+            ChannelAction::Launch(run)
+        }
+        Some(owner)
+            if owner.session_status.as_deref() == Some("running")
+                && owner.session_protocol.as_deref() == Some("acp") =>
+        {
+            if owner.owner_run_id == run.id {
+                sqlx::query(
+                    "UPDATE automation_runs SET status = 'running', session_id = ?, updated_at = ?
+                     WHERE id = ?",
+                )
+                .bind(&owner.session_id)
+                .bind(now_iso())
+                .bind(&run.id)
+                .execute(&mut *tx)
+                .await?;
+                run.session_id = owner.session_id;
+                run.status = "running".to_string();
+                ChannelAction::Ready(run)
+            } else {
+                sqlx::query(
+                    "UPDATE automation_runs
+                     SET status = 'delivering', session_id = ?, updated_at = ?
+                     WHERE id = ?",
+                )
+                .bind(&owner.session_id)
+                .bind(now_iso())
+                .bind(&run.id)
+                .execute(&mut *tx)
+                .await?;
+                run.session_id = owner.session_id;
+                run.status = "delivering".to_string();
+                ChannelAction::Prompt(run)
+            }
+        }
+        Some(owner)
+            if owner.owner_run_id == run.id
+                && owner.session_status.is_none()
+                && owner.run_status == "creating"
+                && owner.run_updated_at > stale_before() =>
+        {
+            ChannelAction::Busy(run)
+        }
+        Some(owner)
+            if matches!(
+                owner.session_status.as_deref(),
+                Some("created" | "orphaned")
+            ) || (owner.session_status.is_none()
+                && owner.run_status == "creating"
+                && owner.run_updated_at > stale_before()) =>
+        {
+            sqlx::query(
+                "UPDATE automation_runs SET status = 'waiting', updated_at = ? WHERE id = ?",
+            )
+            .bind(now_iso())
+            .bind(&run.id)
+            .execute(&mut *tx)
+            .await?;
+            run.status = "waiting".to_string();
+            ChannelAction::Busy(run)
+        }
+        Some(_) => {
+            let session_id = weaver_core::branch::new_id();
+            sqlx::query(
+                "UPDATE automation_channels
+                 SET owner_run_id = ?, session_id = ?, updated_at = ?
+                 WHERE actor_subject = ? AND source = ? AND service_tag = ?
+                   AND profile = ? AND channel = ?",
+            )
+            .bind(&run.id)
+            .bind(&session_id)
+            .bind(now_iso())
+            .bind(&run.actor_subject)
+            .bind(&run.source)
+            .bind(&run.service_tag)
+            .bind(&run.profile)
+            .bind(&channel)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE automation_runs
+                 SET status = 'creating', session_id = ?, updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(&session_id)
+            .bind(now_iso())
+            .bind(&run.id)
+            .execute(&mut *tx)
+            .await?;
+            run.session_id = session_id;
+            run.status = "creating".to_string();
+            ChannelAction::Launch(run)
+        }
+    };
+    tx.commit().await?;
+    Ok(action)
 }
 
 pub async fn get(db: &Db, id: &str) -> Result<Option<Run>> {
@@ -140,19 +320,40 @@ pub async fn launched(db: &Db, id: &str, session_id: &str) -> Result<()> {
 /// five-minute lease; after that, exactly one retry may resume with the same
 /// preallocated session id.
 pub async fn claim_stale(db: &Db, id: &str) -> Result<bool> {
-    let stale_before = (chrono::Utc::now() - chrono::Duration::minutes(5))
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     Ok(sqlx::query(
         "UPDATE automation_runs SET updated_at = ?
          WHERE id = ? AND status = 'creating' AND updated_at <= ?",
     )
     .bind(now_iso())
     .bind(id)
-    .bind(stale_before)
+    .bind(stale_before())
     .execute(db)
     .await?
     .rows_affected()
         == 1)
+}
+
+pub async fn claim_stale_delivery(db: &Db, id: &str) -> Result<bool> {
+    Ok(sqlx::query(
+        "UPDATE automation_runs SET status = 'waiting', updated_at = ?
+         WHERE id = ? AND status = 'delivering' AND updated_at <= ?",
+    )
+    .bind(now_iso())
+    .bind(id)
+    .bind(stale_before())
+    .execute(db)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
+pub async fn waiting(db: &Db, id: &str) -> Result<()> {
+    sqlx::query("UPDATE automation_runs SET status = 'waiting', updated_at = ? WHERE id = ?")
+        .bind(now_iso())
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 pub async fn failed(db: &Db, id: &str, summary: &str) -> Result<()> {
@@ -167,6 +368,11 @@ pub async fn failed(db: &Db, id: &str, summary: &str) -> Result<()> {
     Ok(())
 }
 
+fn stale_before() -> String {
+    (chrono::Utc::now() - chrono::Duration::minutes(5))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,12 +382,15 @@ mod tests {
         let db = crate::db::connect_in_memory().await.unwrap();
         let first = reserve(
             &db,
-            "subject",
-            "actions",
-            "weaver-actions",
-            "default",
-            "delivery",
-            "{}",
+            NewRun {
+                subject: "subject",
+                source: "actions",
+                service_tag: "weaver-actions",
+                profile: "default",
+                idempotency_key: "delivery",
+                channel: None,
+                request_json: "{}",
+            },
         )
         .await
         .unwrap();
@@ -191,12 +400,15 @@ mod tests {
         };
         let second = reserve(
             &db,
-            "subject",
-            "actions",
-            "weaver-actions",
-            "default",
-            "delivery",
-            "different",
+            NewRun {
+                subject: "subject",
+                source: "actions",
+                service_tag: "weaver-actions",
+                profile: "default",
+                idempotency_key: "delivery",
+                channel: None,
+                request_json: "different",
+            },
         )
         .await
         .unwrap();
@@ -215,12 +427,15 @@ mod tests {
         let db = crate::db::connect_in_memory().await.unwrap();
         let run = match reserve(
             &db,
-            "subject",
-            "actions",
-            "weaver-actions",
-            "default",
-            "key",
-            "{}",
+            NewRun {
+                subject: "subject",
+                source: "actions",
+                service_tag: "weaver-actions",
+                profile: "default",
+                idempotency_key: "key",
+                channel: None,
+                request_json: "{}",
+            },
         )
         .await
         .unwrap()
@@ -235,5 +450,61 @@ mod tests {
             .unwrap();
         assert!(claim_stale(&db, &run.id).await.unwrap());
         assert!(!claim_stale(&db, &run.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn channel_waits_for_its_owner_and_replaces_a_failed_launch() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let first = match reserve(
+            &db,
+            NewRun {
+                subject: "subject",
+                source: "grafana",
+                service_tag: "grafana",
+                profile: "default",
+                idempotency_key: "first",
+                channel: Some("operator"),
+                request_json: "{}",
+            },
+        )
+        .await
+        .unwrap()
+        {
+            Reservation::Created(run) => run,
+            Reservation::Existing(_) => unreachable!(),
+        };
+        assert!(matches!(
+            route_channel(&db, &first.id).await.unwrap(),
+            ChannelAction::Launch(_)
+        ));
+
+        let second = match reserve(
+            &db,
+            NewRun {
+                subject: "subject",
+                source: "grafana",
+                service_tag: "grafana",
+                profile: "default",
+                idempotency_key: "second",
+                channel: Some("operator"),
+                request_json: "{}",
+            },
+        )
+        .await
+        .unwrap()
+        {
+            Reservation::Created(run) => run,
+            Reservation::Existing(_) => unreachable!(),
+        };
+        assert!(matches!(
+            route_channel(&db, &second.id).await.unwrap(),
+            ChannelAction::Busy(_)
+        ));
+
+        failed(&db, &first.id, "launch failed").await.unwrap();
+        assert!(matches!(
+            route_channel(&db, &second.id).await.unwrap(),
+            ChannelAction::Launch(_)
+        ));
     }
 }
