@@ -658,7 +658,11 @@ async fn automation_channel_reuses_one_acp_session_without_replaying_deliveries(
             "goal": "first alert"
         }
     });
-    let first = ts.client.post("/api/runs", first_request).await.unwrap();
+    let first = ts
+        .client
+        .post("/api/runs", first_request.clone())
+        .await
+        .unwrap();
     let second_request = json!({
         "profile": "ops",
         "source": "grafana",
@@ -676,11 +680,21 @@ async fn automation_channel_reuses_one_acp_session_without_replaying_deliveries(
         .await
         .unwrap();
     let duplicate = ts.client.post("/api/runs", second_request).await.unwrap();
+    let mut collision_request = first_request;
+    collision_request["channel"] = json!("another-operator");
+    collision_request["session"]["goal"] = json!("must not be delivered");
+    let collision = ts
+        .client
+        .post("/api/runs", collision_request)
+        .await
+        .unwrap();
 
     assert_ne!(first["id"], second["id"]);
     assert_eq!(first["session_id"], second["session_id"]);
     assert_eq!(second["id"], duplicate["id"]);
     assert_eq!(second["channel"], "operator");
+    assert_eq!(collision["id"], first["id"]);
+    assert_eq!(collision["channel"], "operator");
 
     let sessions = ts
         .client

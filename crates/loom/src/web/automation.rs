@@ -335,6 +335,11 @@ pub(super) async fn create_run(
     if req.channel.is_some() {
         let run = match reservation {
             crate::runs::Reservation::Existing(run)
+                if run.channel.as_deref() != req.channel.as_deref() =>
+            {
+                return Ok(Json(run.into()));
+            }
+            crate::runs::Reservation::Existing(run)
                 if matches!(run.status.as_str(), "running" | "failed") =>
             {
                 return Ok(Json(run.into()));
