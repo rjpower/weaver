@@ -1127,17 +1127,11 @@ pub(crate) async fn provision_session(
     // Goal, scratch, and tracking context ride in as the positional prompt that
     // seeds the session's first turn.
     let goal_file = {
-        let supports_hooks = agent::metadata_for(&st.db, &runtime)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|metadata| metadata.supports_hooks);
         let scratch = scratch_note(&scratch_names);
-        let entrance = entrance_note(&title, tracking_issue);
+        let entrance = entrance_note(tracking_issue);
         let launch_prompt = build_launch_prompt(
             &goal,
             &launch_profile.prelude,
-            supports_hooks,
             &entrance,
             scratch.as_deref(),
         );
@@ -1465,20 +1459,16 @@ pub(crate) async fn provision_session(
     session_view(&st.db, &session, &branch).await
 }
 
-/// The session's launch prompt: a pointer to the goal rather than a copy of
-/// it. The goal lives once, as the `goal` artifact (`weaver summary` opens
-/// with it) — pasting it here made a second copy that drifted the moment the
-/// agent revved the artifact. The pointer routes through the `weaver` CLI so
-/// it orients hookless agents (Codex, custom) too, which never receive the
-/// WEAVER.md primer. Mirrors [`scratch_note`]: it rides on the prompt only
-/// (goal.txt), never the stored goal.
-fn entrance_note(title: &str, tracking_issue: Option<i64>) -> String {
-    let mut note = format!(
-        "Your task: {title}.\n\n\
-         Run `weaver summary` first — it prints the full goal, your current \
-         status, and the open tasks. `weaver readme` prints the complete \
-         workflow guide when it is not already in your context."
-    );
+/// Session-specific operating context appended after the goal. Keep this
+/// compact: the goal is the outcome, the primer owns durable workflow rules,
+/// and this note only supplies the tracking contract that neither can know
+/// ahead of time. `weaver summary` is a recovery path, not a mandatory first
+/// tool call that would inject the goal a second time.
+fn entrance_note(tracking_issue: Option<i64>) -> String {
+    let mut note = "You are working in a Weaver session. Use `weaver summary` \
+                    to recover context if needed and `weaver readme` for the \
+                    complete workflow guide."
+        .to_string();
     if let Some(id) = tracking_issue {
         note.push_str(&format!(
             " This session is tracked as weaver issue #{id}: keep `weaver \
@@ -1491,20 +1481,13 @@ fn entrance_note(title: &str, tracking_issue: Option<i64>) -> String {
 }
 
 /// Construct the positional first prompt from the stamped prelude policy.
-/// `none` deliberately makes the caller's goal the whole orientation; the
-/// normal Weaver profile keeps the established hook-capable/hookless split.
-fn build_launch_prompt(
-    goal: &str,
-    prelude: &str,
-    supports_hooks: bool,
-    entrance: &str,
-    scratch: Option<&str>,
-) -> String {
+/// The user's goal is always the opening user message: making an agent fetch it
+/// through `weaver summary` on turn one adds latency and duplicates the goal in
+/// context. `none` deliberately omits all Weaver orientation.
+fn build_launch_prompt(goal: &str, prelude: &str, entrance: &str, scratch: Option<&str>) -> String {
     let mut parts = Vec::new();
     if !goal.is_empty() {
-        if prelude == "none" || !supports_hooks {
-            parts.push(goal);
-        }
+        parts.push(goal);
         if prelude == "weaver" {
             parts.push(entrance);
         }
@@ -3886,17 +3869,18 @@ mod tests {
     }
 
     #[test]
-    fn entrance_note_points_at_the_goal_instead_of_pasting_it() {
-        let note = entrance_note("Wire the flux capacitor", Some(42));
-        assert!(note.contains("Wire the flux capacitor"));
-        // The orientation is a pointer, not a copy: the goal is fetched.
+    fn entrance_note_keeps_catch_up_out_of_the_first_turn() {
+        let note = entrance_note(Some(42));
         assert!(note.contains("weaver summary"));
+        assert!(note.contains("recover context"));
+        assert!(!note.contains("summary` first"));
+        assert!(!note.contains("prints the full goal"));
         // It tells the agent exactly how to signal "done".
         assert!(note.contains("weaver issue #42"));
         assert!(note.contains("weaver issue close 42"));
         assert!(note.contains("weaver status"));
         // Untracked sessions get the orientation with no issue contract.
-        let untracked = entrance_note("Poke around", None);
+        let untracked = entrance_note(None);
         assert!(untracked.contains("weaver summary"));
         assert!(!untracked.contains("issue"));
     }
@@ -3904,17 +3888,11 @@ mod tests {
     #[test]
     fn restricted_prelude_delivers_the_caller_goal_without_weaver_orientation() {
         let goal = "Rewrite only the issue body.\nBody hash: abc123";
+        let entrance = "weaver session metadata";
+        assert_eq!(build_launch_prompt(goal, "none", entrance, None), goal);
         assert_eq!(
-            build_launch_prompt(goal, "none", true, "run weaver summary", None),
-            goal
-        );
-        assert_eq!(
-            build_launch_prompt(goal, "weaver", true, "run weaver summary", None),
-            "run weaver summary"
-        );
-        assert_eq!(
-            build_launch_prompt(goal, "weaver", false, "run weaver summary", None),
-            format!("{goal}\n\nrun weaver summary")
+            build_launch_prompt(goal, "weaver", entrance, None),
+            format!("{goal}\n\n{entrance}")
         );
     }
 }

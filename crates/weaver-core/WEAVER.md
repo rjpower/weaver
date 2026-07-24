@@ -15,8 +15,9 @@ sub-sessions"). Report yourself with `weaver`; drive sessions with `loom`.
 ## The `weaver` CLI
 
 On your `PATH`; every command talks to the loom server, which is already
-running. Start with `weaver summary`, and re-run it whenever you lose the
-thread — after a context compaction weaver replays it for you automatically.
+running. Your opening user message already contains the goal. Run `weaver
+summary` whenever you need to recover the thread — after a context compaction
+weaver replays it for you automatically.
 
 - `weaver summary` — the catch-up: goal, status, artifacts, open discussion,
   outstanding tasks, and what to do next.
