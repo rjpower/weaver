@@ -77,6 +77,44 @@ pub async fn new_session(
     env_clear: bool,
     memory_max_gb: u64,
 ) -> Result<()> {
+    new_session_with_placement(name, cwd, script, env, env_clear, memory_max_gb, None).await
+}
+
+/// Create a detached PTY session in the same runner placement as `owner`.
+///
+/// With the Docker runner this starts another Tapestry supervisor inside the
+/// owner's existing container. With the local runner both supervisors already
+/// share the same host, so placement is unchanged.
+pub async fn new_session_colocated(
+    name: &str,
+    cwd: &std::path::Path,
+    script: &str,
+    env: &[(&str, &str)],
+    env_clear: bool,
+    memory_max_gb: u64,
+    owner: &str,
+) -> Result<()> {
+    new_session_with_placement(
+        name,
+        cwd,
+        script,
+        env,
+        env_clear,
+        memory_max_gb,
+        Some(owner),
+    )
+    .await
+}
+
+async fn new_session_with_placement(
+    name: &str,
+    cwd: &std::path::Path,
+    script: &str,
+    env: &[(&str, &str)],
+    env_clear: bool,
+    memory_max_gb: u64,
+    owner: Option<&str>,
+) -> Result<()> {
     tracing::info!(session = %name, cwd = %cwd.display(), memory_max_gb, "spawning terminal session");
     let script = match memory_max_gb {
         0 => script.to_string(),
@@ -95,7 +133,10 @@ pub async fn new_session(
         segment_max_bytes: None,
         supervisor_bin: supervisor_bin.as_deref(),
     };
-    let result = runner::spawn(&options, memory_max_gb).await;
+    let result = match owner {
+        Some(owner) => runner::spawn_colocated(&options, memory_max_gb, owner).await,
+        None => runner::spawn(&options, memory_max_gb).await,
+    };
     match &result {
         Ok(()) => tracing::info!(session = %name, "terminal session spawned"),
         Err(e) => tracing::warn!(session = %name, error = %e, "failed to spawn terminal session"),

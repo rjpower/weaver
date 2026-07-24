@@ -12,8 +12,9 @@
 //!   reset with [`restart`].
 //!
 //! * Per-session **debug shells** ([`ensure_debug`]): one or more login shells
-//!   *in a session's worktree*, carrying its `WEAVER_BRANCH`, for poking at the
-//!   agent's checkout (run the tests, inspect the diff) beside the live agent.
+//!   in the session agent's runner placement (the same container with the
+//!   Docker runner), rooted in its worktree and carrying its `WEAVER_BRANCH`,
+//!   for poking at the agent's checkout beside the live agent.
 //!   They are spawned lazily on first attach and swept with the session on
 //!   archive/remove ([`kill_debug_all`]) so a worktree shell never outlives the
 //!   worktree it sits in. The UI rediscovers open ones after a reload via
@@ -155,13 +156,14 @@ pub async fn ensure_debug(
     let (script, env) = shell_script(st, Some(&branch.id)).await;
     let cwd = PathBuf::from(&session.work_dir);
     tracing::info!(session = %name, cwd = %cwd.display(), "spawning session debug shell");
-    backend::new_session(
+    backend::new_session_colocated(
         &name,
         &cwd,
         &script,
         &env_refs(&env),
         false,
         backend::memory_max_gb(&st.db).await,
+        &session.term_session,
     )
     .await?;
     Ok(name)
