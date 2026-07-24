@@ -2490,7 +2490,7 @@ async fn builtin_codex_launches_over_codex_acp() {
         .client
         .post(
             "/api/sessions",
-            json!({ "goal": "say:codex online", "cwd": ts.cwd(),
+            json!({ "title": "Codex prompt shape", "goal": "say:codex online", "cwd": ts.cwd(),
                     "agent": "codex", "protocol": "acp" }),
         )
         .await
@@ -2503,6 +2503,24 @@ async fn builtin_codex_launches_over_codex_acp() {
     })
     .await;
     let blocks = chat["blocks"].as_array().unwrap();
+    let prompt = blocks
+        .iter()
+        .find(|b| b["kind"] == "user_message")
+        .and_then(|b| b["payload"]["text"].as_str())
+        .expect("the opening user prompt");
+    assert_eq!(
+        prompt.matches("say:codex online").count(),
+        1,
+        "the opening prompt contains the goal exactly once: {prompt}"
+    );
+    assert!(
+        prompt.contains("Use `weaver summary` to recover context if needed"),
+        "summary is offered as recovery: {prompt}"
+    );
+    assert!(
+        !prompt.contains("Run `weaver summary` first"),
+        "the opening prompt must not request a tool call that reinjects the goal: {prompt}"
+    );
     let reply = blocks
         .iter()
         .find(|b| b["kind"] == "agent_message")
