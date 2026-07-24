@@ -115,6 +115,129 @@ fn run_identity(
     }
 }
 
+async fn run_view(st: &AppState, id: &str) -> ApiResult<Json<RunView>> {
+    let run = crate::runs::get(&st.db, id)
+        .await?
+        .ok_or_else(|| AppError::not_found("automation run"))?;
+    Ok(Json(run.into()))
+}
+
+enum LaunchFailure {
+    Final,
+    Retryable,
+}
+
+async fn launch_run(
+    st: &AppState,
+    req: RunReq,
+    subject: String,
+    profiles: Vec<String>,
+    run: crate::runs::Run,
+    failure: LaunchFailure,
+) -> ApiResult<Json<RunView>> {
+    let actor = crate::runtime::Actor::automation(
+        req.source,
+        subject,
+        profiles,
+        run.id.clone(),
+        run.session_id.clone(),
+    );
+    match crate::runtime::create_session(st.clone(), req.session, actor).await {
+        Ok(session) => {
+            crate::runs::launched(&st.db, &run.id, &session.id).await?;
+            run_view(st, &run.id).await
+        }
+        Err(error) => {
+            match failure {
+                LaunchFailure::Final => {
+                    crate::runs::failed(&st.db, &run.id, &format!("{error:?}"))
+                        .await
+                        .ok();
+                }
+                LaunchFailure::Retryable => {
+                    crate::runs::waiting(&st.db, &run.id).await.ok();
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn prompt_channel_run(
+    st: &AppState,
+    req: &RunReq,
+    run: crate::runs::Run,
+) -> ApiResult<Json<RunView>> {
+    let Some(session) = crate::session::get(&st.db, &run.session_id)
+        .await?
+        .filter(|session| session.status == "running" && session.protocol == "acp")
+    else {
+        crate::runs::waiting(&st.db, &run.id).await.ok();
+        return Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "automation channel session is not ready; retry this delivery",
+        ));
+    };
+    let Some(handle) = st.acp.get(&session.id) else {
+        crate::runs::waiting(&st.db, &run.id).await.ok();
+        return Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "automation channel session is being adopted; retry this delivery",
+        ));
+    };
+    let channel = run
+        .channel
+        .as_deref()
+        .expect("channel dispatch requires a channel");
+    let by = format!("automation:{}/{channel}", run.service_tag);
+    let goal = req
+        .session
+        .goal
+        .clone()
+        .expect("channel runs require a goal");
+    if let Err(error) = handle
+        .prompt(goal.clone(), Some(by.clone()), false, Vec::new())
+        .await
+    {
+        crate::runs::waiting(&st.db, &run.id).await.ok();
+        return Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("automation channel rejected the update: {error}"),
+        ));
+    }
+    crate::events::record(
+        &st.db,
+        &st.bus,
+        &session.branch_id,
+        "nudge",
+        serde_json::json!({ "by": by, "text": goal }),
+    )
+    .await
+    .ok();
+    crate::runs::launched(&st.db, &run.id, &session.id).await?;
+    run_view(st, &run.id).await
+}
+
+async fn dispatch_channel_run(
+    st: &AppState,
+    subject: String,
+    profiles: Vec<String>,
+    run: crate::runs::Run,
+) -> ApiResult<Json<RunView>> {
+    let req: RunReq = serde_json::from_str(&run.request_json)?;
+    match crate::runs::route_channel(&st.db, &run.id).await? {
+        crate::runs::ChannelAction::Launch(run) => {
+            launch_run(st, req, subject, profiles, run, LaunchFailure::Retryable).await
+        }
+        crate::runs::ChannelAction::Prompt(run) => prompt_channel_run(st, &req, run).await,
+        crate::runs::ChannelAction::Ready(run) => Ok(Json(run.into())),
+        crate::runs::ChannelAction::Busy(_) => Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "automation channel is provisioning or orphaned; retry this delivery",
+        )),
+    }
+}
+
 pub(super) async fn create_run(
     State(st): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -129,6 +252,34 @@ pub(super) async fn create_run(
     }
     req.session.profile = Some(profile.clone());
     req.session.class = None;
+    req.channel = match req.channel.take() {
+        Some(channel) => {
+            let channel = channel.trim().to_string();
+            crate::runs::validate_channel(&channel)
+                .map_err(|error| AppError::bad_request(error.to_string()))?;
+            if req
+                .session
+                .goal
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+            {
+                return Err(AppError::bad_request(
+                    "channel automation runs require a non-empty session goal",
+                ));
+            }
+            let launch_profile = crate::profile::get(&st.db, &profile)
+                .await?
+                .ok_or_else(|| AppError::bad_request(format!("unknown profile '{profile}'")))?;
+            if launch_profile.protocol != "acp" {
+                return Err(AppError::bad_request(
+                    "automation channels require an ACP profile",
+                ));
+            }
+            Some(channel)
+        }
+        None => None,
+    };
 
     let idempotency_key = match &principal.automation_context {
         Some(context) if context.provider == "github" => {
@@ -170,14 +321,44 @@ pub(super) async fn create_run(
         .unwrap_or(req.source.as_str());
     let reservation = crate::runs::reserve(
         &st.db,
-        &subject,
-        &req.source,
-        service_tag,
-        &profile,
-        &idempotency_key,
-        &request_json,
+        crate::runs::NewRun {
+            subject: &subject,
+            source: &req.source,
+            service_tag,
+            profile: &profile,
+            idempotency_key: &idempotency_key,
+            channel: req.channel.as_deref(),
+            request_json: &request_json,
+        },
     )
     .await?;
+    if req.channel.is_some() {
+        let run = match reservation {
+            crate::runs::Reservation::Existing(run)
+                if run.channel.as_deref() != req.channel.as_deref() =>
+            {
+                return Ok(Json(run.into()));
+            }
+            crate::runs::Reservation::Existing(run)
+                if matches!(run.status.as_str(), "running" | "failed") =>
+            {
+                return Ok(Json(run.into()));
+            }
+            crate::runs::Reservation::Existing(run) if run.status == "delivering" => {
+                if !crate::runs::claim_stale_delivery(&st.db, &run.id).await? {
+                    return Err(AppError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "automation channel delivery is in progress; retry this delivery",
+                    ));
+                }
+                crate::runs::get(&st.db, &run.id)
+                    .await?
+                    .ok_or_else(|| AppError::not_found("automation run"))?
+            }
+            crate::runs::Reservation::Existing(run) | crate::runs::Reservation::Created(run) => run,
+        };
+        return dispatch_channel_run(&st, subject, profiles, run).await;
+    }
     let run = match reservation {
         crate::runs::Reservation::Existing(run) => {
             if let Some(session) = crate::session::get(&st.db, &run.session_id).await? {
@@ -199,28 +380,7 @@ pub(super) async fn create_run(
         }
         crate::runs::Reservation::Created(run) => run,
     };
-    let actor = crate::runtime::Actor::automation(
-        req.source.clone(),
-        subject,
-        profiles,
-        run.id.clone(),
-        run.session_id.clone(),
-    );
-    match crate::runtime::create_session(st.clone(), req.session, actor).await {
-        Ok(session) => {
-            crate::runs::launched(&st.db, &run.id, &session.id).await?;
-            let run = crate::runs::get(&st.db, &run.id)
-                .await?
-                .ok_or_else(|| AppError::not_found("automation run"))?;
-            Ok(Json(run.into()))
-        }
-        Err(error) => {
-            crate::runs::failed(&st.db, &run.id, &format!("{error:?}"))
-                .await
-                .ok();
-            Err(error)
-        }
-    }
+    launch_run(&st, req, subject, profiles, run, LaunchFailure::Final).await
 }
 
 pub(super) async fn list_runs(
