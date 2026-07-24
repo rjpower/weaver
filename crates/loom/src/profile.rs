@@ -695,7 +695,7 @@ mod tests {
         assert_eq!(allowed_tool_name("Bash"), Some("Bash"));
         assert_eq!(allowed_tool_name("Bash(gh issue view:*"), None);
         assert_eq!(allowed_tool_name(" Bash(gh issue view:*)"), None);
-        assert!(is_restricted_mcp_tool_set("mcp/github/comment"));
+        assert!(is_restricted_mcp_tool_set("mcp/github/comment@v1"));
         assert!(!is_restricted_mcp_tool_set("mcp/github/admin"));
     }
 
@@ -710,7 +710,7 @@ mod tests {
         input.allowed_tools = vec!["Read(./**)".to_string()];
         assert!(upsert(&db, &input).await.is_ok());
 
-        input.allowed_tools = vec!["mcp/github/comment".to_string()];
+        input.allowed_tools = vec!["mcp/github/comment@v1".to_string()];
         assert!(upsert(&db, &input).await.is_ok());
 
         input.allowed_tools = vec!["Read(../**)".to_string()];

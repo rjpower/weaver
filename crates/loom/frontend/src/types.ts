@@ -867,6 +867,28 @@ export interface ProfileEnv {
   updated_at: string;
 }
 
+/** Trusted MCP registry. Capability-set names are provider-neutral profile
+ * policy; a runtime translates their exact tools to its own protocol. */
+export interface McpRegistry {
+  adapters: McpAdapter[];
+  capability_sets: McpCapabilitySet[];
+}
+
+export interface McpAdapter {
+  name: string;
+  description: string;
+  server_name: string;
+}
+
+export interface McpCapabilitySet {
+  name: string;
+  version: string;
+  digest: string;
+  description: string;
+  adapter: string;
+  tools: string[];
+}
+
 export type ProfileInput = Omit<Profile, 'revision' | 'created_at' | 'updated_at' | 'env'>;
 
 /**

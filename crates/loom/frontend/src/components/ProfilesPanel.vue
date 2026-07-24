@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue';
 import * as api from '../api';
-import type { AgentMetadata, Profile, ProfileInput } from '../types';
+import type { AgentMetadata, McpRegistry, Profile, ProfileInput } from '../types';
 
 const profiles = ref<Profile[]>([]);
 const agents = ref<AgentMetadata[]>([]);
+const mcpRegistry = ref<McpRegistry | null>(null);
 const selected = ref('default');
 const draft = ref<ProfileInput | null>(null);
 const creating = ref(false);
@@ -66,9 +67,14 @@ function choose(name: string) {
 
 async function load() {
   try {
-    const [items, metadata] = await Promise.all([api.listProfiles(), api.listAgents()]);
+    const [items, metadata, registry] = await Promise.all([
+      api.listProfiles(),
+      api.listAgents(),
+      api.getMcpRegistry(),
+    ]);
     profiles.value = items;
     agents.value = metadata.agents;
+    mcpRegistry.value = registry;
     choose(
       items.some((item) => item.name === selected.value)
         ? selected.value
@@ -348,7 +354,7 @@ onMounted(load);
             />
           </label>
           <label class="text-xs sm:col-span-2"
-            >Allowed Claude tools (one permission rule per line)
+            >MCP capability sets and runtime permissions (one per line)
             <textarea
               :value="draft.allowed_tools.join('\n')"
               rows="6"
@@ -360,7 +366,20 @@ onMounted(load);
                   .filter(Boolean)
               "
             />
+            <span class="mt-1 block text-muted">
+              Select a versioned set such as
+              <code>mcp/github/comment@v1</code>. Non-MCP lines are passed to the selected runtime
+              as its provider-specific permission policy.
+            </span>
           </label>
+          <div v-if="mcpRegistry?.capability_sets.length" class="text-xs sm:col-span-2">
+            <div class="mb-1 font-medium">Available trusted MCP capability sets</div>
+            <ul class="space-y-1 text-muted">
+              <li v-for="set in mcpRegistry.capability_sets" :key="set.name">
+                <code>{{ set.name }}</code> — {{ set.description }}
+              </li>
+            </ul>
+          </div>
           <div class="flex gap-2 sm:col-span-2">
             <button
               data-testid="profile-save"

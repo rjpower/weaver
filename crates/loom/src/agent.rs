@@ -2128,7 +2128,7 @@ mod tests {
         assert_eq!(restricted["mcpServers"]["loom_github"]["command"], "loom");
         assert_eq!(
             restricted["mcpServers"]["loom_github"]["args"],
-            json!(["mcp", "github"])
+            json!(["mcp", "serve", "github"])
         );
         assert_eq!(opts2["permissionMode"], "plan");
     }

@@ -434,6 +434,7 @@ export const deleteEnv = (name: string) =>
 import type { Profile, ProfileInput } from './types';
 
 export const listProfiles = () => get('/profiles') as Promise<Profile[]>;
+export const getMcpRegistry = () => get('/mcps') as Promise<import('./types').McpRegistry>;
 export const createProfile = (profile: ProfileInput) =>
   post('/profiles', profile) as Promise<Profile>;
 export const updateProfile = (name: string, profile: ProfileInput) =>

@@ -50,8 +50,25 @@ async fn stock_github_comment_profile_round_trips_restricted_policy() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|rule| rule == "mcp/github/comment"));
+        .any(|rule| rule == "mcp/github/comment@v1"));
     assert!(profile["env"].as_array().unwrap().is_empty());
+}
+
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_registry_is_inspectable_without_source_access() {
+    let ts = TestServer::start().await;
+    let registry = ts.client.get("/api/mcps").await.unwrap();
+    let set = registry["capability_sets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|set| set["name"] == "mcp/github/comment@v1")
+        .expect("GitHub comment MCP set");
+    assert_eq!(set["version"], "v1");
+    assert!(set["digest"].as_str().unwrap().starts_with("sha256:"));
+    assert_eq!(set["adapter"], "github");
+    assert_eq!(set["tools"].as_array().unwrap().len(), 6);
 }
 
 #[serial]

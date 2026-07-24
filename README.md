@@ -409,6 +409,8 @@ weaver config ls
 loom profile ls
 loom profile show default
 loom profile show github_comment
+loom mcp ls
+loom mcp show mcp/github/comment@v1
 # App-less deployments can give restricted GitHub tools a shared identity:
 loom profile env secret github_comment GH_TOKEN \
   projects/my-project/secrets/loom-github-ci-token/versions/latest
@@ -424,7 +426,7 @@ Notable settings:
 - Restricted profiles are Claude ACP automation envelopes for caller-supplied
   prompts. They suppress the Weaver prelude and repository setup/config, clear
   Claude setting sources, expose repository-scoped read tools plus fixed
-  server-side GitHub tools selected by the built-in `mcp/github/comment`
+  server-side GitHub tools selected by the built-in `mcp/github/comment@v1`
   capability set, and have Loom reject every unmatched permission request.
   Loom expands profile capability sets into exact permissions when it stamps a
   session and derives adapter processes from its trusted MCP registry; profiles
@@ -436,6 +438,11 @@ Notable settings:
   from its reviewed declarative manifest and remains operator-editable after the
   first seed. See
   [Restricted GitHub sessions](docs/restricted-sessions.md).
+- MCP capability sets are stable, provider-neutral profile policy. Inspect
+  their adapter, exact tool surface, version, and content digest with `loom mcp
+  ls` / `loom mcp show`; the Settings profile editor exposes the same registry.
+  Provider-specific runtime permission rules remain an implementation detail of
+  the selected agent, rather than the vocabulary used to name MCP access.
 - Profile environment values are write-only: API, CLI, and Settings responses
   expose names and update times, never secret values.
 - Ordinary sessions default `CARGO_TARGET_DIR` to the primary repository's

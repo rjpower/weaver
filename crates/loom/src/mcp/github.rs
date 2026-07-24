@@ -9,10 +9,11 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use super::{Adapter, ServeFuture};
+use super::{Adapter, CapabilitySet, ServeFuture};
 
 const SERVER_NAME: &str = "loom_github";
 const COMMENT_TOOL_SET: &str = "mcp/github/comment";
+const COMMENT_TOOL_SET_V1: &str = "mcp/github/comment@v1";
 pub(crate) const BODY_MAX_BYTES: usize = 65_536;
 pub(crate) const TITLE_MAX_BYTES: usize = 256;
 const GITHUB_TOOL_NAMES: [&str; 6] = [
@@ -27,11 +28,24 @@ const GITHUB_TOOL_NAMES: [&str; 6] = [
 pub(super) const ADAPTER: Adapter = Adapter {
     name: "github",
     server_name: SERVER_NAME,
+    description: "Repository-scoped GitHub issue and pull-request operations.",
+    capability_sets,
     expand_tool_set,
     is_permission_rule,
     server_config,
     serve: serve_boxed,
 };
+
+const CAPABILITY_SETS: &[CapabilitySet] = &[CapabilitySet {
+    name: COMMENT_TOOL_SET_V1,
+    version: "v1",
+    description: "Read, comment on, and edit the issue or pull request bound to the session.",
+    tools: &GITHUB_TOOL_NAMES,
+}];
+
+fn capability_sets() -> &'static [CapabilitySet] {
+    CAPABILITY_SETS
+}
 
 pub(crate) fn permission_rule(tool: &str) -> Option<String> {
     GITHUB_TOOL_NAMES
@@ -46,7 +60,7 @@ fn is_permission_rule(rule: &str) -> bool {
 }
 
 fn expand_tool_set(name: &str) -> Option<Vec<String>> {
-    (name == COMMENT_TOOL_SET).then(|| {
+    (matches!(name, COMMENT_TOOL_SET | COMMENT_TOOL_SET_V1)).then(|| {
         GITHUB_TOOL_NAMES
             .iter()
             .map(|tool| permission_rule(tool).expect("registered GitHub tool"))
@@ -58,7 +72,7 @@ fn server_config() -> Value {
     json!({
         "type": "stdio",
         "command": "loom",
-        "args": ["mcp", ADAPTER.name]
+        "args": ["mcp", "serve", ADAPTER.name]
     })
 }
 
@@ -246,7 +260,7 @@ mod tests {
 
     #[test]
     fn comment_set_expands_to_the_fixed_surface() {
-        let expanded = expand_tool_set("mcp/github/comment").unwrap();
+        let expanded = expand_tool_set("mcp/github/comment@v1").unwrap();
         assert_eq!(expanded.len(), GITHUB_TOOL_NAMES.len());
         assert_eq!(expanded[0], permission_rule(GITHUB_TOOL_NAMES[0]).unwrap());
         assert!(expand_tool_set("mcp/github/admin").is_none());
@@ -255,6 +269,9 @@ mod tests {
     #[test]
     fn registry_launches_the_generic_adapter_command() {
         let config = server_config();
-        assert_eq!(config["args"], serde_json::json!(["mcp", "github"]));
+        assert_eq!(
+            config["args"],
+            serde_json::json!(["mcp", "serve", "github"])
+        );
     }
 }

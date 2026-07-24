@@ -722,7 +722,7 @@ automation with `prelude = none`, `mode = default`, no ambient allowlist, and
 scoped Claude SDK tool rules. The first prompt is the caller's complete
 `session.goal`; Loom does not add `WEAVER.md` or infer rewrite instructions.
 Profiles select reviewed built-in MCP capability sets such as
-`mcp/github/comment`; the MCP registry expands them into exact permissions at
+`mcp/github/comment@v1`; the MCP registry expands them into exact permissions at
 session creation and derives the trusted adapter command from those stamped
 rules. Repository/profile data never supplies executable MCP configuration.
 Restricted launch and recovery omit repository environment/setup and Claude

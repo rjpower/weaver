@@ -75,6 +75,7 @@ mod discussion;
 mod env;
 mod issues;
 mod logview;
+mod mcps;
 mod profiles;
 mod repo_env;
 mod repos;
@@ -95,6 +96,7 @@ use discussion::*;
 use env::*;
 use issues::*;
 use logview::*;
+use mcps::*;
 use profiles::*;
 use repo_env::*;
 use repos::*;
@@ -749,6 +751,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/settings", get(get_settings).patch(patch_settings))
         .route("/deployment/reconcile", post(reconcile_deployment))
+        .route("/mcps", get(list_mcps))
         .route("/profiles", get(list_profiles).post(create_profile))
         .route(
             "/profiles/{name}",

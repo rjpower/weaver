@@ -15,9 +15,9 @@ use crate::dto::{
     AutomationTokenView, BranchStatusReq, BranchView, CommentDto, CreateEventReq, CreateIssueReq,
     CreateRepoIssueReq, CreateReq, CreateTokenReq, CreateWatchReq, CreatedTokenView, DeploymentReq,
     DeploymentView, DiagnosticsView, FederationReq, FederationView, HandoffReq, IssueView,
-    NewCommentBody, NewThreadBody, PatchIssueReq, PatchSessionReq, PatchWatchReq, ProfileReq,
-    ProfileView, PutProfileEnvReq, ReadinessView, RunReq, RunView, RunWatchReq, SendReq,
-    SessionView, SettingsEnvelope, TagReq, ThreadDto, TokenView, WatchView,
+    McpRegistryView, NewCommentBody, NewThreadBody, PatchIssueReq, PatchSessionReq, PatchWatchReq,
+    ProfileReq, ProfileView, PutProfileEnvReq, ReadinessView, RunReq, RunView, RunWatchReq,
+    SendReq, SessionView, SettingsEnvelope, TagReq, ThreadDto, TokenView, WatchView,
 };
 
 /// A client for one loom server, identified by its base URL.
@@ -673,6 +673,11 @@ impl Client {
     /// Admin-only redacted operational inventory (`GET /api/diagnostics`).
     pub async fn diagnostics(&self) -> Result<DiagnosticsView> {
         self.get_typed("/api/diagnostics").await
+    }
+
+    /// Trusted MCP adapters and their provider-neutral capability sets.
+    pub async fn mcp_registry(&self) -> Result<McpRegistryView> {
+        self.get_typed("/api/mcps").await
     }
 
     /// List named launch profiles. Secret environment values are withheld.

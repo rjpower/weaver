@@ -17,6 +17,6 @@
   "restricted": true,
   "allowed_tools": [
     "Read(./**)",
-    "mcp/github/comment"
+    "mcp/github/comment@v1"
   ]
 }

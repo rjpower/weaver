@@ -29,9 +29,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run one built-in stdio MCP adapter.
-    #[command(hide = true)]
-    Mcp { adapter: String },
+    /// Inspect trusted MCP capability sets, or run an internal stdio adapter.
+    Mcp {
+        #[command(subcommand)]
+        cmd: McpCmd,
+    },
     /// Manage the loom server daemon: run, start, stop, restart, status.
     ///
     /// `loom server run` runs the server in the foreground (REST API + Vue UI +
@@ -666,6 +668,17 @@ enum DeploymentCmd {
 }
 
 #[derive(Subcommand)]
+enum McpCmd {
+    /// List trusted MCP adapters and capability sets.
+    Ls,
+    /// Show one versioned capability set by name.
+    Show { name: String },
+    /// Run one trusted stdio adapter (used only by Loom's agent runtime).
+    #[command(hide = true)]
+    Serve { adapter: String },
+}
+
+#[derive(Subcommand)]
 enum ProfileCmd {
     /// Add a named launch profile.
     Add(Box<ProfileAddOpts>),
@@ -866,7 +879,7 @@ async fn run() -> Result<()> {
     let Cli { context, cmd } = Cli::parse();
     client::set_context_override(context.as_deref())?;
     match cmd {
-        Cmd::Mcp { adapter } => loom::mcp::serve(&adapter).await,
+        Cmd::Mcp { cmd } => run_mcp(cmd).await,
         Cmd::Server { cmd } => run_server(cmd).await,
         Cmd::Session { cmd } => run_session(cmd).await,
         Cmd::Issue { cmd } => run_issue(cmd).await,
@@ -955,6 +968,32 @@ async fn run_session(cmd: SessionCmd) -> Result<()> {
             branch,
             keep_branch,
         } => cmd_rm(branch, keep_branch).await,
+    }
+}
+
+async fn run_mcp(cmd: McpCmd) -> Result<()> {
+    match cmd {
+        McpCmd::Serve { adapter } => loom::mcp::serve(&adapter).await,
+        McpCmd::Ls => {
+            let registry = client::default()?.mcp_registry().await?;
+            for set in registry.capability_sets {
+                println!(
+                    "{:<30} {:<4} {:<12} {}",
+                    set.name, set.version, set.adapter, set.description
+                );
+            }
+            Ok(())
+        }
+        McpCmd::Show { name } => {
+            let registry = client::default()?.mcp_registry().await?;
+            let set = registry
+                .capability_sets
+                .into_iter()
+                .find(|set| set.name == name)
+                .ok_or_else(|| anyhow!("unknown MCP capability set '{name}'"))?;
+            println!("{}", serde_json::to_string_pretty(&set)?);
+            Ok(())
+        }
     }
 }
 

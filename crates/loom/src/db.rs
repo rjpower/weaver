@@ -299,7 +299,7 @@ mod tests {
         assert!(stock
             .allowed_tool_rules()
             .unwrap()
-            .contains(&"mcp/github/comment".to_string()));
+            .contains(&"mcp/github/comment@v1".to_string()));
 
         insert_branch(&db, "t1").await;
         sqlx::query(

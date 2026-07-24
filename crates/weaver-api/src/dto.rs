@@ -279,6 +279,34 @@ pub struct ProfileEnvView {
     pub updated_at: String,
 }
 
+/// One trusted MCP adapter Loom can launch.  This is deliberately provider
+/// neutral: clients select a capability set, while an agent runtime translates
+/// its tools into that provider's permission vocabulary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpAdapterView {
+    pub name: String,
+    pub description: String,
+    pub server_name: String,
+}
+
+/// An inspectable, content-addressed collection of MCP tools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpCapabilitySetView {
+    pub name: String,
+    pub version: String,
+    pub digest: String,
+    pub description: String,
+    pub adapter: String,
+    pub tools: Vec<String>,
+}
+
+/// The trusted MCP registry exposed to operators and the settings UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpRegistryView {
+    pub adapters: Vec<McpAdapterView>,
+    pub capability_sets: Vec<McpCapabilitySetView>,
+}
+
 /// Body for creating or replacing a profile.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileReq {
