@@ -3,7 +3,8 @@
 //! Build the test image with `HOST_UID=$(id -u)` and `HOST_GID=$(id -g)`, then
 //! run `cargo test -p loom --test docker_runner -- --ignored`. The regular suite
 //! stays Docker-free. This smoke covers placement, launcher death, shared socket
-//! access, and a callback over the configured sibling network.
+//! access, colocating a second supervisor, and a callback over the configured
+//! sibling network.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -74,7 +75,7 @@ fn docker_runner_child() {
         let options = tapestry::LaunchOptions {
             name: &session,
             cwd: Path::new("/home/app/work"),
-            script: "python3 -c 'import os, urllib.request; print(urllib.request.urlopen(os.environ[\"WEAVER_API\"], timeout=5).status)'; printf 'runner-ready\\n'; sleep 60",
+            script: "python3 -c 'import os, urllib.request; print(urllib.request.urlopen(os.environ[\"WEAVER_API\"], timeout=5).status)'; printf 'runner-ready owner-host=%s\\n' \"$(cat /etc/hostname)\"; sleep 60",
             env: &[],
             env_clear: false,
             cols: 80,
@@ -153,20 +154,64 @@ fn docker_runner_supervisor_outlives_its_launcher() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         assert!(tapestry::Client::is_alive(&session).await);
-        let mut screen = String::new();
+        let mut owner_screen = String::new();
         for _ in 0..200 {
-            screen = loom::backend::capture(&session, 0).await.unwrap();
-            if screen.contains("runner-ready") && screen.contains("200") {
+            owner_screen = loom::backend::capture(&session, 0).await.unwrap();
+            if owner_screen.contains("runner-ready") && owner_screen.contains("200") {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+        assert!(owner_screen.contains("runner-ready"));
+        assert!(owner_screen.contains("200"));
+
+        let colocated = format!("{session}-shell");
+        let options = tapestry::LaunchOptions {
+            name: &colocated,
+            cwd: Path::new("/home/app/work"),
+            script: "printf 'shell-ready colocated-host=%s\\n' \"$(cat /etc/hostname)\"; sleep 60",
+            env: &[],
+            env_clear: false,
+            cols: 80,
+            rows: 24,
+            mode: tapestry::Mode::Pty,
+            segment_max_bytes: None,
+            supervisor_bin: None,
+        };
+        loom::runner::spawn_colocated(&options, 1, &session)
+            .await
+            .unwrap();
+
+        let mut shell_screen = String::new();
+        for _ in 0..200 {
+            shell_screen = loom::backend::capture(&colocated, 0).await.unwrap();
+            if shell_screen.contains("shell-ready") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let owner_host = owner_screen
+            .split("owner-host=")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .expect("owner should print its container hostname");
+        let colocated_host = shell_screen
+            .split("colocated-host=")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .expect("shell should print its container hostname");
+        assert_eq!(
+            colocated_host, owner_host,
+            "colocated supervisor should run in the owner's container"
+        );
+
+        loom::backend::kill_session_and_wait(&colocated)
+            .await
+            .unwrap();
         loom::backend::kill_session_and_wait(&session)
             .await
             .unwrap();
         assert!(!tapestry::Client::is_alive(&session).await);
-        assert!(screen.contains("runner-ready"));
-        assert!(screen.contains("200"));
     });
     drop(fixture);
 }

@@ -2,9 +2,10 @@
 //!
 //! Transport remains the shared Unix socket and relay spool under
 //! `WEAVER_TAPESTRY_DIR`. A runner only decides where the supervisor process
-//! lives. Production uses a Docker container per supervisor so replacing the
-//! Loom control-plane container does not kill live agents; local development
-//! keeps the detached-process behavior.
+//! lives. Production uses a Docker container per agent, with auxiliary
+//! supervisors such as its debug shells colocated there, so replacing the Loom
+//! control-plane container does not kill live sessions; local development keeps
+//! the detached-process behavior.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,7 +14,8 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bollard::errors::Error as DockerError;
-use bollard::models::{ContainerCreateBody, HostConfig, HostConfigCgroupnsModeEnum};
+use bollard::exec::StartExecResults;
+use bollard::models::{ContainerCreateBody, ExecConfig, HostConfig, HostConfigCgroupnsModeEnum};
 use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, ListContainersOptionsBuilder,
     LogsOptionsBuilder, RemoveContainerOptionsBuilder,
@@ -44,8 +46,14 @@ pub trait Runner: Send + Sync {
     /// Verify that the placement backend is ready to accept launches.
     async fn validate(&self) -> Result<()>;
 
-    /// Start or adopt the supervisor described by `opts`.
-    async fn start(&self, opts: &tapestry::LaunchOptions<'_>, memory_max_gb: u64) -> Result<()>;
+    /// Start or adopt the supervisor described by `opts`. When `container_of`
+    /// is set, place it alongside that existing supervisor where supported.
+    async fn start(
+        &self,
+        opts: &tapestry::LaunchOptions<'_>,
+        memory_max_gb: u64,
+        container_of: Option<&str>,
+    ) -> Result<()>;
 
     /// Remove placement resources for a supervisor whose socket is gone.
     async fn remove(&self, name: &str) -> Result<()>;
@@ -60,7 +68,12 @@ impl Runner for ProcessRunner {
         Ok(())
     }
 
-    async fn start(&self, opts: &tapestry::LaunchOptions<'_>, _memory_max_gb: u64) -> Result<()> {
+    async fn start(
+        &self,
+        opts: &tapestry::LaunchOptions<'_>,
+        _memory_max_gb: u64,
+        _container_of: Option<&str>,
+    ) -> Result<()> {
         tapestry::spawn_detached(opts).await
     }
 
@@ -79,7 +92,8 @@ struct ContainerConfig {
     api_url: String,
 }
 
-/// Runs each supervisor in its own Docker container.
+/// Runs primary supervisors in their own Docker containers and can exec
+/// auxiliary supervisors into an existing primary's container.
 pub struct ContainerRunner {
     docker: Docker,
     config: ContainerConfig,
@@ -237,6 +251,123 @@ impl ContainerRunner {
             ..Default::default()
         })
     }
+
+    fn exec_config(&self, opts: &tapestry::LaunchOptions<'_>) -> Result<ExecConfig> {
+        if !opts.cwd.starts_with(Path::new(CONTAINER_HOME)) {
+            bail!(
+                "ContainerRunner work directory {} is outside {CONTAINER_HOME}",
+                opts.cwd.display()
+            );
+        }
+        let workdir = opts
+            .cwd
+            .to_str()
+            .context("ContainerRunner work directory is not UTF-8")?;
+        Ok(ExecConfig {
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            cmd: Some(vec![
+                "tapestry".to_string(),
+                "supervise".to_string(),
+                "-".to_string(),
+            ]),
+            working_dir: Some(workdir.to_string()),
+            ..Default::default()
+        })
+    }
+
+    async fn start_in_container(
+        &self,
+        opts: &tapestry::LaunchOptions<'_>,
+        owner: &str,
+    ) -> Result<()> {
+        if tapestry::Client::is_alive(opts.name).await {
+            return Ok(());
+        }
+        let container = container_name(owner);
+        match self.container_state(owner).await? {
+            Some(true) => {}
+            Some(false) => bail!(
+                "cannot place supervisor {} in stopped session container {container}",
+                opts.name
+            ),
+            None => bail!(
+                "cannot place supervisor {} in missing session container {container}",
+                opts.name
+            ),
+        }
+
+        let spec = tapestry::encode_launch_spec(opts, &[("WEAVER_API", &self.config.api_url)])?;
+        let exec = self
+            .docker
+            .create_exec(&container, self.exec_config(opts)?)
+            .await
+            .with_context(|| {
+                format!(
+                    "creating supervisor {} in session container {container}",
+                    opts.name
+                )
+            })?;
+        let StartExecResults::Attached {
+            mut output,
+            mut input,
+        } = self
+            .docker
+            .start_exec(&exec.id, None)
+            .await
+            .with_context(|| {
+                format!(
+                    "starting supervisor {} in session container {container}",
+                    opts.name
+                )
+            })?
+        else {
+            bail!(
+                "supervisor {} unexpectedly started detached in session container {container}",
+                opts.name
+            );
+        };
+        let output_task = tokio::spawn(async move {
+            while output.try_next().await?.is_some() {}
+            Ok::<(), DockerError>(())
+        });
+        let delivery = async {
+            input
+                .write_all(&spec)
+                .await
+                .context("sending launch spec to colocated session supervisor")?;
+            input
+                .flush()
+                .await
+                .context("flushing colocated session supervisor launch input")
+        }
+        .await;
+        if let Err(error) = delivery {
+            drop(input);
+            output_task.abort();
+            return Err(error);
+        }
+        if let Err(error) = wait_for_supervisor(opts.name).await {
+            drop(input);
+            output_task.abort();
+            return Err(error).with_context(|| {
+                format!(
+                    "colocated supervisor {} did not become ready in session container {container}",
+                    opts.name
+                )
+            });
+        }
+        drop(input);
+        output_task.abort();
+        tracing::info!(
+            session = %opts.name,
+            owner,
+            %container,
+            "ContainerRunner supervisor ready in existing container"
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -273,7 +404,15 @@ impl Runner for ContainerRunner {
         Ok(())
     }
 
-    async fn start(&self, opts: &tapestry::LaunchOptions<'_>, memory_max_gb: u64) -> Result<()> {
+    async fn start(
+        &self,
+        opts: &tapestry::LaunchOptions<'_>,
+        memory_max_gb: u64,
+        container_of: Option<&str>,
+    ) -> Result<()> {
+        if let Some(owner) = container_of {
+            return self.start_in_container(opts, owner).await;
+        }
         let container = container_name(opts.name);
         match self.container_state(opts.name).await? {
             Some(true) => {
@@ -439,7 +578,23 @@ pub async fn validate() -> Result<()> {
 
 /// Start a supervisor using the configured placement backend.
 pub async fn spawn(opts: &tapestry::LaunchOptions<'_>, memory_max_gb: u64) -> Result<()> {
-    configured_runner().await?.start(opts, memory_max_gb).await
+    configured_runner()
+        .await?
+        .start(opts, memory_max_gb, None)
+        .await
+}
+
+/// Start a supervisor in the same placement container as `owner`. Local-process
+/// placement has no container boundary, so this is equivalent to [`spawn`].
+pub async fn spawn_colocated(
+    opts: &tapestry::LaunchOptions<'_>,
+    memory_max_gb: u64,
+    owner: &str,
+) -> Result<()> {
+    configured_runner()
+        .await?
+        .start(opts, memory_max_gb, Some(owner))
+        .await
 }
 
 /// Remove placement resources after a supervisor's socket is gone.
@@ -600,6 +755,28 @@ mod tests {
             .contains(&"/var/run/docker.sock:/var/run/docker.sock".to_string()));
 
         let rendered = serde_json::to_string(&body).unwrap();
+        assert!(!rendered.contains("super-secret"));
+        assert!(!rendered.contains("API_TOKEN"));
+        assert!(!rendered.contains("agent --secret"));
+    }
+
+    #[test]
+    fn colocated_exec_uses_the_existing_container_without_launch_secrets() {
+        let env = [("API_TOKEN", "super-secret")];
+        let cwd = Path::new("/home/app/.weaver/repos/example/.worktrees/abc");
+        let config = container_runner()
+            .exec_config(&launch_options(cwd, &env))
+            .unwrap();
+
+        assert_eq!(
+            config.cmd,
+            Some(vec!["tapestry".into(), "supervise".into(), "-".into()])
+        );
+        assert_eq!(config.working_dir.as_deref(), Some(cwd.to_str().unwrap()));
+        assert_eq!(config.attach_stdin, Some(true));
+        assert_eq!(config.attach_stdout, Some(true));
+        assert_eq!(config.attach_stderr, Some(true));
+        let rendered = serde_json::to_string(&config).unwrap();
         assert!(!rendered.contains("super-secret"));
         assert!(!rendered.contains("API_TOKEN"));
         assert!(!rendered.contains("agent --secret"));

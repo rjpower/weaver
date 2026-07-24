@@ -54,9 +54,11 @@ services:
     # request path), so warnings rely on the per-request span (method/path) instead.
     environment:
       RUST_BACKTRACE: "1"
-      # Place every Tapestry supervisor in its own sibling container. These
-      # containers share the durable home/tool volumes and control socket;
-      # recreating this control-plane service therefore leaves live agents up.
+      # Place every agent's primary Tapestry supervisor in its own sibling
+      # container. Auxiliary supervisors such as its debug shells are colocated
+      # there. The containers share the durable home/tool volumes and control
+      # socket; recreating this control-plane service therefore leaves live
+      # sessions up.
       LOOM_RUNNER: docker
       LOOM_SESSION_IMAGE: ${LOOM_IMAGE:-loom:latest}
       LOOM_SESSION_HOME_VOLUME: loom_loom_home
